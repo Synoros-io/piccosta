@@ -19,8 +19,7 @@ It has one session format, a terminal UI, a print mode for scripts, pi's rpc pro
   - Enter while a run goes queues the message, Esc stops the run, Ctrl+X Ctrl+S sends the queue now.
   - Drag to select (it copies when you let go), right-click to paste.
   - Tab completes `/` commands. `/help` lists the rest.
-- **Choices are remembered.** `/model` becomes the default for new sessions, and `/effort` is saved per model. Both use pi's `settings.json` keys.
-- **Long commands go to the background on their own**, and their results come back as messages. A session never sits waiting on one.
+- **Long commands go to the background on their own**, and their results come back as messages. 
 - **Subagents.** The model hands a task to a job, and a list you set says which models may do it. Running subagents show under their session in the sidebar.
 - **Web tools:** search, fetch and PDF reading, with pages stored so the model can page through them.
 
@@ -43,7 +42,7 @@ opencode auth login      # or set OPENCODE_API_KEY, for opencode-go/* models
 piccosta auth status
 ```
 
-piccosta reads those logins where the tools keep them, and never prints a key.
+It reads those logins without handling any keys. ( ...opencode )
 
 ## Use
 
