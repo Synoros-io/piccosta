@@ -11,18 +11,62 @@ It has one session format, a terminal UI, a print mode for scripts, pi's rpc pro
 
 ## What's in it
 
-- **A terminal UI that runs several sessions at once.**
-  - A sidebar groups sessions by project, and up to four panes show sessions side by side.
-  - Formulas are typeset as images (RaTeX, through the kitty graphics protocol; Ghostty, kitty, WezTerm), or drawn as Unicode text where a terminal can't show images.
-- **Pairs and trios.** `/pair <model>` (or `--pair a,b`) has other models check each answer in turn, then hands back to you. Partners can be any models, on any provider.
-- **Claude Code's habits:**
-  - Enter while a run goes queues the message, Esc stops the run, Ctrl+X Ctrl+S sends the queue now.
-  - Drag to select (it copies when you let go), right-click to paste.
-  - Tab completes `/` commands. `/help` lists the rest.
-- **Choices are remembered.** `/model` becomes the default for new sessions, and `/effort` is saved per model. Both use pi's `settings.json` keys.
-- **Long commands go to the background on their own**, and their results come back as messages. A session never sits waiting on one.
-- **Subagents.** The model hands a task to a job, and a list you set says which models may do it. Running subagents show under their session in the sidebar.
-- **Web tools:** search, fetch and PDF reading, with pages stored so the model can page through them.
+### Every model, on the plans you already pay for
+
+- **Claude through Claude Code.** A Claude plan only works inside Claude Code, so piccosta runs Claude Code as a pipe: piccosta's own prompt and tools go in, with none of Claude Code's builtins, settings or CLAUDE.md. A turn that ends on tool calls keeps its query open for the results, so the prompt cache carries from turn to turn.
+- **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn.
+- **All 28 opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent.
+- **Your own models** in `models.json`, in pi's format.
+- **One thinking scale for all of them**, from `off` to `max`, set to what each model actually takes.
+
+### A terminal UI for several sessions at once
+
+- **Sessions side by side.** The sidebar groups sessions by project, and up to four panes run side by side.
+- **Sessions you can find again:**
+  - Alt+↑↓ walks the list, showing earlier sessions without starting them until you type.
+  - Ctrl+S searches the list, and `/resume all` reaches every project's.
+- **No double runs.** A session another piccosta is running is followed live from its file, never run twice.
+- **Typeset math.** Formulas are typeset by RaTeX and shown as images in Ghostty, kitty and WezTerm (through tmux too), or drawn as Unicode where a terminal can't show images.
+- **The keys Claude Code taught you:**
+  - Enter queues a message while a run goes, and Esc stops the run.
+  - Ctrl+X Ctrl+S sends the queue now: running commands move to the background so the model reads it straight away.
+  - ↑ takes the queue back.
+- **Copy and paste with the mouse:** drag to select, and it copies when you let go. Double-click selects a path, triple-click a line. Right-click pastes. Shift+arrows select in the editor.
+- **Commands people reach for:**
+  - `/model` becomes the default, and `/effort` is saved for that model.
+  - `/compact` says what it saved.
+  - `/fork`, `/rewind`, `/diff` (new files included), `/export`, `/usage`.
+  - `/help` has the rest, and Tab completes them.
+
+### Models that check each other
+
+`/pair <model>` makes a pair, and `/pair a b` (or `--pair a,b`) a trio. After each answer, the other models take a turn each checking it against what you asked: they verify, fix, finish, and say what they changed. Then it's your turn again, so they can't keep each other going. Any models can work together, across providers, and the group is saved with the session.
+
+### An agent loop that doesn't get stuck
+
+- **Long commands go to the background.** A command still running after a minute moves there by itself, and its result comes back as a message when it ends. Nothing waits in the foreground, and the model is told not to sleep or poll.
+- **Loop guards.** A response stuck repeating itself is stopped, and so is a run that makes the same tool call five times in a row.
+- **Nothing left running.** If piccosta is killed outright, as an editor stops an agent, a watcher process stops the commands it started.
+- **Retries that know the difference.** Overloads and dropped connections are retried with backoff, while used-up limits and withdrawn models fail straight away.
+- **Compaction that keeps your words.** When the context fills, older turns are summarized, and everything you typed before the cut is kept word for word on top of the summary.
+- **Edits that recover.** A failed edit tells the model where the closest match is, or what changed since it last read the file. A missing path gets "did you mean" suggestions.
+
+### Subagents
+
+The model hands a task to a job: search, scout, worker or reviewer. You set which models may do each job, in order. The first one with a login runs it, and the next takes over if it fails. Each subagent is a piccosta of its own, with its own saved session. While it works, it shows under its parent session in the sidebar.
+
+### Web tools
+
+- **Search** goes through your own SearXNG, or through a search-capable model on an account you already have, so no search API key is needed.
+- **Pages** come back as Markdown, read with Readability. PDFs come back as text. GitHub URLs become shallow clones the model can read.
+- **Long results** are stored, so the model can page through them later instead of fetching again.
+
+### Editors and scripts
+
+- **Print mode.** `piccosta -p` answers and exits, reading stdin too. `--mode json` prints one event per line. Failures exit non-zero.
+- **T3 Code.** `--mode rpc` is pi's protocol, including approvals in T3's supervised mode.
+- **Zed and other editors.** `--mode acp` is the Agent Client Protocol: Ask, Edits and Auto modes, permission cards that show each edit's diff, and live command output in the editor's terminal. Zed's pickers set the model and thinking level.
+- **Your prompt files.** piccosta reads `AGENTS.md` and `CLAUDE.md` from the project and the folders above it. Sessions are saved in pi's JSONL format.
 
 ## Install
 
