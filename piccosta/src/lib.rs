@@ -1,0 +1,23 @@
+// piccosta: one agent harness for every model Jack uses. The library holds everything; the binary
+// in main.rs only reads the command line and hands over.
+
+pub mod acp;
+pub mod agent;
+pub mod auth;
+pub mod cli;
+pub mod clock;
+pub mod compaction;
+pub mod config;
+pub mod host;
+pub mod js;
+pub mod json_number;
+pub mod message;
+pub mod model;
+pub mod pintask;
+pub mod prompt;
+pub mod provider;
+pub mod retry;
+pub mod rpc;
+pub mod session;
+pub mod tools;
+pub mod tui;

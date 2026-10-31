@@ -1,0 +1,40 @@
+[package]
+name = "piccosta"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "One agent harness for every model you use"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
+libc.workspace = true
+unicode-normalization.workspace = true
+image.workspace = true
+regex.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+dom_smoothie.workspace = true
+htmd.workspace = true
+pdf_oxide.workspace = true
+encoding_rs.workspace = true
+url.workspace = true
+sha2.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+ratex-parser.workspace = true
+ratex-layout.workspace = true
+ratex-types.workspace = true
+ratex-render.workspace = true
+term-maths.workspace = true

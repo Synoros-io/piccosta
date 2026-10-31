@@ -1,0 +1,1458 @@
+// Claude through Claude Code: the "claude-bridge" provider.
+//
+// On a Claude plan, Claude runs only through Claude Code, so each request goes to a `claude` child
+// speaking its stream-json control protocol on stdin and stdout, with Claude Code reduced to a pipe:
+// pi's context, system prompt and tools, no builtins, no settings files, no CLAUDE.md. pi's tools
+// are served to it as one MCP server ("custom-tools") inside that same protocol, so a tool call
+// reaches pi as a turn that ends on tool calls, and pi's results go back as the answers to Claude
+// Code's tools/call requests.
+//
+// One live query per pi session. A turn that ends on tool calls parks the query: Claude Code waits
+// inside tools/call. The next call either delivers exactly those results to it, or discards it and
+// starts a new one from a session file holding exactly pi's context (history.rs says how). A
+// one-off summary (compaction) runs as its own short process.
+//
+// Based on piccosta's TypeScript bridge, itself built on pi-claude-bridge (MIT, Eli Dickinson,
+// see LICENSE.md), without the Agent SDK: the parts of its control protocol the
+// bridge used (initialize with the MCP manifests, mcp_message, interrupt) are written here.
+// Left out on purpose:
+// - The SDK's stamps (CLAUDE_CODE_ENTRYPOINT=sdk-ts, CLAUDE_AGENT_SDK_VERSION): Claude Code puts
+//   the entrypoint into its billing header, so it says what it is itself here.
+// - The TypeScript bridge's removal of pi's docs block, which existed to get past Anthropic's
+//   check for third-party apps on the plan. piccosta's prompt never has that block anyway.
+// - onPayload and the rate-limit headers for after_provider_response (no extensions here), the
+//   rate-limit notices (no UI yet), and the flattening of root anyOf/oneOf tool schemas (no
+//   piccosta tool has one).
+//
+// Settings, all from the environment:
+//   CLAUDE_BRIDGE_CLAUDE_PATH      the claude executable (default `claude` on PATH)
+//   CLAUDE_BRIDGE_CONFIG_DIR       a Claude Code config dir for the children only (their
+//                                  CLAUDE_CONFIG_DIR, and where their session files go); one with no
+//                                  account record keeps the account's email out of the prompt, and
+//                                  then needs CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
+//   CLAUDE_BRIDGE_KEEP_SESSIONS=0  don't keep Claude Code's records between queries (history.rs)
+//   CLAUDE_BRIDGE_STRICT_MCP=0     let Claude Code load MCP servers from ~/.claude.json and .mcp.json
+//   CLAUDE_BRIDGE_PLAN=max, CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE=1, CLAUDE_BRIDGE_FORCE_200K=id,id
+//                                  which models get 1M context (runtime_model)
+//   CLAUDE_BRIDGE_DEBUG_PATH       append a debug log here
+//   CLAUDE_BRIDGE_RECORD_STREAM    append every line Claude Code writes here (fixtures, diagnosis)
+
+mod history;
+pub use history::SIDECAR_SUFFIX;
+
+use super::{new_output, transcript, Request, StreamEvent, BODY_IDLE_TIMEOUT};
+use crate::clock;
+use crate::message::{AssistantMessage, Content, Message, StopReason, TextOrBlocks, ToolDefinition, Usage};
+use crate::model::Model;
+use history::{fingerprint, Held, Shape};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep_until, timeout, Instant};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+pub const PROVIDER: &str = "claude-bridge";
+const MCP_SERVER: &str = "custom-tools";
+pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
+// Claude Code keeps a tool result over 50,000 characters out of the conversation (a preview and a
+// file path instead) unless the tool raises that ceiling, up to 500,000. pi cuts read and bash at
+// 50 KB, so every tool declares the maximum and pi's results arrive whole (2.1.300's tool-result
+// store, read in the binary).
+const MCP_RESULT_MAX_CHARS: u64 = 500_000;
+// The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan; a new
+// model serves 200K until someone measures it). An unentitled [1m] fails every turn, so the default
+// is the bare id at 200K.
+const MEASURED_ONE_M: [&str; 9] = ["claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
+    "claude-opus-4-7", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+const ONE_M: u64 = 1_000_000;
+const TWO_HUNDRED_K: u64 = 200_000;
+// Models Claude Code won't run with thinking off: given --thinking=disabled it still asks for
+// adaptive thinking at its default effort (2.1.300 and 2.1.312 against a local mock API,
+// 2026-10-29; the 4.5 models do send thinking disabled). The catalog fetched that day lets them
+// turn it off, pi 1.2's didn't; marked off here, pi clamps "off" up to their lowest level instead.
+const NO_THINKING_OFF: [&str; 1] = ["claude-haiku-5-5"];
+// Claude Code refuses a prompt at window - min(max output, 20,000) - 3,000 tokens before sending it
+// (2.1.300, read in the binary), so that is the window pi is given to compact against.
+const OUTPUT_RESERVE_CAP: u64 = 20_000;
+const BLOCKING_MARGIN: u64 = 3_000;
+// pi's levels to Claude Code's efforts, for a level the model's own map leaves out.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+// What every child gets on top of pi's environment (each one checked against a captured request,
+// 2026-10-25, Claude Code 2.1.300):
+// - no claude.ai MCP servers, no auto-compaction (pi owns compaction), no update checks or telemetry;
+// - no "<total_tokens>" reminders, no @file attachments (pi leaves "@path" text alone), no tool
+//   search (every tool goes in full, as pi sends it);
+// - MCP output cut only past 250,000 tokens: Claude Code estimates characters / 4 and counts the
+//   tokens of anything over half the cap first, so twice 500,000 / 4 lets every whole result by;
+// - tool descriptions never cut (its default is 4,096 characters);
+// - no retries of its own: pi's provider retry count, 0 by default, so failures reach pi's auto-retry.
+const CHILD_ENV: [(&str, &str); 9] = [("ENABLE_CLAUDEAI_MCP_SERVERS", "0"), ("DISABLE_AUTO_COMPACT", "1"),
+    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"), ("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off"), ("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1"),
+    ("ENABLE_TOOL_SEARCH", "false"), ("MAX_MCP_OUTPUT_TOKENS", "250000"), ("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", "1000000"),
+    ("CLAUDE_CODE_MAX_RETRIES", "0")];
+// What a parent Claude Code session sets for the processes under it (what `env` showed inside a
+// Claude Code Bash call, 2026-10-15, plus the two 2.1.312 sets on 2026-10-29). Left in, the child
+// would act as part of that session. NODE_OPTIONS and DEBUG go too, as the SDK removed them.
+const PARENT_ENV: [&str; 18] = ["CLAUDECODE", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_PID", "CLAUDE_PLUGIN_DATA", "CODEX_COMPANION_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS", "NODE_OPTIONS", "DEBUG"];
+// The settings file every provider child gets: no auto-memory, no CLAUDE.md or AGENTS.md (pi
+// owns context files), no git status block (a git change would rewrite it and bust the cache), no
+// hooks (they cost seconds and tokens per query, and an opened repo's would run untrusted).
+const PROVIDER_SETTINGS: &str = r#"{"autoMemoryEnabled":false,"claudeMdExcludes":["**/CLAUDE.md","**/AGENTS.md","**/.claude/rules/**"],"includeGitInstructions":false,"disableAllHooks":true}"#;
+const SUMMARY_SETTINGS: &str = r#"{"autoMemoryEnabled":false}"#;
+// How long a parked tools/call waits before checking that pi was handed its call, and between
+// checks after (pi-claude-bridge #226): far longer than the stream event announcing it can lag.
+const LOST_CALL_CHECK: Duration = Duration::from_secs(120);
+// How long a non-streamed answer's last tool call waits for another block before the turn ends:
+// Claude Code writes all of a message's blocks at once (pi-claude-bridge #225).
+const FALLBACK_SETTLE: Duration = Duration::from_millis(100);
+// Closing a child: stdin ends, then SIGTERM after 2 s, then SIGKILL after 5 more (the SDK's close).
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
+const TERM_GRACE: Duration = Duration::from_secs(5);
+// Claude Code's own wording for a failed connection, which pi's retry rules don't know; such a
+// failure is led by pi's "Connection error" so it is retried.
+const CONNECTION_FAILURES: [&str; 6] = ["Unable to connect to API", "Connection dropped (", "Connection refused \u{2014}", "Can't reach the API server",
+    "No internet route", "Couldn't connect through your proxy"];
+
+pub struct Settings {
+    claude: String,
+    config_dir: Option<PathBuf>,
+    keep: bool,
+    strict_mcp: bool,
+    plan_max: bool,
+    extra_usage: bool,
+    force_200k: Vec<String>,
+    debug: Option<PathBuf>,
+    record: Option<PathBuf>,
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
+fn flag(name: &str) -> bool {
+    env(name).is_some_and(|value| ["1", "true", "yes", "on"].contains(&value.to_lowercase().as_str()))
+}
+
+pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings {
+    claude: env("CLAUDE_BRIDGE_CLAUDE_PATH").unwrap_or_else(|| "claude".into()),
+    config_dir: env("CLAUDE_BRIDGE_CONFIG_DIR").map(PathBuf::from),
+    keep: env("CLAUDE_BRIDGE_KEEP_SESSIONS").as_deref() != Some("0"),
+    strict_mcp: env("CLAUDE_BRIDGE_STRICT_MCP").as_deref() != Some("0"),
+    plan_max: env("CLAUDE_BRIDGE_PLAN").is_some_and(|plan| plan.eq_ignore_ascii_case("max")),
+    extra_usage: flag("CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE"),
+    force_200k: env("CLAUDE_BRIDGE_FORCE_200K").map(|ids| ids.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()).unwrap_or_default(),
+    debug: env("CLAUDE_BRIDGE_DEBUG_PATH").map(PathBuf::from),
+    record: env("CLAUDE_BRIDGE_RECORD_STREAM").map(PathBuf::from),
+});
+
+fn append(path: &PathBuf, line: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub fn debug(line: &str) {
+    if let Some(path) = &SETTINGS.debug {
+        append(path, &format!("{} {line}", clock::iso_from_ms(clock::now_ms())));
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// --- Models ---
+
+// Input: a model id. Output: the id Claude Code is asked for and the window it serves. 1M needs the
+// [1m] suffix, given only where measured; opus-4-6 serves it on Max or with extra usage, sonnet-4-6
+// with extra usage only.
+fn runtime_model(id: &str) -> (String, u64) {
+    let settings = &*SETTINGS;
+    let gated = match id {
+        "claude-opus-4-6" => settings.plan_max || settings.extra_usage,
+        "claude-sonnet-4-6" => settings.extra_usage,
+        _ => false,
+    };
+    if !settings.force_200k.iter().any(|forced| forced == id) && (MEASURED_ONE_M.contains(&id) || gated) {
+        (format!("{id}[1m]"), ONE_M)
+    } else {
+        (id.to_string(), TWO_HUNDRED_K)
+    }
+}
+
+// The window pi compacts against: where Claude Code starts refusing, or what its own overrides
+// (CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE; CLAUDE_CODE_MAX_CONTEXT_TOKENS with DISABLE_COMPACT) make it.
+fn effective_window(window: u64, max_tokens: u64) -> u64 {
+    let positive = |name: &str| env(name).and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0);
+    if let Some(limit) = positive("CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE") {
+        return limit;
+    }
+    let served = if flag("DISABLE_COMPACT") { positive("CLAUDE_CODE_MAX_CONTEXT_TOKENS").unwrap_or(window) } else { window };
+    served.saturating_sub(max_tokens.min(OUTPUT_RESERVE_CAP) + BLOCKING_MARGIN)
+}
+
+// Input: the anthropic catalog. Output: the bridge's models, the catalog's own fields that matter
+// here and nothing that would make piccosta treat them as an Anthropic API (no compat, no prompt
+// cache warming). Dated snapshot ids are left out; cost is 0, the plan pays.
+pub fn catalog_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
+    anthropic.into_iter().filter_map(|model| {
+        let id = model.get("id")?.as_str()?.to_string();
+        let tail = id.len().checked_sub(9).map(|start| &id[start..]).unwrap_or_default();
+        if tail.starts_with("-20") && tail[3..].bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let (_, window) = runtime_model(&id);
+        let max_tokens = model.get("maxTokens").and_then(Value::as_u64).unwrap_or(OUTPUT_RESERVE_CAP);
+        let name = model.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+        let says_1m = name.split(|c: char| !c.is_alphanumeric()).any(|word| word.eq_ignore_ascii_case("1m"));
+        let name = if window > TWO_HUNDRED_K && !says_1m { format!("{name} 1M") } else { name };
+        let mut out = json!({"id": id, "name": name, "api": PROVIDER, "provider": PROVIDER, "baseUrl": PROVIDER,
+            "reasoning": model.get("reasoning").cloned().unwrap_or(json!(false)), "input": model.get("input").cloned().unwrap_or(json!(["text"])),
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": effective_window(window, max_tokens), "maxTokens": max_tokens});
+        if let Some(map) = model.get("thinkingLevelMap") {
+            out["thinkingLevelMap"] = map.clone();
+        }
+        if NO_THINKING_OFF.contains(&id.as_str()) {
+            out["thinkingLevelMap"]["off"] = Value::Null;
+        }
+        out.as_object().cloned()
+    }).collect()
+}
+
+// pi's thinking level as Claude Code's effort: the model's own map first (a null entry means no
+// effort is sent and Claude Code's default applies), else the generic table. None for "off".
+fn effort(model: &Model, level: &str) -> Option<String> {
+    match model.thinking_level_map.as_ref().and_then(|map| map.get(level)) {
+        _ if level == "off" => None,
+        None => Some(match level {
+            "minimal" | "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            "xhigh" | "max" => "max",
+            _ => return None,
+        }.to_string()),
+        Some(mapped) => mapped.clone().filter(|effort| EFFORTS.contains(&effort.as_str())),
+    }
+}
+
+// --- The child process ---
+
+struct Child {
+    process: tokio::process::Child,
+    stdin: Option<ChildStdin>,
+    lines: Lines<BufReader<ChildStdout>>,
+}
+
+fn spawn(args: &[String], cwd: &str) -> Result<Child, String> {
+    let mut command = tokio::process::Command::new(&SETTINGS.claude);
+    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    for name in PARENT_ENV {
+        command.env_remove(name);
+    }
+    command.envs(CHILD_ENV);
+    if let Some(dir) = &SETTINGS.config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
+    lock(&CHILDREN).extend(process.id());
+    debug(&format!("spawn: {} {}", SETTINGS.claude, args.join(" ")));
+    let stdout = process.stdout.take().ok_or("Claude Code started without a stdout")?;
+    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines() })
+}
+
+impl Child {
+    // One protocol message, one line. A child that stopped reading just loses the rest.
+    async fn send(&mut self, message: &Value) {
+        if let Some(stdin) = &mut self.stdin
+            && stdin.write_all(format!("{message}\n").as_bytes()).await.is_err()
+        {
+            self.stdin = None;
+        }
+    }
+
+    // End its input, then SIGTERM and SIGKILL if it doesn't go. Output: how it exited.
+    async fn close(&mut self) -> Option<ExitStatus> {
+        self.stdin = None;
+        let pid = self.process.id();
+        let mut status = timeout(CLOSE_GRACE, self.process.wait()).await.ok().and_then(Result::ok);
+        if let (None, Some(pid)) = (status, pid) {
+            // SAFETY: kill(2) on our own child, which isn't reaped until the wait below.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            status = timeout(TERM_GRACE, self.process.wait()).await.ok().and_then(Result::ok);
+        }
+        if status.is_none() {
+            let _ = self.process.kill().await;
+        }
+        if let Some(pid) = pid {
+            lock(&CHILDREN).remove(&pid);
+        }
+        status
+    }
+}
+
+// Every claude child still running, by pid, for the exit on a signal.
+static CHILDREN: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(Default::default);
+
+// piccosta is exiting on a signal, where nothing would be dropped: stop every live query (its task
+// closes the child and deletes its session files), wait a little for them, then SIGTERM whatever
+// child is left (a summary in the middle of a compaction).
+pub async fn shutdown() {
+    let lives: Vec<Live> = lock(&LIVE).drain().map(|(_, live)| live).collect();
+    let tasks: Vec<_> = lives.into_iter().filter_map(|mut live| {
+        let _ = live.commands.send(Command::Discard("piccosta is exiting".into()));
+        live.task.take()
+    }).collect();
+    let _ = timeout(CLOSE_GRACE + CLOSE_GRACE, futures_util::future::join_all(tasks)).await;
+    for pid in lock(&CHILDREN).drain() {
+        // SAFETY: kill(2) on a child of ours that hasn't been reaped (close removes reaped ones).
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+}
+
+fn request_id() -> String {
+    Uuid::new_v4().simple().to_string()[..13].to_string()
+}
+
+fn base_args(thinking_off: bool, effort: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json"].map(String::from).to_vec();
+    if thinking_off {
+        args.push("--thinking=disabled".into());
+    }
+    if let Some(effort) = effort {
+        args.push(format!("--effort={effort}"));
+    }
+    args
+}
+
+// The tools as an MCP tools/list result lists them, pi's schemas served verbatim.
+fn manifest(tools: &[ToolDefinition]) -> Value {
+    tools.iter().map(|tool| json!({"name": tool.name, "description": tool.description, "inputSchema": tool.parameters,
+        "_meta": {"anthropic/maxResultSizeChars": MCP_RESULT_MAX_CHARS}})).collect()
+}
+
+fn initialize_result() -> Value {
+    json!({"protocolVersion": "2025-11-25", "capabilities": {"tools": {"listChanged": true}}, "serverInfo": {"name": MCP_SERVER, "version": "1.0.0"}})
+}
+
+// The control request a session opens with: pi's prompt in place of Claude Code's, and our MCP
+// server with its handshake already answered, so Claude Code needs no round trip for it.
+fn initialize(system_prompt: &str, tools: &[ToolDefinition]) -> Value {
+    let mut request = json!({"subtype": "initialize"});
+    if !tools.is_empty() {
+        let mut manifests = Map::new();
+        manifests.insert(MCP_SERVER.into(), json!({"initializeResult": initialize_result(), "toolsListResult": {"tools": manifest(tools)}}));
+        request["sdkMcpServers"] = json!([MCP_SERVER]);
+        request["sdkMcpServerManifests"] = Value::Object(manifests);
+    }
+    request["systemPrompt"] = json!([system_prompt]);
+    json!({"request_id": request_id(), "type": "control_request", "request": request})
+}
+
+// --- Usage ---
+
+// One API request's counters, as its frames (message_start, message_delta, a whole message) have
+// built them up: each frame reports running totals, so a counter it carries replaces the last.
+#[derive(Default, Clone)]
+struct Counters {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cache_write_1h: u64,
+    reasoning: Option<u64>,
+}
+
+impl Counters {
+    fn merge(&mut self, usage: &Value) {
+        let set = |target: &mut u64, value: &Value| {
+            if let Some(count) = value.as_u64() {
+                *target = count;
+            }
+        };
+        set(&mut self.input, &usage["input_tokens"]);
+        set(&mut self.output, &usage["output_tokens"]);
+        set(&mut self.cache_read, &usage["cache_read_input_tokens"]);
+        set(&mut self.cache_write, &usage["cache_creation_input_tokens"]);
+        set(&mut self.cache_write_1h, &usage["cache_creation"]["ephemeral_1h_input_tokens"]);
+        if let Some(thinking) = usage["output_tokens_details"]["thinking_tokens"].as_u64() {
+            self.reasoning = Some(thinking);
+        }
+    }
+}
+
+// A message's usage is the sum of the requests behind it: Claude Code can make more than one for
+// one turn (a stalled stream and its retry, the re-ask after an unserved tool), all billed.
+fn usage_of<'a>(requests: impl Iterator<Item = &'a Counters>) -> Usage {
+    let mut sum = Counters::default();
+    for request in requests {
+        sum.input += request.input;
+        sum.output += request.output;
+        sum.cache_read += request.cache_read;
+        sum.cache_write += request.cache_write;
+        sum.cache_write_1h += request.cache_write_1h;
+        sum.reasoning = request.reasoning.map(|reasoning| sum.reasoning.unwrap_or(0) + reasoning).or(sum.reasoning);
+    }
+    Usage { input: sum.input, output: sum.output, cache_read: sum.cache_read, cache_write: sum.cache_write, cache_write_1h: Some(sum.cache_write_1h),
+        reasoning: sum.reasoning, total_tokens: sum.input + sum.output + sum.cache_read + sum.cache_write, cost: Default::default() }
+}
+
+// The response a message came from, as pi's own Anthropic provider names it: responseModel only
+// when the served model isn't the one asked for.
+fn record_response(output: &mut AssistantMessage, id: &Value, served: &Value, model: &Model) {
+    if let Some(id) = id.as_str() {
+        output.response_id = Some(id.to_string());
+    }
+    if let Some(served) = served.as_str() {
+        output.response_model = (served != model.id).then(|| served.to_string());
+    }
+}
+
+// --- Failures ---
+
+// Input: a result message. Output: its failure text, None when it succeeded. API failures come as
+// is_error on a success-shaped result, the error subtypes carry `errors`.
+fn result_error(message: &Value) -> Option<String> {
+    if message["subtype"] == "success" {
+        let text = message["result"].as_str().filter(|text| !text.is_empty()).unwrap_or("Claude Code reported an error");
+        let bare = text.strip_prefix("API Error: ").unwrap_or(text);
+        let connection = CONNECTION_FAILURES.iter().any(|phrase| bare.starts_with(phrase));
+        return (message["is_error"] == true).then(|| if connection { format!("Connection error: {text}") } else { text.to_string() });
+    }
+    if let Some(errors) = message["errors"].as_array().filter(|errors| !errors.is_empty()) {
+        return Some(errors.iter().map(|error| error.as_str().map_or_else(|| error.to_string(), String::from)).collect::<Vec<_>>().join("\n"));
+    }
+    Some(message["error"].as_str().map_or_else(|| format!("Claude Code failed: {}", message["subtype"].as_str().unwrap_or("unknown result")), String::from))
+}
+
+// A failure that a rate-limit rejection preceded, named as one. pi has no typed rate-limit error,
+// so fallbacks match the text; "quota exceeded" is on pi's non-retryable list and wins over its
+// retryable "rate limit", so a limit that resets in hours goes to fallback instead of retrying.
+fn describe_rate_limit(info: &Value, failure: &str) -> String {
+    let kind = info["rateLimitType"].as_str().map(|kind| format!(" ({kind})")).unwrap_or_default();
+    let resets = info["resetsAt"].as_f64().map(|seconds| format!(" \u{2014} resets {}", clock::iso_from_ms((seconds * 1000.0) as i64))).unwrap_or_default();
+    format!("Claude quota exceeded \u{2014} rate limit{kind}{resets}: {failure}")
+}
+
+fn failed(model: &Model, reason: StopReason, message: &str) -> AssistantMessage {
+    let mut output = new_output(model, PROVIDER);
+    output.stop_reason = reason;
+    output.error_message = Some(message.to_string());
+    output
+}
+
+// Claude Code's argument names where they differ from pi's (pass-through otherwise; the first
+// alias wins).
+fn pi_arguments(tool: &str, arguments: Map<String, Value>) -> Map<String, Value> {
+    let rename = |key: &str| match (tool.to_lowercase().as_str(), key) {
+        ("read" | "write" | "edit", "file_path") => "path",
+        ("edit", "old_string" | "old_text") => "oldText",
+        ("edit", "new_string" | "new_text") => "newText",
+        _ => key,
+    }.to_string();
+    let mut out = Map::new();
+    for (key, value) in arguments {
+        out.entry(rename(&key)).or_insert(value);
+    }
+    out
+}
+
+// --- Live queries ---
+
+// What a call shares with its query's task: what Claude Code holds, and the visible messages' prints
+// and roles that a clean end keeps (with the final answer added).
+struct State {
+    held: Held,
+    kept_base: (Vec<String>, Vec<String>),
+}
+
+struct Live {
+    id: u64,
+    state: Arc<Mutex<State>>,
+    commands: mpsc::UnboundedSender<Command>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum Command {
+    // The call's tool results (id, MCP result) and its stream.
+    Deliver(Vec<(String, Value)>, Turn),
+    Discard(String),
+}
+
+// One provider call's stream: where its events go, the message it ends with, and its abort.
+struct Turn {
+    events: mpsc::UnboundedSender<StreamEvent>,
+    reply: oneshot::Sender<AssistantMessage>,
+    cancel: CancellationToken,
+}
+
+static LIVE: LazyLock<Mutex<HashMap<String, Live>>> = LazyLock::new(Default::default);
+static NEXT_QUERY: AtomicU64 = AtomicU64::new(1);
+
+fn kept_base(messages: &[Message]) -> (Vec<String>, Vec<String>) {
+    messages.iter().filter(history::visible).map(|message| (fingerprint(message), match message {
+        Message::User(_) => "user",
+        Message::Assistant(_) => "assistant",
+        _ => "toolResult",
+    }.to_string())).unzip()
+}
+
+fn discard(key: &str, reason: &str) {
+    if let Some(live) = lock(&LIVE).remove(key) {
+        let _ = live.commands.send(Command::Discard(reason.to_string()));
+    }
+}
+
+// The end of one of pi's runs. A query still live here is parked on calls pi won't answer (the run
+// was aborted, or a tool ended it), and would hold its child forever; the next call, if any,
+// rewrites. Waits for the query to finish, so its session files are gone before piccosta exits.
+pub async fn end_run(session_id: &str) {
+    let live = lock(&LIVE).remove(session_id);
+    if let Some(mut live) = live {
+        let _ = live.commands.send(Command::Discard("pi's run ended with the query still live".into()));
+        if let Some(task) = live.task.take() {
+            let _ = timeout(CLOSE_GRACE + TERM_GRACE + CLOSE_GRACE, task).await;
+        }
+    }
+}
+
+// --- One provider call ---
+
+// Input: the request and where its events go. Output: the turn's message. A cacheRetention "none"
+// request (compaction's summaries) runs on its own; every other one delivers to the parked query or
+// rewrites.
+pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamEvent>) -> AssistantMessage {
+    let model = request.model;
+    let system = transcript::current_system_message(request.messages);
+    let system_prompt = system.as_ref().map(transcript::system_message_text).unwrap_or_default();
+    let tools = system.and_then(|system| system.tools_added).unwrap_or_default();
+    let messages: Vec<Message> = request.messages.iter().filter(|message| !matches!(message, Message::System(_))).cloned().collect();
+    let (cli_model, _) = runtime_model(&model.id);
+    let effort = effort(model, request.thinking_level);
+    let thinking_off = request.thinking_level == "off";
+    let cwd = request.cwd.to_string_lossy().into_owned();
+    if !request.cache {
+        return summary(request, &messages, &system_prompt, &cli_model, effort.as_deref(), thinking_off, &cwd).await;
+    }
+    let key = request.session_id.unwrap_or("(none)").to_string();
+    history::attach(&key, request.session_file);
+    let shape = history::shape(&system_prompt, &tools, &cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
+    let prints: Vec<String> = messages.iter().map(fingerprint).collect();
+    if request.cancel.is_cancelled() {
+        discard(&key, "the run was aborted");
+        return failed(model, StopReason::Aborted, "Operation aborted");
+    }
+    let mut forced: Option<String> = None;
+    loop {
+        let (reply, answer) = oneshot::channel();
+        let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
+        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, forced.take(), turn) {
+            Ok(()) => match answer.await {
+                Ok(message) => return message,
+                // The query ended before it took them: rewrite like any other mismatch.
+                Err(_) => {
+                    forced = Some("the parked query ended before it took the results".into());
+                    continue;
+                }
+            },
+            Err(rewrite) => rewrite,
+        };
+        debug(&format!("sync: rewrite, {reason} (session {key})"));
+        let start = Start { key: &key, model, cli_model: &cli_model, effort: effort.as_deref(), thinking_off, system_prompt: &system_prompt,
+            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd };
+        if let Err(error) = start_query(start, turn) {
+            return failed(model, StopReason::Error, &error);
+        }
+        return answer.await.unwrap_or_else(|_| failed(model, StopReason::Error, "Claude Code ended the query without answering"));
+    }
+}
+
+// Hand this call's tool results to the parked query when the sync check allows it. Output: Ok once
+// they're sent (the next turn streams into `turn`), else the rewrite reason and the turn back; the
+// live query, if any, is discarded then.
+fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
+    let mut live = lock(&LIVE);
+    let decision = match forced {
+        Some(reason) => Err(reason),
+        None => history::decide(live.get(key).map(|live| lock(&live.state)).as_deref().map(|state| &state.held), messages, prints, shape),
+    };
+    let start = match decision {
+        Ok(start) => start,
+        Err(reason) => {
+            if let Some(old) = live.remove(key) {
+                let _ = old.commands.send(Command::Discard(format!("pi's context changed: {reason}")));
+            }
+            return Err((reason, turn));
+        }
+    };
+    let Some(entry) = live.get(key) else { return Err(("no live query for this session".into(), turn)) };
+    let results = messages[start..].iter().filter_map(|message| match message {
+        Message::ToolResult(result) => {
+            let mut content: Vec<Value> = result.content.iter().filter_map(|block| match block {
+                Content::Text { text, .. } if !text.is_empty() => Some(json!({"type": "text", "text": text})),
+                Content::Image { data, mime_type } if !data.is_empty() && !mime_type.is_empty() => Some(json!({"type": "image", "data": data, "mimeType": mime_type})),
+                _ => None,
+            }).collect();
+            if content.is_empty() {
+                content.push(json!({"type": "text", "text": if result.is_error { history::EMPTY_ERROR_RESULT } else { "" }}));
+            }
+            Some((result.tool_call_id.clone(), json!({"content": content, "isError": result.is_error})))
+        }
+        _ => None,
+    }).collect();
+    {
+        let mut state = lock(&entry.state);
+        state.held.prints = prints.to_vec();
+        state.held.pending = None;
+        state.kept_base = kept_base(messages);
+    }
+    debug(&format!("sync: deliver to the parked query (session {key}, {} messages)", prints.len()));
+    match entry.commands.send(Command::Deliver(results, turn)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendError(Command::Deliver(_, turn))) => {
+            live.remove(key);
+            Err(("the parked query is gone".into(), turn))
+        }
+        Err(_) => unreachable!("a Deliver comes back as a Deliver"),
+    }
+}
+
+struct Start<'a> {
+    key: &'a str,
+    model: &'a Model,
+    cli_model: &'a str,
+    effort: Option<&'a str>,
+    thinking_off: bool,
+    system_prompt: &'a str,
+    tools: &'a [ToolDefinition],
+    messages: &'a [Message],
+    prints: &'a [String],
+    shape: &'a Shape,
+    cwd: &'a str,
+}
+
+// Start a query holding exactly pi's context: the history in a fresh session file it resumes, the
+// trailing user turn (or the continue note) as its opening prompt.
+fn start_query(start: Start, turn: Turn) -> Result<(), String> {
+    let visible: Vec<Message> = start.messages.iter().filter(history::visible).cloned().collect();
+    let (history_end, prompt, continued) = history::split(&visible);
+    let project_path = history::real_or(start.cwd);
+    let written = if history_end > 0 {
+        let history = &visible[..history_end];
+        let prints: Vec<String> = history.iter().map(fingerprint).collect();
+        let id = history::write_session(start.key, history, &prints, start.cwd, &project_path, start.tools, start.cli_model, start.shape)
+            .map_err(|error| format!("Could not write Claude Code's session file: {error}"))?;
+        Some(id)
+    } else {
+        None
+    };
+    if continued {
+        debug("start: context ends at a tool result, opening with the continue note");
+    }
+    let mut args = base_args(start.thinking_off, start.effort);
+    args.extend(written.iter().map(|id| format!("--resume={id}")));
+    args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--model", start.cli_model,
+        "--disable-slash-commands"].map(String::from));
+    if SETTINGS.strict_mcp {
+        args.push("--strict-mcp-config".into());
+    }
+    // Some models default to omitted thinking text; summarized makes thinking_delta events arrive.
+    if start.effort.is_some() {
+        args.extend(["--thinking-display", "summarized"].map(String::from));
+    }
+    args.extend(["--settings", PROVIDER_SETTINGS].map(String::from));
+    let child = spawn(&args, start.cwd).inspect_err(|_| {
+        if let Some(id) = &written {
+            history::delete_session(id, &project_path);
+        }
+    })?;
+    let opening = vec![initialize(start.system_prompt, start.tools),
+        json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null})];
+    let state = Arc::new(Mutex::new(State {
+        held: Held { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None },
+        kept_base: kept_base(&visible),
+    }));
+    let (commands, inbox) = mpsc::unbounded_channel();
+    let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
+    let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
+    query.turn = Some(turn);
+    lock(&LIVE).insert(start.key.to_string(), Live { id, state, commands, task: None });
+    let task = tokio::spawn(query.run(opening));
+    if let Some(live) = lock(&LIVE).get_mut(start.key).filter(|live| live.id == id) {
+        live.task = Some(task);
+    }
+    Ok(())
+}
+
+// --- A running query ---
+
+struct Parked {
+    request_id: Value,
+    rpc_id: Value,
+    tool: String,
+    check_at: Instant,
+}
+
+enum Wake {
+    Line(Option<String>),
+    Command(Option<Command>),
+    Idle,
+    Settle,
+    Lost,
+    Abort,
+}
+
+// Everything a query's task holds. Per turn: the message being built (`out`) with, per content
+// block, the stream index it came under (None once it stopped) and its tool-call JSON so far.
+struct Query {
+    id: u64,
+    key: String,
+    model: Model,
+    tools: Vec<String>,
+    manifest: Value,
+    child: Child,
+    inbox: mpsc::UnboundedReceiver<Command>,
+    state: Arc<Mutex<State>>,
+    project_path: String,
+    cwd: String,
+    shape: Shape,
+    written: Option<String>,
+    cc_session: Option<String>,
+    turn: Option<Turn>,
+    out: AssistantMessage,
+    open: Vec<Option<u64>>,
+    partial: Vec<String>,
+    started: bool,
+    saw_stream_event: bool,
+    saw_tool_call: bool,
+    // The last message_start's id, whether its message_stop came, whether its message_delta did
+    // (a stream Claude Code gave up on and closed itself has none), and where its blocks start.
+    stream_id: Option<String>,
+    stream_open: bool,
+    stream_delta: bool,
+    stream_start: usize,
+    // The id of a non-streamed answer arriving one assistant message per block.
+    fallback_id: Option<String>,
+    // Every request of the query, and this turn's by response id.
+    requests: Vec<Counters>,
+    turn_requests: HashMap<String, usize>,
+    // The tool calls of the current response (kept across a delivery), and every one pi was given.
+    tool_ids: Vec<String>,
+    handed: HashSet<String>,
+    // tools/call requests waiting for pi's results, and results that came before their request.
+    parked: HashMap<String, Parked>,
+    queued: HashMap<String, Value>,
+    settle_at: Option<Instant>,
+    last_activity: Instant,
+    rejection: Option<Value>,
+    failure: Option<String>,
+    result_seen: bool,
+    closed: bool,
+    aborted: bool,
+}
+
+impl Query {
+    #[allow(clippy::too_many_arguments)]
+    fn new(id: u64, key: &str, model: Model, tools: &[ToolDefinition], child: Child, inbox: mpsc::UnboundedReceiver<Command>, state: Arc<Mutex<State>>,
+        project_path: String, cwd: &str, shape: Shape, written: Option<String>) -> Query {
+        let out = new_output(&model, PROVIDER);
+        Query { id, key: key.to_string(), out, model, tools: tools.iter().map(|tool| tool.name.clone()).collect(), manifest: manifest(tools), child, inbox, state,
+            project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
+            saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
+            requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, aborted: false }
+    }
+
+    async fn run(mut self, opening: Vec<Value>) {
+        self.reset_turn();
+        for message in &opening {
+            self.child.send(message).await;
+        }
+        while !self.closed && self.failure.is_none() {
+            let far = Instant::now() + LOST_CALL_CHECK;
+            let streaming = self.turn.is_some();
+            let cancel = self.turn.as_ref().map_or_else(CancellationToken::new, |turn| turn.cancel.clone());
+            let lost = self.parked.values().map(|call| call.check_at).min();
+            let wake = tokio::select! {
+                line = self.child.lines.next_line() => Wake::Line(line.ok().flatten()),
+                command = self.inbox.recv() => Wake::Command(command),
+                () = sleep_until(self.last_activity + BODY_IDLE_TIMEOUT), if streaming => Wake::Idle,
+                () = sleep_until(self.settle_at.unwrap_or(far)), if self.settle_at.is_some() => Wake::Settle,
+                () = sleep_until(lost.unwrap_or(far)), if lost.is_some() => Wake::Lost,
+                () = cancel.cancelled(), if streaming => Wake::Abort,
+            };
+            match wake {
+                Wake::Line(Some(line)) => self.line(&line).await,
+                Wake::Line(None) => break,
+                Wake::Command(Some(Command::Deliver(results, turn))) => self.deliver(results, turn).await,
+                Wake::Command(Some(Command::Discard(reason))) => self.discard(&reason).await,
+                Wake::Command(None) => self.discard("the bridge let go of it").await,
+                Wake::Idle => self.idle().await,
+                Wake::Settle => self.end_turn_on_tool_use(),
+                Wake::Lost => self.check_lost().await,
+                Wake::Abort => {
+                    self.aborted = true;
+                    self.end_open(StopReason::Aborted, "Operation aborted");
+                    self.discard("the run was aborted").await;
+                }
+            }
+        }
+        self.finish().await;
+    }
+
+    fn reset_turn(&mut self) {
+        self.out = new_output(&self.model, PROVIDER);
+        self.out.stop_reason = StopReason::Stop;
+        (self.open, self.partial) = (Vec::new(), Vec::new());
+        (self.started, self.saw_stream_event, self.saw_tool_call) = (false, false, false);
+        (self.stream_id, self.stream_open, self.stream_delta, self.stream_start, self.fallback_id) = (None, false, false, 0, None);
+        self.turn_requests.clear();
+    }
+
+    fn emit(&self, event: StreamEvent) {
+        if let Some(turn) = &self.turn {
+            let _ = turn.events.send(event);
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if !self.started && self.turn.is_some() {
+            self.emit(StreamEvent::Start);
+            self.started = true;
+        }
+    }
+
+    fn push(&mut self, block: Content, stream_index: Option<u64>) -> usize {
+        self.out.content.push(block);
+        self.open.push(stream_index);
+        self.partial.push(String::new());
+        self.out.content.len() - 1
+    }
+
+    fn remove_block(&mut self, index: usize) {
+        self.out.content.remove(index);
+        self.open.remove(index);
+        self.partial.remove(index);
+    }
+
+    fn tool_call_ids(&self) -> Vec<String> {
+        self.out.content.iter().filter_map(|block| match block {
+            Content::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    // End the open stream, if any, with a failure. A turn whose stream already ended stays as pi got it.
+    fn end_open(&mut self, reason: StopReason, message: &str) {
+        if let Some(turn) = self.turn.take() {
+            self.out.stop_reason = reason;
+            self.out.error_message.get_or_insert_with(|| message.to_string());
+            let _ = turn.reply.send(self.out.clone());
+        }
+    }
+
+    // The one way a turn ends on tool calls: pi gets the message, and the query is parked on them.
+    fn end_turn_on_tool_use(&mut self) {
+        self.settle_at = None;
+        let Some(turn) = self.turn.take() else { return };
+        self.out.stop_reason = StopReason::ToolUse;
+        let _ = turn.reply.send(self.out.clone());
+        self.handed.extend(self.tool_call_ids());
+        let mut state = lock(&self.state);
+        state.held.prints.push(fingerprint(&Message::Assistant(self.out.clone())));
+        state.held.pending = Some(self.tool_ids.clone());
+        debug(&format!("sync: parked on [{}] (session {})", self.tool_ids.join(", "), self.key));
+    }
+
+    fn flush_settle(&mut self) {
+        if self.settle_at.is_some() {
+            self.end_turn_on_tool_use();
+        }
+    }
+
+    fn forget(&self) {
+        let mut live = lock(&LIVE);
+        if live.get(&self.key).is_some_and(|live| live.id == self.id) {
+            live.remove(&self.key);
+        }
+    }
+
+    // Stop the query: it holds a context pi no longer has, or something went wrong. The child is
+    // interrupted and its input ended, so nothing it waits on gets answered and it starts no
+    // further request; whatever waited on it is let go.
+    async fn discard(&mut self, reason: &str) {
+        debug(&format!("discard: session {}: {reason}", self.key));
+        self.closed = true;
+        self.forget();
+        self.child.send(&json!({"type": "control_request", "request_id": request_id(), "request": {"subtype": "interrupt"}})).await;
+        self.child.stdin = None;
+        self.end_open(StopReason::Error, &format!("Claude Code query discarded: {reason}"));
+        (self.parked, self.queued, self.settle_at) = (HashMap::new(), HashMap::new(), None);
+    }
+
+    // A stream gone silent mid-message ends as a retryable failure ("timed out" is on pi's list), the
+    // way pi's own providers time out an idle response.
+    async fn idle(&mut self) {
+        let silent = self.last_activity.elapsed();
+        if silent < BODY_IDLE_TIMEOUT {
+            return;
+        }
+        let message = format!("Claude Code stream timed out: no event for {} s (limit {} ms)", silent.as_secs_f64().round(), BODY_IDLE_TIMEOUT.as_millis());
+        self.end_open(StopReason::Error, &message);
+        self.discard(&message).await;
+    }
+
+    // A tools/call pi was never handed can never be answered: stop the query and fail the turn,
+    // naming it, rather than wait forever. A call pi has is never failed, however long it runs.
+    async fn check_lost(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self.parked.iter().filter(|(_, call)| call.check_at <= now).map(|(id, _)| id.clone()).collect();
+        for id in due {
+            let streaming = self.turn.is_some() && self.tool_call_ids().contains(&id);
+            if let Some(call) = self.parked.get_mut(&id).filter(|_| streaming || self.handed.contains(&id)) {
+                call.check_at = now + LOST_CALL_CHECK;
+                continue;
+            }
+            let message = format!("Claude Code dispatched tool call {} [{id}] that pi never received; the query was stopped so the turn would not wait on it forever",
+                self.parked[&id].tool);
+            self.end_open(StopReason::Error, &message);
+            return self.discard(&message).await;
+        }
+    }
+
+    async fn answer(&mut self, request_id: Value, rpc_id: Value, result: Result<Value, String>) {
+        let rpc = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": rpc_id, "result": result}),
+            Err(message) => json!({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32603, "message": message}}),
+        };
+        self.child.send(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"mcp_response": rpc}}})).await;
+    }
+
+    async fn deliver(&mut self, results: Vec<(String, Value)>, turn: Turn) {
+        self.turn = Some(turn);
+        self.reset_turn();
+        self.last_activity = Instant::now();
+        for (id, result) in results {
+            match self.parked.remove(&id) {
+                Some(call) => self.answer(call.request_id, call.rpc_id, Ok(result)).await,
+                // The result beat Claude Code's tools/call for it.
+                None => {
+                    self.queued.insert(id, result);
+                }
+            }
+        }
+    }
+
+    async fn line(&mut self, line: &str) {
+        if let Some(path) = &SETTINGS.record {
+            append(path, line);
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line) else { return };
+        self.last_activity = Instant::now();
+        match message["type"].as_str().unwrap_or_default() {
+            "control_request" => self.control(&message).await,
+            "control_response" if message["response"]["subtype"] == "error" => {
+                self.failure = Some(format!("Claude Code refused the session: {}", message["response"]["error"].as_str().unwrap_or("no reason given")));
+            }
+            "control_response" | "control_cancel_request" | "keep_alive" | "transcript_mirror" => {}
+            _ => self.message(&message),
+        }
+    }
+
+    // Claude Code asking the host something. Only MCP traffic for our server is answered; the
+    // handshake normally came with initialize, but it is answered here too.
+    async fn control(&mut self, message: &Value) {
+        let request_id = message["request_id"].clone();
+        let request = &message["request"];
+        if request["subtype"] != "mcp_message" {
+            let error = format!("Unsupported control request subtype: {}", request["subtype"].as_str().unwrap_or("none"));
+            return self.child.send(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": request_id, "error": error}})).await;
+        }
+        let rpc = &request["message"];
+        let rpc_id = rpc.get("id").cloned().unwrap_or(json!(0));
+        let result = match rpc["method"].as_str().unwrap_or_default() {
+            "initialize" => Ok(initialize_result()),
+            "tools/list" => Ok(json!({"tools": self.manifest})),
+            "tools/call" => {
+                let name = rpc["params"]["name"].as_str().unwrap_or_default().to_string();
+                let tool_use_id = rpc["params"]["_meta"]["claudecode/toolUseId"].as_str().map(String::from);
+                match tool_use_id {
+                    _ if !self.tools.contains(&name) => Err(format!("Unknown tool: {name}")),
+                    // Claude Code stamps every call with its tool_use id, the only reliable pairing.
+                    None => Err(format!("{name}: tools/call is missing _meta[\"claudecode/toolUseId\"], so its result can't be paired with its call")),
+                    Some(id) => match self.queued.remove(&id) {
+                        Some(result) => Ok(result),
+                        None => {
+                            self.parked.insert(id, Parked { request_id, rpc_id, tool: name, check_at: Instant::now() + LOST_CALL_CHECK });
+                            return;
+                        }
+                    },
+                }
+            }
+            _ => Ok(json!({})),
+        };
+        self.answer(request_id, rpc_id, result).await;
+    }
+
+    // pi's name for a tool Claude called, or None for a name we don't serve: a hallucinated builtin,
+    // which Claude Code rejects and retries under a fresh id itself, so it must not reach pi.
+    fn pi_tool_name(&self, name: &str) -> Option<String> {
+        let lower = name.to_lowercase();
+        self.tools.iter().find(|tool| format!("{MCP_TOOL_PREFIX}{tool}") == name)
+            .or_else(|| self.tools.iter().find(|tool| format!("{MCP_TOOL_PREFIX}{tool}").to_lowercase() == lower)).cloned()
+    }
+
+    fn record_usage(&mut self, key: Option<&str>, usage: &Value) {
+        let next = self.requests.len();
+        let index = *self.turn_requests.entry(key.unwrap_or("(no message id)").to_string()).or_insert(next);
+        if index == next {
+            self.requests.push(Counters::default());
+        }
+        self.requests[index].merge(usage);
+        self.out.usage = usage_of(self.turn_requests.values().map(|&index| &self.requests[index]));
+    }
+
+    // One message from Claude Code's stream. Lifecycle first (the end of input at the result, a
+    // failure, rate limits, the session id), then content, which has nowhere to go once a turn has
+    // ended on tool calls.
+    fn message(&mut self, message: &Value) {
+        let kind = message["type"].as_str().unwrap_or_default();
+        let error = if kind == "result" { result_error(message) } else { None };
+        // A non-streamed answer still settling ends when Claude Code moves on, unless it failed.
+        if kind == "result" && error.is_some() {
+            self.settle_at = None;
+        } else if matches!(kind, "stream_event" | "user" | "result") {
+            self.flush_settle();
+        }
+        if kind == "result" {
+            self.result_seen = true;
+            // Ends the input: Claude Code exits once the last turn is done.
+            self.child.stdin = None;
+            if let Some(mut error) = error {
+                if let Some(info) = self.rejection.take() {
+                    error = describe_rate_limit(&info, &error);
+                }
+                self.failure = Some(error);
+                return;
+            }
+        }
+        if kind == "rate_limit_event" {
+            if message["rate_limit_info"]["status"] == "rejected" {
+                self.rejection = Some(message["rate_limit_info"].clone());
+            }
+            return;
+        }
+        if kind == "system" && message["subtype"] == "init" {
+            self.cc_session = message["session_id"].as_str().map(String::from).or(self.cc_session.take());
+        }
+        if self.turn.is_none() {
+            return;
+        }
+        match kind {
+            "stream_event" => self.stream_event(&message["event"]),
+            "assistant" => self.assistant(&message["message"]),
+            "result" => {
+                self.add_unstreamed_usage(&message["usage"]);
+                if !self.saw_stream_event && message["subtype"] == "success" {
+                    self.whole_text(message["result"].as_str().unwrap_or_default());
+                }
+            }
+            // Claude Code re-sends a request whose response broke off, after closing the broken
+            // stream itself: its blocks look finished, but it never got its message_delta.
+            "system" if message["subtype"] == "api_retry" && self.saw_stream_event && !self.stream_delta && self.out.content.len() > self.stream_start => {
+                self.drop_abandoned();
+            }
+            _ => {}
+        }
+    }
+
+    fn whole_text(&mut self, text: &str) {
+        self.ensure_started();
+        let index = self.push(Content::text(text), None);
+        self.emit(StreamEvent::TextStart { index });
+        self.emit(StreamEvent::TextDelta { index, delta: text.to_string() });
+        self.emit(StreamEvent::TextEnd { index, content: text.to_string() });
+    }
+
+    // What the success result counts beyond what the stream showed (a request made out of sight) is
+    // added to the turn it ends. Only a surplus: a stalled stream's first frame was billed too.
+    fn add_unstreamed_usage(&mut self, total: &Value) {
+        if !total.is_object() {
+            return;
+        }
+        let seen = usage_of(self.requests.iter());
+        let surplus = |name: &str, seen: u64| total[name].as_u64().unwrap_or(0).saturating_sub(seen);
+        let extra = json!({"input_tokens": surplus("input_tokens", seen.input), "output_tokens": surplus("output_tokens", seen.output),
+            "cache_read_input_tokens": surplus("cache_read_input_tokens", seen.cache_read), "cache_creation_input_tokens": surplus("cache_creation_input_tokens", seen.cache_write),
+            "cache_creation": {"ephemeral_1h_input_tokens": total["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0).saturating_sub(seen.cache_write_1h.unwrap_or(0))}});
+        let any = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter().any(|name| extra[*name] != 0);
+        if any {
+            self.record_usage(Some("(in the result, not streamed)"), &extra);
+        }
+    }
+
+    // Blocks of the message that just stopped which never got their own content_block_stop (the
+    // stream was cut inside them): a tool call Claude Code will never dispatch, a thinking block with
+    // no signature. Per block, since Claude Code keeps the ones that did complete.
+    fn drop_unfinished(&mut self) {
+        let before = self.out.content.len();
+        for index in (self.stream_start..before).rev() {
+            if self.open[index].is_some() {
+                self.remove_block(index);
+            }
+        }
+        if self.out.content.len() != before {
+            self.tool_ids = self.tool_call_ids();
+            self.saw_tool_call = !self.tool_ids.is_empty();
+        }
+    }
+
+    // The blocks of a stream Claude Code abandoned mid-message; its retry restarts those indices.
+    fn drop_abandoned(&mut self) {
+        while self.out.content.len() > self.stream_start {
+            self.remove_block(self.out.content.len() - 1);
+        }
+        self.tool_ids.clear();
+        self.saw_tool_call = !self.tool_call_ids().is_empty();
+        self.stream_open = false;
+    }
+
+    fn stream_event(&mut self, event: &Value) {
+        self.saw_stream_event = true;
+        let stream_index = event["index"].as_u64();
+        let position = self.open.iter().position(|open| open.is_some() && *open == stream_index);
+        match event["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                // Still open from an earlier message_start: Claude Code gave up on that one.
+                if self.stream_open {
+                    self.drop_abandoned();
+                }
+                self.tool_ids.clear();
+                self.stream_id = event["message"]["id"].as_str().map(String::from);
+                (self.stream_open, self.stream_delta, self.stream_start) = (true, false, self.out.content.len());
+                record_response(&mut self.out, &event["message"]["id"], &event["message"]["model"], &self.model);
+                if event["message"]["usage"].is_object() {
+                    self.record_usage(self.stream_id.clone().as_deref(), &event["message"]["usage"]);
+                }
+            }
+            "content_block_start" => {
+                self.ensure_started();
+                let block = &event["content_block"];
+                match block["type"].as_str() {
+                    Some("text") => {
+                        let index = self.push(Content::text(""), stream_index);
+                        self.emit(StreamEvent::TextStart { index });
+                    }
+                    Some("thinking") => {
+                        let index = self.push(Content::Thinking { thinking: String::new(), thinking_signature: Some(String::new()), redacted: None }, stream_index);
+                        self.emit(StreamEvent::ThinkingStart { index });
+                    }
+                    Some("tool_use") => {
+                        let Some(name) = self.pi_tool_name(block["name"].as_str().unwrap_or_default()) else { return };
+                        let id = block["id"].as_str().unwrap_or_default().to_string();
+                        self.tool_ids.push(id.clone());
+                        let arguments = block["input"].as_object().cloned().unwrap_or_default();
+                        let index = self.push(Content::ToolCall { id: id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, stream_index);
+                        self.emit(StreamEvent::ToolCallStart { index, id, name });
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_delta" => {
+                let Some(index) = position else { return };
+                let delta = &event["delta"];
+                let piece = |key: &str| delta[key].as_str().unwrap_or_default().to_string();
+                match (delta["type"].as_str().unwrap_or_default(), &mut self.out.content[index]) {
+                    ("text_delta", Content::Text { text, .. }) => {
+                        text.push_str(&piece("text"));
+                        self.emit(StreamEvent::TextDelta { index, delta: piece("text") });
+                    }
+                    ("thinking_delta", Content::Thinking { thinking, .. }) => {
+                        thinking.push_str(&piece("thinking"));
+                        self.emit(StreamEvent::ThinkingDelta { index, delta: piece("thinking") });
+                    }
+                    // The arguments update only once the JSON so far parses whole.
+                    ("input_json_delta", Content::ToolCall { arguments, .. }) => {
+                        self.partial[index].push_str(&piece("partial_json"));
+                        if let Ok(Value::Object(parsed)) = serde_json::from_str(&self.partial[index]) {
+                            *arguments = parsed;
+                        }
+                        self.emit(StreamEvent::ToolCallDelta { index, delta: piece("partial_json") });
+                    }
+                    ("signature_delta", Content::Thinking { thinking_signature, .. }) => {
+                        thinking_signature.get_or_insert_default().push_str(&piece("signature"));
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let Some(index) = position else { return };
+                self.open[index] = None;
+                let event = match &mut self.out.content[index] {
+                    Content::Text { text, .. } => StreamEvent::TextEnd { index, content: text.clone() },
+                    Content::Thinking { thinking, .. } => StreamEvent::ThinkingEnd { index, content: thinking.clone() },
+                    Content::ToolCall { name, arguments, .. } => {
+                        self.saw_tool_call = true;
+                        let parsed = serde_json::from_str::<Value>(&self.partial[index]).ok().and_then(|value| value.as_object().cloned());
+                        *arguments = pi_arguments(name, parsed.unwrap_or_else(|| std::mem::take(arguments)));
+                        StreamEvent::ToolCallEnd { index, tool_call: self.out.content[index].clone() }
+                    }
+                    Content::Image { .. } => return,
+                };
+                self.emit(event);
+            }
+            "message_delta" => {
+                self.stream_delta = true;
+                self.out.stop_reason = match event["delta"]["stop_reason"].as_str() {
+                    Some("tool_use") => StopReason::ToolUse,
+                    Some("max_tokens") => StopReason::Length,
+                    _ => StopReason::Stop,
+                };
+                // message_delta carries no id: it reports on the last message_start's message.
+                if event["usage"].is_object() {
+                    self.record_usage(self.stream_id.clone().as_deref(), &event["usage"]);
+                }
+            }
+            "message_stop" => {
+                self.drop_unfinished();
+                self.stream_open = false;
+                if self.saw_tool_call {
+                    self.end_turn_on_tool_use();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A whole assistant message. After a streamed one it repeats what the stream delivered; under a
+    // new id it is Claude Code's non-streamed fallback for a stalled stream, one message per block,
+    // and the content path. A "<synthetic>" one is Claude Code's own failure report, kept off the
+    // stream so the turn still reads as one that produced nothing.
+    fn assistant(&mut self, message: &Value) {
+        let Some(blocks) = message["content"].as_array() else { return };
+        let id = message["id"].as_str().map(String::from);
+        if message["model"] == "<synthetic>" {
+            if self.saw_stream_event && self.stream_open {
+                self.drop_abandoned();
+            }
+            for text in blocks.iter().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()).filter(|text| !text.is_empty()) {
+                self.push(Content::text(text), None);
+            }
+            if message["usage"].is_object() {
+                self.record_usage(id.as_deref(), &message["usage"]);
+            }
+            return;
+        }
+        if self.saw_stream_event {
+            if id.is_none() || self.stream_id.is_none() || id == self.stream_id {
+                return;
+            }
+            if self.stream_open {
+                self.drop_abandoned();
+            }
+        }
+        if id.is_none() || id != self.fallback_id {
+            self.tool_ids.clear();
+            self.fallback_id = id.clone();
+        }
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") if block["text"].as_str().is_some_and(|text| !text.is_empty()) => self.whole_text(block["text"].as_str().unwrap_or_default()),
+                Some("thinking") => {
+                    self.ensure_started();
+                    let thinking = block["thinking"].as_str().unwrap_or_default().to_string();
+                    let signature = block["signature"].as_str().unwrap_or_default().to_string();
+                    let index = self.push(Content::Thinking { thinking: thinking.clone(), thinking_signature: Some(signature), redacted: None }, None);
+                    self.emit(StreamEvent::ThinkingStart { index });
+                    if !thinking.is_empty() {
+                        self.emit(StreamEvent::ThinkingDelta { index, delta: thinking.clone() });
+                    }
+                    self.emit(StreamEvent::ThinkingEnd { index, content: thinking });
+                }
+                Some("tool_use") => {
+                    let Some(name) = self.pi_tool_name(block["name"].as_str().unwrap_or_default()) else { continue };
+                    self.ensure_started();
+                    self.saw_tool_call = true;
+                    let call_id = block["id"].as_str().unwrap_or_default().to_string();
+                    self.tool_ids.push(call_id.clone());
+                    let arguments = pi_arguments(&name, block["input"].as_object().cloned().unwrap_or_default());
+                    let index = self.push(Content::ToolCall { id: call_id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, None);
+                    self.emit(StreamEvent::ToolCallStart { index, id: call_id, name });
+                    self.emit(StreamEvent::ToolCallEnd { index, tool_call: self.out.content[index].clone() });
+                }
+                _ => {}
+            }
+        }
+        record_response(&mut self.out, &message["id"], &message["model"], &self.model);
+        if message["usage"].is_object() {
+            self.record_usage(id.as_deref(), &message["usage"]);
+        }
+        // Every block of a fallback answer says tool_use and no message_stop follows the last, so
+        // the turn ends once its blocks have settled (or sooner, when Claude Code moves on).
+        if self.saw_tool_call && self.turn.is_some() {
+            self.settle_at = Some(Instant::now() + FALLBACK_SETTLE);
+        }
+    }
+
+    // However the query ended: answer the open stream, keep a clean end's records for the next
+    // rewrite (before answering, so pi's next call finds them), delete its session files.
+    async fn finish(mut self) {
+        if self.aborted || self.failure.is_some() {
+            self.settle_at = None;
+        } else {
+            self.flush_settle();
+        }
+        let status = self.child.close().await;
+        if let Some(status) = status.filter(|status| !status.success() && !self.result_seen && !self.closed && self.failure.is_none()) {
+            self.failure = Some(match status.code() {
+                Some(code) => format!("Claude Code process exited with code {code}"),
+                None => format!("Claude Code process was stopped ({status})"),
+            });
+        }
+        if let Some(failure) = self.failure.clone() {
+            if !self.closed || self.aborted {
+                self.end_open(if self.aborted { StopReason::Aborted } else { StopReason::Error }, &failure);
+            }
+        } else if !self.closed {
+            let (parked, (mut prints, mut roles)) = {
+                let state = lock(&self.state);
+                (state.held.pending.is_some(), state.kept_base.clone())
+            };
+            if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !parked && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)) {
+                prints.push(fingerprint(&Message::Assistant(self.out.clone())));
+                roles.push("assistant".into());
+                history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles);
+            }
+            if let Some(turn) = self.turn.take() {
+                if !self.started {
+                    let _ = turn.events.send(StreamEvent::Start);
+                }
+                let _ = turn.reply.send(self.out.clone());
+            }
+        }
+        let ids: HashSet<&String> = self.written.iter().chain(&self.cc_session).collect();
+        for id in ids {
+            history::delete_session(id, &self.project_path);
+        }
+        debug(&format!("query done: session {} closed={} aborted={} failure={:?}", self.key, self.closed, self.aborted, self.failure));
+        self.forget();
+    }
+}
+
+// --- One-off summaries ---
+
+// User content as text: a string as is, else its non-empty text blocks joined by newlines.
+fn text_of(content: &TextOrBlocks) -> String {
+    match content {
+        TextOrBlocks::Text(text) => text.clone(),
+        TextOrBlocks::Blocks(blocks) => blocks.iter().filter_map(|block| match block {
+            Content::Text { text, .. } if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n"),
+    }
+}
+
+// pi's compaction and branch summaries (cacheRetention "none"): the summarization prompt as Claude
+// Code's system prompt, the trailing user turn as one prompt, one turn, nothing kept.
+async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &str, cli_model: &str, effort: Option<&str>, thinking_off: bool, cwd: &str) -> AssistantMessage {
+    let model = request.model;
+    let prompt: Vec<String> = messages[history::turn_start(messages)..].iter().filter_map(|message| match message {
+        Message::User(user) => Some(text_of(&user.content)),
+        _ => None,
+    }).filter(|text| !text.is_empty()).collect();
+    if prompt.is_empty() {
+        return failed(model, StopReason::Error, "one-off summary without a user prompt (last message is not user?)");
+    }
+    let mut args = base_args(thinking_off, effort);
+    args.extend(["--max-turns=1".to_string(), format!("--model={cli_model}")]);
+    args.extend(["--tools=", "--setting-sources=", "--strict-mcp-config", "--no-session-persistence", "--settings", SUMMARY_SETTINGS].map(String::from));
+    let mut child = match spawn(&args, cwd) {
+        Ok(child) => child,
+        Err(error) => return failed(model, StopReason::Error, &error),
+    };
+    child.send(&json!({"request_id": request_id(), "type": "control_request", "request": {"subtype": "initialize", "systemPrompt": [system_prompt], "skills": []}})).await;
+    child.send(&json!({"type": "user", "session_id": "", "message": {"role": "user", "content": [{"type": "text", "text": prompt.join("\n")}]}, "parent_tool_use_id": null})).await;
+    let mut output = new_output(model, PROVIDER);
+    let (mut text, mut final_text, mut result_usage) = (String::new(), String::new(), None);
+    let mut requests: HashMap<String, Counters> = HashMap::new();
+    let mut last_activity = Instant::now();
+    let ended: Result<(), String> = loop {
+        let line = tokio::select! {
+            line = child.lines.next_line() => match line {
+                Ok(Some(line)) => line,
+                Ok(None) => break Err("Claude Code summary ended without a result".into()),
+                Err(error) => break Err(format!("Claude Code summary read failed: {error}")),
+            },
+            () = sleep_until(last_activity + BODY_IDLE_TIMEOUT) => break Err(format!("Claude Code summary timed out: no event for {} s (limit {} ms)", BODY_IDLE_TIMEOUT.as_secs(), BODY_IDLE_TIMEOUT.as_millis())),
+            () = request.cancel.cancelled() => break Err("Operation aborted".into()),
+        };
+        last_activity = Instant::now();
+        let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+        let body = &message["message"];
+        match message["type"].as_str().unwrap_or_default() {
+            "assistant" => {
+                text.extend(body["content"].as_array().into_iter().flatten().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()));
+                if body["model"] != "<synthetic>" {
+                    record_response(&mut output, &body["id"], &body["model"], model);
+                    if body["usage"].is_object() {
+                        requests.entry(body["id"].as_str().unwrap_or("(no message id)").to_string()).or_default().merge(&body["usage"]);
+                    }
+                }
+            }
+            "result" => {
+                child.stdin = None;
+                result_usage = message["usage"].is_object().then(|| message["usage"].clone());
+                let error = result_error(&message);
+                if error.is_none() {
+                    final_text = message["result"].as_str().filter(|result| !result.is_empty()).map_or_else(|| text.clone(), String::from);
+                }
+                break error.map_or(Ok(()), Err);
+            }
+            "control_request" => {
+                child.send(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": message["request_id"], "error": "nothing is served to a summary"}})).await;
+            }
+            _ => {}
+        }
+    };
+    let status = child.close().await;
+    if request.cancel.is_cancelled() {
+        return failed(model, StopReason::Aborted, "Operation aborted");
+    }
+    // The result's usage covers every request; the messages' own are only the fallback.
+    output.usage = match &result_usage {
+        Some(usage) => {
+            let mut counters = Counters::default();
+            counters.merge(usage);
+            usage_of(std::iter::once(&counters))
+        }
+        None => usage_of(requests.values()),
+    };
+    let text = if final_text.is_empty() { text } else { final_text };
+    let error = ended.err().or_else(|| match status {
+        Some(status) if status.success() => None,
+        Some(status) => Some(format!("Claude Code summary process exited with {status}")),
+        None => Some("Claude Code summary process did not exit successfully".into()),
+    });
+    match error {
+        Some(failure) => output.error_message = Some(failure),
+        None if text.trim().is_empty() => output.error_message = Some("Claude Code summary returned empty text".into()),
+        None => {
+            output.content.push(Content::text(text));
+            output.stop_reason = StopReason::Stop;
+            return output;
+        }
+    }
+    output.stop_reason = StopReason::Error;
+    output
+}
