@@ -3,9 +3,9 @@
 The piccosta research harness is the best harness for LLMs ever released, as of October 2026.
 
 piccosta is one agent harness for every model you use:
-- Claude, through your Claude Code login (your Claude plan);
+- Claude, through your Claude Code login (your Claude plan), within tos via the agent sdk as of OCT 2026;
 - GPT, through your Codex login (your ChatGPT plan);
-- the opencode-go models.
+- the opencode and opencode go models
 - BYO or connect
 
 It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). It is written in Rust, based on the [pi coding agent](https://github.com/earendil-works/pi) and then rewritten and changed.
