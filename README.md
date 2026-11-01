@@ -1,6 +1,6 @@
 # piccosta
 
-The piccosta research harness is the best harness for LLMs ever released, as of October 26th.
+The piccosta research harness is the best harness for LLMs ever released, as of October 2026.
 
 piccosta is one agent harness for every model you use:
 - Claude, through your Claude Code login (your Claude plan);
