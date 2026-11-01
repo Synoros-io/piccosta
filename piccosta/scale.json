@@ -1,0 +1,43 @@
+{
+  "critical": {
+    "for": "very critical work and managing a main lane",
+    "models": ["claude-bridge/claude-opus-5-5:xhigh", "openai-codex/gpt-6.1-sol:xhigh"]
+  },
+  "general": {
+    "for": "general work: building and changing things",
+    "models": ["claude-bridge/claude-opus-5-5:medium", "openai-codex/gpt-6.1-sol:high"]
+  },
+  "review": {
+    "for": "reviewing work, and work slightly less important than general",
+    "models": ["openai-codex/gpt-6.1-sol:high", "claude-bridge/claude-opus-5-5:medium"]
+  },
+  "reading": {
+    "for": "reading code for issues",
+    "models": ["claude-bridge/claude-opus-5-5:medium", "openai-codex/gpt-6.1-sol:high"]
+  },
+  "bugs": {
+    "for": "searching for bugs",
+    "models": ["claude-bridge/claude-sonnet-5-5:high", "openai-codex/gpt-6-luna:medium"]
+  },
+  "search": {
+    "for": "web search",
+    "models": ["claude-bridge/claude-haiku-5-5:medium", "openai-codex/gpt-6-luna:low"],
+    "compactAt": 100000
+  },
+  "tests": {
+    "for": "writing and running tests",
+    "models": ["openai-codex/gpt-6-luna:medium"]
+  },
+  "visual": {
+    "for": "visual work: images, screenshots, layouts and anything judged by eye",
+    "models": ["openai-codex/gpt-6.1-terra:xhigh"]
+  },
+  "monitoring": {
+    "for": "watching runs, jobs and machines, and saying when something changes or goes wrong",
+    "models": ["claude-bridge/claude-opus-5-5:medium", "openai-codex/gpt-6.1-sol:high"]
+  },
+  "exploration": {
+    "for": "exploring a codebase or a topic, cheaply",
+    "models": ["opencode-go/deepseek-v4.1-flash:high"]
+  }
+}

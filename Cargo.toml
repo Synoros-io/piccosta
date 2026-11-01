@@ -1,0 +1,88 @@
+# piccosta. One workspace and one shared target dir (target/), so every member builds with the
+# same feature set and nothing recompiles from flipping features between packages.
+
+[workspace]
+resolver = "2"
+members = ["piccosta"]
+
+[workspace.package]
+edition = "2024"
+# FSL-1.1-ALv2 (Synoros), with the notices of the MIT projects piccosta is based on, all in
+# LICENSE.md; a file based on one says so in its header.
+license = "FSL-1.1-ALv2 AND MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps object keys in the order they were read or built, the way JSON.stringify
+# writes them. Session lines, prompt sections and tool schemas all depend on key order.
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+# Session ids are UUIDv7 (time-ordered) and entry ids come from random v4 UUIDs, as in pi.
+uuid = { version = "1", features = ["v4", "v7"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+# rustls with the system's certificate store; no OpenSSL to link against.
+reqwest = { version = "0.13", features = ["json", "stream"] }
+base64 = "0.22"
+futures-util = "0.3"
+# Cancelling a running request or tool when the user aborts.
+tokio-util = "0.7"
+# setsid, kill and access for the shell tools; already in the tree through tokio.
+libc = "0.2"
+# NFKC for edit's fuzzy matching, as JavaScript's String.normalize does it.
+unicode-normalization = "0.1"
+# Decoding, resizing and re-encoding images for read; pi uses this same crate through WebAssembly.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# Patterns in tool output (bash's path hints).
+regex = "1"
+# Codex's websocket transport. Only tungstenite's handshake: TLS goes through the same rustls
+# stack (aws-lc-rs, the platform's certificate verifier) that reqwest already uses.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+# fetch_content's page extraction: dom_smoothie is a port of Mozilla's Readability (the article
+# finder pi-web-access runs), htmd turns the article's HTML into Markdown the way turndown does.
+dom_smoothie = "0.19"
+htmd = "0.5"
+# Text out of PDFs, without the rendering, OCR and signature features.
+pdf_oxide = { version = "0.3", default-features = false, features = ["legacy-crypto"] }
+# Decoding a page by its declared charset, as the WHATWG Encoding Standard (JavaScript's
+# TextDecoder) does it.
+encoding_rs = "0.8"
+# sha256 for the Claude bridge's message prints, the same hash the TypeScript bridge wrote into
+# its sidecars; already in the tree through pdf_oxide.
+sha2 = "0.11"
+# WHATWG URL parsing, as JavaScript's URL does it; already in the tree through reqwest.
+url = "2"
+# The terminal UI: ratatui draws and diffs the screen, crossterm talks to the terminal (its
+# event stream feeds the async loop), pulldown-cmark reads the models' Markdown (with $..$ math).
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+# TeX: RaTeX typesets a formula (KaTeX's layout, fonts embedded) into a PNG for terminals that
+# show images; term-maths draws it as Unicode text for those that don't.
+ratex-parser = "0.1.15"
+ratex-layout = "0.1.15"
+ratex-types = "0.1.15"
+ratex-render = { version = "0.1.15", features = ["embed-fonts"] }
+term-maths = "1"
+
+# The everyday build (`cargo build --release`), made to rebuild quickly: piccosta is one large crate,
+# and thin LTO with one codegen unit spent about two minutes on every change. What it runs is
+# network-bound, so the code they'd speed up isn't where its time goes. `--profile dist` is the
+# slower, smaller build for handing out, and a release is it built static, for musl
+# (`--target x86_64-unknown-linux-musl`): a glibc build only starts on a glibc as new as the one
+# it was built on (Arch's 2.43 rules out Ubuntu 24.04 and Debian 12), and the static one needs no
+# libraries at all. Debug info is stripped; the symbols stay, so a panic's backtrace still names
+# its functions.
+[profile.release]
+incremental = true
+codegen-units = 16
+
+[profile.dist]
+inherits = "release"
+incremental = false
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
