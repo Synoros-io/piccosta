@@ -21,7 +21,7 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 
 - **Claude through Claude Code.** A Claude plan only works inside Claude Code, so piccosta runs Claude Code as a pipe. piccosta's own prompt goes in, with your AGENTS.md and CLAUDE.md files in it, and piccosta's own tools; Claude Code adds none of its builtins or settings, and doesn't load CLAUDE.md a second time. When a turn ends on tool calls, the query stays open for the results, so the prompt cache carries from turn to turn. Rate-limit messages name the limit and when it resets.
 - **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn, and falls back to plain HTTP streaming when it can't be used.
-- **All 28 opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
+- **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
 - **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats.
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
