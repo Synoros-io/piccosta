@@ -10,11 +10,15 @@ piccosta is one agent harness for every model you use:
 
 It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). It is written in Rust, based on the [pi coding agent](https://github.com/earendil-works/pi) and then rewritten and changed.
 
+*To install, paste this to your coding agent:*
+
+*Install piccosta (https://github.com/Synoros-io/piccosta) on this machine by following its README: put the release binary on my PATH, or build it if there's no release for this platform. Run `piccosta auth status`, and tell me how to log in to any account it doesn't find. Set `defaultProvider` and `defaultModel` in piccosta's settings.json to a model I'm logged in to. If I use Zed or T3 Code, set them up with `piccosta zed` or `piccosta t3`. Finish with `piccosta -p "say hello"` to show it works.*
+
 ## Features
 
 ### Every model on the plans you already pay for
 
-- **Claude through Claude Code.** A Claude plan only works inside Claude Code, so piccosta runs Claude Code as a pipe. piccosta's own prompt and tools go in, and none of Claude Code's builtins, settings or CLAUDE.md. When a turn ends on tool calls, the query stays open for the results, so the prompt cache carries from turn to turn. Rate-limit messages name the limit and when it resets.
+- **Claude through Claude Code.** A Claude plan only works inside Claude Code, so piccosta runs Claude Code as a pipe. piccosta's own prompt goes in, with your AGENTS.md and CLAUDE.md files in it, and piccosta's own tools; Claude Code adds none of its builtins or settings, and doesn't load CLAUDE.md a second time. When a turn ends on tool calls, the query stays open for the results, so the prompt cache carries from turn to turn. Rate-limit messages name the limit and when it resets.
 - **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn, and falls back to plain HTTP streaming when it can't be used.
 - **All 28 opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
@@ -125,6 +129,7 @@ match, tried on Arch, Alpine 3.24, Debian 12 and Ubuntu 24.04. It needs a CA cer
 To install the release binary:
 
 ```sh
+mkdir -p ~/.local/bin
 curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.0/piccosta-x86_64-linux -o ~/.local/bin/piccosta
 chmod +x ~/.local/bin/piccosta   # or put it anywhere on your PATH
 ```
@@ -142,7 +147,7 @@ ln -s "$PWD/target/x86_64-unknown-linux-musl/dist/piccosta" ~/.local/bin/piccost
 `cargo build --release` builds faster against your own glibc, and runs only on a glibc at least
 as new.
 
-Log in with each account's own tool, then check that piccosta finds the logins:
+Log in with each account's own tool, check that piccosta finds the logins, and set the model it starts on (`defaultProvider` and `defaultModel` in `~/.local/share/piccosta/agent/settings.json`, or `/model` in the terminal UI):
 
 ```sh
 claude auth login        # Claude Code (claude.ai/code), for claude-bridge/* models
