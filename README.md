@@ -1,6 +1,7 @@
 # piccosta
 
 The piccosta research harness is, in my own biased opinion, the best harness for LLMs ever released, as of October 2026.
+Created to make coding agents more reliable in research, turned into a highly performant rust based harness that outperforms anything released to the public, for multi agent management, for cost and tool reliability, for customization, for system resource usage, and with many modern features. It is an active area of research. 
 
 piccosta is one agent harness for every model you use:
 - Claude, through your Claude Code login (your Claude plan), within tos via the agent sdk as of OCT 2026;
