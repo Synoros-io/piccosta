@@ -30,8 +30,8 @@ Every kind of work has its models: critical, general, review, reading code, bug 
 
 ### Managers
 
-- **The assistant** is a standing session that runs as a background service. Start it with `piccosta assistant`, or set `"manager": {"autostart": true}` in settings and piccosta writes and starts its systemd user unit when the terminal UI opens (a plain background process where there's no systemd). It heads the sidebar; you talk to it there, or with `piccosta tell <text>` from any shell.
-- **Project managers.** The first session ever opened in a directory becomes that project's manager, and `/manager` makes one anywhere else. It looks after its project's sessions only.
+- **The assistant** is a standing session that runs as a background service, inspired by Grokbot, OPENAI dots, and meta muse. Start it with `piccosta assistant`, or set `"manager": {"autostart": true}` in settings and piccosta writes and starts its systemd user unit when the terminal UI opens (a plain background process where there's no systemd). It heads the sidebar; you talk to it there, or with `piccosta tell <text>` from any shell.
+- **Project managers.** The first session ever opened in a directory becomes that project's manager, and `/manager` makes one anywhere else. It looks after its project's sessions only, like a scoped version of an assistant.
 - **What managers can do:** list, read, start and message sessions in any project, on any model, by kind of work from the scale, with partners; see what sessions cost; keep schedules; notify you on the desktop.
 - **They report back.** A session a manager starts runs in the background, and its end comes back to the manager, which reads the last turn before it tells you what happened. A session it started that goes quiet for half an hour gets it a reminder to close it or update it.
 - **They never make you wait.** Anything a manager runs that takes more than a few seconds goes to the background.
@@ -40,7 +40,7 @@ Every kind of work has its models: critical, general, review, reading code, bug 
 
 ### Models that check each other
 
-`/pair <model>` makes a pair, and `/pair a b` (or `--pair a,b`) makes a trio. After each answer, every other model takes a turn checking it against what you asked. They verify, fix, finish, and say what they changed. Then it's your turn again, so they can't keep each other going. Any models can work together, across providers. The group is saved with the session, and works in print mode too.
+Like Devin Fusion, way to run any two models as a "pair", with yourself in the loop. `/pair <model>` makes a pair, and `/pair a b` (or `--pair a,b`) makes a trio. After each answer, every other model takes a turn checking it against what you asked. They verify, fix, finish, and say what they changed. Then it's your turn again, so they can't keep each other going. Any models can work together, across providers. The group is saved with the session, and works in print mode too.
 
 ### Subagents
 
