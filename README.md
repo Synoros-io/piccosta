@@ -64,7 +64,6 @@ The model hands a task to a job: search, scout, worker, reviewer or monitor. Eac
 - **An editor that behaves:** history across sessions, Tab completion of commands, word moves and deletes (Alt+B/F/D, Ctrl+Backspace), Ctrl+Shift+Delete to clear, and Ctrl+_ to undo.
 - **Copy and paste with the mouse.** Drag to select and it copies when you let go. Double-click selects a path, triple-click a line, and right-click pastes. Shift+arrows select in the editor. Copies go to your desktop's clipboard, or through the terminal over ssh.
 - **Typeset math.** RaTeX typesets formulas and shows them as images in Ghostty, kitty and WezTerm (through tmux too). Terminals that can't show images get Unicode.
-- **You can see it working:** a line under the conversation with moving dots and the time since the run started, and a spinner on each running session in the sidebar.
 - **Commands:**
   - `/model`, `/effort` (`auto` returns to the default), `/compact` (it says what it saved), `/autocompact`.
   - `/new`, `/clear`, `/fork`, `/rewind`, `/rename`, `/close`, `/delete`.
