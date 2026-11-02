@@ -38,9 +38,6 @@ const IMPORT_MAX_BYTES: usize = crate::tools::truncate::DEFAULT_MAX_BYTES;
 const CONSTITUTION_TEXT_ENV: &str = "PICCOSTA_CONSTITUTION";
 const CONSTITUTION_FILE_ENV: &str = "PICCOSTA_CONSTITUTION_FILE";
 const BUILT_IN_CONSTITUTION: &str = include_str!("../prompts/constitution.md");
-// The pi-subagents roles a constitution placeholder can name, {<role>_model}, filled from
-// settings.json `subagents.agentOverrides.<role>.model` so the wording and the role table agree.
-const CONSTITUTION_ROLES: [&str; 5] = ["scout", "worker", "reviewer", "oracle", "researcher"];
 
 pub struct ContextFile {
     pub path: PathBuf,
@@ -193,7 +190,7 @@ fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf]) -> String {
 
 // The constitution text with its placeholders filled, or None when it's turned off. A file that
 // can't be read is an error: a run that thinks it has a constitution and doesn't is worse.
-pub fn constitution(settings: &crate::config::Settings, model_name: &str) -> Result<Option<String>, String> {
+pub fn constitution(model_name: &str) -> Result<Option<String>, String> {
     let text = match (std::env::var(CONSTITUTION_TEXT_ENV), std::env::var(CONSTITUTION_FILE_ENV)) {
         (Ok(text), _) if !text.trim().is_empty() => text,
         (_, Ok(path)) if path.is_empty() => return Ok(None),
@@ -202,12 +199,6 @@ pub fn constitution(settings: &crate::config::Settings, model_name: &str) -> Res
     };
     if text.trim().is_empty() {
         return Ok(None);
-    }
-    let mut text = text;
-    for role in CONSTITUTION_ROLES {
-        if let Some(model) = settings.get(&format!("subagents.agentOverrides.{role}.model")).and_then(|value| value.as_str()).map(str::trim).filter(|model| !model.is_empty()) {
-            text = text.replace(&format!("{{{role}_model}}"), model);
-        }
     }
     Ok(Some(crate::js::trim(&text.replace("{modelname}", model_name)).to_string()))
 }
@@ -300,11 +291,11 @@ pub fn custom_prompts(agent_dir: &Path) -> (Option<String>, Option<String>) {
 
 // What /init asks for (the TUI and ACP both offer it): AGENTS.md, direction.md and ledger.md.
 pub const INIT_PROMPT: &str = "Set up this repository's agent docs. Read the code and any existing docs first. Write AGENTS.md: the rules for working in this repo (how to build, run and check it, its conventions, what not to touch), short and specific to this repo, with CLAUDE.md as a symlink to it. Write direction.md: the current goal and what is planned for later. Start ledger.md: an append-only log of what the user asked and what happened, a few lines per session. Update any of these that already exist instead of replacing them, and create no other documents.";
-const REVIEW_PROMPT: &str = "Use the subagent tool with the reviewer job to review {target}. Have it report problems it can show, each with the file and line, and change nothing. Then tell me what it found.";
+const REVIEW_PROMPT: &str = "Use the subagent tool with the review job to review {target}. Have it report problems it can show, each with the file and line, and change nothing. Then tell me what it found.";
 const REVIEW_DEFAULT: &str = "the current changes in this repository (git diff, including untracked files)";
 
 // What /review sends: a review of `target`, or of the working tree's changes when it's empty,
-// handed to the reviewer job.
+// handed to the review job.
 pub fn review_prompt(target: &str) -> String {
     REVIEW_PROMPT.replace("{target}", if target.trim().is_empty() { REVIEW_DEFAULT } else { target.trim() })
 }
@@ -313,7 +304,7 @@ pub fn review_prompt(target: &str) -> String {
 // them.
 pub const PROMPT_COMMANDS: [(&str, &str); 2] = [
     ("init", "have the model write AGENTS.md, direction.md and ledger.md"),
-    ("review", "hand a review of the changes to the reviewer job"),
+    ("review", "hand a review of the changes to the review job"),
 ];
 
 // A typed `/init` or `/review [what]` as the prompt it stands for; None for anything else.

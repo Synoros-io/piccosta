@@ -44,7 +44,7 @@ pub mod theme {
 
 // The status line when there's no notice: what's most used first, since a narrow screen cuts the
 // end; /help has every key and command.
-const HELP: &str = "enter send · esc stop · alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair two models · /help all keys · ^c ^c quit";
+const HELP: &str = "enter send · esc stop · alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
 // How many of this directory's earlier sessions the sidebar lists, and of other projects': the most
 // recently used projects, a few sessions each.
 const RECENT_SESSIONS: usize = 30;
@@ -124,9 +124,9 @@ struct Slot {
     agents: Vec<crate::tools::subagent::RunningAgent>,
     // When its current run started, for the working line under the conversation.
     working_since: Option<Instant>,
-    // Whether it compacts on its own (/autocompact), and the model it works in a pair with (/pair).
+    // Whether it compacts on its own (/autocompact), and the models it works with (/pair, /trio).
     auto_compaction: bool,
-    partners: Vec<String>,
+    team: crate::host::Team,
     // Run by another piccosta (it holds the file's lock), and, when shown here, the file's time
     // as last read: such a session is followed from its file, never run twice.
     elsewhere: bool,
@@ -168,7 +168,7 @@ impl Slot {
             agents: Vec::new(),
             auto_compaction: true,
             working_since: None,
-            partners: Vec::new(),
+            team: Default::default(),
             elsewhere: false,
             followed: None,
             manager: false,
@@ -265,6 +265,12 @@ struct App {
     saved: String,
     // /restart: start again on the binary as it is now, once everything here has stopped.
     restart: bool,
+    // A file to open in the user's editor (/scale edit), with the screen handed over meanwhile.
+    edit: Option<PathBuf>,
+    // When this piccosta started, and each session folder's time when last looked at, for the
+    // sessions made since (find_new_sessions).
+    started: std::time::SystemTime,
+    folder_times: HashMap<PathBuf, std::time::SystemTime>,
     // Since when the focused draft has been /d…, on the way to the easter egg (commands.rs).
     descent_since: Option<Instant>,
     // The session files `/resume all` listed, by their number there.
@@ -386,6 +392,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         scans: 0,
         saved: String::new(),
         restart: false,
+        edit: None,
+        started: std::time::SystemTime::now(),
+        folder_times: HashMap::new(),
         descent_since: None,
         found: Vec::new(),
         selection: None,
@@ -436,6 +445,26 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         // Everything else already waiting goes in before the next frame.
         while let Ok((slot, update)) = app.updates.try_recv() {
             app.update(slot, update);
+        }
+        // A file to edit: the user's editor gets the terminal ($VISUAL, else $EDITOR), and the
+        // screen comes back when it exits. Sessions carry on meanwhile; their updates wait.
+        if let Some(path) = app.edit.take() {
+            match std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) {
+                None => app.notice = Some(format!("Set $EDITOR to edit it here; the file is {}", path.display())),
+                Some(editor) => {
+                    restore();
+                    let ran = std::process::Command::new(&editor).arg(&path).status();
+                    terminal = setup().map_err(|error| format!("could not set up the terminal again: {error}"))?;
+                    terminal.clear().map_err(|error| error.to_string())?;
+                    app.notice = Some(match ran {
+                        Ok(_) => match crate::scale::changes(&app.host.agent_dir) {
+                            Ok(_) => format!("{} saved; new sessions and subagents use it", path.display()),
+                            Err(error) => format!("Not valid, so it's left out: {error}"),
+                        },
+                        Err(error) => format!("{}: {error}", editor.to_string_lossy()),
+                    });
+                }
+            }
         }
     }
     app.save_state();
@@ -523,9 +552,8 @@ impl App {
             self.slots[first].title = name.clone();
             self.tell(Command::Name(name.clone()));
         }
-        if !args.pair.is_empty() {
-            self.slots[first].partners = args.pair.clone();
-            self.tell(Command::Pair(args.pair.clone()));
+        if let Some(team) = &args.team {
+            self.set_team(team.clone());
         }
         // This directory's earlier sessions, then the latest few of the projects used most recently,
         // so the sidebar can group them by project.
@@ -545,20 +573,11 @@ impl App {
             .take(OTHER_PROJECTS)
             .flatten();
         // The manager's session, when there is one, heads the sidebar.
-        let manager = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok());
-        let mut seen: std::collections::HashSet<PathBuf> = self.slots.iter().filter_map(|slot| slot.path.clone()).collect();
-        let manager = manager.filter(|file| !seen.contains(file)).map(|file| crate::host::SessionSummary {
-            title: crate::manager::ASSISTANT_NAME.into(), id: String::new(), cwd: crate::manager::home(&self.host.agent_dir), modified: std::time::SystemTime::now(), path: file,
+        let manager = crate::manager::session_file(&self.host.agent_dir).map(|file| crate::host::SessionSummary {
+            title: crate::manager::assistant_name(&self.host.agent_dir), id: String::new(), cwd: crate::manager::home(&self.host.agent_dir), modified: std::time::SystemTime::now(), path: file,
         });
-        let assistant = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok());
-        for summary in manager.into_iter().chain(self.host.sessions(RECENT_SESSIONS)).chain(others) {
-            let path = summary.path.canonicalize().unwrap_or(summary.path);
-            if seen.insert(path.clone()) {
-                let project_manager = crate::manager::project_manager(&self.host.agent_dir, &summary.cwd).and_then(|file| file.canonicalize().ok());
-                let manager = Some(&path) == assistant.as_ref() || Some(&path) == project_manager.as_ref();
-                self.slots.push(Slot { cwd: summary.cwd, manager, ..Slot::new(Some(path), summary.title) });
-            }
-        }
+        let others: Vec<crate::host::SessionSummary> = manager.into_iter().chain(self.host.sessions(RECENT_SESSIONS)).chain(others).collect();
+        self.list_sessions(others);
         // -r with no session named: the picker, over the new session it opened on. A restart
         // doesn't ask again, or send the opening message again.
         if args.resume.as_deref() == Some("") && !args.restore {
@@ -627,6 +646,35 @@ impl App {
         }
     }
 
+    // Add sessions to the list that aren't in it yet, each marked when it's a manager.
+    fn list_sessions(&mut self, summaries: Vec<crate::host::SessionSummary>) {
+        let assistant = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok());
+        for summary in summaries {
+            let path = summary.path.canonicalize().unwrap_or(summary.path);
+            if self.slots.iter().any(|slot| slot.path.as_ref() == Some(&path)) {
+                continue;
+            }
+            let project_manager = crate::manager::project_manager(&self.host.agent_dir, &summary.cwd).and_then(|file| file.canonicalize().ok());
+            let manager = Some(&path) == assistant.as_ref() || Some(&path) == project_manager.as_ref();
+            self.slots.push(Slot { cwd: summary.cwd, manager, ..Slot::new(Some(path), summary.title) });
+        }
+    }
+
+    // Sessions made since this piccosta started (a manager's, another terminal's) join the list,
+    // looked for in the session folders whose time has changed since the last look (a new file
+    // changes its folder's time).
+    fn find_new_sessions(&mut self) {
+        let folders = std::fs::read_dir(self.host.agent_dir.join("sessions")).into_iter().flatten().flatten();
+        let mut found = Vec::new();
+        for (folder, modified) in folders.filter_map(|folder| Some((folder.path(), folder.metadata().ok()?.modified().ok()?))) {
+            if self.folder_times.insert(folder.clone(), modified) != Some(modified) {
+                let new = crate::host::sessions_in(&folder, None, RECENT_PER_OTHER_PROJECT).into_iter().filter(|summary| summary.modified >= self.started && summary.cwd.is_dir());
+                found.extend(new);
+            }
+        }
+        self.list_sessions(found);
+    }
+
     // Open a session in a new slot: a file, or a new session on `model`.
     fn open(&mut self, path: Option<PathBuf>, model: Option<String>, thinking: Option<String>) -> Result<usize, String> {
         let slot = self.slots.len();
@@ -670,7 +718,7 @@ impl App {
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
         let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
         let view = &mut self.slots[slot];
-        view.title = crate::host::title(&agent.session);
+        view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
         view.manager = crate::manager::role(&agent.session).is_some();
         view.path = agent.session.file().map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         view.cwd = PathBuf::from(&agent.session.header().cwd);
@@ -688,7 +736,7 @@ impl App {
         }
         view.context_tokens = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
         view.auto_compaction = agent.auto_compaction();
-        view.partners = crate::host::pair_partners(&agent.session);
+        view.team = crate::host::team(&agent.session);
         let (commands, receiver) = unbounded_channel();
         view.id = agent.session.id().to_string();
         // Everything queued goes in together at the next step, as Claude Code sends it.
@@ -791,7 +839,7 @@ impl App {
     }
 
     // The same in another directory (None: the focused session's), with the command line's flags
-    // when given (/new <dir> --model … --pair …): the model and level, its partners and name, and
+    // when given (/new <dir> --model … --pair …): the model and level, its team and name, and
     // its own tools and prompt settings. Without flags it takes the focused session's model and
     // level. The session runs in that directory: its tools, its AGENTS.md, its session folder.
     fn new_session_in(&mut self, dir: Option<PathBuf>, args: Option<crate::cli::Args>) -> Option<usize> {
@@ -815,16 +863,16 @@ impl App {
         if let Some(asked) = flags.and_then(|args| args.thinking.as_ref()).filter(|asked| **asked != self.slots[slot].thinking) {
             self.notice = Some(format!("{} doesn't take {asked}; it runs at {}", self.slots[slot].model, self.slots[slot].thinking));
         }
-        // Its name and partners go to it as the commands /rename and /pair send.
+        // Its name and team go to it as the commands /rename and /pair send.
         let commands = self.slots[slot].live.as_ref().map(|(_, commands)| commands.clone());
         if let (Some(args), Some(commands)) = (flags, commands) {
             if let Some(name) = &args.name {
                 self.slots[slot].title = name.clone();
                 let _ = commands.send(Command::Name(name.clone()));
             }
-            if !args.pair.is_empty() {
-                self.slots[slot].partners = args.pair.clone();
-                let _ = commands.send(Command::Pair(args.pair.clone()));
+            if let Some(team) = &args.team {
+                self.slots[slot].team = team.clone();
+                let _ = commands.send(Command::Team(team.clone()));
             }
         }
         Some(slot)
@@ -875,6 +923,18 @@ impl App {
         if slot.title == NEW_TITLE {
             slot.title = render::fit(text.lines().next().unwrap_or(""), 80);
         }
+    }
+
+    // Work with other models in the focused session (none: alone again), and say how.
+    fn set_team(&mut self, team: crate::host::Team) {
+        let names = team.models.join(" and ");
+        self.notice = Some(match (team.models.is_empty(), team.pair) {
+            (true, _) => "Working alone again.".into(),
+            (false, true) => format!("A pair with {names}: after you ask, the two answer each other in turn until one says it's done, then it's your turn. /pair off ends it."),
+            (false, false) => format!("A trio with {names}: each answer is checked by {names}, then it's your turn. /trio off ends it."),
+        });
+        self.focused().team = team.clone();
+        self.tell(Command::Team(team));
     }
 
     fn tell(&mut self, command: Command) {
@@ -1018,7 +1078,10 @@ impl App {
         if let Some(file) = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok())
             && !self.slots.iter().any(|slot| slot.path.as_ref() == Some(&file))
         {
-            self.slots.push(Slot { cwd: crate::manager::home(&self.host.agent_dir), manager: true, ..Slot::new(Some(file), crate::manager::ASSISTANT_NAME.into()) });
+            self.slots.push(Slot { cwd: crate::manager::home(&self.host.agent_dir), manager: true, ..Slot::new(Some(file), crate::manager::assistant_name(&self.host.agent_dir)) });
+        }
+        if locks_due {
+            self.find_new_sessions();
         }
         // Each running subagent with a session gets a row of its own under its parent, so it can
         // be walked to and opened (followed live); a finished one's row goes unless it's on screen.
@@ -1062,14 +1125,14 @@ impl App {
         view.call_owner.clear();
         view.cache.clear();
         if view.parent.is_none() {
-            view.title = crate::host::title(&session);
+            view.title = crate::manager::title(&self.host.agent_dir, &session);
         }
         view.id = session.id().to_string();
         view.cwd = PathBuf::from(&session.header().cwd);
         view.model = model;
         view.thinking = context.thinking_level.clone();
         view.manager = crate::manager::role(&session).is_some();
-        view.partners = crate::host::pair_partners(&session);
+        view.team = crate::host::team(&session);
         view.context_tokens = crate::compaction::estimate_projected_context_tokens(&session.projection(), &session.path_to_leaf()).tokens;
         for message in context.messages {
             view.remember(message);
@@ -1598,9 +1661,9 @@ impl App {
         let slot = &self.slots[slot_index];
         let mut spans = vec![Span::styled(render::fit(&slot.title, usize::from(width) / 2), if focused { Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) })];
         let mut facts = format!("  {} · {} · {}/{} context", slot.model, slot.thinking, tokens(slot.context_tokens), tokens(slot.context_window));
-        if !slot.partners.is_empty() {
-            let names: Vec<&str> = slot.partners.iter().map(|model| model.rsplit('/').next().unwrap_or(model)).collect();
-            facts.push_str(&format!(" · checked by {}", names.join(" then ")));
+        if !slot.team.models.is_empty() {
+            let names: Vec<&str> = slot.team.models.iter().map(|model| model.rsplit('/').next().unwrap_or(model)).collect();
+            facts.push_str(&format!(" · {} with {}", if slot.team.pair { "pair" } else { "trio" }, names.join(" and ")));
         }
         if slot.live.is_none() && slot.elsewhere {
             facts.push_str(" · running in another piccosta, followed here");
@@ -1663,8 +1726,9 @@ impl App {
                     (true, ..) => "queue a message (read after the current step) · ^x^s sends now · ↑ takes it back · esc stops",
                     (false, false, true) => "another piccosta is running this session; it's shown here as it goes",
                     (false, false, false) => "an earlier session: type to carry on with it",
-                    (false, true, _) if !view.partners.is_empty() => "ask anything · each answer is checked by the other models in turn · /pair off works alone",
-                    (false, true, _) => "ask anything · / for commands · /pair <model> to have a second model check each answer",
+                    (false, true, _) if view.team.pair => "ask anything · the two models answer each other until one is done, then you · /pair off works alone",
+                    (false, true, _) if !view.team.models.is_empty() => "ask anything · the other model checks each answer, then you · /trio off works alone",
+                    (false, true, _) => "ask anything · / for commands · /pair or /trio <model> to work with a second model",
                 };
                 frame.render_widget(Paragraph::new(hint).style(Style::new().fg(theme::DIM)), text_area);
             } else {
@@ -1769,11 +1833,16 @@ fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags
             render::assistant(&render::blocks(assistant), Some((&assistant.stop_reason, assistant.error_message.as_deref())), tools, flags, frame, width, tex)
         }
         AgentMessage::Custom(custom) if custom.custom_type == commands::REPORT => render::report(&custom.content.text(), width, tex),
-        // A pair's handover: one line saying who checks whose answer, not the note the model reads.
+        // A pair's or trio's turn: one line saying whose turn it is, not the note the model reads.
+        // Notes from before pairs went back and forth name a `partner` checking a `lead`.
         AgentMessage::Custom(custom) if custom.custom_type == crate::host::PAIR_TYPE => {
             let name = |key: &str| custom.details.as_ref().and_then(|details| details.get(key)?.as_str()).map(|model| model.rsplit('/').next().unwrap_or(model).to_string());
-            let text = match (name("partner"), name("lead")) {
-                (Some(partner), Some(lead)) => format!("⇄ {partner} checks {lead}'s answer"),
+            let pair = name("mode").as_deref() == Some("pair");
+            let text = match (name("speaker").or(name("partner")), name("after").or(name("lead"))) {
+                (Some(speaker), Some(after)) if pair => format!("⇄ {speaker} answers {after}"),
+                (Some(speaker), Some(after)) => format!("⇄ {speaker} checks {after}'s answer"),
+                (Some(speaker), None) if pair => format!("⇄ pair: {speaker} answers first"),
+                (Some(speaker), None) => format!("⇄ trio: {speaker} answers first"),
                 _ => "⇄ the second model checks the answer".into(),
             };
             vec![Line::default(), Line::from(Span::styled(text, Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)))]

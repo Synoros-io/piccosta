@@ -66,8 +66,11 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
 // Claude Code keeps a tool result over 50,000 characters out of the conversation (a preview and a
 // file path instead) unless the tool raises that ceiling, up to 500,000. pi cuts read and bash at
 // 50 KB, so every tool declares the maximum and pi's results arrive whole (2.1.300's tool-result
-// store, read in the binary).
+// store, read in the binary; 2.1.316 against a stand-in API: a 51,341-character result arrives whole).
+// Past the ceiling the model gets a 2,000-character preview and a path to the rest.
 const MCP_RESULT_MAX_CHARS: u64 = 500_000;
+// Linux's cap on one argument (MAX_ARG_STRLEN).
+const MAX_ARGUMENT_BYTES: usize = 128 * 1024;
 // The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan; a new
 // model serves 200K until someone measures it). An unentitled [1m] fails every turn, so the default
 // is the bare id at 200K.
@@ -94,11 +97,25 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 // - MCP output cut only past 250,000 tokens: Claude Code estimates characters / 4 and counts the
 //   tokens of anything over half the cap first, so twice 500,000 / 4 lets every whole result by;
 // - tool descriptions never cut (its default is 4,096 characters);
-// - no retries of its own: pi's provider retry count, 0 by default, so failures reach pi's auto-retry.
-const CHILD_ENV: [(&str, &str); 9] = [("ENABLE_CLAUDEAI_MCP_SERVERS", "0"), ("DISABLE_AUTO_COMPACT", "1"),
+// - no retries of its own: pi's provider retry count, 0 by default, so failures reach pi's auto-retry;
+// - no remote feature flags. Two of them cut tool results to 2,000-character previews whatever the
+//   tool declares: one sets a tool's ceiling by name, one caps a turn's results at 200,000
+//   characters together. Turning off non-essential traffic already keeps the flags at their
+//   defaults (off), but the flags' disk cache can be switched back on from the environment, and
+//   this setting turns that off too (2.1.316, read in the binary and checked against a stand-in
+//   API: five 51,000-character results in one turn arrive whole).
+const CHILD_ENV: [(&str, &str); 10] = [("ENABLE_CLAUDEAI_MCP_SERVERS", "0"), ("DISABLE_AUTO_COMPACT", "1"),
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"), ("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off"), ("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1"),
     ("ENABLE_TOOL_SEARCH", "false"), ("MAX_MCP_OUTPUT_TOKENS", "250000"), ("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", "1000000"),
-    ("CLAUDE_CODE_MAX_RETRIES", "0")];
+    ("CLAUDE_CODE_MAX_RETRIES", "0"), ("DISABLE_GROWTHBOOK", "1")];
+// Claude Code resuming a transcript that ends at a user record (tool results, maybe a message
+// after them) takes that turn as owed and answers it at once, with the results and any message in
+// one user turn. Without these it writes "No response requested." as the model's reply there,
+// which the model then reads as its own and copies. Its own default age limit for that (an hour)
+// is lifted, since a resumed history can be days old; the continue note is what it adds when the
+// turn ends at tool results alone. Found in Claude Code 2.1.316's resume code, and checked against
+// a stand-in model: one request, no notice.
+const RESUME_ENV: [(&str, &str); 3] = [("CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "1"), ("CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS", "315360000000"), ("CLAUDE_CODE_RESUME_PROMPT", history::CONTINUE_NOTE)];
 // What a parent Claude Code session sets for the processes under it (what `env` showed inside a
 // Claude Code Bash call, 2026-10-15, plus the two 2.1.312 sets on 2026-10-29). Left in, the child
 // would act as part of that session. NODE_OPTIONS and DEBUG go too, as the SDK removed them.
@@ -255,13 +272,16 @@ struct Child {
     lines: Lines<BufReader<ChildStdout>>,
 }
 
-fn spawn(args: &[String], cwd: &str) -> Result<Child, String> {
+fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String> {
     let mut command = tokio::process::Command::new(&SETTINGS.claude);
     command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     for name in PARENT_ENV {
         command.env_remove(name);
     }
     command.envs(CHILD_ENV);
+    if resumes_turn {
+        command.envs(RESUME_ENV);
+    }
     if let Some(dir) = &SETTINGS.config_dir {
         command.env("CLAUDE_CONFIG_DIR", dir);
     }
@@ -537,7 +557,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let system = transcript::current_system_message(request.messages);
     let system_prompt = system.as_ref().map(transcript::system_message_text).unwrap_or_default();
     let tools = system.and_then(|system| system.tools_added).unwrap_or_default();
-    let messages: Vec<Message> = request.messages.iter().filter(|message| !matches!(message, Message::System(_))).cloned().collect();
+    let messages = fold_into_results(request.messages.iter().filter(|message| !matches!(message, Message::System(_))).cloned());
     let (cli_model, _) = runtime_model(&model.id);
     let effort = effort(model, request.thinking_level);
     let thinking_off = request.thinking_level == "off";
@@ -576,6 +596,31 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         }
         return answer.await.unwrap_or_else(|_| failed(model, StopReason::Error, "Claude Code ended the query without answering"));
     }
+}
+
+// Messages that arrive while tools run (the user's, a background job's notice) come after the
+// tool results in pi's context. Claude Code takes only tool results into a query that is waiting
+// on them, so such a message would end the query and make Claude Code resume the turn from its
+// session file instead: that rewrites the whole conversation into the prompt cache, and the
+// resumed turn is often answered with nothing ("No response requested.", 2026-11-01: eleven
+// such turns, 285K to 960K tokens written each). Here each such message goes on the end of the
+// last result instead, under a line saying it arrived meanwhile, the way Claude Code itself hands
+// the model a message typed while a tool runs. The same fold applies to every call, so a later
+// rewrite sends the same bytes the live query did and the cache holds.
+const ARRIVED_NOTE: &str = "[Sent while this tool ran:]";
+
+fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    for message in messages {
+        match (message, out.last_mut()) {
+            (Message::User(user), Some(Message::ToolResult(result))) => {
+                result.content.push(Content::text(ARRIVED_NOTE));
+                result.content.extend(user.content.into_blocks().into_iter().filter(|block| matches!(block, Content::Text { .. } | Content::Image { .. })));
+            }
+            (message, _) => out.push(message),
+        }
+    }
+    out
 }
 
 // Hand this call's tool results to the parked query when the sync check allows it. Output: Ok once
@@ -643,10 +688,15 @@ struct Start<'a> {
 }
 
 // Start a query holding exactly pi's context: the history in a fresh session file it resumes, the
-// trailing user turn (or the continue note) as its opening prompt.
+// trailing user turn as its opening prompt; or, when the turn starts at tool results, all of it in
+// the history, for Claude Code to answer on resume.
 fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     let visible: Vec<Message> = start.messages.iter().filter(history::visible).cloned().collect();
     let (history_end, prompt, continued) = history::split(&visible);
+    // A context whose last turn starts at tool results goes into the history whole, and Claude Code
+    // answers it on resume (RESUME_ENV), rather than ending the history at the results.
+    let resumes_turn = history_end > 0 && matches!(visible[history_end - 1], Message::ToolResult(_));
+    let history_end = if resumes_turn { visible.len() } else { history_end };
     let project_path = history::real_or(start.cwd);
     let written = if history_end > 0 {
         let history = &visible[..history_end];
@@ -657,8 +707,10 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     } else {
         None
     };
-    if continued {
-        debug("start: context ends at a tool result, opening with the continue note");
+    if resumes_turn {
+        debug("start: the turn starts at tool results; Claude Code answers it on resume");
+    } else if continued {
+        debug("start: context ends at an assistant message, opening with the continue note");
     }
     let mut args = base_args(start.thinking_off, start.effort);
     args.extend(written.iter().map(|id| format!("--resume={id}")));
@@ -672,13 +724,22 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         args.extend(["--thinking-display", "summarized"].map(String::from));
     }
     args.extend(["--settings", PROVIDER_SETTINGS].map(String::from));
-    let child = spawn(&args, start.cwd).inspect_err(|_| {
+    // A turn Claude Code answers on resume runs before the initialize request's prompt applies, so
+    // without this it goes out with Claude Code's own system prompt: none of pi's, no AGENTS.md, a
+    // prompt cache miss on everything, and the model told it may answer "No response requested."
+    // (2.1.316 against a stand-in API). A prompt too long for one argument keeps that behaviour.
+    if resumes_turn && start.system_prompt.len() < MAX_ARGUMENT_BYTES {
+        args.extend(["--system-prompt", start.system_prompt].map(String::from));
+    }
+    let child = spawn(&args, start.cwd, resumes_turn).inspect_err(|_| {
         if let Some(id) = &written {
             history::delete_session(id, &project_path);
         }
     })?;
-    let opening = vec![initialize(start.system_prompt, start.tools),
-        json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null})];
+    let mut opening = vec![initialize(start.system_prompt, start.tools)];
+    if !resumes_turn {
+        opening.push(json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null}));
+    }
     let state = Arc::new(Mutex::new(State {
         held: Held { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None },
         kept_base: kept_base(&visible),
@@ -1388,7 +1449,7 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
     let mut args = base_args(thinking_off, effort);
     args.extend(["--max-turns=1".to_string(), format!("--model={cli_model}")]);
     args.extend(["--tools=", "--setting-sources=", "--strict-mcp-config", "--no-session-persistence", "--settings", SUMMARY_SETTINGS].map(String::from));
-    let mut child = match spawn(&args, cwd) {
+    let mut child = match spawn(&args, cwd, false) {
         Ok(child) => child,
         Err(error) => return failed(model, StopReason::Error, &error),
     };

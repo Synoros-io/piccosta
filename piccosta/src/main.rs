@@ -157,9 +157,12 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     if prompts.is_empty() {
         return Err("nothing to answer: give a message, or pipe one in".into());
     }
-    // Partners (--pair, or the ones the session already has): after each answer they take their
-    // turns, as in the terminal UI, and the run ends after the last one's.
-    let partners = if args.pair.is_empty() { piccosta::host::pair_partners(&agent.session) } else { args.pair.clone() };
+    // The team (--pair or --trio, recorded with the session, or the one it already has): each
+    // answer goes round it as in the terminal UI, and the run ends after the exchange.
+    let team = match &args.team {
+        Some(team) => piccosta::host::record_team(&host.registry()?, &mut agent.session, team)?,
+        None => piccosta::host::team(&agent.session),
+    };
     // Then whatever was left in the session's inbox meanwhile (another piccosta's messages for it),
     // until it's empty.
     let mut queue: std::collections::VecDeque<String> = prompts.into();
@@ -167,10 +170,21 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         queue.extend(more);
         queue.pop_front()
     })) {
-        let text = &text;
-        let mut answered = agent.prompt(text).await;
-        if answered.is_ok() {
-            answered = host.partner_turns(&mut agent, &partners).await;
+        let before = agent.session.context().messages.len();
+        let answered = host.answer(&mut agent, &team, &text, Vec::new()).await;
+        // With a team, every reply of the exchange is printed under the model that wrote it, so
+        // the conversation reads as it happened; alone, only the last message is (below).
+        if !json && !team.models.is_empty() {
+            let mut speaker = String::new();
+            for message in agent.session.context().messages.into_iter().skip(before) {
+                let AgentMessage::Assistant(reply) = message else { continue };
+                let model = format!("{}/{}", reply.provider, reply.model);
+                if model != speaker {
+                    write_line(&format!("\n── {model} ──"));
+                    speaker = model;
+                }
+                reply.content.iter().for_each(|block| if let Content::Text { text, .. } = block { write_line(text) });
+            }
         }
         if let Err(error) = answered {
             tool_shared.jobs.shutdown("error");
@@ -192,7 +206,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         }
         return Ok(ExitCode::FAILURE);
     }
-    if json {
+    if json || !team.models.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
     for block in &answer.content {
@@ -214,6 +228,9 @@ async fn main() -> ExitCode {
         piccosta::tools::reaper::run();
         return ExitCode::SUCCESS;
     }
+    // The model catalogs, fetched again in the background when they're stale (model.rs).
+    let agent_dir = config::agent_dir();
+    tokio::spawn(model::refresh_catalogs(agent_dir.clone(), config::Settings::load(&agent_dir, &std::env::current_dir().unwrap_or_default())));
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let fail = |error: String| {
         eprintln!("piccosta: {error}");

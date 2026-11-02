@@ -24,32 +24,39 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
 - **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats.
+- **New models show up on their own.** The model lists for Claude, Codex and opencode-go ship with piccosta, and are fetched again from pi.dev's catalog (the one pi reads) at most every four hours. `modelCatalog.url` in settings points elsewhere; `modelCatalog.refresh: false` keeps to the built-in lists.
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
 ### The model scale
 
-Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, monitoring and exploration. Each has a first choice and the models that take over when a plan runs low.
+Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. Each has a first choice and the models that take over when a plan runs low.
 - piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and moves to the next model once one passes 80% of a window.
-- The defaults ship with piccosta. `modelScale` in `settings.json` changes any of them, adds your own or turns one off, and a project can have its own.
+- The defaults ship with piccosta. Your changes go in one file, `scale.json` in piccosta's folder: `/scale edit` writes all of it there and opens it in your editor, and `/scale <kind> <model[:level]> …` sets one kind's models. A kind you change keeps the rest of its defaults; `"off": true` turns one off.
 - `/scale` shows it all with the plans' usage. `--use <kind>` starts a session on its pick, on the command line, in `/new` and in Ctrl+N's box.
 
 ### Managers
 
-- **The assistant** is a standing session that runs as a background service, inspired by Grokbot, OPENAI dots, and meta muse. Start it with `piccosta assistant`, or set `"manager": {"autostart": true}` in settings and piccosta writes and starts its systemd user unit when the terminal UI opens (a plain background process where there's no systemd). It heads the sidebar; you talk to it there, or with `piccosta tell <text>` from any shell.
-- **Project managers.** The first session ever opened in a directory becomes that project's manager, and `/manager` makes one anywhere else. It looks after its project's sessions only, like a scoped version of an assistant.
-- **What managers can do:** list, read, start and message sessions in any project, on any model, by kind of work from the scale, with partners; see what sessions cost; keep schedules; notify you on the desktop.
-- **They report back.** A session a manager starts runs in the background, and its end comes back to the manager, which reads the last turn before it tells you what happened. A session it started that goes quiet for half an hour gets it a reminder to close it or update it.
+- **The assistant** is a standing session that runs as a background service, inspired by Grokbot, OPENAI dots, and meta muse. Start it with `piccosta assistant`, or set `"manager": {"autostart": true}` in settings and piccosta writes and starts its systemd user unit when the terminal UI opens (a plain background process where there's no systemd). It heads the sidebar; you talk to it there, or with `piccosta tell <text>` from any shell. Name it with `/rename` on its row, or by telling it its name.
+- **Project managers.** The first session ever opened in a directory becomes that project's manager, `/manager` makes one anywhere else, and the assistant can make one for you. It looks after its project's sessions only, like a scoped version of an assistant.
+- **What managers can do:** list projects and sessions; read, start, message and stop sessions in any project, on any model, by kind of work from the scale, with partners; see what sessions cost; keep schedules; notify you on the desktop.
+- **They report back.** A session a manager starts is a real session, listed under its project. Given work, it runs in a process of its own that carries on when the manager restarts, and when its turn ends the manager hears what it said, reads it and tells you what happened. Without work it waits for you. A session it started that goes quiet for half an hour gets it a reminder to close it or update it.
 - **They never make you wait.** Anything a manager runs that takes more than a few seconds goes to the background.
 - **A ledger that keeps everything.** Each manager has an append-only ledger. Past 256 KB its older half moves to a monthly archive, and nothing is deleted. When a manager compacts, it keeps your newest words and its ledger's newest entries word for word, and `ledger search` reaches all the rest. The ledger records what's happening, not facts about you. The assistant also keeps a short memory of what should hold from day to day (`ledger remember` and `forget`), all of it in its prompt.
-- **Spending:** a manager asks before it starts sessions on your Claude or Codex plan, unless you've told it it needn't.
+- **Spending:** a manager asks before it starts work on your Claude or Codex plan on its own initiative, unless you've told it it needn't; work you asked for is your go-ahead.
 
-### Models that check each other
+### Pairs and trios
 
-Like Devin Fusion, way to run any two models as a "pair", with yourself in the loop. `/pair <model>` makes a pair, and `/pair a b` (or `--pair a,b`) makes a trio. After each answer, every other model takes a turn checking it against what you asked. They verify, fix, finish, and say what they changed. Then it's your turn again, so they can't keep each other going. Any models can work together, across providers. The group is saved with the session, and works in print mode too.
+Like Devin Fusion, piccosta can run two models together in one chat. A pair is two models going back and forth. A trio is the same two models with you in the loop.
+
+- `/pair <model>` (or `--pair <model>`): your session's model answers, the other model checks it, fixes it or builds on it, and they carry on in the one conversation you read, without waiting for you. It stops when a model ends its reply with a line saying only `[done]` (counted from the second model's first reply), or after 3 rounds. `pairRounds` in settings.json changes the limit. Then it's your turn.
+- `/trio <model>` (or `--trio <model>`): the session's model answers, the other checks that answer once, says what it changed or that it holds up, and waits for you.
+- `/pair off` or `/trio off` goes back to working alone.
+
+Each model is told who the other is and how the exchange ends, and each turn is labelled with the model that wrote it. Any two models work together, across providers. The setup is saved with the session, and works in print mode and in sessions a manager starts (with `pair` or `trio`). Older sessions that had a partner open as trios.
 
 ### Subagents
 
-The model hands a task to a job: search, scout, worker, reviewer or monitor. Each job runs on its kind of work from the scale; a model without a login is skipped, and if a run fails, the next model takes over. Each subagent is a piccosta of its own, with its own saved session. While it works, it shows under its parent session in the sidebar, where you can open it and follow it live. You can write your own jobs as Markdown files.
+The model hands a task to a kind of work on the scale (critical, general, review, reading, bugs, search, tests, visual, prose, monitoring, exploration), which runs it on its models with its own tools and instructions; a model without a login is skipped, and if a run fails, the next model takes over. Each subagent is a piccosta of its own, with its own saved session. While it works, it shows under its parent session in the sidebar, where you can open it and follow it live. Each kind's tools and instructions are in the scale's file with its models (`/scale edit`); add your own kinds there.
 
 ### A terminal UI for many sessions at once
 
@@ -131,7 +138,7 @@ To install the release binary:
 
 ```sh
 mkdir -p ~/.local/bin
-curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.0/piccosta-x86_64-linux -o ~/.local/bin/piccosta
+curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.1/piccosta-x86_64-linux -o ~/.local/bin/piccosta
 chmod +x ~/.local/bin/piccosta   # or put it anywhere on your PATH
 ```
 
@@ -205,12 +212,13 @@ Add `--yolo` to skip permissions.
 
 ## Settings
 
-piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT_DIR`: `settings.json`, `models.json`, sessions and subagent roles (`agents/<name>.md`).
+piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT_DIR`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`catalog/`).
 
 `settings.json` uses pi's keys:
 - `defaultProvider` and `defaultModel`;
 - `defaultThinkingLevel` and `modelThinkingLevels`;
-- `compaction`, `retry`, `shellCommandPrefix`, `transport` and `subagents`.
+- `compaction`, `retry`, `shellCommandPrefix` and `transport`;
+- piccosta's own `manager`, `gui` and `modelCatalog`.
 
 A project's `.pi/settings.json` is merged over them.
 

@@ -225,7 +225,7 @@ impl Settings {
             enabled: self.get_bool("compaction.enabled").unwrap_or(true),
             reserve_tokens: token_setting("reserveTokens", DEFAULT_COMPACTION_RESERVE_TOKENS),
             keep_recent_tokens: token_setting("keepRecentTokens", DEFAULT_COMPACTION_KEEP_RECENT_TOKENS),
-            compact_at: Some(token_setting("compactAt", 0)).filter(|tokens| *tokens > 0).or_else(|| crate::scale::compact_at(self, &model_key)),
+            compact_at: Some(token_setting("compactAt", 0)).filter(|tokens| *tokens > 0).or_else(|| crate::scale::compact_at(&agent_dir(), &model_key)),
         }
     }
 }

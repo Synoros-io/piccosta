@@ -830,7 +830,7 @@ fn commands() -> Value {
     json!({"sessionUpdate": "available_commands_update", "availableCommands": [
         {"name": "compact", "description": "Summarize the conversation to free context", "input": {"hint": "what to keep (optional)"}},
         {"name": "init", "description": "Write this repo's AGENTS.md, direction.md and ledger.md"},
-        {"name": "review", "description": "Hand a review of the changes to the reviewer job", "input": {"hint": "what to review (optional)"}}
+        {"name": "review", "description": "Hand a review of the changes to the review job", "input": {"hint": "what to review (optional)"}}
     ]})
 }
 

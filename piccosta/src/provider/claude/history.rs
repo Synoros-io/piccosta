@@ -616,8 +616,9 @@ enum Kind {
 const PROMPT_ATTACHMENTS: [&str; 3] = ["prompt_snapshot", "prompt_render_point", "deferred_tools_record"];
 
 // Claude Code's notice for a turn that got no reply: it writes one after a resumed session that ends
-// at a user record (a query that opens at tool results, as one does after a compaction mid-turn).
-// Read back as the model's own words, a run of them teaches it to answer that way.
+// at a user record. The bridge has it answer such a turn instead (mod.rs, RESUME_ENV), but kept
+// records from before can hold the notice, and read back as the model's own words, a run of them
+// teaches it to answer that way.
 pub const NO_RESPONSE: &str = "No response requested.";
 
 // Whether an assistant message is that notice.

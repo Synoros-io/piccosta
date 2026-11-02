@@ -6,12 +6,9 @@
 // do it: the first one with a login runs it, and when that run fails the next one takes it over.
 // The lists are the user's; nothing the calling model sends can change them.
 //
-// A job is a role file: `<agent dir>/agents/<name>.md` when there is one, else the built-in of
-// that name (piccosta/agents/). Frontmatter keys: description, models (provider/id, comma
-// separated, in the order to try them; pi-subagents' single `model` also works; none means the
-// calling session's own model), or `use` (a kind of work on the model scale, scale.rs, whose models
-// and levels it takes, in the order usage allows at the time), thinking, tools (comma separated; every tool when absent) and
-// disabled. The body is appended to the subagent's system prompt.
+// The jobs are the model scale's kinds of work (scale.rs): each says what it's for, its models and
+// levels (in the order usage allows at the time; none means the calling session's own model), its
+// tools (all when it lists none) and its instructions, appended to the subagent's system prompt.
 //
 // A run is a child piccosta in print mode, started through bash's runner, so it is a shell command
 // like any other the session runs: its output streams to the UI, an abort kills it, one still going
@@ -24,19 +21,8 @@ use crate::auth::{credential_for, CredentialPaths};
 use crate::message::ToolDefinition;
 use crate::model::ModelRegistry;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-// The built-in jobs, a monitor among them; their models come from the model scale. The advisor
-// (research design or rescue) ships disabled, since it shouldn't be called on its own.
-const BUILTIN: [(&str, &str); 6] = [
-    ("search", include_str!("../../agents/search.md")),
-    ("scout", include_str!("../../agents/scout.md")),
-    ("worker", include_str!("../../agents/worker.md")),
-    ("reviewer", include_str!("../../agents/reviewer.md")),
-    ("monitor", include_str!("../../agents/monitor.md")),
-    ("advisor", include_str!("../../agents/advisor.md")),
-];
 // Set in a subagent's environment (to its job's name); a session that has it offers no subagent tool.
 pub const CHILD_ENV: &str = "PICCOSTA_SUBAGENT";
 // The tool's name, as the model calls it.
@@ -47,10 +33,6 @@ const MAX_COMMAND_BYTES: usize = 128 * 1024;
 struct Job {
     name: String,
     description: String,
-    models: Vec<String>,
-    // A kind of work on the model scale, whose models it runs on instead.
-    scale_use: Option<String>,
-    thinking: Option<String>,
     tools: Option<String>,
     prompt: String,
 }
@@ -60,69 +42,32 @@ pub struct SubagentTool {
     agent_dir: PathBuf,
 }
 
-// Input: a job's name and its role file. Output: the job, or None when it is disabled or the file
-// has no frontmatter.
-fn parse(name: &str, text: &str) -> Option<Job> {
-    let rest = text.strip_prefix("---\n")?;
-    let (head, body) = rest.split_once("\n---\n").or_else(|| rest.strip_suffix("\n---").map(|head| (head, "")))?;
-    let fields: HashMap<&str, &str> = head.lines().filter_map(|line| line.split_once(':')).map(|(key, value)| (key.trim(), value.trim())).collect();
-    if fields.get("disabled") == Some(&"true") {
-        return None;
-    }
-    let list = |key: &str| -> Vec<String> { fields.get(key).into_iter().flat_map(|value| value.split(',')).map(str::trim).filter(|item| !item.is_empty()).map(String::from).collect() };
-    let models = if fields.contains_key("models") { list("models") } else { list("model") };
-    Some(Job {
-        name: name.to_string(),
-        description: fields.get("description").unwrap_or(&"").to_string(),
-        models,
-        scale_use: fields.get("use").filter(|name| !name.is_empty()).map(|name| name.to_string()),
-        thinking: fields.get("thinking").filter(|level| !level.is_empty()).map(|level| level.to_string()),
-        tools: fields.get("tools").map(|tools| tools.to_string()),
-        prompt: body.trim().to_string(),
-    })
-}
-
 // Text as one single-quoted shell word.
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 impl SubagentTool {
-    // The jobs for an agent dir: each built-in one unless a role file of its name replaces it, then
-    // the agent dir's other role files by name. None when no job is enabled (no tool then).
+    // The scale's jobs for an agent dir. None when none is on (no tool then).
     pub fn load(agent_dir: &Path) -> Option<SubagentTool> {
-        let mut files: Vec<(String, String)> = std::fs::read_dir(agent_dir.join("agents"))
+        let strings = |entry: &Map<String, Value>, key: &str| -> Vec<String> { entry.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect() };
+        let text = |entry: &Map<String, Value>, key: &str| entry.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string);
+        let jobs: Vec<Job> = crate::scale::jobs(agent_dir)
             .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = path.file_stem()?.to_str()?.to_string();
-                (path.extension()? == "md").then(|| Some((name, std::fs::read_to_string(&path).ok()?)))?
+            .map(|(name, entry)| Job {
+                description: text(&entry, "for").unwrap_or_default(),
+                tools: Some(strings(&entry, "tools").join(",")).filter(|tools| !tools.is_empty()),
+                prompt: text(&entry, "instructions").unwrap_or_default(),
+                name,
             })
             .collect();
-        files.sort();
-        let mut roles: Vec<(String, String)> = BUILTIN.iter().map(|(name, text)| (name.to_string(), text.to_string())).collect();
-        for (name, text) in files {
-            match roles.iter_mut().find(|(builtin, _)| *builtin == name) {
-                Some(role) => role.1 = text,
-                None => roles.push((name, text)),
-            }
-        }
-        let jobs: Vec<Job> = roles.iter().filter_map(|(name, text)| parse(name, text)).collect();
         (!jobs.is_empty()).then(|| SubagentTool { jobs, agent_dir: agent_dir.to_path_buf() })
     }
 
     // The job's models that are in the registry and have a login, in its order (the calling
     // session's own model for a job that lists none), and a line for each one left out and why.
     async fn available(&self, job: &Job, context: &ToolContext) -> Result<(Vec<String>, Vec<String>), String> {
-        let models = match &job.scale_use {
-            Some(name) => {
-                let settings = crate::config::Settings::load(&self.agent_dir, &context.cwd);
-                crate::scale::order(&self.agent_dir, &settings, &crate::scale::find(&settings, name)?)
-            }
-            None => job.models.clone(),
-        };
+        let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name)?);
         if models.is_empty() {
             return Ok((vec![format!("{}/{}", context.provider, context.model_id)], Vec::new()));
         }
@@ -143,7 +88,7 @@ impl SubagentTool {
             }
         }
         if found.is_empty() {
-            return Err(format!("None of the {} job's models can run: {}. Log in to one, or change its models in {}.", job.name, skipped.join(" "), self.agent_dir.join("agents").join(format!("{}.md", job.name)).display()));
+            return Err(format!("None of the {} job's models can run: {}. Log in to one, or change its models in {} (/scale edit).", job.name, skipped.join(" "), crate::scale::path(&self.agent_dir).display()));
         }
         Ok((found, skipped))
     }
@@ -161,7 +106,6 @@ impl SubagentTool {
             Some(file) => format!("--session-dir {}", quote(&file.parent().unwrap_or(Path::new(".")).join("subagents").to_string_lossy())),
             None => "--no-session".to_string(),
         }];
-        flags.extend(job.thinking.as_ref().map(|level| format!("--thinking {}", quote(level))));
         flags.extend(job.tools.as_ref().map(|tools| format!("--tools {}", quote(tools))));
         if !job.prompt.is_empty() {
             flags.push(format!("--append-system-prompt {}", quote(&job.prompt)));
@@ -184,12 +128,11 @@ impl SubagentTool {
         self.jobs
             .iter()
             .map(|job| {
-                let models = match (&job.scale_use, job.models.is_empty()) {
-                    (Some(name), _) => format!("the scale's {name} models"),
-                    (None, true) => "your own model".to_string(),
-                    (None, false) => job.models.join(", else "),
-                };
-                format!("{}: {} Runs on {models}.", job.name, job.description)
+                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| entry.models.join(", else ")).unwrap_or_default();
+                let models = if models.is_empty() { "your own model".to_string() } else { models };
+                let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
+                let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
+                format!("{}: {}. Runs on {models}.{owns}", job.name, job.description)
             })
             .collect()
     }

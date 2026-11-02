@@ -28,8 +28,8 @@ pub struct Args {
     pub name: Option<String>,
     // --use <name>: the model scale's choice for that kind of work (scale.rs), unless --model is given.
     pub use_scale: Option<String>,
-    // --pair <model,model>: the session works with these partners (/pair): one is a pair, two a trio.
-    pub pair: Vec<String>,
+    // --pair <model> or --trio <model>: the session works with that model (/pair, /trio).
+    pub team: Option<crate::host::Team>,
     // --tools a,b: only these tools; --exclude-tools a,b: all but these.
     pub tools: Option<Vec<String>>,
     pub exclude_tools: Vec<String>,
@@ -108,7 +108,7 @@ pub fn parse(arguments: &[String]) -> Args {
             "--session-dir" => args.session_dir = take(&mut index).or(args.session_dir.take()),
             "--name" | "-n" => args.name = take(&mut index).or(args.name.take()),
             "--use" => args.use_scale = take(&mut index).or(args.use_scale.take()),
-            "--pair" => args.pair.extend(take(&mut index).map(|list| names(&list)).unwrap_or_default()),
+            "--pair" | "--trio" => args.team = take(&mut index).map(|list| crate::host::Team { models: names(&list), pair: arg == "--pair" }).or(args.team.take()),
             "--extension" | "-e" => {
                 take(&mut index);
             }
@@ -213,7 +213,10 @@ Options:
   --no-session           Keep the session in memory only
   --session-dir <dir>    Where session files go
   -n, --name <name>      Name the session
-  --pair <model[,model]> After each answer these models check it in turn (a pair, or a trio)
+  --pair <model>         Work with that model as a pair: the two answer each other in turn
+                         until one says it's done or the round limit, then you speak
+  --trio <model>         Work with that model as a trio: after each answer it checks it once,
+                         then you speak
   -t, --tools <a,b>      Only these tools; --no-tools for none
   -xt, --exclude-tools <a,b>  Every tool but these
   --append-system-prompt <text|file>  Add to the system prompt (repeatable)

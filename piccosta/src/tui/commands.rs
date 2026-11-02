@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 38] = [
+const COMMANDS: [(&str, &str); 39] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -55,7 +55,8 @@ const COMMANDS: [(&str, &str); 38] = [
     ("/rewind", "go back to before one of your prompts, in a copy, with that prompt in the editor"),
     ("/rename, /name <name>", "name this session"),
     ("/model [name]", "switch the model; new sessions start on it too"),
-    ("/pair [model…|off]", "after each answer these models check it in turn (one: a pair, two: a trio), then you speak"),
+    ("/pair [model|off]", "work with a second model as a pair: the two answer each other in turn until one says it's done, then you speak"),
+    ("/trio [model|off]", "work with a second model as a trio: it checks each answer once, then you speak"),
     ("/thinking, /effort [level|auto]", "set the thinking level, saved for the model; auto forgets it"),
     ("/compact [focus]", "summarize the conversation to free context"),
     ("/autocompact [on|off]", "compact on its own when the context fills; alone, says which"),
@@ -67,7 +68,7 @@ const COMMANDS: [(&str, &str); 38] = [
     ("/copy [n]", "copy the last (or nth last) response"),
     ("/export [file]", "write the conversation as Markdown"),
     ("/init", "have the model write AGENTS.md, direction.md and ledger.md"),
-    ("/review [what]", "hand a review of the changes to the reviewer job"),
+    ("/review [what]", "hand a review of the changes to the review job"),
     ("/agents", "the subagent jobs and their models"),
     ("/ps", "background jobs"),
     ("/stop", "kill the background jobs"),
@@ -168,7 +169,29 @@ impl App {
                 }
             }
             "resume" => self.sessions(argument),
-            "scale" => self.report(format!("The model scale (modelScale in settings changes it):\n{}", crate::scale::describe(&self.host.agent_dir, &self.host.settings))),
+            // The scale is one file: /scale edit opens it (written out whole the first time), and
+            // /scale <use> <model[:level]> ... sets one use's models there.
+            "scale" if argument == "edit" => match crate::scale::write_out(&self.host.agent_dir) {
+                Ok(path) => self.edit = Some(path),
+                Err(error) => self.notice = Some(error),
+            },
+            "scale" if !argument.is_empty() => {
+                let words = words(argument);
+                let (name, models) = words.split_first().map_or(("", &[][..]), |(name, models)| (name.as_str(), models));
+                self.notice = Some(if models.is_empty() {
+                    format!("/scale {name} <model[:level]> …: the models for that kind of work, first choice first")
+                } else {
+                    match crate::scale::set_use(&self.host.agent_dir, name, models) {
+                        Ok(()) => format!("{name} now runs on {}", models.join(", then ")),
+                        Err(error) => error,
+                    }
+                });
+            }
+            "scale" => {
+                let problem = crate::scale::changes(&self.host.agent_dir).err().map_or(String::new(), |error| format!("\n\nYour file isn't valid, so it's left out: {error}"));
+                let path = crate::scale::path(&self.host.agent_dir);
+                self.report(format!("The model scale: each kind of work, its models, and the subagent job of its name. It's one file, {} (/scale edit opens it; /scale <kind> <model[:level]> … sets a kind's models).\n\n{}{problem}", path.display(), crate::scale::describe(&self.host.agent_dir)));
+            }
             // This directory's project manager: shown when there is one, else made, as a new session.
             "manager" => {
                 // From the assistant's pane, the project piccosta was started in.
@@ -237,19 +260,8 @@ impl App {
                 self.pick("thinking", items, argument, App::set_thinking);
                 self.select(&self.current().thinking.clone());
             }
-            "pair" if argument == "off" => {
-                self.focused().partners.clear();
-                self.tell(Command::Pair(Vec::new()));
-                self.notice = Some("Working alone again.".into());
-            }
-            // Two or more models named: a trio (or more), checking in the order given.
-            "pair" if argument.split([' ', ',']).filter(|name| !name.is_empty()).count() > 1 => {
-                let models: Vec<String> = argument.split([' ', ',']).filter(|name| !name.is_empty()).map(str::to_string).collect();
-                self.notice = Some(format!("After each answer, {} check it in turn; then it's your turn. /pair off ends it.", models.join(" then ")));
-                self.focused().partners = models.clone();
-                self.tell(Command::Pair(models));
-            }
-            "pair" => {
+            "pair" | "trio" if argument == "off" => self.set_team(Default::default()),
+            "pair" | "trio" => {
                 let items = match self.host.registry() {
                     Ok(registry) => registry.models().iter().map(|model| format!("{}/{}", model.provider, model.id)).collect(),
                     Err(error) => {
@@ -257,15 +269,25 @@ impl App {
                         return true;
                     }
                 };
-                self.pick("pair with", items, argument, |app, model| {
-                    app.notice = Some(format!("After each answer, {model} checks it; then it's your turn. /pair off ends it."));
-                    app.focused().partners = vec![model.clone()];
-                    app.tell(Command::Pair(vec![model]));
-                });
+                // pick takes a plain function, so one for each.
+                let (title, apply): (_, fn(&mut App, String)) = match name {
+                    "pair" => ("pair with", |app, model| app.set_team(crate::host::Team { models: vec![model], pair: true })),
+                    _ => ("trio with", |app, model| app.set_team(crate::host::Team { models: vec![model], pair: false })),
+                };
+                self.pick(title, items, argument, apply);
             }
             "name" | "rename" if !argument.is_empty() => {
                 self.focused().title = argument.to_string();
-                self.tell(Command::Name(argument.to_string()));
+                // The assistant's name is kept apart from its session, which its service runs.
+                let assistant = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok());
+                if assistant.is_some() && self.current().path == assistant {
+                    self.notice = Some(match crate::manager::set_assistant_name(&self.host.agent_dir, argument) {
+                        Ok(()) => format!("The assistant is {argument} now"),
+                        Err(error) => format!("Couldn't keep the name: {error}"),
+                    });
+                } else {
+                    self.tell(Command::Name(argument.to_string()));
+                }
             }
             "name" | "rename" => self.notice = Some(format!("This session is “{}”; /rename <name> changes it.", self.current().title)),
             "compact" => {

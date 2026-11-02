@@ -5,8 +5,9 @@
 // merge rules of packages/coding-agent/src/core/provider-composer.ts and model-config.ts.
 //
 // pi ships 42 provider catalogs and refreshes them from pi.dev in the background. piccosta needs
-// three, so those are compiled in from catalog/<provider>.json and nothing is fetched at run time.
-// To refresh one, fetch it and replace the file:
+// three: they're compiled in from catalog/<provider>.json, and refreshed the same way into
+// <agent dir>/catalog/, whose copy goes over the built-in one model by model (refresh_catalogs).
+// To refresh a built-in one, fetch it and replace the file:
 //   curl -s "https://pi.dev/api/models/providers/<provider>?types=chat" | jq . > catalog/<provider>.json
 // (last fetched 2026-10-29).
 
@@ -15,7 +16,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // The compiled-in catalogs: (provider id, JSON list of models).
 const BUILT_IN_CATALOGS: [(&str, &str); 3] = [
@@ -24,6 +26,58 @@ const BUILT_IN_CATALOGS: [(&str, &str); 3] = [
     // The Claude models the bridge serves under its own provider name.
     ("anthropic", include_str!("../catalog/anthropic.json")),
 ];
+
+// The catalog service pi itself reads (remote-catalog-provider.ts), unless settings'
+// `modelCatalog.url` names another; how often a copy is fetched again and how long one request may
+// take, pi's interval and its per-attempt timeout.
+const CATALOG_SERVICE: &str = "https://pi.dev";
+const CATALOG_REFRESH: Duration = Duration::from_secs(4 * 60 * 60);
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn catalog_copy(agent_dir: &Path, provider: &str) -> PathBuf {
+    agent_dir.join("catalog").join(format!("{provider}.json"))
+}
+
+// The chat models of a provider's fetched copy, each marked with the provider (as pi does), or none
+// when there's no copy or it doesn't read.
+fn fetched(agent_dir: &Path, provider: &str) -> Vec<Map<String, Value>> {
+    let models: Vec<Value> = fs::read_to_string(catalog_copy(agent_dir, provider)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    let chat = |model: &Map<String, Value>| model.contains_key("id") && model.get("type").is_none_or(|kind| kind == "chat");
+    let mut models: Vec<Map<String, Value>> = models.into_iter().filter_map(|model| model.as_object().cloned()).filter(chat).collect();
+    for model in &mut models {
+        model.insert("provider".into(), Value::String(provider.to_string()));
+    }
+    models
+}
+
+// Fetch each provider's catalog again when the copy kept is older than CATALOG_REFRESH (or there is
+// none), for the next load to read. Run in the background as piccosta starts; a failure leaves the
+// copy there is, or the built-in one, and `modelCatalog.refresh: false` keeps to the built-in ones.
+pub async fn refresh_catalogs(agent_dir: PathBuf, settings: crate::config::Settings) {
+    if settings.get("modelCatalog.refresh").and_then(Value::as_bool) == Some(false) {
+        return;
+    }
+    let service = settings.get("modelCatalog.url").and_then(Value::as_str).unwrap_or(CATALOG_SERVICE).trim_end_matches('/').to_string();
+    let Ok(client) = reqwest::Client::builder().user_agent(crate::provider::user_agent()).timeout(CATALOG_TIMEOUT).build() else { return };
+    for (provider, _) in BUILT_IN_CATALOGS {
+        let copy = catalog_copy(&agent_dir, provider);
+        let age = copy.metadata().and_then(|metadata| metadata.modified()).ok().and_then(|modified| modified.elapsed().ok());
+        if age.is_some_and(|age| age < CATALOG_REFRESH) {
+            continue;
+        }
+        let request = client.get(format!("{service}/api/models/providers/{provider}?types=chat")).header("accept", "application/json");
+        let Ok(response) = request.send().await.and_then(reqwest::Response::error_for_status) else { continue };
+        let Ok(body) = response.text().await else { continue };
+        if !serde_json::from_str::<Vec<Value>>(&body).is_ok_and(|models| !models.is_empty()) {
+            continue;
+        }
+        // Written whole, then moved into place, so a load never reads half of one.
+        let partial = copy.with_extension("json.partial");
+        if fs::create_dir_all(agent_dir.join("catalog")).and_then(|()| fs::write(&partial, body)).is_ok() {
+            let _ = fs::rename(&partial, &copy);
+        }
+    }
+}
 
 // What a model declared in models.json gets when it says nothing else and no catalog model shares
 // its id (provider-composer.ts:232-247).
@@ -172,8 +226,15 @@ impl ModelRegistry {
     pub fn load(models_json: &Path) -> Result<ModelRegistry, String> {
         let mut models_by_provider: IndexMap<String, Vec<Map<String, Value>>> = IndexMap::new();
         for (provider, json) in BUILT_IN_CATALOGS {
-            let list: Vec<Map<String, Value>> =
+            let mut list: Vec<Map<String, Value>> =
                 serde_json::from_str(json).map_err(|error| format!("built-in catalog {provider}: {error}"))?;
+            // The fetched copy, model by model over the built-in one.
+            for model in models_json.parent().map(|dir| fetched(dir, provider)).unwrap_or_default() {
+                match list.iter_mut().find(|known| known.get("id") == model.get("id")) {
+                    Some(known) => *known = model,
+                    None => list.push(model),
+                }
+            }
             models_by_provider.insert(provider.to_string(), list);
         }
         // Claude runs only through the bridge, under its own provider name.

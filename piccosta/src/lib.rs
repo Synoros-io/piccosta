@@ -11,6 +11,7 @@ pub mod config;
 pub mod gui;
 pub mod host;
 pub mod js;
+pub mod machine;
 pub mod manager;
 pub mod json_number;
 pub mod message;

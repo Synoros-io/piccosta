@@ -20,7 +20,10 @@
 // - `memory.md`, the assistant's only, since it looks after everything for the long run: what
 //   should hold from one day to the next, a line each, edited by `remember` and `forget` and kept
 //   under MEMORY_CHARS; all of it is in the assistant's prompt and carried through compactions;
-// - `schedules.json`: messages for it at set times or on a repeat.
+// - `schedules.json`: messages for it at set times or on a repeat;
+// - `lanes.json`: the sessions it started or messaged, which it answers for (below), and `runs/`,
+//   what each lane's latest run printed;
+// - `name`, the assistant's only: what the user calls it, when they've named it.
 //
 // Its context stays bounded however long it runs. When it compacts, the summary carries the
 // newest of the user's words verbatim up to MANAGER_PIN_CHARS (older ones as a one-line index;
@@ -53,28 +56,28 @@ const PROMPT: &str = "{role} Your job is to {job}, delegate responsibly using pi
 
 How you work:{project}
 - Nothing you run makes the user wait: a command or subagent still going after a few seconds moves to the background, and its result comes to you as a message when it ends. Answer the user meanwhile; don't wait, sleep or poll.
-- Messages reach you from the user, from sessions that ended, and from your schedules; each says which, with the time.
-- `sessions` lists, reads, starts and messages the sessions on this computer, in any project, on any model, and reports what they've cost. A session you start or message runs in the background; when it ends, you get a message. Read its last turn before you say what happened: a run that ended isn't proof the work was done. Then tell the user what happened and which session to open, and use `ledger notify` when it's something they'd want to know now.
+- Messages reach you from the user, from your lanes as their turns end, and from your schedules; each says which, with the time.
+- `sessions` lists, reads, starts and messages the sessions on this computer, in any project, on any model, lists the projects (`sessions projects`) and reports what sessions cost. `sessions start` makes a real session in a directory, listed under its project for the user to open. Given a first message, it starts work at once, in a process of its own that carries on when you stop or restart. Without one it just waits, for the user or for you; start it that way when the user asks for a session and not for work in it, and don't make up a first task. When a lane's turn ends you get a message with what it said: a turn that ended isn't proof the work was done, so read it (`sessions read`) before you say what happened. Then tell the user what happened and which session to open, and use `ledger notify` when it's something they'd want to know now. Report what was asked; suggest next steps only when they asked, or when something needs their decision.
 - {quota}
 - Your ledger ({ledger}) is your running record of what's happening and what's going on {scope}: `ledger append` adds an entry, a line or two, of the lanes you started and why (session ids, models), what each is doing and what came of it, what the user decided, and what's next. piccosta carries its newest entries through your compactions; `ledger search` finds the rest, and anything the user said to you, word for word. A project's own files (AGENTS.md, direction.md, its ledger.md) belong to the project and the sessions working in it; when one of those should change, tell the user.{memory_line}
 - `ledger schedule` keeps messages for you at set times or on a repeat.
 - The sessions you start or message are your lanes. Check in on them while they work, not only when they end: read their latest turns (`sessions read`), and when a lane will run a while, schedule your next look (`ledger schedule`). Act on what you see: a lane stuck, off track, repeating itself or waiting on something gets a message or a stop (`sessions stop`), and the user hears what you did. When one goes quiet you also get a reminder: close it (`sessions close`) when it's done, or update it.
-- A project can have its own manager: the session named \"manager\" in its directory. Hand that project's work to it rather than starting sessions there yourself.
-- Choose models by the user's model scale: start a session with `use`, the kind of work, and piccosta picks the model, moving to the next one when a plan runs low. Pick the use that fits, say which and why, and consider a twin (`pair`) for long or important lanes. Name a `model` only when the user did. When something you read (a project's docs, the user's standards) disagrees with the scale about which model to use, ask the user before you choose.
+- A project can have its own manager, a standing session that looks after that project: `sessions list` and `sessions projects` show which. Make one with `sessions start` and `manager: true`, with no message unless the user gave it work; one directory has one. Hand a project's work to its manager (`sessions message`) rather than starting sessions there yourself.
+- Choose models by the user's model scale: start a session with `use`, the kind of work, and piccosta picks the model, moving to the next one when a plan runs low. Pick the use that fits, say which and why, and consider a second model for long or important lanes (`trio`: it checks each answer once; `pair`: the two work it through together). Name a `model` only when the user did. When something you read (a project's docs, the user's standards) disagrees with the scale about which model to use, ask the user before you choose.
 
 The model scale (`sessions usage` shows it with the plans' usage now):
 {scale}{memory}";
 const ASSISTANT_ROLE: &str = "You are the general assistant, the lead director.";
 const ASSISTANT_JOB: &str = "monitor the network or the single computer, check in on and manage agents in each project";
 const PROJECT_JOB: &str = "check in on and manage the agents in this project";
-const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold from one day to the next, whatever is happening: what the user wants done and how, the projects and machines you look after, who to hand what. `ledger remember` adds a line, `ledger forget` takes out the lines holding a phrase. All of it is below, and after every compaction. Never a credential, key or password, in it or in your ledger.";
+const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold from one day to the next, whatever is happening: what the user wants done and how, the projects and machines you look after, who to hand what. `ledger remember` adds a line, `ledger forget` takes out the lines holding a phrase. All of it is below, and after every compaction. Never a credential, key or password, in it or in your ledger. When the user gives you a name, take it with `ledger name`.";
 // How long a manager's command runs before it moves to the background, since nothing should run in
 // a manager's foreground: a quick look (ls, rg, git status) comes back whole, and anything slower,
 // a subagent above all, goes to the background so the manager stays free for the user. The usual
 // limit is a minute.
 pub const SOFT_LIMIT: Duration = Duration::from_secs(3);
-const QUOTA_ASK: &str = "Sessions on claude-bridge/* and openai-codex/* models spend the user's plan quota: ask the user before you start or message one, unless they've told you to go ahead.";
-const QUOTA_FREE: &str = "Sessions on claude-bridge/* and openai-codex/* models spend the user's plan quota; the user has let you use it as you judge best, so watch `sessions usage`.";
+const QUOTA_ASK: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.";
+const QUOTA_FREE: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans, as piccosta is meant to; the user has let you use them as you judge best, so watch `sessions usage`.";
 
 // The model and thinking level the manager runs on unless `manager.model`/`manager.thinking`
 // say otherwise: a model that writes few tokens and holds 1M of context, at a medium level.
@@ -124,6 +127,25 @@ const ROLE_ENTRY: &str = "piccosta-manager";
 // The names managers take, which the sidebar and `sessions list` show.
 pub const ASSISTANT_NAME: &str = "assistant";
 pub const PROJECT_NAME: &str = "manager";
+// The file in the assistant's home that holds its name.
+const NAME_FILE: &str = "name";
+
+// The assistant's name: what the user calls it, once they've named it (/rename on its row in the
+// terminal UI, or asking it), else "assistant".
+pub fn assistant_name(agent_dir: &Path) -> String {
+    let named = fs::read_to_string(home(agent_dir).join(NAME_FILE)).ok().map(|name| name.trim().to_string());
+    named.filter(|name| !name.is_empty()).unwrap_or_else(|| ASSISTANT_NAME.into())
+}
+
+pub fn set_assistant_name(agent_dir: &Path, name: &str) -> std::io::Result<()> {
+    fs::create_dir_all(home(agent_dir))?;
+    fs::write(home(agent_dir).join(NAME_FILE), name.trim())
+}
+
+// A session's title, the assistant's being its name.
+pub fn title(agent_dir: &Path, session: &crate::session::Session) -> String {
+    if role(session) == Some(Role::Assistant) { assistant_name(agent_dir) } else { crate::host::title(session) }
+}
 
 // The kind a session was made, if it's a manager.
 pub fn role(session: &crate::session::Session) -> Option<Role> {
@@ -322,6 +344,9 @@ struct Lane {
     // The file's last change (epoch seconds) when its reminders started, and how many it's had.
     quiet_since: u64,
     reminders: u32,
+    // The process of its run going now, when `sessions` started one.
+    #[serde(default)]
+    run: Option<u32>,
 }
 
 fn load_lanes(home: &Path) -> Vec<Lane> {
@@ -337,27 +362,91 @@ fn changed(file: &Path) -> Option<u64> {
     file.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|age| age.as_secs())
 }
 
-// Start answering for a lane, or carry on with one already listed.
-fn take_lane(home: &Path, file: &Path, title: &str) {
+// Start answering for a lane, or carry on with one already listed; `run` is the process of a run
+// just started in it.
+fn take_lane(home: &Path, file: &Path, title: &str, run: Option<u32>) {
     let mut lanes = load_lanes(home);
-    if !lanes.iter().any(|lane| lane.file == file) {
-        lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0 });
-        save_lanes(home, &lanes);
+    match lanes.iter_mut().find(|lane| lane.file == file) {
+        Some(lane) => lane.run = run.or(lane.run),
+        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, run }),
     }
+    save_lanes(home, &lanes);
 }
 
-// The reminders due for a manager's lanes: each lane quiet for its wait (the setting's minutes,
-// doubled for each reminder it has had since it last changed), as a message for the manager.
-// A lane whose file is gone leaves the list.
-fn lane_reminders(home: &Path, wait_minutes: u64) -> Vec<String> {
+// Where a lane's latest run writes what it prints: its answer, or why it failed.
+fn run_log(home: &Path, file: &Path) -> PathBuf {
+    home.join("runs").join(format!("{}.log", session_id(file)))
+}
+
+// A session's id, from its file's name (<time>_<id>.jsonl). Whole, since ids are UUIDv7: their
+// first 12 characters are the time in milliseconds, so sessions started together share a prefix.
+fn session_id(file: &Path) -> String {
+    file.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit('_').next()).unwrap_or_default().to_string()
+}
+
+// Whether a lane's run is still going: its process is there and is that session's run (a pid can
+// pass to another process once the run is gone, and a zombie has no command line).
+fn running(pid: u32, file: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|line| line.split(|byte| *byte == 0).any(|argument| argument == file.as_os_str().as_bytes()))
+}
+
+// Run a message in a session in a piccosta of its own (print mode), apart from whoever starts it:
+// in a session and process group of its own, so it carries on when the manager, its terminal or
+// its service stops (the service's unit has KillMode=process for this). What it prints goes to
+// `log`. Output: its process id.
+fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result<u32> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
+    fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
+    let output = fs::File::create(log)?;
+    let mut command = std::process::Command::new(exe);
+    command.arg("-p").arg("--session").arg(file).arg(message).current_dir(cwd);
+    command.stdin(std::process::Stdio::null()).stdout(output.try_clone()?).stderr(output);
+    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    // Waited for, so it isn't left a zombie while this piccosta runs; if this one ends first, init
+    // takes it over.
+    std::thread::spawn(move || child.wait());
+    Ok(pid)
+}
+
+// What a manager hears about its lanes, as messages for it: each run that ended since the last
+// look, with the end of what it printed; and, when `remind`, each lane quiet for its wait (the
+// setting's minutes, doubled for each reminder it has had since it last changed). A lane whose
+// file is gone leaves the list.
+fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
     let mut lanes = load_lanes(home);
     if lanes.is_empty() {
         return Vec::new();
     }
     let now = (crate::clock::now_ms() / 1000) as u64;
     let mut reminders = Vec::new();
+    let mut save = remind;
     lanes.retain_mut(|lane| {
-        let Some(last) = changed(&lane.file) else { return false };
+        let Some(last) = changed(&lane.file) else {
+            save = true;
+            return false;
+        };
+        if let Some(pid) = lane.run.filter(|pid| !running(*pid, &lane.file)) {
+            lane.run = None;
+            save = true;
+            let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
+            let printed: Vec<char> = printed.trim().chars().collect();
+            let tail: String = printed[printed.len().saturating_sub(READ_CHARS)..].iter().collect();
+            reminders.push(format!("[{}, a lane's turn ended] Session {} \"{}\" (its run, pid {pid}) is done. The end of what it said:\n{tail}", now_text(), session_id(&lane.file), lane.title));
+        }
+        if !remind {
+            return true;
+        }
         if last != lane.quiet_since {
             (lane.quiet_since, lane.reminders) = (last, 0);
         }
@@ -365,12 +454,13 @@ fn lane_reminders(home: &Path, wait_minutes: u64) -> Vec<String> {
         if quiet_minutes >= wait_minutes << lane.reminders.min(16) {
             lane.reminders += 1;
             let running = if crate::session::held_elsewhere(&lane.file) { "it's still running" } else { "nothing is running it" };
-            let id = lane.file.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit('_').next()).unwrap_or_default();
-            reminders.push(format!("[{}, a quiet lane] Session {} \"{}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text(), &id[..id.len().min(8)], lane.title));
+            reminders.push(format!("[{}, a quiet lane] Session {} \"{}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text(), session_id(&lane.file), lane.title));
         }
         true
     });
-    save_lanes(home, &lanes);
+    if save {
+        save_lanes(home, &lanes);
+    }
     reminders
 }
 
@@ -468,10 +558,6 @@ fn text(output: impl Into<String>) -> Result<ToolOutput, String> {
     Ok(ToolOutput { content: vec![Content::text(output.into())], details: None, is_error: false })
 }
 
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
 fn string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     arguments.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty())
 }
@@ -543,7 +629,7 @@ impl SessionsTool {
                 };
                 let model = session.as_ref().and_then(|session| session.context().model).map_or(String::new(), |(provider, id)| format!(" · {provider}/{id}"));
                 let cost = session.as_ref().and_then(|session| crate::rpc::session_stats(session).get("cost").and_then(Value::as_f64)).unwrap_or(0.0);
-                let id = &summary.id[..summary.id.len().min(8)];
+                let id = &summary.id;
                 format!("{id} · {} · {}{kind}{model}{running} · {} · ${cost:.2}", crate::tools::jobs::command_preview(&summary.title), summary.cwd.display(), ago(summary.modified))
             })
             .collect();
@@ -559,34 +645,66 @@ impl SessionsTool {
         Ok(format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n")))
     }
 
-    // Run a message in a session through a headless piccosta in the background, so its end comes
-    // back as a message. A session another piccosta runs gets it in its inbox instead.
-    async fn run(&self, file: &Path, cwd: &Path, message: &str, arguments: &Map<String, Value>, context: &ToolContext) -> Result<ToolOutput, String> {
-        let title = string(arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
-        take_lane(&self.home, file, &title);
+    // Send a message to a session: into its inbox when another piccosta runs it (that one takes it
+    // in after its current step), else in a run of its own (launch). Either way it's one of this
+    // manager's lanes from then on. Output: what happened, for the reply.
+    fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
         if crate::session::held_elsewhere(file) {
+            take_lane(&self.home, file, title, None);
             deliver(file, message).map_err(|error| error.to_string())?;
-            return text(format!("Delivered to {}: it's running in another piccosta, which takes the message in after its current step. Its end won't come back to you on its own; read it later.", file.display()));
+            return Ok("It's open in another piccosta, which takes the message in after its current step; read the session later to see what came of it.".into());
         }
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?.to_string_lossy().trim_end_matches(" (deleted)").to_string();
-        let mut flags = format!("--session {}", quote(&file.to_string_lossy()));
-        // A kind of work on the model scale: its model now, unless a model is named.
-        if string(arguments, "model").is_none()
-            && let Some(name) = string(arguments, "use")
-        {
-            flags.push_str(&format!(" --use {}", quote(name)));
+        let pid = launch(file, cwd, message, &run_log(&self.home, file)).map_err(|error| format!("Couldn't start its run: {error}"))?;
+        take_lane(&self.home, file, title, Some(pid));
+        Ok(format!("Its run started (pid {pid}) in a process of its own; when its turn ends you get a message with what it said."))
+    }
+
+    // Write a session's model, level, partners and name into its file before anything runs it, so
+    // it opens the same in a run, the terminal UI or an editor. `use` picks from the model scale
+    // unless a model is named. Input: a session nobody is running. Output: its model, when set.
+    fn configure(&self, session: &mut crate::session::Session, arguments: &Map<String, Value>) -> Result<Option<String>, String> {
+        use crate::session::SessionEntry;
+        let registry = crate::model::ModelRegistry::load(&self.agent_dir.join("models.json"))?;
+        let written = |result: std::io::Result<String>| result.map(drop).map_err(|error| error.to_string());
+        let (model, scale_level) = match (string(arguments, "model"), string(arguments, "use")) {
+            (Some(model), _) => (Some(model.to_string()), None),
+            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind).map(|(model, level)| (Some(model), level))?,
+            (None, None) => (None, None),
+        };
+        let mut chosen = None;
+        if let Some(model) = model {
+            let found = registry.resolve(&model)?;
+            chosen = Some(format!("{}/{}", found.provider, found.id));
+            written(session.append(SessionEntry::ModelChange { base: session.next_base(), provider: found.provider.clone(), model_id: found.id.clone() }))?;
         }
-        for (key, flag) in [("model", "--model"), ("thinking", "--thinking"), ("name", "--name")] {
-            if let Some(value) = string(arguments, key) {
-                flags.push_str(&format!(" {flag} {}", quote(value)));
+        if let Some(level) = string(arguments, "thinking").map(str::to_string).or(scale_level) {
+            written(session.append(SessionEntry::ThinkingLevelChange { base: session.next_base(), thinking_level: level }))?;
+        }
+        // A pair or a trio with the model named (pair wins when both are).
+        if let Some((partner, pair)) = string(arguments, "pair").map(|model| (model, true)).or(string(arguments, "trio").map(|model| (model, false))) {
+            crate::host::record_team(&registry, session, &crate::host::Team { models: vec![partner.to_string()], pair })?;
+        }
+        if let Some(name) = string(arguments, "name") {
+            written(session.append(SessionEntry::SessionInfo { base: session.next_base(), name: Some(name.to_string()) }))?;
+        }
+        Ok(chosen)
+    }
+
+    // The directories that have sessions, the latest used first: how many, when last used, and
+    // their project manager when they have one.
+    fn projects(&self) -> String {
+        let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+        for folder in fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()) {
+            let Some(newest) = crate::host::sessions_in(&folder, None, 1).into_iter().next() else { continue };
+            if !newest.cwd.is_dir() || newest.cwd == home(&self.agent_dir) {
+                continue;
             }
+            let count = fs::read_dir(&folder).into_iter().flatten().flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jsonl")).count();
+            let manager = project_manager(&self.agent_dir, &newest.cwd).map_or(String::new(), |file| format!(" · manager {}", session_id(&file)));
+            found.push((newest.modified, format!("{} · {count} sessions · last used {}{manager}", newest.cwd.display(), ago(newest.modified))));
         }
-        if let Some(partners) = arguments.get("pair").and_then(Value::as_array).filter(|list| !list.is_empty()) {
-            let names: Vec<&str> = partners.iter().filter_map(Value::as_str).collect();
-            flags.push_str(&format!(" --pair {}", quote(&names.join(","))));
-        }
-        let command = format!("# session {}: {}\ncd {} && message={} && {} -p {flags} \"$message\" </dev/null", file.display(), message.lines().next().unwrap_or_default(), quote(&cwd.to_string_lossy()), quote(message), quote(&exe));
-        crate::tools::bash::run_in_background(command, context).await
+        found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        if found.is_empty() { "No projects yet.".into() } else { found.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n") }
     }
 
     // What the sessions of the last day and week cost, by provider, from their own records.
@@ -609,8 +727,7 @@ impl SessionsTool {
         if lines.is_empty() {
             lines.push("Nothing spent this week.".into());
         }
-        let settings = crate::config::Settings::load(&self.agent_dir, &self.agent_dir);
-        lines.push(format!("The model scale now:\n{}", crate::scale::describe(&self.agent_dir, &settings)));
+        lines.push(format!("The model scale now:\n{}", crate::scale::describe(&self.agent_dir)));
         lines.join("\n")
     }
 }
@@ -623,20 +740,22 @@ impl Tool for SessionsTool {
     fn definition(&self) -> crate::message::ToolDefinition {
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. read: a session's latest messages (session, count). start: a new session in a directory with a first message (dir, message; use: the kind of work, from the model scale; or model, only when the user named one; thinking, pair, name optional), run in the background; you get a message when it ends. message: another message in an existing session (session, message), the same way. A session you start or message is one of your lanes: when it goes quiet you're reminded, until close (session) says you're done with it. stop: end a lane's background run now (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: when it goes quiet you're reminded, until close (session) says you're done with it. stop: end a lane's background run now (session). usage: what sessions cost in the last day and week, by provider.".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "read", "start", "message", "stop", "close", "usage"]},
+                    "action": {"type": "string", "enum": ["list", "projects", "read", "start", "message", "stop", "close", "usage"]},
                     "session": {"type": "string", "description": "A session's id, the start of one, or its name"},
                     "count": {"type": "number", "description": "How many messages read shows"},
                     "dir": {"type": "string", "description": "The directory a new session works in"},
-                    "message": {"type": "string", "description": "What to send the session"},
+                    "message": {"type": "string", "description": "What to send the session; start can leave it out"},
+                    "manager": {"type": "boolean", "description": "start: make it the directory's project manager"},
                     "use": {"type": "string", "description": "The kind of work, from the model scale: piccosta picks its model now"},
                     "model": {"type": "string", "description": "provider/id, when the user named one; else use"},
                     "thinking": {"type": "string"},
-                    "pair": {"type": "array", "items": {"type": "string"}, "description": "Models that check each answer in turn"},
+                    "pair": {"type": "string", "description": "A model to work with as a pair: the two answer each other in turn until one says it's done, then the user (or you) speaks"},
+                    "trio": {"type": "string", "description": "A model to work with as a trio: it checks each answer once, then the user (or you) speaks"},
                     "name": {"type": "string"}
                 }
             }),
@@ -644,28 +763,53 @@ impl Tool for SessionsTool {
         }
     }
 
-    fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
+    fn execute<'a>(&'a self, arguments: Map<String, Value>, _context: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             let need = |key: &str| string(&arguments, key).ok_or_else(|| format!("{key} is needed"));
             match string(&arguments, "action").unwrap_or_default() {
                 "list" => text(self.list()),
+                "projects" => text(self.projects()),
                 "read" => text(self.read(need("session")?, arguments.get("count").and_then(Value::as_u64).map_or(READ_MESSAGES, |count| count as usize))?),
                 "usage" => text(self.usage()),
                 "start" => {
                     let dir = PathBuf::from(need("dir")?);
                     let dir = dir.canonicalize().map_err(|error| format!("{}: {error}", dir.display()))?;
+                    let manager = arguments.get("manager").and_then(Value::as_bool) == Some(true);
+                    if manager && let Some(existing) = project_manager(&self.agent_dir, &dir) {
+                        return Err(format!("{} has a project manager already, session {}; message it instead.", dir.display(), session_id(&existing)));
+                    }
+                    // Written whole now, so it's listed at once and a run opens this very session.
                     let folder = crate::session::default_session_dir(&self.agent_dir, &dir);
-                    // Written now with just its header, so the headless run opens this very session.
                     let mut session = crate::session::Session::create(&dir, Some(&folder));
                     session.persist_now().map_err(|error| error.to_string())?;
+                    if manager {
+                        make(&self.agent_dir, &mut session, Role::Project).map_err(|error| format!("could not make the project manager: {error}"))?;
+                    }
+                    let model = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
-                    let mut output = self.run(&file, &dir, need("message")?, &arguments, context).await?;
-                    output.content.insert(0, Content::text(format!("Started session {} in {}.", session.id(), dir.display())));
-                    Ok(output)
+                    let (id, name) = (session_id(&file), crate::host::title(&session));
+                    drop(session);
+                    let what = if manager { format!("{}'s project manager", dir.display()) } else { format!("a session in {}", dir.display()) };
+                    let started = format!("Made session {id}, {what}{}.", model.map_or(String::new(), |model| format!(", on {model}")));
+                    match string(&arguments, "message") {
+                        Some(message) => {
+                            let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
+                            text(format!("{started} {}", self.run(&file, &dir, message, &title)?))
+                        }
+                        None => {
+                            take_lane(&self.home, &file, &name, None);
+                            text(format!("{started} It has no message, so it waits: the user can open it in piccosta, where it's listed under its project, or you can message it."))
+                        }
+                    }
                 }
                 "message" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
-                    self.run(&summary.path, &summary.cwd, need("message")?, &arguments, context).await
+                    let changes = ["use", "model", "thinking", "pair", "trio", "name"].iter().any(|key| arguments.contains_key(*key));
+                    if changes && !crate::session::held_elsewhere(&summary.path) {
+                        let mut session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
+                        self.configure(&mut session, &arguments)?;
+                    }
+                    text(self.run(&summary.path, &summary.cwd, need("message")?, &summary.title)?)
                 }
                 // Stop a lane's run: the headless piccosta (print mode) holding its session, which
                 // stops its own commands as it goes. A session open in someone's terminal or editor
@@ -690,7 +834,7 @@ impl Tool for SessionsTool {
                     save_lanes(&self.home, &lanes);
                     text(if lanes.len() < before { format!("Closed: no more reminders for \"{}\".", summary.title) } else { format!("\"{}\" wasn't one of your lanes.", summary.title) })
                 }
-                other => Err(format!("No action \"{other}\": list, read, start, message, stop, close or usage")),
+                other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close or usage")),
             }
         })
     }
@@ -710,9 +854,9 @@ impl Tool for ManagerTools {
 
     fn definition(&self) -> crate::message::ToolDefinition {
         let mut actions = vec!["append", "search", "notify", "schedule", "schedules", "unschedule"];
-        let memory = if self.memory { " remember: add a line to your memory (text). forget: take out the lines of your memory that hold a phrase (text)." } else { "" };
+        let memory = if self.memory { " remember: add a line to your memory (text). forget: take out the lines of your memory that hold a phrase (text). name: take the name the user gives you (text)." } else { "" };
         if self.memory {
-            actions.extend(["remember", "forget"]);
+            actions.extend(["remember", "forget", "name"]);
         }
         crate::message::ToolDefinition {
             name: "ledger".into(),
@@ -741,6 +885,7 @@ impl Tool for ManagerTools {
                 "search" => text(ledger_search(&self.home, context.session_file.as_deref(), need("text")?)),
                 "remember" if self.memory => remember(&self.home, need("text")?),
                 "forget" if self.memory => forget(&self.home, need("text")?),
+                "name" if self.memory => fs::write(self.home.join(NAME_FILE), need("text")?.trim()).map_err(|error| error.to_string()).and_then(|()| text("That's your name now; the user sees it in piccosta's sidebar.")),
                 "notify" => {
                     let status = std::process::Command::new(&self.notify[0]).args(&self.notify[1..]).arg(need("text")?).status();
                     match status {
@@ -792,17 +937,22 @@ pub fn tools(agent_dir: &Path, settings: &crate::config::Settings, role: Role, c
 // A manager's system prompt addition.
 pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> String {
     let ask = settings.get("manager.askBeforePlanQuota").and_then(Value::as_bool).unwrap_or(true);
-    // A project's manager is encouraged to start twins (asking the user first) and to manage the
-    // reviewing and the builds, leaving long, large arms of work and plans to subsessions.
+    // A project's manager is encouraged to start sessions with a second model (asking the user
+    // first) and to manage the reviewing and the builds, leaving long, large arms of work and plans
+    // to subsessions.
     let (who, job, project) = match role {
-        Role::Assistant => (ASSISTANT_ROLE.to_string(), ASSISTANT_JOB, String::new()),
+        Role::Assistant => {
+            let name = assistant_name(&crate::config::agent_dir());
+            let named = if name == ASSISTANT_NAME { String::new() } else { format!(" The user calls you {name}.") };
+            (format!("{ASSISTANT_ROLE}{named}"), ASSISTANT_JOB, String::new())
+        }
         Role::Project => (
             format!("You are a senior project manager: the manager of the project in {}.", cwd.display()),
             PROJECT_JOB,
-            "\n- Its sessions are yours to watch and direct. The assistant, the user's lead director, may message you too; answer it as you would the user.\n- For real work, start twins, sessions where a second model checks each answer (`sessions start` with `pair`); ask the user before you start them. Manage the reviewing and the builds yourself, and leave long, large arms of work and plans to subsessions.".to_string(),
+            "\n- Its sessions are yours to watch and direct. The assistant, the user's lead director, may message you too; answer it as you would the user.\n- For real work, start sessions with a second model (`sessions start` with `trio` to have it check each answer, `pair` to have the two work it through together); ask the user before you start them. Manage the reviewing and the builds yourself, and leave long, large arms of work and plans to subsessions.".to_string(),
         ),
     };
-    let scale = crate::scale::uses(settings).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, entry.models.join(", then "))).collect::<Vec<_>>().join("\n");
+    let scale = crate::scale::uses(&crate::config::agent_dir()).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, entry.models.join(", then "))).collect::<Vec<_>>().join("\n");
     let home = home_for(&crate::config::agent_dir(), role, cwd);
     let memory = fs::read_to_string(home.join("memory.md")).unwrap_or_default();
     let memory = if role != Role::Assistant { String::new() } else if memory.trim().is_empty() { "\n\nYour memory: nothing yet.".into() } else { format!("\n\nYour memory:\n{}", memory.trim_end()) };
@@ -814,24 +964,19 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
 }
 
 // Wake a manager that isn't the one running here: a message into its session, through its inbox
-// when a piccosta runs it, else a headless run of its own. Its answer stays in its session.
-fn wake(file: &Path, cwd: &Path, text: &str) {
+// when a piccosta runs it, else a run of its own (launch). Its answer stays in its session.
+fn wake(home: &Path, file: &Path, cwd: &Path, text: &str) {
     if crate::session::held_elsewhere(file) {
         let _ = deliver(file, text);
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
-    let spawned = tokio::process::Command::new(exe).arg("-p").arg("--session").arg(file).arg(text).current_dir(cwd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
-    if let Ok(mut child) = spawned {
-        tokio::spawn(async move { child.wait().await });
-    }
+    let _ = launch(file, cwd, text, &home.join("runs").join("manager.log"));
 }
 
 // What's waiting for the project managers: their schedules that are due, and messages left in the
-// inbox of one nobody is running (it was closed when they came), each as (session file,
+// inbox of one nobody is running (it was closed when they came), each as (its home, session file,
 // directory, message).
-fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, String)> {
+fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
     let homes = fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten();
     let mut work = Vec::new();
     for home in homes.map(|entry| entry.path()) {
@@ -844,7 +989,7 @@ fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, String)> {
             continue;
         }
         let Some(cwd) = crate::session::Session::open(&file, &home).ok().map(|session| PathBuf::from(&session.header().cwd)) else { continue };
-        work.push((file, cwd, messages.join("\n\n")));
+        work.push((home, file, cwd, messages.join("\n\n")));
     }
     work
 }
@@ -877,7 +1022,7 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     if systemctl(&["show-environment"]) {
         let unit = format!(
-            "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={exe} assistant\nEnvironment=PATH={}\nRestart=on-failure\nRestartSec={RESTART_SECONDS}\n\n[Install]\nWantedBy=default.target\n",
+            "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={exe} assistant\nEnvironment=PATH={}\nRestart=on-failure\nRestartSec={RESTART_SECONDS}\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
             std::env::var("PATH").unwrap_or_default()
         );
         let path = config.join("systemd/user").join(UNIT);
@@ -961,21 +1106,20 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
             _ = poll.tick() => {
                 let mut incoming: Vec<String> = take_inbox(&file).into_iter().map(|text| format!("[{}, from the user]\n{text}", now_text())).collect();
                 incoming.extend(due_schedules(&home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)));
-                // Every minute, the managers' quiet lanes: the assistant's come here, a project
-                // manager's go to it.
+                // The managers' lanes: runs that ended, every second, and quiet lanes, every
+                // minute. The assistant's come here, a project manager's go to it.
                 ticks += 1;
-                if ticks.is_multiple_of(LANE_SCAN_SECONDS) {
-                    incoming.extend(lane_reminders(&home, wait_minutes));
-                    for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-                        let reminders = lane_reminders(&project_home, wait_minutes);
-                        if let (false, Some(manager)) = (reminders.is_empty(), pointer(&project_home)) {
-                            let cwd = crate::session::Session::open(&manager, &project_home).ok().map(|session| PathBuf::from(&session.header().cwd)).unwrap_or_default();
-                            wake(&manager, &cwd, &reminders.join("\n\n"));
-                        }
+                let remind = ticks.is_multiple_of(LANE_SCAN_SECONDS);
+                incoming.extend(lane_news(&home, wait_minutes, remind));
+                for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
+                    let news = lane_news(&project_home, wait_minutes, remind);
+                    if let (false, Some(manager)) = (news.is_empty(), pointer(&project_home)) {
+                        let cwd = crate::session::Session::open(&manager, &project_home).ok().map(|session| PathBuf::from(&session.header().cwd)).unwrap_or_default();
+                        wake(&project_home, &manager, &cwd, &news.join("\n\n"));
                     }
                 }
-                for (file, cwd, message) in project_work(&agent_dir) {
-                    wake(&file, &cwd, &message);
+                for (project_home, file, cwd, message) in project_work(&agent_dir) {
+                    wake(&project_home, &file, &cwd, &message);
                 }
                 for message in incoming {
                     if busy.load(Ordering::SeqCst) {

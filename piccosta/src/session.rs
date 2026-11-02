@@ -256,7 +256,7 @@ impl From<io::Error> for OpenError {
 
 // The folder a working directory's sessions go in (session-manager.ts:589-594). Input: the agent
 // dir and an absolute cwd. Output: <agent dir>/sessions/--<cwd with the leading slash dropped and
-// every / \ : turned into ->--, e.g. sessions/--home-jack-projects-piccosta--. Two different cwds
+// every / \ : turned into ->--, e.g. sessions/--home-me-projects-piccosta--. Two different cwds
 // can map to one folder (/a/b-c and /a/b/c); resuming checks each session's recorded cwd for that.
 pub fn default_session_dir(agent_dir: &Path, cwd: &Path) -> PathBuf {
     let cwd_text = cwd.to_string_lossy();

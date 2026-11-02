@@ -294,6 +294,8 @@ pub struct Agent {
     held: Vec<CustomMessage>,
     // The loop guard's count of the same tool call made back to back: the call, and how many times.
     repeated_call: (String, u32),
+    // When the model was last told the machine is overused (machine.rs).
+    machine_noted: Option<std::time::Instant>,
 }
 
 // The loop guards. A response whose last LOOP_WINDOW
@@ -343,7 +345,7 @@ impl Agent {
         let config = AgentConfig { thinking_level: level, ..config };
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
-        Ok(Agent { session, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0) })
+        Ok(Agent { session, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0), machine_noted: None })
     }
 
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
@@ -685,8 +687,13 @@ impl Agent {
             let has_calls = assistant.content.iter().any(|block| matches!(block, Content::ToolCall { .. }));
             let mut results = Vec::new();
             if has_calls {
-                let runs = if assistant.stop_reason == StopReason::Length { self.refuse_truncated_calls(&assistant) } else { self.execute_tools(&assistant).await };
+                let mut runs = if assistant.stop_reason == StopReason::Length { self.refuse_truncated_calls(&assistant) } else { self.execute_tools(&assistant).await };
                 self.append_web_results()?;
+                // An overused machine goes on the end of the last result, where the model reads it
+                // with what it just ran and the cached prefix stays as it was.
+                if let (Some(note), Some(Ok(output))) = (crate::machine::note(&self.config.cwd, &mut self.machine_noted), runs.last_mut().map(|run| &mut run.output)) {
+                    output.content.push(Content::text(note));
+                }
                 for run in runs {
                     let message = tool_result_message(run);
                     self.add_message(AgentMessage::ToolResult(message.clone()), &mut new_messages)?;

@@ -48,34 +48,99 @@ pub enum Command {
     Compact(Option<String>),
     AutoCompaction(bool),
     AutoRetry(bool),
-    // Work with partners: after each of the user's prompts, these models (provider/id), one after
-    // another, each take a turn checking the work so far, then the session model takes it back for
-    // the user (a pair with one, a trio with two); none works alone again.
-    Pair(Vec<String>),
+    // Work with other models from the next prompt on (none: alone again).
+    Team(Team),
 }
 
-// The message that opens the partner's turn, shown in the conversation: the models review each
-// other's answers in the user's one session, a three-part conversation with the user in the loop.
-pub const PAIR_TYPE: &str = "piccosta-pair";
-// The session entry that records the partners, so a reopened session still works with them.
-const PAIR_SETTING: &str = "piccosta-pair-partner";
+// The models a session works with besides its own (provider/id, in the order they speak after
+// it), and how. A pair answers back and forth in the one chat until a model says it's done or the
+// round limit, then the user speaks; a trio is the session's model answering, the other checking
+// that once, then the user.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Team {
+    pub models: Vec<String>,
+    pub pair: bool,
+}
 
-// The partners a session last recorded (none when it works alone). The first recordings named one
-// `partner`; later ones list `partners`.
-pub fn pair_partners(session: &Session) -> Vec<String> {
+// The note that opens each model's turn with a team: what the model reads, and in the conversation
+// one line saying whose turn it is.
+pub const PAIR_TYPE: &str = "piccosta-pair";
+// The session entry that records the team, so a reopened session still works with it.
+pub const PAIR_SETTING: &str = "piccosta-pair-partner";
+// How many rounds (every model speaking once) a pair goes before it's the user's turn without
+// either saying it's done; `pairRounds` in settings changes it. Three is a guess, not measured:
+// it lets each model answer the other's corrections twice, and each turn rereads the whole chat.
+const PAIR_ROUNDS: u64 = 3;
+// What a model in a pair ends its reply with, alone on the last line, when the work is done and it
+// has nothing to add. A line of its own is easy to ask for and to find, unlike a phrase in prose;
+// the brackets keep a plain closing "Done." from ending it by accident.
+const DONE_LINE: &str = "[done]";
+
+// The team a session last recorded (none when it works alone). Recordings before pairs answered
+// back and forth (one `partner`, or a list of `partners` without `pair`) open as trios.
+pub fn team(session: &Session) -> Team {
     let recorded = session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
         session::SessionEntry::Custom { custom_type, data, .. } if custom_type == PAIR_SETTING => Some(data.clone().unwrap_or_default()),
         _ => None,
     });
-    let Some(recorded) = recorded else { return Vec::new() };
-    match (recorded.get("partners").and_then(Value::as_array), recorded.get("partner").and_then(Value::as_str)) {
+    let Some(recorded) = recorded else { return Team::default() };
+    let models = match (recorded.get("partners").and_then(Value::as_array), recorded.get("partner").and_then(Value::as_str)) {
         (Some(list), _) => list.iter().filter_map(Value::as_str).map(str::to_string).collect(),
         (None, Some(one)) => vec![one.to_string()],
         _ => Vec::new(),
-    }
+    };
+    Team { models, pair: recorded.get("pair").and_then(Value::as_bool).unwrap_or(false) }
 }
 
-const PAIR_NOTE: &str = "{partner}: you are working with {others} in this session, and the user reads you all. {lead} has just answered the user's last message above{checked}. Check the work against what the user asked: verify what it claims, fix what is wrong, finish what was left undone, and say plainly what you changed, or that it holds up. Then stop; {next} speaks next.";
+// Record a session's team, each model by its full provider/id so any model the registry has can
+// join, whichever provider it's on. Output: the team as recorded.
+pub fn record_team(registry: &ModelRegistry, session: &mut Session, team: &Team) -> Result<Team, String> {
+    let models = team.models.iter().map(|name| registry.resolve(name).map(|model| format!("{}/{}", model.provider, model.id))).collect::<Result<Vec<_>, _>>()?;
+    let data = serde_json::json!({ "partners": models, "pair": team.pair });
+    session.append_custom(PAIR_SETTING, Some(data)).map_err(|error| format!("could not write the session: {error}"))?;
+    Ok(Team { models, pair: team.pair })
+}
+
+// The note opening turn `turn` of an exchange: turn 0 is the session model's answer to the user's
+// message, each turn after is the next speaker's reply to the one before. `speakers` are the
+// session's model then its team's; `last` says the user speaks after this turn. It tells the model
+// who it's working with, what this turn is for, and how the exchange ends.
+fn team_note(team: &Team, speakers: &[String], turn: usize, rounds: u64, last: bool) -> crate::message::CustomMessage {
+    let speaker = &speakers[turn % speakers.len()];
+    let previous = turn.checked_sub(1).map(|before| speakers[before % speakers.len()].clone());
+    let others: Vec<&str> = speakers.iter().map(String::as_str).filter(|other| other != speaker).collect();
+    let next = if last { "the user" } else { &speakers[(turn + 1) % speakers.len()] };
+    let (kind, how, check) = if team.pair {
+        let how = format!("You take turns in this chat, back and forth, without waiting for the user. When the work is done and you have nothing to add, end your reply with a line that says only {DONE_LINE}; that, or {rounds} rounds each, hands it back to the user.");
+        ("pair", how, "Respond to it: check it against what the user asked, fix what is wrong, finish or build on what was left, and say plainly what you changed.")
+    } else {
+        ("trio", "One of you answers the user, the other checks that answer, then the user speaks.".to_string(), "Check the work against what the user asked: verify what it claims, fix what is wrong, finish what was left undone, and say plainly what you changed, or that it holds up.")
+    };
+    let task = match &previous {
+        Some(previous) => format!("{previous} has just replied above. {check}"),
+        None => "Answer the user's message below.".to_string(),
+    };
+    let text = format!("{speaker}: you're in a {kind} with {}, and the user reads you all. {how} {task} Then stop; {next} speaks next.", others.join(" and "));
+    let details = serde_json::json!({ "mode": kind, "speaker": speaker, "after": previous });
+    crate::message::CustomMessage { custom_type: PAIR_TYPE.into(), content: crate::message::TextOrBlocks::Text(text), display: true, details: Some(details), timestamp: crate::clock::now_ms() }
+}
+
+// Whether an exchange stops before the next turn: the last reply failed or was stopped, or (in a
+// pair, once the first answer has been answered) its last line is the done line, give or take
+// markdown around it.
+fn exchange_over(session: &Session, done_counts: bool) -> bool {
+    let last_reply = session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
+        session::SessionEntry::Message { message: AgentMessage::Assistant(reply), .. } => Some(reply),
+        _ => None,
+    });
+    let Some(reply) = last_reply else { return true };
+    if matches!(reply.stop_reason, crate::message::StopReason::Error | crate::message::StopReason::Aborted) {
+        return true;
+    }
+    let text: String = reply.content.iter().filter_map(|block| if let crate::message::Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
+    let last_line = text.lines().rev().map(|line| line.trim_matches(|character: char| character.is_whitespace() || "*_`.".contains(character))).find(|line| !line.is_empty());
+    done_counts && last_line.is_some_and(|line| line.eq_ignore_ascii_case(DONE_LINE))
+}
 
 // What the task reports after each command (and after a turn a background job started, marked
 // `notice`): how it went, and the model and thinking level the session has now.
@@ -207,25 +272,32 @@ impl Host {
 
     // The model's tools: the built-in ones, the subagent tool (not in a subagent, which can't hand
     // its task on) and, for a manager (`role`, in `cwd`), its own; cut to --tools when given.
+    // A session that can hand work on leaves the tools a kind of work owns to that kind's job, so
+    // searching (say) runs on the scale's search models; a manager keeps them all, and so does a
+    // subagent, which has no one to hand them to. --tools naming one keeps it.
     fn tool_list(&self, role: Option<crate::manager::Role>, cwd: &Path) -> Vec<Arc<dyn tools::Tool>> {
         if !self.tools {
             return Vec::new();
         }
         let mut list = tools::builtin();
-        if std::env::var_os(tools::subagent::CHILD_ENV).is_none() {
-            list.extend(tools::subagent::SubagentTool::load(&self.agent_dir).map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
-        }
+        let subagents = std::env::var_os(tools::subagent::CHILD_ENV).is_none().then(|| tools::subagent::SubagentTool::load(&self.agent_dir)).flatten();
+        let owned: Vec<String> = match (&subagents, role) {
+            (Some(_), None) => crate::scale::owned(&self.agent_dir).into_iter().map(|(tool, _)| tool).collect(),
+            _ => Vec::new(),
+        };
+        list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
         if let Some(role) = role {
             list.extend(crate::manager::tools(&self.agent_dir, &self.settings, role, cwd));
         }
-        let wanted = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_none_or(|names| names.iter().any(|name| name == tool.name()));
+        let named = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_some_and(|names| names.iter().any(|name| name == tool.name()));
+        let wanted = |tool: &Arc<dyn tools::Tool>| (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool);
         list.into_iter().filter(|tool| wanted(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect()
     }
 
     // The prompt sections for a model (its constitution can differ by model), with a manager's
     // part when the session is one.
     pub fn sections(&self, model: &Model, cwd: &Path, role: Option<crate::manager::Role>) -> Result<IndexMap<String, String>, String> {
-        let constitution = prompt::constitution(&self.settings, &model.name)?;
+        let constitution = prompt::constitution(&model.name)?;
         let (custom_prompt, discovered_append) = prompt::custom_prompts(&self.agent_dir);
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(&self.settings, role, cwd));
@@ -304,7 +376,7 @@ impl Host {
     pub fn launch(&self, args: &crate::cli::Args) -> Result<(Option<String>, Option<String>), String> {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
-                let (model, level) = crate::scale::pick(&self.agent_dir, &self.settings, name)?;
+                let (model, level) = crate::scale::pick(&self.agent_dir, name)?;
                 Ok((Some(model), args.thinking.clone().or(level)))
             }
             (model, _) => Ok((model, args.thinking.clone())),
@@ -325,11 +397,11 @@ impl Host {
     // higher-ranked lifetimes).
     pub fn spawn(self: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: bool, mut commands: UnboundedReceiver<Command>, mut done: impl FnMut(Done) + 'static) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_local(async move {
-            let mut partners = pair_partners(&agent.session);
+            let mut team = team(&agent.session);
             loop {
                 let (result, notice) = tokio::select! {
                     command = commands.recv() => match command {
-                        Some(command) if !commands.is_closed() => (self.obey(&mut agent, command, &mut partners).await, false),
+                        Some(command) if !commands.is_closed() => (self.obey(&mut agent, command, &mut team).await, false),
                         _ => break,
                     },
                     Some(notice) = agent.notice(), if wake => {
@@ -347,21 +419,13 @@ impl Host {
         })
     }
 
-    // Carry out one command. `partners` are the models that check the session model's work.
-    async fn obey(&self, agent: &mut Agent, command: Command, partners: &mut Vec<String>) -> Result<(), String> {
+    // Carry out one command. `team` is the models the session works with.
+    async fn obey(&self, agent: &mut Agent, command: Command, team: &mut Team) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         match command {
-            // With partners, a prompt the session model answered (not stopped) goes round them next.
-            Command::Prompt(text, images) => {
-                agent.prompt_with_images(&text, images).await?;
-                self.partner_turns(agent, partners).await
-            }
-            // Each named by its full provider/id, so any model the registry has can join.
-            Command::Pair(models) => {
-                let registry = self.registry()?;
-                let models = models.iter().map(|name| registry.resolve(name).map(|model| format!("{}/{}", model.provider, model.id))).collect::<Result<Vec<_>, _>>()?;
-                written(agent.session.append_custom(PAIR_SETTING, Some(serde_json::json!({ "partners": models }))).map(drop))?;
-                *partners = models;
+            Command::Prompt(text, images) => self.answer(agent, team, &text, images).await,
+            Command::Team(asked) => {
+                *team = record_team(&self.registry()?, &mut agent.session, &asked)?;
                 Ok(())
             }
             Command::Compact(instructions) => agent.compact(instructions.as_deref()).await,
@@ -391,30 +455,41 @@ impl Host {
         written(agent.set_thinking_level(&level))
     }
 
-    // The partners' turns, in order, after the session model answered: each takes the session for
-    // one run, opened by a note saying whose work to check and who checked it already, and the
-    // session model takes it back for the user's next message, also when a turn failed. A turn the
-    // user stops ends the round.
-    pub async fn partner_turns(&self, agent: &mut Agent, partners: &[String]) -> Result<(), String> {
+    // Answer the user's message, with the session's team when it has one. Alone it's one run. In
+    // a trio the session model answers, then each other model checks once. In a pair they take
+    // turns until one ends its reply with the done line, or the round limit. Each turn is the
+    // speaker's model on the session for one run, opened by its note; the session model takes it
+    // back for the user's next message. A failed or stopped turn ends the exchange.
+    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>) -> Result<(), String> {
         let lead = format!("{}/{}", agent.model().provider, agent.model().id);
-        let mut result = Ok(());
-        for (index, partner) in partners.iter().enumerate().filter(|(_, partner)| **partner != lead) {
-            if agent.aborted() || result.is_err() {
-                break;
-            }
-            let others: Vec<&str> = std::iter::once(lead.as_str()).chain(partners.iter().map(String::as_str).filter(|other| other != partner)).collect();
-            let checked = if index == 0 { String::new() } else { format!(", and {} checked it since", partners[..index].join(" and ")) };
-            let next = partners.get(index + 1).map_or("the user", String::as_str);
-            let text = PAIR_NOTE.replace("{partner}", partner).replace("{others}", &others.join(" and ")).replace("{lead}", &lead).replace("{checked}", &checked).replace("{next}", next);
-            if let Err(error) = self.switch_model(agent, partner) {
-                result = Err(error);
-                break;
-            }
-            let details = serde_json::json!({ "partner": partner, "lead": lead });
-            let note = crate::message::CustomMessage { custom_type: PAIR_TYPE.into(), content: crate::message::TextOrBlocks::Text(text), display: true, details: Some(details), timestamp: crate::clock::now_ms() };
-            result = agent.take_notice(note).await;
+        let speakers: Vec<String> = std::iter::once(lead.clone()).chain(team.models.iter().filter(|model| **model != lead).cloned()).collect();
+        let rounds = self.settings.get("pairRounds").and_then(Value::as_u64).unwrap_or(PAIR_ROUNDS).max(1);
+        let turns = match speakers.len() {
+            1 => 1,
+            count if team.pair => rounds as usize * count,
+            count => count,
+        };
+        if turns > 1 {
+            agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
-        self.switch_model(agent, &lead)?;
+        agent.prompt_with_images(text, images).await?;
+        let mut result = Ok(());
+        for turn in 1..turns {
+            if agent.aborted() || exchange_over(&agent.session, team.pair && turn > 1) {
+                break;
+            }
+            result = self.switch_model(agent, &speakers[turn % speakers.len()]);
+            if result.is_err() {
+                break;
+            }
+            result = agent.take_notice(team_note(team, &speakers, turn, rounds, turn + 1 == turns)).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        if turns > 1 {
+            self.switch_model(agent, &lead)?;
+        }
         result
     }
 }

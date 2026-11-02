@@ -1,22 +1,26 @@
-// The model scale: which model does which kind of work, and which takes over when a plan runs
-// low. It ships with default assignments, each saying what it's for (piccosta/scale.json), and
-// the user can change any of it.
+// The model scale: the kinds of work, which model does each, and which takes over when a plan
+// runs low. Each kind is also a subagent job (tools/subagent.rs): the subagent tool hands work to
+// a kind by name. All of it is one file: piccosta/scale.json ships compiled in, and the user's
+// <agent dir>/scale.json changes it by name, field by field (a kind it names gets those fields, new
+// names join; "off": true drops one, false brings back one that ships off). /scale shows it,
+// /scale edit writes the whole of it there and opens it, and /scale <kind> <model[:level]> ...
+// sets one kind's models.
 //
-// A use (critical, general, review, ...) says what it's for and lists models as provider/id:level,
-// first choice first. The defaults are piccosta/scale.json; settings' `modelScale` changes a use
-// field by field, adds new ones, and `"off": true` drops one; a project's .pi/settings.json
-// does the same over the user's. A model whose plan is running low (any of its usage windows at
-// `modelScaleLowUsage` percent or more, LOW_USAGE_PERCENT unless set) goes to the back of the
-// list, so the next one takes over until the window resets.
+// A kind (critical, general, review, ...) says what it's for and lists models as provider/id:level,
+// first choice first; as a job, its tools (all when it lists none) and its instructions, which go
+// on the end of the subagent's system prompt. A kind can own tools ("owns"): a session that can
+// hand work to it leaves those tools to its job (host.rs), so that work runs on its models.
+// A model whose plan is running low (any of its usage windows at `lowUsagePercent` or more) goes
+// to the back of the list, so the next one takes over until the window resets.
 //
 // Plans report their usage as they're used: Claude Code in its rate_limit_event messages, Codex in
 // its response headers. piccosta keeps the latest in <agent dir>/usage.json.
 
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DEFAULTS: &str = include_str!("../scale.json");
-// The share of a usage window past which a plan counts as running low.
+// The share of a usage window past which a plan counts as running low, unless the file says.
 const LOW_USAGE_PERCENT: f64 = 80.0;
 // How long a reading that doesn't say when its window resets (Codex's) counts: long enough to
 // steer the next few sessions, short enough that a plan read as low is tried again within the hour.
@@ -31,20 +35,78 @@ pub struct Use {
     pub compact_at: Option<u64>,
 }
 
-// Every use, the defaults with the user's and the project's changes.
-pub fn uses(settings: &crate::config::Settings) -> Vec<Use> {
+// The user's scale file.
+pub fn path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("scale.json")
+}
+
+// The user's changes: nothing when there's no file, an error naming it when it isn't valid JSON
+// (// comments are allowed, as in settings).
+pub fn changes(agent_dir: &Path) -> Result<Map<String, Value>, String> {
+    let Ok(text) = std::fs::read_to_string(path(agent_dir)) else { return Ok(Map::new()) };
+    serde_json::from_str(&crate::model::strip_json_comments(&text)).map_err(|error| format!("{}: {error}", path(agent_dir).display()))
+}
+
+// The scale in effect: the defaults with the user's changes on top. An invalid file changes
+// nothing (/scale says why).
+fn merged(agent_dir: &Path) -> Map<String, Value> {
     let mut scale: Map<String, Value> = serde_json::from_str(DEFAULTS).unwrap_or_default();
-    for (name, change) in settings.get("modelScale").and_then(Value::as_object).into_iter().flatten() {
-        if change.get("off").and_then(Value::as_bool) == Some(true) {
-            scale.shift_remove(name);
+    for (key, change) in changes(agent_dir).unwrap_or_default() {
+        let Some(section) = scale.get_mut(&key).and_then(Value::as_object_mut).filter(|_| change.is_object()) else {
+            scale.insert(key, change);
             continue;
-        }
-        let entry = scale.entry(name.clone()).or_insert_with(|| json!({}));
-        if let (Some(entry), Some(change)) = (entry.as_object_mut(), change.as_object()) {
-            entry.extend(change.clone());
+        };
+        for (name, fields) in change.as_object().into_iter().flatten() {
+            let entry = section.entry(name.clone()).or_insert_with(|| json!({}));
+            if let (Some(entry), Some(fields)) = (entry.as_object_mut(), fields.as_object()) {
+                entry.extend(fields.clone());
+            }
         }
     }
     scale
+}
+
+// A section's entries that aren't off, by name.
+fn entries(scale: &Map<String, Value>, section: &str) -> Vec<(String, Map<String, Value>)> {
+    let all = scale.get(section).and_then(Value::as_object).cloned().unwrap_or_default();
+    all.into_iter().filter_map(|(name, entry)| Some((name, entry.as_object()?.clone()))).filter(|(_, entry)| entry.get("off").and_then(Value::as_bool) != Some(true)).collect()
+}
+
+// The kinds of work as subagent jobs, each as its name and fields.
+pub fn jobs(agent_dir: &Path) -> Vec<(String, Map<String, Value>)> {
+    entries(&merged(agent_dir), "uses")
+}
+
+// The tools kinds of work own, each with the kind that owns it.
+pub fn owned(agent_dir: &Path) -> Vec<(String, String)> {
+    let owns = |entry: &Map<String, Value>| entry.get("owns").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    jobs(agent_dir).into_iter().flat_map(|(kind, entry)| owns(&entry).into_iter().map(move |tool| (tool, kind.clone()))).collect()
+}
+
+// Set one use's models (first choice first) in the user's file, leaving the rest of it as it is.
+pub fn set_use(agent_dir: &Path, name: &str, models: &[String]) -> Result<(), String> {
+    find(agent_dir, name)?;
+    let mut file = changes(agent_dir)?;
+    let section = file.entry("uses").or_insert_with(|| json!({}));
+    let entry = section.as_object_mut().ok_or("its \"uses\" isn't an object")?.entry(name).or_insert_with(|| json!({}));
+    entry.as_object_mut().ok_or_else(|| format!("its use \"{name}\" isn't an object"))?.insert("models".into(), json!(models));
+    std::fs::write(path(agent_dir), serde_json::to_string_pretty(&file).unwrap_or_default() + "\n").map_err(|error| error.to_string())
+}
+
+// Write the whole scale in effect to the user's file (their changes are in it), so all of it is
+// there to change. A file that isn't valid is left as it is, to be fixed. Output: the file's path.
+pub fn write_out(agent_dir: &Path) -> Result<PathBuf, String> {
+    let file = path(agent_dir);
+    if changes(agent_dir).is_ok() {
+        std::fs::create_dir_all(agent_dir).map_err(|error| error.to_string())?;
+        std::fs::write(&file, serde_json::to_string_pretty(&merged(agent_dir)).unwrap_or_default() + "\n").map_err(|error| format!("{}: {error}", file.display()))?;
+    }
+    Ok(file)
+}
+
+// Every use that isn't off.
+pub fn uses(agent_dir: &Path) -> Vec<Use> {
+    entries(&merged(agent_dir), "uses")
         .into_iter()
         .map(|(name, entry)| Use {
             name,
@@ -55,8 +117,8 @@ pub fn uses(settings: &crate::config::Settings) -> Vec<Use> {
         .collect()
 }
 
-pub fn find(settings: &crate::config::Settings, name: &str) -> Result<Use, String> {
-    let all = uses(settings);
+pub fn find(agent_dir: &Path, name: &str) -> Result<Use, String> {
+    let all = uses(agent_dir);
     let names: Vec<String> = all.iter().map(|entry| entry.name.clone()).collect();
     all.into_iter().find(|entry| entry.name == name).ok_or_else(|| format!("No use \"{name}\" in the model scale: {}", names.join(", ")))
 }
@@ -107,31 +169,31 @@ fn used(agent_dir: &Path, plan: &str) -> Option<f64> {
     usage.get(plan)?.as_object()?.values().filter(current).filter_map(|window| window.get("usedPercent")?.as_f64()).reduce(f64::max)
 }
 
-fn low(agent_dir: &Path, settings: &crate::config::Settings, model: &str) -> bool {
-    let limit = settings.get("modelScaleLowUsage").and_then(Value::as_f64).unwrap_or(LOW_USAGE_PERCENT);
+fn low(agent_dir: &Path, model: &str) -> bool {
+    let limit = merged(agent_dir).get("lowUsagePercent").and_then(Value::as_f64).unwrap_or(LOW_USAGE_PERCENT);
     used(agent_dir, plan(model)).is_some_and(|percent| percent >= limit)
 }
 
 // A use's models in the order to try them now: those whose plan isn't running low, then the rest.
-pub fn order(agent_dir: &Path, settings: &crate::config::Settings, entry: &Use) -> Vec<String> {
-    let (low, fine): (Vec<String>, Vec<String>) = entry.models.iter().cloned().partition(|model| low(agent_dir, settings, model));
+pub fn order(agent_dir: &Path, entry: &Use) -> Vec<String> {
+    let (low, fine): (Vec<String>, Vec<String>) = entry.models.iter().cloned().partition(|model| low(agent_dir, model));
     fine.into_iter().chain(low).collect()
 }
 
 // The model and level a use runs on now.
-pub fn pick(agent_dir: &Path, settings: &crate::config::Settings, name: &str) -> Result<(String, Option<String>), String> {
-    let entry = find(settings, name)?;
-    let first = order(agent_dir, settings, &entry).into_iter().next().ok_or_else(|| format!("The \"{name}\" use lists no models"))?;
+pub fn pick(agent_dir: &Path, name: &str) -> Result<(String, Option<String>), String> {
+    let entry = find(agent_dir, name)?;
+    let first = order(agent_dir, &entry).into_iter().next().ok_or_else(|| format!("The \"{name}\" use lists no models"))?;
     let (model, level) = split(&first);
     Ok((model.to_string(), level.map(str::to_string)))
 }
 
 // The scale as text, for a prompt and /scale: each use with its models (low ones marked), and
 // how much of each plan is used.
-pub fn describe(agent_dir: &Path, settings: &crate::config::Settings) -> String {
+pub fn describe(agent_dir: &Path) -> String {
     let mut lines = Vec::new();
-    for entry in uses(settings) {
-        let models: Vec<String> = order(agent_dir, settings, &entry).iter().map(|model| if low(agent_dir, settings, model) { format!("{model} (plan running low)") } else { model.clone() }).collect();
+    for entry in uses(agent_dir) {
+        let models: Vec<String> = order(agent_dir, &entry).iter().map(|model| if low(agent_dir, model) { format!("{model} (plan running low)") } else { model.clone() }).collect();
         let compact = entry.compact_at.map_or(String::new(), |tokens| format!(" · compacts at {}k tokens", tokens / 1000));
         lines.push(format!("- {}: {}. {}{compact}", entry.name, entry.purpose, models.join(", then ")));
     }
@@ -143,6 +205,6 @@ pub fn describe(agent_dir: &Path, settings: &crate::config::Settings) -> String 
 }
 
 // The compaction point a scale use sets for a model, if one does.
-pub fn compact_at(settings: &crate::config::Settings, model: &str) -> Option<u64> {
-    uses(settings).into_iter().filter(|entry| entry.models.iter().any(|listed| split(listed).0 == model)).find_map(|entry| entry.compact_at)
+pub fn compact_at(agent_dir: &Path, model: &str) -> Option<u64> {
+    uses(agent_dir).into_iter().filter(|entry| entry.models.iter().any(|listed| split(listed).0 == model)).find_map(|entry| entry.compact_at)
 }
