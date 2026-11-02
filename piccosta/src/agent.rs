@@ -502,6 +502,10 @@ impl Agent {
 
     // A prompt with images attached (rpc mode's `images`).
     pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>) -> Result<(), String> {
+        // A prompt in a closed session opens it again.
+        if let Some(file) = self.session.file() {
+            crate::session::set_closed(&crate::config::agent_dir(), file, false);
+        }
         self.run_from(with_images(text, images)).await
     }
 

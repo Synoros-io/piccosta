@@ -263,8 +263,10 @@ struct App {
     scans: u64,
     // The state last saved (state.rs), as written, so it's written again only when it changes.
     saved: String,
-    // /restart: start again on the binary as it is now, once everything here has stopped.
+    // /restart: start again on the binary as it is now, once everything here has stopped; and
+    // asked for, waiting for the sessions' turns to end.
     restart: bool,
+    restart_waiting: bool,
     // A file to open in the user's editor (/scale edit), with the screen handed over meanwhile.
     edit: Option<PathBuf>,
     // When this piccosta started, and each session folder's time when last looked at, for the
@@ -366,6 +368,14 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut term = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
     let host = Arc::new(Host::for_args(&args));
+    // After /restart: the reaper and the background jobs the image before handed over.
+    let handover = if args.restore { state::take_handover(&host.agent_dir) } else { state::Handover::default() };
+    if let Some((fd, pid)) = handover.reaper {
+        crate::tools::reaper::adopt(fd, pid);
+    }
+    if args.restore {
+        reap_inherited_children(&handover);
+    }
     // --use becomes the model and level the scale picks, before anything opens.
     (args.model, args.thinking) = host.launch(&args)?;
     args.provider = None;
@@ -392,6 +402,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         scans: 0,
         saved: String::new(),
         restart: false,
+        restart_waiting: false,
         edit: None,
         started: std::time::SystemTime::now(),
         folder_times: HashMap::new(),
@@ -420,6 +431,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         app.report(format!("Invalid settings file:\n{}", host.settings.load_errors.join("\n")));
         app.notice = Some("Invalid settings; details are shown above.".into());
     }
+    app.adopt_jobs(handover.sessions);
     let mut input = EventStream::new();
     let mut spinner = tokio::time::interval(FRAME);
     let mut agent_scan = tokio::time::interval(AGENT_SCAN);
@@ -446,6 +458,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         while let Ok((slot, update)) = app.updates.try_recv() {
             app.update(slot, update);
         }
+        // A /restart waiting for turns to end goes ahead once none is running.
+        if app.restart_waiting && !app.slots.iter().any(Slot::busy) {
+            (app.restart, app.quit) = (true, true);
+        }
         // A file to edit: the user's editor gets the terminal ($VISUAL, else $EDITOR), and the
         // screen comes back when it exits. Sessions carry on meanwhile; their updates wait.
         if let Some(path) = app.edit.take() {
@@ -470,6 +486,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     app.save_state();
     let _ = app.tex.clear(&mut stdout);
     restore();
+    // /restart hands the background jobs over before the sessions end, so their end doesn't kill them.
+    let handover = if app.restart { app.hand_over() } else { state::Handover::default() };
     app.shutdown(match exit_code { 143 => "SIGTERM", 129 => "SIGHUP", _ => "quit" }).await;
     // /restart: this process becomes the binary now at its path (a build replaces the file, which
     // the kernel then names "… (deleted)"), on the same command line, bringing everything back.
@@ -477,10 +495,29 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
+        state::save_handover(&host.agent_dir, &handover).map_err(|error| format!("could not hand the background jobs over: {error}"))?;
         let error = std::process::Command::new(&exe).args(std::env::args_os().skip(1).filter(|argument| argument != "--restore")).arg("--restore").exec();
+        state::take_handover(&host.agent_dir);
         return Err(format!("could not start {} again: {error}", exe.display()));
     }
     Ok(std::process::ExitCode::from(exit_code))
+}
+
+// After /restart, the processes the old image started are still this process's children. The
+// jobs it handed over are taken back and reaped by their watchers, and the reaper runs on; any
+// other child (a Claude process still closing, say) would stay a zombie when it ends, since
+// nothing in this image waits on it, so a thread waits on each. Only children that existed before
+// this image started any are listed, so none of its own are taken from tokio.
+fn reap_inherited_children(handover: &state::Handover) {
+    let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid)).collect();
+    let tasks = std::fs::read_dir("/proc/self/task").into_iter().flatten().flatten();
+    let children = tasks.filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok());
+    for pid in children.flat_map(|text| text.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).collect::<Vec<_>>()) {
+        if !kept.contains(&pid) {
+            // SAFETY: waitpid on a known child pid with a status pointer it may ignore.
+            std::thread::spawn(move || unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) });
+        }
+    }
 }
 
 fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
@@ -574,7 +611,7 @@ impl App {
             .flatten();
         // The manager's session, when there is one, heads the sidebar.
         let manager = crate::manager::session_file(&self.host.agent_dir).map(|file| crate::host::SessionSummary {
-            title: crate::manager::assistant_name(&self.host.agent_dir), id: String::new(), cwd: crate::manager::home(&self.host.agent_dir), modified: std::time::SystemTime::now(), path: file,
+            title: crate::manager::assistant_name(&self.host.agent_dir), id: String::new(), cwd: crate::manager::home(&self.host.agent_dir), modified: std::time::SystemTime::now(), closed: false, path: file,
         });
         let others: Vec<crate::host::SessionSummary> = manager.into_iter().chain(self.host.sessions(RECENT_SESSIONS)).chain(others).collect();
         self.list_sessions(others);
@@ -646,10 +683,44 @@ impl App {
         }
     }
 
+    // /restart: each saved session's running background jobs, and the reaper, for the next image.
+    fn hand_over(&self) -> state::Handover {
+        let sessions = self.slots.iter().filter_map(|slot| Some((slot.path.clone()?, slot.shared.as_ref()?.jobs.hand_over()))).filter(|(_, jobs)| !jobs.is_empty()).collect();
+        state::Handover { reaper: crate::tools::reaper::hand_over(), sessions }
+    }
+
+    // After /restart: open each session that had background jobs, where restore didn't, and give
+    // it its jobs back, so /ps lists them and their messages reach it.
+    fn adopt_jobs(&mut self, sessions: Vec<(PathBuf, Vec<crate::tools::jobs::HandedJob>)>) {
+        for (path, jobs) in sessions {
+            let slot = match self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)) {
+                Some(slot) if self.slots[slot].live.is_some() => Ok(slot),
+                // Shown from its file: a fresh view to open, so its messages don't show twice.
+                Some(slot) => {
+                    self.slots[slot] = Slot { cwd: self.slots[slot].cwd.clone(), ..Slot::new(Some(path.clone()), self.slots[slot].title.clone()) };
+                    self.load(slot, None, None, None).map(|()| slot)
+                }
+                None => self.open(Some(path.clone()), None, None),
+            };
+            let shared = slot.map(|slot| self.slots[slot].shared.clone());
+            for job in jobs {
+                let adopted = match &shared {
+                    Ok(Some(shared)) => crate::tools::bash::adopt(shared.clone(), job).map_err(|error| error.to_string()),
+                    Ok(None) => Err("its session didn't open".into()),
+                    Err(error) => Err(error.clone()),
+                };
+                if let Err(error) = adopted {
+                    self.notice = Some(format!("A background job of {} wasn't taken back: {error}", path.display()));
+                }
+            }
+        }
+    }
+
     // Add sessions to the list that aren't in it yet, each marked when it's a manager.
     fn list_sessions(&mut self, summaries: Vec<crate::host::SessionSummary>) {
         let assistant = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok());
-        for summary in summaries {
+        // Closed sessions stay out of the list; /resume still finds them.
+        for summary in summaries.into_iter().filter(|summary| !summary.closed) {
             let path = summary.path.canonicalize().unwrap_or(summary.path);
             if self.slots.iter().any(|slot| slot.path.as_ref() == Some(&path)) {
                 continue;
@@ -1408,6 +1479,10 @@ impl App {
                     self.notice = Some(format!("{running}{pressed} again quits piccosta (to delete a session: the Delete key)"));
                 }
             }
+            KeyCode::Esc if self.restart_waiting => {
+                self.restart_waiting = false;
+                self.notice = Some("Not restarting.".into());
+            }
             KeyCode::Esc if self.current().busy() => self.interrupt(),
             KeyCode::Esc => self.panes[self.focus].scroll = 0,
             KeyCode::Char('x') if control => {
@@ -1693,8 +1768,9 @@ impl App {
             };
             let dots = ".".repeat(1 + self.frame / WORKING_DOT_FRAMES % 3);
             let seconds = slot.working_since.map_or(String::new(), |since| format!(" · {}", render::duration(since.elapsed())));
+            let restart = if self.restart_waiting { " · piccosta restarts when every turn has ended (esc or /restart: don't)" } else { "" };
             rows.push(Line::default());
-            rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
+            rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}{restart}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
         }
         let scroll = self.panes[index].scroll.min(rows.len().saturating_sub(height));
         self.panes[index].scroll = scroll;

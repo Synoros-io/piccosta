@@ -1273,10 +1273,15 @@ impl Query {
                 let event = match &mut self.out.content[index] {
                     Content::Text { text, .. } => StreamEvent::TextEnd { index, content: text.clone() },
                     Content::Thinking { thinking, .. } => StreamEvent::ThinkingEnd { index, content: thinking.clone() },
-                    Content::ToolCall { name, arguments, .. } => {
+                    // The final arguments parse strictly: a call whose JSON doesn't parse runs with
+                    // none and the error goes back to the model, not with the prefix that parsed.
+                    // No deltas at all means the block's start held the whole input.
+                    Content::ToolCall { name, arguments, arguments_error, .. } => {
                         self.saw_tool_call = true;
-                        let parsed = serde_json::from_str::<Value>(&self.partial[index]).ok().and_then(|value| value.as_object().cloned());
-                        *arguments = pi_arguments(name, parsed.unwrap_or_else(|| std::mem::take(arguments)));
+                        if !self.partial[index].trim().is_empty() {
+                            (*arguments, *arguments_error) = super::responses::parse_tool_call_arguments(&self.partial[index]);
+                        }
+                        *arguments = pi_arguments(name, std::mem::take(arguments));
                         StreamEvent::ToolCallEnd { index, tool_call: self.out.content[index].clone() }
                     }
                     Content::Image { .. } => return,

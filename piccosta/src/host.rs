@@ -159,6 +159,8 @@ pub struct SessionSummary {
     pub cwd: PathBuf,
     pub title: String,
     pub modified: std::time::SystemTime,
+    // Someone said it's done (session.rs, closed sessions).
+    pub closed: bool,
 }
 
 impl Host {
@@ -504,11 +506,12 @@ pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionS
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .collect();
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let closed = session::closed_sessions(&config::agent_dir());
     files.into_iter().filter_map(|(modified, path)| {
         let session = Session::open(&path, cwd.unwrap_or(dir)).ok()?;
         let recorded = Path::new(&session.header().cwd);
         cwd.is_none_or(|cwd| recorded == cwd).then(|| SessionSummary {
-            title: title(&session), id: session.id().to_string(), cwd: recorded.to_path_buf(), path, modified,
+            title: title(&session), id: session.id().to_string(), cwd: recorded.to_path_buf(), closed: closed.contains_key(&crate::tools::paths::canonical(&path)), path, modified,
         })
     }).take(limit).collect()
 }

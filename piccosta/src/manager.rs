@@ -61,7 +61,7 @@ How you work:{project}
 - {quota}
 - Your ledger ({ledger}) is your running record of what's happening and what's going on {scope}: `ledger append` adds an entry, a line or two, of the lanes you started and why (session ids, models), what each is doing and what came of it, what the user decided, and what's next. piccosta carries its newest entries through your compactions; `ledger search` finds the rest, and anything the user said to you, word for word. A project's own files (AGENTS.md, direction.md, its ledger.md) belong to the project and the sessions working in it; when one of those should change, tell the user.{memory_line}
 - `ledger schedule` keeps messages for you at set times or on a repeat.
-- The sessions you start or message are your lanes. Check in on them while they work, not only when they end: read their latest turns (`sessions read`), and when a lane will run a while, schedule your next look (`ledger schedule`). Act on what you see: a lane stuck, off track, repeating itself or waiting on something gets a message or a stop (`sessions stop`), and the user hears what you did. When one goes quiet you also get a reminder: close it (`sessions close`) when it's done, or update it.
+- The sessions you start or message are your lanes. Check in on them while they work, not only when they end: read their latest turns (`sessions read`), and when a lane will run a while, schedule your next look (`ledger schedule`). Act on what you see: a lane stuck, off track, repeating itself or waiting on something gets a message or a stop (`sessions stop`), and the user hears what you did. When a lane finishes a turn you get what it said; tell the user what came of it, then close the lane (`sessions close`: it stops anything the lane still runs and takes it out of the list) once its work is done, or message it with what's next. Don't leave a finished lane open: one left quiet keeps reminding you until you close or update it.
 - A project can have its own manager, a standing session that looks after that project: `sessions list` and `sessions projects` show which. Make one with `sessions start` and `manager: true`, with no message unless the user gave it work; one directory has one. Hand a project's work to its manager (`sessions message`) rather than starting sessions there yourself.
 - Choose models by the user's model scale: start a session with `use`, the kind of work, and piccosta picks the model, moving to the next one when a plan runs low. Pick the use that fits, say which and why, and consider a second model for long or important lanes (`trio`: it checks each answer once; `pair`: the two work it through together). Name a `model` only when the user did. When something you read (a project's docs, the user's standards) disagrees with the scale about which model to use, ask the user before you choose.
 
@@ -110,6 +110,11 @@ const INACTIVE_MINUTES: u64 = 30;
 const LIST_LIMIT: usize = 40;
 const READ_MESSAGES: usize = 6;
 const READ_CHARS: usize = 3_000;
+// How long a lane's file has to stay still after a finished turn before the manager hears of it:
+// a pair's next turn, or a run's last writes, start within that.
+const TURN_SETTLE_SECONDS: u64 = 5;
+// How much of a session file's end is read for its last message: room for a long answer.
+const TAIL_BYTES: u64 = 1024 * 1024;
 // How much `ledger search` returns.
 const SEARCH_CHARS: usize = 12_000;
 const DAY_MS: i64 = 86_400_000;
@@ -347,6 +352,12 @@ struct Lane {
     // The process of its run going now, when `sessions` started one.
     #[serde(default)]
     run: Option<u32>,
+    // The time stamp of the last turn end the manager heard about, and the file's last change
+    // when it was last looked at for one.
+    #[serde(default)]
+    reported: String,
+    #[serde(default)]
+    looked: u64,
 }
 
 fn load_lanes(home: &Path) -> Vec<Lane> {
@@ -368,7 +379,7 @@ fn take_lane(home: &Path, file: &Path, title: &str, run: Option<u32>) {
     let mut lanes = load_lanes(home);
     match lanes.iter_mut().find(|lane| lane.file == file) {
         Some(lane) => lane.run = run.or(lane.run),
-        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, run }),
+        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, run, reported: String::new(), looked: 0 }),
     }
     save_lanes(home, &lanes);
 }
@@ -419,16 +430,42 @@ fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result
     Ok(pid)
 }
 
-// What a manager hears about its lanes, as messages for it: each run that ended since the last
-// look, with the end of what it printed; and, when `remind`, each lane quiet for its wait (the
-// setting's minutes, doubled for each reminder it has had since it last changed). A lane whose
-// file is gone leaves the list.
+// The model's last finished turn in a session file (one that didn't end on tool calls): its time
+// stamp and its text. Read from the file's end, so a long session costs no more than a short one.
+fn last_turn(file: &Path) -> Option<(String, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = fs::File::open(file).ok()?;
+    let length = handle.metadata().ok()?.len();
+    handle.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES))).ok()?;
+    let mut tail = Vec::new();
+    handle.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let last = tail.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|entry| entry["type"] == "message")?;
+    let message = &last["message"];
+    let finished = message["role"] == "assistant" && message["stopReason"] != "toolUse";
+    let text: String = message["content"].as_array()?.iter().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
+    finished.then(|| (last["timestamp"].as_str().unwrap_or_default().to_string(), text))
+}
+
+// The last `READ_CHARS` characters of a text.
+fn ending(text: &str) -> String {
+    let characters: Vec<char> = text.trim().chars().collect();
+    characters[characters.len().saturating_sub(READ_CHARS)..].iter().collect()
+}
+
+// What a manager hears about its lanes, as messages for it: each turn a lane finished (once its
+// file has been still for TURN_SETTLE_SECONDS, so a pair's next turn or the last writes can land),
+// with what it said and whether its run is still going; a run that ended without finishing a
+// turn, with the end of what it printed; a lane someone else closed; and, when `remind`, each lane
+// quiet for its wait (the setting's minutes, doubled for each reminder since it last changed). A
+// lane whose file is gone, or that was closed, leaves the list.
 fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
     let mut lanes = load_lanes(home);
     if lanes.is_empty() {
         return Vec::new();
     }
     let now = (crate::clock::now_ms() / 1000) as u64;
+    let agent_dir = crate::config::agent_dir();
     let mut reminders = Vec::new();
     let mut save = remind;
     lanes.retain_mut(|lane| {
@@ -436,13 +473,31 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
             save = true;
             return false;
         };
-        if let Some(pid) = lane.run.filter(|pid| !running(*pid, &lane.file)) {
-            lane.run = None;
+        let (id, title) = (session_id(&lane.file), lane.title.clone());
+        if crate::session::is_closed(&agent_dir, &lane.file) {
             save = true;
-            let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
-            let printed: Vec<char> = printed.trim().chars().collect();
-            let tail: String = printed[printed.len().saturating_sub(READ_CHARS)..].iter().collect();
-            reminders.push(format!("[{}, a lane's turn ended] Session {} \"{}\" (its run, pid {pid}) is done. The end of what it said:\n{tail}", now_text(), session_id(&lane.file), lane.title));
+            reminders.push(format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text()));
+            return false;
+        }
+        let run_ended = lane.run.is_some_and(|pid| !running(pid, &lane.file));
+        if (last != lane.looked && now.saturating_sub(last) >= TURN_SETTLE_SECONDS) || run_ended {
+            lane.looked = last;
+            save = true;
+            match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
+                Some((stamp, said)) => {
+                    lane.reported = stamp;
+                    let still = if lane.run.is_some() && !run_ended { " Its run is still going (a background job, or a partner's turn)." } else { "" };
+                    reminders.push(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)));
+                }
+                None if run_ended => {
+                    let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
+                    reminders.push(format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), lane.run.unwrap_or_default(), ending(&printed)));
+                }
+                None => {}
+            }
+        }
+        if run_ended {
+            lane.run = None;
         }
         if !remind {
             return true;
@@ -620,7 +675,7 @@ impl SessionsTool {
         let lines: Vec<String> = all_sessions(&self.agent_dir, LIST_LIMIT)
             .iter()
             .map(|summary| {
-                let running = if crate::session::held_elsewhere(&summary.path) { " · running" } else { "" };
+                let running = if crate::session::held_elsewhere(&summary.path) { " · running" } else if summary.closed { " · closed" } else { "" };
                 let session = crate::session::Session::open(&summary.path, &summary.cwd).ok();
                 let kind = match session.as_ref().and_then(role) {
                     Some(Role::Assistant) => " · the assistant (you)",
@@ -740,7 +795,7 @@ impl Tool for SessionsTool {
     fn definition(&self) -> crate::message::ToolDefinition {
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: when it goes quiet you're reminded, until close (session) says you're done with it. stop: end a lane's background run now (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). usage: what sessions cost in the last day and week, by provider.".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -826,13 +881,21 @@ impl Tool for SessionsTool {
                     }
                     text(format!("Stopped \"{}\" (pid {}).", summary.title, runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")))
                 }
+                // Close a session: it's done. Its background run stops, it's marked closed for
+                // everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
+                    let runs = headless_runs(&summary.path);
+                    for pid in &runs {
+                        // SAFETY: kill() takes plain integers; a pid already gone fails with ESRCH.
+                        unsafe { libc::kill(*pid, libc::SIGTERM) };
+                    }
+                    crate::session::set_closed(&self.agent_dir, &summary.path, true);
                     let mut lanes = load_lanes(&self.home);
-                    let before = lanes.len();
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
-                    text(if lanes.len() < before { format!("Closed: no more reminders for \"{}\".", summary.title) } else { format!("\"{}\" wasn't one of your lanes.", summary.title) })
+                    let stopped = if runs.is_empty() { String::new() } else { format!(", and its run (pid {}) stopped", runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")) };
+                    text(format!("Closed \"{}\"{stopped}. A message to it opens it again.", summary.title))
                 }
                 other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close or usage")),
             }

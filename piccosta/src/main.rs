@@ -194,6 +194,13 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     }
     tool_shared.jobs.shutdown("quit");
     tool_shared.web.shutdown();
+    // A subagent's session is one task: done when its run is, so it closes and leaves its parent's
+    // list.
+    if std::env::var_os(piccosta::tools::subagent::CHILD_ENV).is_some()
+        && let Some(file) = agent.session.file()
+    {
+        piccosta::session::set_closed(&host.agent_dir, file, true);
+    }
 
     // The last message, when it's the model's (print-mode.ts:139-159). A run that ended in an
     // error exits 1 in json mode too, so a script checking $? sees it (pi's json mode exits 0).

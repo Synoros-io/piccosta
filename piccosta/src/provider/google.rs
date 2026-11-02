@@ -69,6 +69,9 @@ fn build_body(request: &Request<'_>) -> Result<Value, String> {
                     .filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None })
                     .collect::<Vec<_>>()
                     .join("\n");
+                // Gemini rejects whitespace-only output (a bare \r\n from bash) with a 400, so it goes as
+                // empty (pi #8720).
+                let text = if text.trim().is_empty() { String::new() } else { text };
                 let response = if result.is_error { json!({"error":text}) } else { json!({"output":text}) };
                 let mut part = json!({"functionResponse":{"id":result.tool_call_id,"name":result.tool_name,"response":response}});
                 let images: Vec<_> = result.content.iter().filter(|block| matches!(block, Content::Image { .. })).filter_map(input_part).collect();

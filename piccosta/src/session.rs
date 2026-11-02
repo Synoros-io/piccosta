@@ -365,6 +365,39 @@ pub const LIVE_ELSEWHERE: &str = "is open in another piccosta";
 
 // Whether another process runs the session in `path` (holds its lock). Two piccostas writing one
 // file would fork its tree, so a frontend shows such a session instead of running it.
+// Closed sessions: the ones someone said are done (a manager's `sessions close`, the terminal's
+// /close, a subagent's run when it ends). A closed session leaves the lists that show what's
+// going on (the sidebar, a manager's lanes) and is still there to find (/resume, `sessions list`);
+// a new prompt in it opens it again. Kept in one file for the agent dir, each session's file and
+// when it closed (epoch ms), rather than in the session file, which another piccosta may be
+// holding open and writing.
+const CLOSED_FILE: &str = "closed.json";
+
+pub fn closed_sessions(agent_dir: &Path) -> HashMap<PathBuf, i64> {
+    fs::read_to_string(agent_dir.join(CLOSED_FILE)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+pub fn is_closed(agent_dir: &Path, file: &Path) -> bool {
+    closed_sessions(agent_dir).contains_key(&crate::tools::paths::canonical(file))
+}
+
+// Close a session, or open it again. Entries for files that are gone are dropped as it's written,
+// whole through a temporary file so a reader never sees half of one.
+pub fn set_closed(agent_dir: &Path, file: &Path, closed: bool) {
+    let mut all = closed_sessions(agent_dir);
+    let file = crate::tools::paths::canonical(file);
+    let changed = if closed { all.insert(file, clock::now_ms()).is_none() } else { all.remove(&file).is_some() };
+    if !changed {
+        return;
+    }
+    all.retain(|file, _| file.exists());
+    let path = agent_dir.join(CLOSED_FILE);
+    let partial = path.with_extension("json.partial");
+    if fs::write(&partial, serde_json::to_string_pretty(&all).unwrap_or_default()).is_ok() {
+        let _ = fs::rename(partial, path);
+    }
+}
+
 pub fn held_elsewhere(path: &Path) -> bool {
     fs::File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)))
 }

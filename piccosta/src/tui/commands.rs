@@ -46,7 +46,7 @@ where even numbers slow.
 // /help's list, in the order people reach for them.
 const COMMANDS: [(&str, &str); 39] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
-    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was"),
+    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
     ("/scale", "which model does which kind of work, and how much of each plan is used (--use <kind> picks from it)"),
     ("/manager", "this project's manager: shown, or made (the first session in a directory is one)"),
@@ -73,7 +73,7 @@ const COMMANDS: [(&str, &str); 39] = [
     ("/ps", "background jobs"),
     ("/stop", "kill the background jobs"),
     ("/split", "open a new session in another pane"),
-    ("/close", "close this session: it goes back among the earlier ones"),
+    ("/close", "close this session: it's done and leaves the list (/resume finds it, and a message opens it again)"),
     ("/delete", "move this session to the trash and show the next; the Delete key twice, with nothing typed, does it too"),
     ("/help", "this list"),
     ("/quit, /exit", "leave piccosta"),
@@ -330,20 +330,32 @@ impl App {
                 self.notice = Some(format!("Stopped {count} background job{}.", if count == 1 { "" } else { "s" }));
             }
             "split" => self.split(),
+            // Closing says the session is done: it leaves the list for good, and a message in it
+            // (from /resume, or a manager) opens it again.
             "close" => {
-                self.close(self.panes[self.focus].slot);
+                let slot = self.panes[self.focus].slot;
+                if self.close(slot)
+                    && let Some(path) = self.slots[slot].path.take()
+                {
+                    crate::session::set_closed(&self.host.agent_dir, &path, true);
+                }
             }
             "delete" => self.delete_shown(),
             "quit" | "exit" => self.quit = true,
-            // Start again on the binary as it is now (after a build), with everything as it was. Not
-            // while a session is running or has background jobs, which would stop.
-            "restart" => match self.slots.iter().find(|slot| slot.busy() || slot.shared.as_ref().is_some_and(|shared| shared.jobs.running_count() > 0)) {
-                Some(slot) => self.notice = Some(format!("“{}” is running or has background jobs (/ps); when it's done, /restart", super::render::fit(&slot.title, 60))),
-                None => {
-                    self.restart = true;
-                    self.quit = true;
+            // Start again on the binary as it is now (after a build), with everything as it was and
+            // the background jobs carrying on. A turn can't go across, so this waits for the running
+            // ones to end (the main loop restarts then); asked again while waiting, it doesn't.
+            "restart" if self.restart_waiting => {
+                self.restart_waiting = false;
+                self.notice = Some("Not restarting.".into());
+            }
+            "restart" => {
+                self.restart_waiting = true;
+                let running = self.slots.iter().filter(|slot| slot.busy()).count();
+                if running > 0 {
+                    self.notice = Some(format!("Restarting when {running} running turn{} end{} (esc or /restart: don't).", if running == 1 { "" } else { "s" }, if running == 1 { "s" } else { "" }));
                 }
-            },
+            }
             "descent" => self.report(DESCENT.into()),
             "help" => self.report(COMMANDS.iter().map(|(name, what)| format!("{name:<28} {what}")).collect::<Vec<_>>().join("\n")),
             _ if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') => {
@@ -462,8 +474,9 @@ impl App {
     // where it can't go there. A running session is left alone.
     fn delete(&mut self, slot: usize) {
         let (path, title) = (self.slots[slot].path.clone().filter(|path| path.exists()), self.slots[slot].title.clone());
-        // A session another piccosta is running would lose its file from under it.
-        if path.as_deref().is_some_and(crate::session::held_elsewhere) {
+        // A session another piccosta is running would lose its file from under it. One open here
+        // is held by this piccosta's own lock, which reads as held from a second look.
+        if self.slots[slot].live.is_none() && path.as_deref().is_some_and(crate::session::held_elsewhere) {
             self.notice = Some(format!("“{title}” is open in another piccosta; quit it there first."));
             return;
         }

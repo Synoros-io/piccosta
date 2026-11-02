@@ -5,28 +5,33 @@
 // and path hints (pathhint.rs) built in. pi's own behaviour, kept:
 // - The shell is settings' shellPath, else /bin/bash, else bash on PATH, else sh, run as
 //   `<shell> -c "<shellCommandPrefix>\n<command>"`, in its own session (setsid), stdin closed,
-//   stdout and stderr read into one stream.
+//   stdout and stderr on one pipe, read as one stream.
 // - PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL and PI_REASONING_LEVEL describe the
 //   session; the agent dir's bin/ goes on the front of PATH.
 // - A timeout or an abort SIGKILLs a bash command's whole process group. Subagents get SIGTERM
 //   first so their own shell groups are cleaned up. After the shell exits, output is
-//   still read until both pipes close or nothing arrives for 100 ms, so a descendant that keeps
-//   a pipe open can't hang the call (pi#5303).
+//   still read until the pipe closes or nothing arrives for 100 ms, so a descendant that keeps
+//   the pipe open can't hang the call (pi#5303).
+// - A shell is waited on through a pidfd and reaped by hand rather than through tokio, so one
+//   in the background can be handed to the image /restart execs (hand_over, adopt): it stays
+//   this process's child, and its pipe goes across the exec.
 // - The model sees the last 2000 lines or 50 KB, raw (ANSI codes and CRs included), with pi's
 //   notice saying what was cut and where the full output is.
 // - A non-zero exit is an error result whose text ends "Command exited with code N".
 
-use super::jobs::{self, JobEnd, Tail};
+use super::jobs::{self, HandedJob, JobEnd, Tail};
 use super::output::OutputAccumulator;
 use super::truncate::{self, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use super::{pathhint, Tool, ToolContext, ToolFuture, ToolOutput, ToolUpdate};
 use crate::message::{Content, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::net::unix::pipe::Receiver;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -201,6 +206,10 @@ struct Running {
     pid: u32,
     own: bool,
     kill_at: Option<Instant>,
+    // Its output pipe, held here so the descriptor stays open as long as the shell is listed.
+    pipe: Arc<Receiver>,
+    // Handed to the next image (/restart): this one no longer reaps it or kills it.
+    handed: bool,
 }
 
 static RUNNING: std::sync::Mutex<Vec<Running>> = std::sync::Mutex::new(Vec::new());
@@ -230,25 +239,60 @@ async fn stop_group(pid: u32) {
     }
 }
 
+// Stop every shell this image still owns: all but the ones handed to the next image.
 pub fn kill_all_running() {
-    let pids: Vec<_> = running().iter().map(|child| child.pid).collect();
+    let pids: Vec<_> = running().iter().filter(|child| !child.handed).map(|child| child.pid).collect();
     for pid in pids {
         kill_group(pid);
     }
     // This also runs just before process::exit, when an async escalation would never finish.
-    let deadline = running().iter().filter_map(|child| child.kill_at).max();
+    let deadline = running().iter().filter(|child| !child.handed).filter_map(|child| child.kill_at).max();
     if let Some(deadline) = deadline {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
     }
-    for child in running().drain(..) {
-        signal_group(child.pid, libc::SIGKILL);
-    }
+    running().retain(|child| {
+        if !child.handed {
+            signal_group(child.pid, libc::SIGKILL);
+        }
+        child.handed
+    });
 }
 
-fn spawn(command: &str, context: &ToolContext) -> Result<tokio::process::Child, String> {
+// Hand a background shell to the image /restart is about to exec: from now on this image neither
+// reaps it nor kills it (its pipe is still read into the log until the exec). Output: whether it's
+// a command of piccosta's own, and its pipe's descriptor; None when it isn't running.
+pub fn hand_over(pid: u32) -> Option<(bool, i32)> {
+    let mut running = running();
+    let child = running.iter_mut().find(|child| child.pid == pid && !child.handed)?;
+    child.handed = true;
+    super::reaper::keep_across_exec(child.pipe.as_raw_fd());
+    Some((child.own, child.pipe.as_raw_fd()))
+}
+
+// Take back a background job the image before this one handed over: its shell is still this
+// process's child and its pipe came across the exec. It's watched and finished the way
+// to_background does it, so its end reaches the session as if nothing happened. The reaper
+// already lists its group.
+pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Result<()> {
+    let pipe = Arc::new(Receiver::from_owned_fd(super::reaper::inherited(handed.pipe))?);
+    let kill = CancellationToken::new();
+    let job = shared.jobs.adopt(&handed, kill.clone())?;
+    running().push(Running { pid: handed.pid, own: handed.own, kill_at: None, pipe: pipe.clone(), handed: false });
+    let (event_sender, events) = mpsc::unbounded_channel();
+    tokio::spawn(watch(pipe, handed.pid, kill, None, event_sender));
+    let tail = Tail::from_log(&job.log_path);
+    tokio::spawn(log_until_done(shared, job, handed.command, tail, events));
+    Ok(())
+}
+
+// Start the shell. Output: its pid and the read end of the one pipe its stdout and stderr share.
+fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), String> {
+    use std::os::unix::process::CommandExt;
     let shell = shell_path(context.shared.shell_path.as_deref())?;
-    let mut process = tokio::process::Command::new(&shell);
-    process.arg("-c").arg(command).current_dir(&context.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (reader, writer) = std::io::pipe().map_err(|error| format!("pipe: {error}"))?;
+    let error_writer = writer.try_clone().map_err(|error| format!("pipe: {error}"))?;
+    let mut process = std::process::Command::new(&shell);
+    process.arg("-c").arg(command).current_dir(&context.cwd).stdin(Stdio::null()).stdout(writer).stderr(error_writer);
 
     // The agent dir's bin/ first on PATH, and the session variables from this session only.
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -276,33 +320,66 @@ fn spawn(command: &str, context: &ToolContext) -> Result<tokio::process::Child, 
             Ok(())
         });
     }
-    process.spawn().map_err(|error| format!("spawn {} {}", shell.display(), super::paths::error_code(&error)))
+    let child = process.spawn().map_err(|error| format!("spawn {} {}", shell.display(), super::paths::error_code(&error)))?;
+    // The Command holds the pipe's write ends; they close here, so the pipe ends with the shell's
+    // own copies. Dropping a std Child reaps nothing: exit_of does that.
+    drop(process);
+    let pipe = Receiver::from_owned_fd(OwnedFd::from(reader)).map_err(|error| format!("pipe: {error}"))?;
+    Ok((child.id(), Arc::new(pipe)))
 }
 
-// Read one pipe into the channel until it closes.
-async fn pump(mut pipe: impl tokio::io::AsyncRead + Unpin, chunks: mpsc::UnboundedSender<Vec<u8>>) {
+// Read the pipe into the channel until it closes.
+async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
-    loop {
-        match pipe.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
+    while pipe.readable().await.is_ok() {
+        match pipe.try_read(&mut buffer) {
+            Ok(0) => break,
             Ok(count) => {
                 if chunks.send(buffer[..count].to_vec()).is_err() {
                     break;
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
         }
+    }
+}
+
+// Wait for a shell to exit, through a pidfd, then reap it. One handed to the next image (/restart)
+// is left unreaped and this never returns: the next image reaps it and reports its end.
+async fn exit_of(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::ExitStatusExt;
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor (close-on-exec) or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor just made and owned by nothing else, which the OwnedFd keeps open as
+    // long as the AsyncFd holds it.
+    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd::from_raw_fd(fd)) }.map_err(std::io::Error::from)?;
+    let _ready = pidfd.readable().await?;
+    // The check and the reap happen under the list's lock, so hand_over can't come between them.
+    let reaped = {
+        let running = running();
+        let handed = running.iter().any(|child| child.pid == pid && child.handed);
+        let mut status = 0;
+        // SAFETY: waitpid on our own child, which has exited, into a local status.
+        (!handed).then(|| if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(std::process::ExitStatus::from_raw(status)) })
+    };
+    match reaped {
+        Some(result) => result,
+        None => std::future::pending().await,
     }
 }
 
 // Own the child until it's done: forward its output, kill it on `kill` or at the timeout, and
 // report how it ended. Runs as its own task so a command can outlive the tool call that started it.
-async fn watch(mut child: tokio::process::Child, pid: u32, kill: CancellationToken, timeout: Option<Duration>, events: mpsc::UnboundedSender<Event>) {
+async fn watch(pipe: Arc<Receiver>, pid: u32, kill: CancellationToken, timeout: Option<Duration>, events: mpsc::UnboundedSender<Event>) {
     let (chunk_sender, mut chunks) = mpsc::unbounded_channel();
-    let readers = [
-        child.stdout.take().map(|pipe| tokio::spawn(pump(pipe, chunk_sender.clone()))),
-        child.stderr.take().map(|pipe| tokio::spawn(pump(pipe, chunk_sender.clone()))),
-    ];
-    drop(chunk_sender);
+    let reader = tokio::spawn(pump(pipe, chunk_sender));
+    let exit = exit_of(pid);
+    tokio::pin!(exit);
 
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let mut status = None;
@@ -320,7 +397,7 @@ async fn watch(mut child: tokio::process::Child, pid: u32, kill: CancellationTok
                 }
                 None => pipes_open = false,
             },
-            result = child.wait(), if status.is_none() => {
+            result = &mut exit, if status.is_none() => {
                 status = Some(result);
                 grace_until = Some(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
             }
@@ -335,9 +412,7 @@ async fn watch(mut child: tokio::process::Child, pid: u32, kill: CancellationTok
             }
         }
     }
-    for reader in readers.into_iter().flatten() {
-        reader.abort();
-    }
+    reader.abort();
     let outcome = match (killed, status) {
         (Some(outcome), _) => outcome,
         (None, Some(Ok(status))) => {
@@ -428,14 +503,13 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     if !context.cwd.exists() {
         return Err(format!("Working directory does not exist: {}\nCannot execute bash commands.", context.cwd.display()));
     }
-    let child = spawn(&command, context)?;
-    let pid = child.id().unwrap_or_default();
-    running().push(Running { pid, own: arguments.own, kill_at: None });
+    let (pid, pipe) = spawn(&command, context)?;
+    running().push(Running { pid, own: arguments.own, kill_at: None, pipe: pipe.clone(), handed: false });
     super::reaper::track(pid, true);
     let started = Instant::now();
     let kill = CancellationToken::new();
     let (event_sender, mut events) = mpsc::unbounded_channel();
-    tokio::spawn(watch(child, pid, kill.clone(), timeout, event_sender));
+    tokio::spawn(watch(pipe, pid, kill.clone(), timeout, event_sender));
 
     let spill_jobs = shared.clone();
     let spill_cwd = context.cwd.clone();
@@ -542,8 +616,8 @@ fn to_background(
     pid: u32,
     kill: CancellationToken,
     started: Instant,
-    mut tail: Tail,
-    mut events: mpsc::UnboundedReceiver<Event>,
+    tail: Tail,
+    events: mpsc::UnboundedReceiver<Event>,
 ) -> Result<ToolOutput, mpsc::UnboundedReceiver<Event>> {
     let shared = context.shared.clone();
     let session_tag: String = if context.session_id.is_empty() { std::process::id().to_string() } else { context.session_id.chars().take(8).collect() };
@@ -552,7 +626,7 @@ fn to_background(
         Ok(raw) => raw,
         Err(_) => return Err(events),
     };
-    let mut job = match shared.jobs.start(&session_tag, &context.cwd, &arguments.command, pid, kill, started, raw) {
+    let job = match shared.jobs.start(&session_tag, &context.cwd, &arguments.command, pid, kill, started, raw) {
         Ok(job) => job,
         Err(_) => return Err(events),
     };
@@ -574,21 +648,24 @@ fn to_background(
     );
     let reply = format!("{}{status}\n{instruction}", if text.is_empty() { String::new() } else { format!("{text}\n\n") });
 
-    let command = arguments.command.clone();
-    tokio::spawn(async move {
-        let end = loop {
-            match events.recv().await {
-                Some(Event::Data(data)) => {
-                    job.write(&data);
-                    tail.push(&data);
-                }
-                Some(Event::Done(Outcome::Exited(code))) => break JobEnd::Exited(code),
-                Some(Event::Done(Outcome::Failed(message))) => break JobEnd::Failed(message),
-                Some(Event::Done(Outcome::Aborted | Outcome::TimedOut)) => break JobEnd::Failed("Command aborted".into()),
-                None => break JobEnd::Failed("Command terminated without an exit code".into()),
-            }
-        };
-        shared.jobs.finish(job, &command, &tail, end);
-    });
+    tokio::spawn(log_until_done(shared, job, arguments.command.clone(), tail, events));
     Ok(ToolOutput { content: vec![Content::text(reply)], details: None, is_error: false })
+}
+
+// A background job's output goes to its log and its tail until the command ends; then the job
+// finishes, which sends its message.
+async fn log_until_done(shared: Arc<super::ToolShared>, mut job: jobs::Job, command: String, mut tail: Tail, mut events: mpsc::UnboundedReceiver<Event>) {
+    let end = loop {
+        match events.recv().await {
+            Some(Event::Data(data)) => {
+                job.write(&data);
+                tail.push(&data);
+            }
+            Some(Event::Done(Outcome::Exited(code))) => break JobEnd::Exited(code),
+            Some(Event::Done(Outcome::Failed(message))) => break JobEnd::Failed(message),
+            Some(Event::Done(Outcome::Aborted | Outcome::TimedOut)) => break JobEnd::Failed("Command aborted".into()),
+            None => break JobEnd::Failed("Command terminated without an exit code".into()),
+        }
+    };
+    shared.jobs.finish(job, &command, &tail, end);
 }

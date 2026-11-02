@@ -14,7 +14,8 @@
 // - In print and json mode the run is held open after the model's last turn until a job exits,
 //   so its message becomes a new turn before piccosta exits.
 // - At session end and when piccosta is killed by a signal, running jobs die with their whole
-//   process group, and their logs say so. An abort during the model's turn doesn't kill a job
+//   process group, and their logs say so. /restart is not an end: its jobs are handed to the
+//   image it execs (hand_over, adopt), which sends their messages when they exit. An abort during the model's turn doesn't kill a job
 //   that is already in the background: the turn that started it is over.
 //
 // No new tools: the model stops a job with `kill -- -<pid>` through bash and reads the log with
@@ -34,7 +35,7 @@
 
 use crate::message::{CustomMessage, TextOrBlocks};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,6 +119,28 @@ impl Tail {
     fn ends_with_newline(&self) -> bool {
         self.bytes.last() == Some(&b'\n')
     }
+
+    // A job taken back after /restart: its tail is the end of its log, which holds all it printed.
+    pub fn from_log(path: &Path) -> Tail {
+        let Ok(mut log) = std::fs::File::open(path) else { return Tail::default() };
+        let total = log.metadata().map_or(0, |metadata| metadata.len() as usize);
+        let mut bytes = Vec::new();
+        let _ = log.seek(std::io::SeekFrom::Start(total.saturating_sub(TAIL_KEEP_BYTES) as u64)).and_then(|_| log.read_to_end(&mut bytes));
+        Tail { bytes, total }
+    }
+}
+
+// A running job as /restart hands it to the next image: enough to watch it again and send its
+// message. `pipe` is the descriptor of its output pipe, kept open across the exec.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HandedJob {
+    pub id: u64,
+    pub pid: u32,
+    pub own: bool,
+    pub command: String,
+    pub elapsed_ms: u64,
+    pub log_path: PathBuf,
+    pub pipe: i32,
 }
 
 struct RunningJob {
@@ -303,11 +326,38 @@ impl Jobs {
                 std::io::copy(&mut source, &mut log)?;
             }
         }
+        Ok(self.list(id, pid, command, started, path, log, kill))
+    }
+
+    // List a job as running. Output: its handle, holding its open log.
+    #[allow(clippy::too_many_arguments)]
+    fn list(&self, id: u64, pid: u32, command: &str, started: Instant, log_path: PathBuf, log: std::fs::File, kill: CancellationToken) -> Job {
         let kill_reason = Arc::new(Mutex::new(None));
         let silent = Arc::new(AtomicBool::new(false));
-        let running = RunningJob { pid, command: command.to_string(), started, log_path: path.clone(), kill, kill_reason: kill_reason.clone(), silent: silent.clone() };
+        let running = RunningJob { pid, command: command.to_string(), started, log_path: log_path.clone(), kill, kill_reason: kill_reason.clone(), silent: silent.clone() };
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id, running);
-        Ok(Job { id, pid, log_path: path, log: Some(log), kill_reason, silent, started })
+        Job { id, pid, log_path, log: Some(log), kill_reason, silent, started }
+    }
+
+    // /restart: take the running jobs out of this session, so its end doesn't kill them, and hand
+    // them to the next image. Output: one record each (a job whose shell already ended isn't one).
+    pub fn hand_over(&self) -> Vec<HandedJob> {
+        let mut handed = Vec::new();
+        self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|&id, job| {
+            let Some((own, pipe)) = super::bash::hand_over(job.pid) else { return true };
+            let elapsed_ms = job.started.elapsed().as_millis() as u64;
+            handed.push(HandedJob { id, pid: job.pid, own, command: job.command.clone(), elapsed_ms, log_path: job.log_path.clone(), pipe });
+            false
+        });
+        handed
+    }
+
+    // The next image takes a handed job back: listed again under its id, its log opened to go on.
+    pub fn adopt(&self, handed: &HandedJob, kill: CancellationToken) -> std::io::Result<Job> {
+        let log = std::fs::OpenOptions::new().append(true).open(&handed.log_path)?;
+        self.next_id.fetch_max(handed.id + 1, Ordering::SeqCst);
+        let started = Instant::now().checked_sub(Duration::from_millis(handed.elapsed_ms)).unwrap_or_else(Instant::now);
+        Ok(self.list(handed.id, handed.pid, &handed.command, started, handed.log_path.clone(), log, kill))
     }
 
     // Input: a job whose command ended, the command, its output tail and how it ended. Closes the
