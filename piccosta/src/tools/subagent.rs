@@ -185,6 +185,8 @@ impl Tool for SubagentTool {
 const PROCESS_NAME: &str = "piccosta";
 // The variable bash sets to the session that ran a command, which everything it starts inherits.
 const SESSION_ENV: &str = "PI_SESSION_ID";
+// How a piccosta is pointed at another agent dir (config.rs agent_dir).
+const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
 // Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the
 // fields after the name's ')', which start at field 3.
 const STAT_STARTTIME_AFTER_NAME: usize = 22 - 3;
@@ -206,6 +208,7 @@ pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, 
     let mut found: std::collections::HashMap<String, Vec<RunningAgent>> = std::collections::HashMap::new();
     let wanted: Vec<String> = session_ids.iter().map(|id| format!("{SESSION_ENV}={id}")).collect();
     let job_prefix = format!("{CHILD_ENV}=");
+    let (own_agent_dir, default_agent_dir) = (crate::config::agent_dir(), crate::config::data_home().join("piccosta").join("agent"));
     let Some(uptime) = std::fs::read_to_string("/proc/uptime").ok().and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok()) else { return found };
     // SAFETY: sysconf only reads a configuration value.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
@@ -222,6 +225,12 @@ pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, 
             let reaper = format!("{}=", super::reaper::REAPER_ENV);
             let started_by = wanted.iter().find(|wanted| variables.contains(&wanted.as_bytes()))?;
             if variables.iter().any(|variable| variable.starts_with(reaper.as_bytes())) {
+                return None;
+            }
+            // One that keeps its sessions in another agent dir (a test run with a scratch one) isn't
+            // among this user's agents.
+            let agent_dir = variables.iter().find_map(|variable| variable.strip_prefix(AGENT_DIR_VARIABLE.as_bytes())).map(|dir| PathBuf::from(String::from_utf8_lossy(dir).into_owned()));
+            if agent_dir.as_deref().filter(|dir| !dir.as_os_str().is_empty()).map_or(own_agent_dir != default_agent_dir, |dir| *dir != own_agent_dir) {
                 return None;
             }
             let job = variables.iter().find_map(|variable| variable.strip_prefix(job_prefix.as_bytes())).map(|name| String::from_utf8_lossy(name).into_owned());
