@@ -1,6 +1,6 @@
 # piccosta
 
-The piccosta research harness is a new standard for LLM harnesses as of November 2026.
+The piccosta research harness is, in my own biased opinion, the best harness for LLMs ever released, as of October 2026.
 Created to make coding agents more reliable in research, turned into a highly performant rust based harness that outperforms anything released to the public, for multi agent management, for cost and tool reliability, for customization, for system resource usage, and with many modern features. It is an active area of research.
 
 piccosta is one agent harness for every model you use:
@@ -138,7 +138,7 @@ To install the release binary:
 
 ```sh
 mkdir -p ~/.local/bin
-curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.1/piccosta-x86_64-linux -o ~/.local/bin/piccosta
+curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.2/piccosta-x86_64-linux -o ~/.local/bin/piccosta
 chmod +x ~/.local/bin/piccosta   # or put it anywhere on your PATH
 ```
 
