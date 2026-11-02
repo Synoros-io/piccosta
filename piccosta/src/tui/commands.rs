@@ -488,18 +488,10 @@ impl App {
             self.notice = Some(format!("Closed “{title}”: it was never saved."));
             return;
         };
-        // The Claude bridge's record of the session and its inbox go with it, where there are any.
-        for suffix in [crate::provider::claude::SIDECAR_SUFFIX, ".inbox"] {
-            let beside = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
-            if beside.exists() && !trash(&beside) {
-                let _ = std::fs::remove_file(&beside);
-            }
-        }
-        let trashed = trash(&path);
-        self.notice = Some(match (trashed, trashed || std::fs::remove_file(&path).is_ok()) {
-            (true, _) => format!("Moved “{title}” to the trash."),
-            (false, true) => format!("Deleted “{title}”."),
-            (false, false) => format!("Could not delete {}.", path.display()),
+        self.notice = Some(match trash_session(&path) {
+            Some(true) => format!("Moved “{title}” to the trash."),
+            Some(false) => format!("Deleted “{title}”."),
+            None => format!("Could not delete {}.", path.display()),
         });
     }
 
@@ -807,6 +799,20 @@ fn markdown(messages: &[AgentMessage]) -> String {
 // create_new, as the spec asks, so two deletes never take one name; a name already taken gets .2,
 // .3 and so on. Output: whether the file is in the trash. It isn't when the rename would cross file
 // systems (the spec's per-volume trash folders aren't done), and the caller deletes it instead.
+// A session's file to the trash, with the files beside it (the Claude bridge's record of it, its
+// inbox), each deleted instead where it can't go there. Output: Some(true) when the session's file
+// is in the trash, Some(false) when it was deleted, None when it's still there.
+pub(crate) fn trash_session(path: &Path) -> Option<bool> {
+    for suffix in [crate::provider::claude::SIDECAR_SUFFIX, ".inbox"] {
+        let beside = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        if beside.exists() && !trash(&beside) {
+            let _ = std::fs::remove_file(&beside);
+        }
+    }
+    let trashed = trash(path);
+    (trashed || std::fs::remove_file(path).is_ok()).then_some(trashed)
+}
+
 fn trash(file: &Path) -> bool {
     use std::os::unix::fs::DirBuilderExt;
     let trash = crate::config::data_home().join("Trash");

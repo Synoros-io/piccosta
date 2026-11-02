@@ -4,7 +4,7 @@
 // here tagged with its slot, so a session keeps working while another one is on screen.
 
 mod clip;
-mod commands;
+pub(crate) mod commands;
 mod render;
 mod state;
 mod tex;
@@ -958,7 +958,9 @@ impl App {
         if self.history.last() != Some(&text) {
             self.history.push(text.clone());
         }
+        // A command is its name right after the slash; "/ something" is a message like any other.
         if let Some(command) = text.strip_prefix('/')
+            && command.starts_with(|character: char| !character.is_whitespace())
             && self.command(command.trim())
         {
             return;

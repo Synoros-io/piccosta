@@ -110,6 +110,8 @@ const INACTIVE_MINUTES: u64 = 30;
 const LIST_LIMIT: usize = 40;
 const READ_MESSAGES: usize = 6;
 const READ_CHARS: usize = 3_000;
+// The sessions a manager started, one file path a line in its home: the ones it may delete.
+const STARTED_FILE: &str = "started";
 // How long a lane's file has to stay still after a finished turn before the manager hears of it:
 // a pair's next turn, or a run's last writes, start within that.
 const TURN_SETTLE_SECONDS: u64 = 5;
@@ -795,12 +797,12 @@ impl Tool for SessionsTool {
     fn definition(&self) -> crate::message::ToolDefinition {
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "projects", "read", "start", "message", "stop", "close", "usage"]},
+                    "action": {"type": "string", "enum": ["list", "projects", "read", "start", "message", "stop", "close", "delete", "usage"]},
                     "session": {"type": "string", "description": "A session's id, the start of one, or its name"},
                     "count": {"type": "number", "description": "How many messages read shows"},
                     "dir": {"type": "string", "description": "The directory a new session works in"},
@@ -842,6 +844,8 @@ impl Tool for SessionsTool {
                     }
                     let model = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
+                    // Kept, so this manager may delete it later: a manager deletes only what it made.
+                    let _ = fs::OpenOptions::new().create(true).append(true).open(self.home.join(STARTED_FILE)).and_then(|mut list| writeln!(list, "{}", file.display()));
                     let (id, name) = (session_id(&file), crate::host::title(&session));
                     drop(session);
                     let what = if manager { format!("{}'s project manager", dir.display()) } else { format!("a session in {}", dir.display()) };
@@ -897,7 +901,27 @@ impl Tool for SessionsTool {
                     let stopped = if runs.is_empty() { String::new() } else { format!(", and its run (pid {}) stopped", runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")) };
                     text(format!("Closed \"{}\"{stopped}. A message to it opens it again.", summary.title))
                 }
-                other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close or usage")),
+                // Delete a session this manager started: to the trash, with the Claude bridge's record
+                // and its inbox. A session still running is left alone.
+                "delete" => {
+                    let summary = find(&self.agent_dir, need("session")?)?;
+                    let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default();
+                    if !started.lines().any(|line| Path::new(line) == summary.path) {
+                        return Err(format!("\"{}\" wasn't started by you, and you delete only sessions you started; close it instead (`sessions close`).", summary.title));
+                    }
+                    if crate::session::held_elsewhere(&summary.path) {
+                        return Err(format!("\"{}\" is running; stop it (`sessions stop`) or close it first, then delete it.", summary.title));
+                    }
+                    let mut lanes = load_lanes(&self.home);
+                    lanes.retain(|lane| lane.file != summary.path);
+                    save_lanes(&self.home, &lanes);
+                    text(match crate::tui::commands::trash_session(&summary.path) {
+                        Some(true) => format!("Moved \"{}\" to the trash.", summary.title),
+                        Some(false) => format!("Deleted \"{}\".", summary.title),
+                        None => return Err(format!("Could not delete {}.", summary.path.display())),
+                    })
+                }
+                other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close, delete or usage")),
             }
         })
     }
