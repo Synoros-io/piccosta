@@ -262,6 +262,9 @@ pub struct AgentConfig {
     pub cwd: PathBuf,
     // The system prompt as sections (prompt.rs).
     pub sections: IndexMap<String, String>,
+    // Whether the prompt carries the session's AGENTS.md files (--no-context-files turns them off);
+    // they're read again before each run.
+    pub context_files: bool,
     pub retry: RetrySettings,
     // When to compact, resolved for this model.
     pub compaction: CompactionSettings,
@@ -374,10 +377,15 @@ impl Agent {
 
     // Switch models for the next request. The prompt sections and compaction settings depend on
     // the model, so the caller resolves them again; the thinking level is clamped to the new
-    // model. The session records both changes.
+    // model. The session records both changes. Picking the model the session is already on records
+    // nothing: a model change lets the prompt be brought up to date, which rewrites the cache, and a
+    // frontend that sets the model it's already on after each run left a model change after every
+    // answer in real sessions (2026-11-01).
     pub fn set_model(&mut self, model: Model, sections: IndexMap<String, String>, compaction: CompactionSettings) -> std::io::Result<()> {
-        let base = self.session.next_base();
-        self.session.append(SessionEntry::ModelChange { base, provider: model.provider.clone(), model_id: model.id.clone() })?;
+        if (&model.provider, &model.id) != (&self.config.model.provider, &self.config.model.id) {
+            let base = self.session.next_base();
+            self.session.append(SessionEntry::ModelChange { base, provider: model.provider.clone(), model_id: model.id.clone() })?;
+        }
         self.config.model = model;
         self.config.sections = sections;
         // The new model's compaction numbers, with the session's on/off kept (/autocompact).
@@ -436,6 +444,13 @@ impl Agent {
 
     // The system message that brings the session's prompt and tools up to date, or None when they
     // already are (system-prompt.ts diffSystemPromptSections, agent-loop.ts declareToolChanges).
+    // A session keeps the prompt it has: any change to it rewrites the provider's whole prompt
+    // cache (a new build's prompt text did that to every running session on its next turn,
+    // 11.9M tokens written in a day, 2026-11-01). So it's brought up to date only when it has none
+    // yet, at a compaction or a model change (which start a new cache anyway), or when what it's
+    // built from changed: its context files (prompt::INPUT_SECTIONS) or what a tool can be called
+    // with, its name and parameters (a subagent job added or removed changes the job enum in the
+    // subagent tool's parameters). A tool's description, like the prompt's wording, waits.
     fn system_update(&self) -> Option<SystemMessage> {
         let messages = crate::message::to_model_messages(&self.session.context().messages);
         let current = transcript::current_system_message(&messages);
@@ -444,6 +459,20 @@ impl Agent {
             .and_then(|system| system.sections.as_ref())
             .map(|sections| sections.iter().filter_map(|(name, text)| text.clone().map(|text| (name.clone(), text))).collect())
             .unwrap_or_default();
+        let current_tools: Vec<ToolDefinition> = current.and_then(|system| system.tools_added).unwrap_or_default();
+        let desired: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
+        let callable = |tool: &ToolDefinition| current_tools.iter().any(|held| (&held.name, &held.parameters) == (&tool.name, &tool.parameters));
+        let tools_changed = desired.len() != current_tools.len() || !desired.iter().all(callable);
+        let inputs_changed = crate::prompt::INPUT_SECTIONS.iter().any(|name| previous.get(*name) != self.config.sections.get(*name)) || tools_changed;
+        // The newest of a system message, a compaction or a model change, walking back from the leaf.
+        let since_reset = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
+            SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
+            SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
+            _ => None,
+        });
+        if !previous.is_empty() && since_reset != Some(true) && !inputs_changed {
+            return None;
+        }
         let mut patch: IndexMap<String, Option<String>> = IndexMap::new();
         for (name, text) in &self.config.sections {
             if previous.get(name) != Some(text) {
@@ -456,8 +485,6 @@ impl Agent {
             }
         }
 
-        let current_tools: Vec<ToolDefinition> = current.and_then(|system| system.tools_added).unwrap_or_default();
-        let desired: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
         let added: Vec<ToolDefinition> = desired.iter().filter(|tool| !current_tools.contains(tool)).cloned().collect();
         let removed: Vec<ToolReference> = current_tools
             .iter()
@@ -474,6 +501,13 @@ impl Agent {
             tools_removed: (!removed.is_empty()).then_some(removed),
             timestamp: clock::now_ms(),
         })
+    }
+
+    // Read the session's AGENTS.md files again, unless they're off.
+    fn reload_context_files(&mut self) {
+        if self.config.context_files {
+            crate::prompt::reload_context_files(&mut self.config.sections, &self.config.cwd, &crate::config::agent_dir());
+        }
     }
 
     // Add a message to the session and announce it. Custom messages are their own entry type.
@@ -542,12 +576,13 @@ impl Agent {
         starting.push(first);
         let mut aborted = false;
         loop {
+            self.reload_context_files();
             if let Some(system) = self.system_update() {
                 starting.insert(0, AgentMessage::System(system));
             }
             let outcome = self.run(std::mem::take(&mut starting)).await?;
             // The end of a run, which a Claude query still parked on tool calls doesn't outlive.
-            provider::claude::end_run(self.session.id()).await;
+            provider::claude::end_run(self.session.id());
             if outcome.aborted {
                 aborted = true;
                 break;
@@ -664,6 +699,10 @@ impl Agent {
             self.add_message(message, &mut new_messages)?;
         }
         loop {
+            // Before each response, with all it will carry in the session (the starting messages,
+            // steering, job notices): compact if it wouldn't fit (agent-session.ts
+            // _compactBeforeNextAssistantResponse).
+            self.compact_before_next_response().await?;
             let (assistant, entry_id) = self.respond().await?;
             new_messages.push(AgentMessage::Assistant(assistant.clone()));
 
@@ -725,17 +764,10 @@ impl Agent {
             let aborted = self.cancel.is_cancelled();
             // Background jobs that finished during the turn, and what the user queued to steer,
             // go into the next one.
-            let mut steering = if aborted { Vec::new() } else { self.steering() };
+            let steering = if aborted { Vec::new() } else { self.steering() };
             if aborted || (!has_calls && steering.is_empty()) {
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
                 return Ok(RunOutcome { aborted, retry: None, last_assistant: Some((assistant, entry_id)) });
-            }
-            // Before the next response: compact if the context crossed the threshold
-            // (agent-session.ts _compactBeforeNextAssistantResponse). A job that finished while it
-            // ran steers this turn, when nothing else does yet (agent-loop.ts:206-213).
-            self.compact_before_next_response().await?;
-            if steering.is_empty() {
-                steering = self.steering();
             }
             (self.emit)(&Event::TurnStart);
             // What's left queued, just before the queued messages start, where pi says it.
@@ -856,6 +888,13 @@ impl Agent {
         };
         (self.emit)(&Event::MessageEnd { message: AgentMessage::Assistant(message.clone()) });
         let id = self.session.append_message(AgentMessage::Assistant(message.clone())).map_err(|error| format!("Could not write the session: {error}"))?;
+        // The cache monitor: a response that had to write most of its context to the cache again
+        // is recorded with its cause, and the session's views show it as one line.
+        if let Some(miss) = crate::cache::check(&self.session, &id, provider::claude::take_rewrite(self.session.id())) {
+            let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: crate::cache::MISS_TYPE.into(), data: Some(miss) };
+            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+            (self.emit)(&Event::EntryAppended { entry });
+        }
         // A response that neither failed nor ran out of room ends any overflow recovery.
         if !matches!(message.stop_reason, StopReason::Error | StopReason::Length) {
             self.overflow_recovery_attempted = false;
@@ -1021,8 +1060,11 @@ impl Agent {
         Ok(false)
     }
 
-    // Between turns: compact when the context about to be sent is past the threshold
-    // (agent-session.ts _compactBeforeNextAssistantResponse).
+    // Right before a response, inside a run (its messages and tool results all in): compact only
+    // when the request wouldn't fit, since a compaction rewrites the whole prompt cache (on the Claude
+    // bridge, all of it). So compactAt waits for the turn's end, and the room kept for the reply
+    // is reserveTokens, except on the bridge, whose window already keeps it (claude effective_window).
+    // An estimate that falls short still gets the overflow's compact-and-retry after the run.
     async fn compact_before_next_response(&mut self) -> Result<(), String> {
         let context_window = self.config.model.context_window;
         if context_window == 0 {
@@ -1033,7 +1075,9 @@ impl Agent {
             let branch = self.session.path_to_leaf();
             compaction::estimate_projected_context_tokens(&projection, &branch).tokens
         };
-        if compaction::should_compact(tokens, context_window, self.config.compaction) {
+        let reply_room = if self.config.model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
+        let last_resort = CompactionSettings { compact_at: None, reserve_tokens: reply_room, ..self.config.compaction };
+        if compaction::should_compact(tokens, context_window, last_resort) {
             self.run_auto_compaction(Reason::Threshold, false, None).await?;
         }
         Ok(())
@@ -1113,6 +1157,16 @@ impl Agent {
                 Some(summary.usage.clone()),
             )
             .map_err(write_error)?;
+        // The compacted context starts a new cache anyway, so the prompt is brought up to date now,
+        // before the first response on it: a compaction inside a tool loop goes straight on to the
+        // next response, and an update left for the next run would rewrite the cache a second time.
+        self.reload_context_files();
+        if let Some(system) = self.system_update() {
+            let message = AgentMessage::System(system);
+            (self.emit)(&Event::MessageStart { message: message.clone() });
+            (self.emit)(&Event::MessageEnd { message: message.clone() });
+            self.session.append_message(message).map_err(write_error)?;
+        }
         if let Some(pin) = &pin {
             let stats_id = self.session.append_custom(pintask::STATS_ENTRY, Some(pin.stats(&compaction_id))).map_err(write_error)?;
             if let Some(entry) = self.session.entry(&stats_id).cloned() {

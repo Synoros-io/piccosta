@@ -43,9 +43,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
-// The soft limit before a command moves to the background. 60 s is dsh-base's default bash
-// timeout (dsh:packages/bundle/base/cordis.patch.yml:249-253).
-const DEFAULT_SOFT_LIMIT_SECONDS: f64 = 60.0;
+// The soft limit before a command moves to the background: long enough for the quick commands
+// (ls, cat, rg, git status) to answer in place, short enough that nothing holds a session up.
+// $PICCOSTA_LONGCMD_SOFT_S changes it; 0 sends every command to the background.
+const DEFAULT_SOFT_LIMIT_SECONDS: f64 = 2.0;
 const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
 const DEFAULT_JOB_DIR: &str = ".pi-jobs";
 const JOB_DIR_ENV: &str = "PICCOSTA_LONGCMD_DIR";
@@ -200,7 +201,7 @@ impl Jobs {
     // Input: where finish messages go. Settings come from the environment (see the constants).
     pub fn new(notices: mpsc::UnboundedSender<CustomMessage>) -> Jobs {
         Jobs {
-            soft_limit: seconds_from_env(SOFT_LIMIT_ENV, Some(DEFAULT_SOFT_LIMIT_SECONDS)).unwrap_or(Duration::from_secs(60)),
+            soft_limit: seconds_from_env(SOFT_LIMIT_ENV, Some(DEFAULT_SOFT_LIMIT_SECONDS)).unwrap_or(Duration::from_secs_f64(DEFAULT_SOFT_LIMIT_SECONDS)),
             hold: seconds_from_env(HOLD_ENV, None),
             path_hints: std::env::var(PATH_HINTS_ENV).map_or(true, |value| value != "0"),
             job_dir_override: std::env::var(JOB_DIR_ENV).ok().filter(|dir| !dir.is_empty()),

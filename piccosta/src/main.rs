@@ -106,7 +106,12 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     let json = args.mode.as_deref() == Some("json");
     let host = piccosta::host::Host::for_args(&args);
     host.show_settings_errors();
-    let session = host.opening(&args)?;
+    let mut session = host.opening(&args)?;
+    // A subagent's new session records its job as its kind, whose tools and readOnly it then runs
+    // with, now and whenever it's reopened.
+    if let Some(job) = std::env::var(piccosta::tools::subagent::CHILD_ENV).ok().filter(|_| session.entries().is_empty()) {
+        piccosta::manager::set_work(&mut session, &job).map_err(|error| format!("could not write the session: {error}"))?;
+    }
     let emit: piccosta::agent::EventSink = if json {
         Box::new(|event: &Event| write_line(&serde_json::to_string(event).unwrap_or_default()))
     } else {
@@ -187,11 +192,14 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
             }
         }
         if let Err(error) = answered {
+            piccosta::provider::claude::shutdown().await;
             tool_shared.jobs.shutdown("error");
             tool_shared.web.shutdown();
             return Err(error);
         }
     }
+    // The last answer's Claude query waits for a next message that won't come here.
+    piccosta::provider::claude::shutdown().await;
     tool_shared.jobs.shutdown("quit");
     tool_shared.web.shutdown();
     // A subagent's session is one task: done when its run is, so it closes and leaves its parent's
@@ -249,6 +257,11 @@ async fn main() -> ExitCode {
         Some("assistant") => return piccosta::manager::run(cli::parse(&arguments[1..])).await.unwrap_or_else(fail),
         // `piccosta zed [dir]`, `piccosta t3 [dir]`: the GUI, running piccosta as its agent.
         Some(gui @ ("zed" | "t3")) => return piccosta::gui::open(gui, &arguments[1..]).map_or_else(fail, |()| ExitCode::SUCCESS),
+        // `piccosta cache [hours]`: the prompt-cache misses across sessions (cache.rs).
+        Some("cache") => {
+            print!("{}", piccosta::cache::report(&config::agent_dir(), arguments.get(1).map(String::as_str)));
+            return ExitCode::SUCCESS;
+        }
         Some("tell") => {
             let text = arguments[1..].join(" ");
             let Some(file) = piccosta::manager::session_file(&config::agent_dir()) else { return fail("no assistant yet: start it with `piccosta assistant`".into()) };

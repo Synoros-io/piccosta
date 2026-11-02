@@ -32,6 +32,20 @@ const CONTEXT_FILE_NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENT
 // doesn't belong in every request either.
 const IMPORT_MAX_BYTES: usize = crate::tools::truncate::DEFAULT_MAX_BYTES;
 
+// The sections built from the session's own files rather than piccosta's text: its AGENTS.md /
+// CLAUDE.md files and its directory. A running session takes a change to these at once; a change to
+// any other section (a new build's wording, the constitution, SYSTEM.md, APPEND_SYSTEM.md, the
+// manager's part) waits for its next compaction or model change (agent.rs system_update).
+pub const INPUT_SECTIONS: [&str; 2] = ["project_context", "cwd"];
+// How recently a context file may have been written for its new text to be taken: a save that
+// truncates the file and then writes it is mid-way for milliseconds, and a read then would put half
+// a file in the prompt and the whole one in the next, two rewrites for one edit. Two seconds is far
+// past any such save and well short of the time to the next message.
+const SAVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+// The last good bytes of every context file and import read in this piccosta process, by path.
+static SNAPSHOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
+
 // The constitution: PICCOSTA_CONSTITUTION holds the text itself (how the bench passes it into a
 // sandbox), PICCOSTA_CONSTITUTION_FILE a path to it. With neither, prompts/constitution.md, the
 // text this binary was built with. PICCOSTA_CONSTITUTION_FILE set to an empty string turns it off.
@@ -44,19 +58,54 @@ pub struct ContextFile {
     pub content: String,
 }
 
-fn read_context_file(dir: &Path) -> Option<ContextFile> {
+// What reading the context files ran into: the files that couldn't be read and had no last good
+// bytes to stand in, and whether one was still being saved with none (piccosta just started).
+#[derive(Default)]
+struct Reads {
+    failures: Vec<String>,
+    unsettled: bool,
+}
+
+impl Reads {
+    // A file's bytes, or None when it's not there (only a not-found says so). A file that can't be
+    // read, or was written under SAVE_SETTLE ago, gives its last good bytes instead, so each file
+    // keeps its own and the rest still update; one with none that can't be read is a failure.
+    fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
+        let read = std::fs::metadata(path).and_then(|metadata| Ok((metadata.modified()?, std::fs::read(path)?)));
+        let mut snapshots = SNAPSHOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match read {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                snapshots.remove(path);
+                None
+            }
+            Ok((written, bytes)) if !written.elapsed().is_ok_and(|age| age < SAVE_SETTLE) => {
+                snapshots.insert(path.to_path_buf(), bytes.clone());
+                Some(bytes)
+            }
+            // Still being saved: its last good bytes, or with none these, marked unsettled, so a
+            // session that holds instructions keeps them and a new one starts with what's there.
+            Ok((_, bytes)) => snapshots.get(path).cloned().or_else(|| {
+                self.unsettled = true;
+                Some(bytes)
+            }),
+            Err(error) => snapshots.get(path).cloned().or_else(|| {
+                self.failures.push(format!("Could not read {}: {error}", path.display()));
+                None
+            }),
+        }
+    }
+}
+
+fn read_context_file(dir: &Path, reads: &mut Reads) -> Option<ContextFile> {
     for name in CONTEXT_FILE_NAMES {
         let path = dir.join(name);
-        if !path.is_file() {
+        if path.is_dir() {
             continue;
         }
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let content = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
-                return Some(ContextFile { path, content });
-            }
-            Err(error) => eprintln!("Warning: Could not read {}: {error}", path.display()),
+        if let Some(bytes) = reads.read(&path) {
+            let text = String::from_utf8_lossy(&bytes);
+            let content = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
+            return Some(ContextFile { path, content });
         }
     }
     None
@@ -94,7 +143,7 @@ fn git_paths(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
 // copy of the repo's AGENTS.md; loading both would give the model the same instructions twice.
 // Output: the main checkout's context file that the worktree's copy stands in for
 // (resource-loader.ts:203-227).
-fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+fn shadowed_context_file(cwd: &Path, reads: &mut Reads) -> Option<PathBuf> {
     let (repo_dir, common_git_dir) = git_paths(cwd)?;
     let common_git_dir = crate::tools::paths::canonical(&common_git_dir);
     let worktree_root = crate::tools::paths::canonical(&repo_dir);
@@ -105,24 +154,24 @@ fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
     if crate::tools::paths::canonical(&main_root.join(".git")) != common_git_dir {
         return None;
     }
-    let worktree_file = read_context_file(&worktree_root)?;
+    let worktree_file = read_context_file(&worktree_root, reads)?;
     Some(main_root.join(worktree_file.path.file_name()?))
 }
 
 // The context files for a session (resource-loader.ts:229-273): the agent dir's own first, then
 // every ancestor directory's, outermost first, ending with the cwd's.
-pub fn context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
+fn context_files(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = Vec::new();
-    if let Some(global) = read_context_file(agent_dir) {
+    if let Some(global) = read_context_file(agent_dir, reads) {
         seen.push(global.path.clone());
         files.push(global);
     }
-    let shadowed = shadowed_context_file(cwd);
+    let shadowed = shadowed_context_file(cwd, reads);
     let mut ancestors = Vec::new();
     let mut dir = cwd.to_path_buf();
     loop {
-        if let Some(file) = read_context_file(&dir) {
+        if let Some(file) = read_context_file(&dir, reads) {
             let real_dir = crate::tools::paths::canonical(&dir);
             let is_shadowed = shadowed.as_ref().is_some_and(|shadowed| file.path.file_name().is_some_and(|name| real_dir.join(name) == *shadowed));
             if !is_shadowed && !seen.contains(&file.path) {
@@ -155,7 +204,7 @@ fn import_target(raw: &str, importing_file: &Path) -> PathBuf {
 
 // One context file's text with each import line replaced by the file it names (lean.ts:77-101).
 // Input: the file, and the real paths of every context file already in the prompt.
-fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf]) -> String {
+fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], reads: &mut Reads) -> String {
     let mut imported_here: Vec<PathBuf> = Vec::new();
     let lines: Vec<String> = file
         .content
@@ -169,10 +218,10 @@ fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf]) -> String {
             if in_prompt.contains(&target) || imported_here.contains(&target) {
                 return line.to_string();
             }
-            let Ok(bytes) = std::fs::read(&target) else { return line.to_string() };
             if target.is_dir() {
                 return line.to_string();
             }
+            let Some(bytes) = reads.read(&target) else { return line.to_string() };
             imported_here.push(target);
             let mut text = if bytes.len() > IMPORT_MAX_BYTES {
                 format!("{}\n[{raw} cut at {IMPORT_MAX_BYTES} bytes; read the file for the rest]", String::from_utf8_lossy(&bytes[..IMPORT_MAX_BYTES]))
@@ -214,6 +263,8 @@ pub struct PromptInputs<'a> {
     pub constitution: Option<String>,
     // AGENTS.md / CLAUDE.md files go in unless --no-context-files.
     pub context_files: bool,
+    // The project_context section the session holds, if it has one.
+    pub held_context: Option<String>,
 }
 
 // pi's rules: one line for shell file work, each tool's guidelines in tool order, then two of its
@@ -235,6 +286,8 @@ fn rules(tools: &[Arc<dyn Tool>]) -> String {
             add(guideline);
         }
     }
+    // People watch a session work: a run of tool calls with no word between them reads as a hang.
+    add("Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first");
     add("Be concise in your responses");
     add("Show file paths clearly when working with files");
     rules.iter().map(|rule| format!("- {rule}")).collect::<Vec<_>>().join("\n")
@@ -259,26 +312,75 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
     if let Some(append) = inputs.append_prompt.as_ref().filter(|text| !text.is_empty()) {
         raw.insert("addendum".into(), append.clone());
     }
-    let files = if inputs.context_files { context_files(inputs.cwd, inputs.agent_dir) } else { Vec::new() };
-    if !files.is_empty() {
-        let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
-        let mut parts = vec!["Project-specific instructions and guidelines:".to_string()];
-        for file in &files {
-            parts.push(format!("<project_instructions path=\"{}\">\n{}\n</project_instructions>", file.path.display(), expand_imports(file, &in_prompt)));
-        }
-        raw.insert("project_context".into(), parts.join("\n\n"));
+    let mut reads = Reads::default();
+    let project = inputs.context_files.then(|| project_context(inputs.cwd, inputs.agent_dir, &mut reads)).flatten();
+    // A file that can't be read with no last good bytes in this process (piccosta just started): a
+    // session that holds instructions keeps them, rather than lose that file's.
+    let held = inputs.held_context.as_deref().and_then(|held| held.strip_prefix("<project_context>\n")?.strip_suffix("\n</project_context>"));
+    let project = if reads.failures.is_empty() && !reads.unsettled { project } else { held.map(String::from).or(project) };
+    if let Some(project) = project {
+        raw.insert("project_context".into(), project);
+    }
+    for failure in reads.failures {
+        eprintln!("Warning: {failure}");
     }
     raw.insert("cwd".into(), inputs.cwd.to_string_lossy().replace('\\', "/"));
 
     let mut sections = IndexMap::new();
     for (name, content) in raw {
-        let value = if name == "preamble" { content } else { format!("<{name}>\n{content}\n</{name}>") };
+        let value = if name == "preamble" { content } else { tagged(&name, &content) };
         sections.insert(name, value);
     }
     if let Some(constitution) = &inputs.constitution {
         sections.insert("constitution".into(), constitution.clone());
     }
     sections
+}
+
+// A section as the prompt carries it: its text inside a tag named for it.
+fn tagged(name: &str, content: &str) -> String {
+    format!("<{name}>\n{content}\n</{name}>")
+}
+
+// The project_context section's text: every context file for the session, imports expanded, or
+// None when there are none.
+fn project_context(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Option<String> {
+    let files = context_files(cwd, agent_dir, reads);
+    let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
+    let mut parts = vec!["Project-specific instructions and guidelines:".to_string()];
+    for file in &files {
+        parts.push(format!("<project_instructions path=\"{}\">\n{}\n</project_instructions>", file.path.display(), expand_imports(file, &in_prompt, reads)));
+    }
+    (!files.is_empty()).then(|| parts.join("\n\n"))
+}
+
+// Read a running session's context files again into its sections, so an AGENTS.md edited, added or
+// removed since it opened reaches the next request. The section keeps its place, and a new one goes
+// where sections() puts it, just before cwd. A file that can't be read, or is still being saved,
+// goes in as it last read whole (Reads::read); one that never did leaves the section as it was,
+// since dropping instructions that are still there would rewrite the cache now and again once
+// they read. The next run reads them again.
+pub fn reload_context_files(sections: &mut IndexMap<String, String>, cwd: &Path, agent_dir: &Path) {
+    let mut reads = Reads::default();
+    let project = project_context(cwd, agent_dir, &mut reads);
+    if !reads.failures.is_empty() || reads.unsettled {
+        return;
+    }
+    match project {
+        Some(project) => {
+            let text = tagged("project_context", &project);
+            match sections.get_index_of("project_context") {
+                Some(index) => sections[index] = text,
+                None => {
+                    let before_cwd = sections.get_index_of("cwd").unwrap_or(sections.len());
+                    sections.shift_insert(before_cwd, "project_context".into(), text);
+                }
+            }
+        }
+        None => {
+            sections.shift_remove("project_context");
+        }
+    }
 }
 
 // The agent dir's SYSTEM.md and APPEND_SYSTEM.md, when present (resource-loader.ts:1213-1239).

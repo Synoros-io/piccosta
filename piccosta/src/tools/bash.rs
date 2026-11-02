@@ -312,15 +312,25 @@ fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), S
     process.env("PI_PROVIDER", &context.provider).env("PI_MODEL", &context.model_id).env("PI_REASONING_LEVEL", &context.thinking_level);
 
     // Its own session, as Node's detached spawn does: a process group we can kill as one, and no
-    // controlling terminal, so nothing it runs can grab the TUI's keyboard.
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
+    // controlling terminal, so nothing it runs can grab the TUI's keyboard. A read-only job's
+    // shell goes in the read-only sandbox too (readonly.rs), on a kernel that can hold it.
+    let read_only = context.shared.read_only;
+    if read_only {
+        super::readonly::check()?;
+    }
+    // SAFETY: setsid() and the sandbox's system calls are async-signal-safe and run in the child
+    // between fork and exec.
     unsafe {
-        process.pre_exec(|| {
+        process.pre_exec(move || {
             libc::setsid();
+            if read_only {
+                super::readonly::enter()?;
+            }
             Ok(())
         });
     }
-    let child = process.spawn().map_err(|error| format!("spawn {} {}", shell.display(), super::paths::error_code(&error)))?;
+    let sandbox = if read_only { " in the read-only sandbox (Landlock)" } else { "" };
+    let child = process.spawn().map_err(|error| format!("spawn {}{sandbox} {}", shell.display(), super::paths::error_code(&error)))?;
     // The Command holds the pipe's write ends; they close here, so the pipe ends with the shell's
     // own copies. Dropping a std Child reaps nothing: exit_of does that.
     drop(process);
@@ -531,7 +541,10 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     let mut update_at: Option<tokio::time::Instant> = None;
 
     let outcome = loop {
+        // In order: a move to the background ahead of an abort, so Esc (which asks for both) leaves
+        // the command running as a job instead of killing it.
         tokio::select! {
+            biased;
             event = events.recv() => match event {
                 Some(Event::Data(data)) => {
                     output.append(&data);
@@ -564,7 +577,6 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
                     send_update(context, &mut output);
                 }
             }
-            () = context.cancel.cancelled(), if !kill.is_cancelled() => kill.cancel(),
             () = async {
                 tokio::select! {
                     () = &mut soft_limit => {}
@@ -580,6 +592,7 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
                     }
                 }
             }
+            () = context.cancel.cancelled(), if !kill.is_cancelled() => kill.cancel(),
         }
     };
 

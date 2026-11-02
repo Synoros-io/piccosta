@@ -8,13 +8,16 @@
 //
 // The jobs are the model scale's kinds of work (scale.rs): each says what it's for, its models and
 // levels (in the order usage allows at the time; none means the calling session's own model), its
-// tools (all when it lists none) and its instructions, appended to the subagent's system prompt.
+// tools (all when it lists none), whether its commands may change files (readOnly: bash runs in
+// a sandbox that can't, readonly.rs) and its instructions, appended to the subagent's system prompt.
 //
 // A run is a child piccosta in print mode, started through bash's runner, so it is a shell command
 // like any other the session runs: its output streams to the UI, an abort kills it, one still going
 // at the soft limit becomes a background job whose message arrives when it ends, and print mode
 // waits for it. The child's session goes in a `subagents` folder next to the parent's, out of the
-// parent folder's list. A subagent gets no subagent tool of its own (CHILD_ENV).
+// parent folder's list. A subagent gets no subagent tool of its own (CHILD_ENV), and its session
+// records its job as its kind of work, so it has the job's tools and readOnly when it's reopened
+// too (host.rs tool_list).
 
 use super::{Tool, ToolContext, ToolFuture};
 use crate::auth::{credential_for, CredentialPaths};
@@ -34,6 +37,7 @@ struct Job {
     name: String,
     description: String,
     tools: Option<String>,
+    read_only: bool,
     prompt: String,
 }
 
@@ -57,6 +61,7 @@ impl SubagentTool {
             .map(|(name, entry)| Job {
                 description: text(&entry, "for").unwrap_or_default(),
                 tools: Some(strings(&entry, "tools").join(",")).filter(|tools| !tools.is_empty()),
+                read_only: entry.get("readOnly").and_then(Value::as_bool) == Some(true),
                 prompt: text(&entry, "instructions").unwrap_or_default(),
                 name,
             })
@@ -106,7 +111,6 @@ impl SubagentTool {
             Some(file) => format!("--session-dir {}", quote(&file.parent().unwrap_or(Path::new(".")).join("subagents").to_string_lossy())),
             None => "--no-session".to_string(),
         }];
-        flags.extend(job.tools.as_ref().map(|tools| format!("--tools {}", quote(tools))));
         if !job.prompt.is_empty() {
             flags.push(format!("--append-system-prompt {}", quote(&job.prompt)));
         }
@@ -132,7 +136,8 @@ impl SubagentTool {
                 let models = if models.is_empty() { "your own model".to_string() } else { models };
                 let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
                 let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
-                format!("{}: {}. Runs on {models}.{owns}", job.name, job.description)
+                let read_only = if job.read_only { " Changes no files." } else { "" };
+                format!("{}: {}. Runs on {models}.{read_only}{owns}", job.name, job.description)
             })
             .collect()
     }
@@ -149,7 +154,7 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory and returns its final answer. You choose the job; the user chose the models each job runs on, and the first one available is used. The subagent knows only the task you give it, so include the paths, what you already know and what you want back. One that runs long moves to the background, and you get a message when it ends.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent knows only the task you give it, so include the paths, what you already know and what you want back.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",
@@ -176,15 +181,17 @@ impl Tool for SubagentTool {
                 return Err(format!("No subagent job \"{name}\". Jobs: {}", names.join(", ")));
             };
             let models = self.available(job, context).await?;
-            super::bash::run_own(self.command(job, task, models, context)?, context).await
+            // Straight to the background: a subagent runs for minutes, and the session stays free
+            // to answer meanwhile; its answer comes back as the job's message.
+            super::bash::run_in_background(self.command(job, task, models, context)?, context).await
         })
     }
 }
 
 // The program name a piccosta process has in /proc/<pid>/comm.
-const PROCESS_NAME: &str = "piccosta";
+pub const PROCESS_NAME: &str = "piccosta";
 // The variable bash sets to the session that ran a command, which everything it starts inherits.
-const SESSION_ENV: &str = "PI_SESSION_ID";
+pub const SESSION_ENV: &str = "PI_SESSION_ID";
 // How a piccosta is pointed at another agent dir (config.rs agent_dir).
 const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
 // Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the
@@ -255,5 +262,7 @@ pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, 
 // The tools a job's subagent runs with, for an approval card: its own list, or "all tools".
 pub fn tools_of(job: &str) -> String {
     let jobs = SubagentTool::load(&crate::config::agent_dir()).map(|tool| tool.jobs).unwrap_or_default();
-    jobs.into_iter().find(|candidate| candidate.name == job).and_then(|job| job.tools).unwrap_or_else(|| "all tools".into())
+    let Some(job) = jobs.into_iter().find(|candidate| candidate.name == job) else { return "all tools".into() };
+    let tools = job.tools.unwrap_or_else(|| "all tools".into());
+    if job.read_only { format!("{tools}, changing no files") } else { tools }
 }

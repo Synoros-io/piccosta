@@ -276,15 +276,20 @@ impl Host {
     // its task on) and, for a manager (`role`, in `cwd`), its own; cut to --tools when given.
     // A session that can hand work on leaves the tools a kind of work owns to that kind's job, so
     // searching (say) runs on the scale's search models; a manager keeps them all, and so does a
-    // subagent, which has no one to hand them to. --tools naming one keeps it.
-    fn tool_list(&self, role: Option<crate::manager::Role>, cwd: &Path) -> Vec<Arc<dyn tools::Tool>> {
+    // subagent, which has no one to hand them to. --tools naming one keeps it. A session started
+    // for a kind of work (a subagent's job among them) gets exactly the tools its kind lists, owned
+    // or not, else all of them; and none that write when it's read-only, since edit and write run
+    // here, outside its commands' sandbox (work). --exclude-tools still takes any away.
+    fn tool_list(&self, session: &Session) -> Vec<Arc<dyn tools::Tool>> {
+        let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
+        let (work_tools, work_read_only) = self.work(session);
         if !self.tools {
             return Vec::new();
         }
         let mut list = tools::builtin();
         let subagents = std::env::var_os(tools::subagent::CHILD_ENV).is_none().then(|| tools::subagent::SubagentTool::load(&self.agent_dir)).flatten();
-        let owned: Vec<String> = match (&subagents, role) {
-            (Some(_), None) => crate::scale::owned(&self.agent_dir).into_iter().map(|(tool, _)| tool).collect(),
+        let owned: Vec<String> = match (&subagents, role, crate::manager::work(session)) {
+            (Some(_), None, None) => crate::scale::owned(&self.agent_dir).into_iter().map(|(tool, _)| tool).collect(),
             _ => Vec::new(),
         };
         list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
@@ -292,20 +297,39 @@ impl Host {
             list.extend(crate::manager::tools(&self.agent_dir, &self.settings, role, cwd));
         }
         let named = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_some_and(|names| names.iter().any(|name| name == tool.name()));
-        let wanted = |tool: &Arc<dyn tools::Tool>| (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool);
-        list.into_iter().filter(|tool| wanted(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect()
+        let wanted = |tool: &Arc<dyn tools::Tool>| match &work_tools {
+            // A kind's list, narrowed further by an explicit --tools.
+            Some(names) => names.iter().any(|name| name == tool.name()) && (self.tool_names.is_none() || named(tool)),
+            None => (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool),
+        };
+        let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write");
+        list.into_iter().filter(|tool| wanted(tool) && !writes(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect()
+    }
+
+    // The kind of work a session was started for (the sessions tool's `use`, manager.rs work): its
+    // tools (None for all) and whether it's read-only. A session started for none gets (None,
+    // false); one whose kind has since left the scale is read-only, so it doesn't gain rights.
+    fn work(&self, session: &Session) -> (Option<Vec<String>>, bool) {
+        let Some(kind) = crate::manager::work(session) else { return (None, false) };
+        let Some((_, entry)) = crate::scale::jobs(&self.agent_dir).into_iter().find(|(name, _)| *name == kind) else { return (None, true) };
+        let tools: Vec<String> = entry.get("tools").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        (Some(tools).filter(|tools| !tools.is_empty()), entry.get("readOnly").and_then(Value::as_bool) == Some(true))
     }
 
     // The prompt sections for a model (its constitution can differ by model), with a manager's
-    // part when the session is one.
-    pub fn sections(&self, model: &Model, cwd: &Path, role: Option<crate::manager::Role>) -> Result<IndexMap<String, String>, String> {
+    // part when the session is one. The instructions the session holds stand in when a context
+    // file can't be read (prompt::sections).
+    pub fn sections(&self, model: &Model, session: &Session) -> Result<IndexMap<String, String>, String> {
+        let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
+        let messages = crate::message::to_model_messages(&session.context().messages);
+        let held_context = crate::provider::transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
         let constitution = prompt::constitution(&model.name)?;
         let (custom_prompt, discovered_append) = prompt::custom_prompts(&self.agent_dir);
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(&self.settings, role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
-        let tool_list = self.tool_list(role, cwd);
-        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: &tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files }))
+        let tool_list = self.tool_list(session);
+        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: &tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
     }
 
     // A session ready to run. Input: the model and thinking level asked for, if any (else what
@@ -337,7 +361,13 @@ impl Host {
         let thinking_level = remembered.unwrap_or_else(|| if has_thinking { resumed.thinking_level.clone() } else { self.settings.default_thinking_level() });
         let cwd = PathBuf::from(&session.header().cwd);
         let role = crate::manager::role(&session);
-        let sections = self.sections(&model, &cwd, role)?;
+        // Managers are the user's: an agent's command (a test, a lane) doesn't run one in the
+        // user's own agent dir, whether by `piccosta assistant`, a print run or the terminal UI.
+        // A scratch agent dir (PICCOSTA_AGENT_DIR) is for testing them.
+        if role.is_some() {
+            crate::manager::users_only()?;
+        }
+        let sections = self.sections(&model, &session)?;
 
         let (notice_sender, notices) = tokio::sync::mpsc::unbounded_channel();
         let credentials = auth::CredentialPaths::from_environment(&self.agent_dir);
@@ -345,6 +375,7 @@ impl Host {
         if role.is_some() {
             tool_shared.jobs.soft_limit = crate::manager::SOFT_LIMIT;
         }
+        tool_shared.read_only |= self.work(&session).1;
         let tool_shared = Arc::new(tool_shared);
         // A reopened session's stored web results, so its responseIds still page.
         tool_shared.web.store.restore(session.path_to_leaf());
@@ -355,10 +386,11 @@ impl Host {
             registry,
             credentials,
             thinking_level,
-            tools: self.tool_list(role, &cwd),
+            tools: self.tool_list(&session),
             tool_shared: tool_shared.clone(),
             cwd,
             sections,
+            context_files: self.context_files,
             retry: self.settings.retry(),
             compaction,
             transport: self.settings.transport(),
@@ -416,6 +448,8 @@ impl Host {
                 };
                 done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
             }
+            // The session is closed: a Claude query waiting for its next message goes too.
+            crate::provider::claude::close(agent.session.id());
             shared.jobs.shutdown("quit");
             shared.web.shutdown();
         })
@@ -450,7 +484,7 @@ impl Host {
     fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         let model = self.registry()?.resolve(name)?.clone();
-        let sections = self.sections(&model, Path::new(&agent.session.header().cwd), crate::manager::role(&agent.session))?;
+        let sections = self.sections(&model, &agent.session)?;
         let compaction = self.settings.compaction(&model.provider, &model.id);
         let level = self.remembered_thinking_level(&model).unwrap_or_else(|| agent.thinking_level().to_string());
         written(agent.set_model(model, sections, compaction))?;

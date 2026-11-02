@@ -19,6 +19,7 @@ pub mod output;
 pub mod pathhint;
 pub mod paths;
 pub mod read;
+pub mod readonly;
 pub mod reaper;
 pub mod subagent;
 pub mod truncate;
@@ -86,6 +87,9 @@ pub struct ToolShared {
     pub bin_dir: PathBuf,
     // The web tools' client, settings and stored results.
     pub web: web::WebShared,
+    // Whether bash runs in the read-only sandbox: a session for a read-only kind, a read-only job's
+    // subagent among them (host.rs).
+    pub read_only: bool,
 }
 
 impl ToolShared {
@@ -109,6 +113,7 @@ impl ToolShared {
             shell_command_prefix: settings.shell_command_prefix(),
             bin_dir: agent_dir.join("bin"),
             web: web::WebShared::new(settings.web(), agent_dir, registry, credentials),
+            read_only: false,
         }
     }
 }

@@ -5,7 +5,8 @@
 // - the assistant, the main one, which runs as a background service (`piccosta assistant`, under
 //   systemd when `manager.autostart` is on) in <agent dir>/assistant;
 // - a project manager, one per directory: the first session ever started there in the terminal
-//   UI, or one made with /manager. It runs wherever it's opened, or headless when it's messaged;
+//   UI, or one made with /manager. Both are the user's: no agent starts one, and a piccosta an
+//   agent's command started, or one on a scratch agent dir, makes none on its own (host.rs open). It runs wherever it's opened, or headless when it's messaged;
 //   the assistant's service fires its schedules. Its home is <agent dir>/projects/<the directory's
 //   session folder name>.
 //
@@ -62,7 +63,7 @@ How you work:{project}
 - Your ledger ({ledger}) is your running record of what's happening and what's going on {scope}: `ledger append` adds an entry, a line or two, of the lanes you started and why (session ids, models), what each is doing and what came of it, what the user decided, and what's next. piccosta carries its newest entries through your compactions; `ledger search` finds the rest, and anything the user said to you, word for word. A project's own files (AGENTS.md, direction.md, its ledger.md) belong to the project and the sessions working in it; when one of those should change, tell the user.{memory_line}
 - `ledger schedule` keeps messages for you at set times or on a repeat.
 - The sessions you start or message are your lanes. Check in on them while they work, not only when they end: read their latest turns (`sessions read`), and when a lane will run a while, schedule your next look (`ledger schedule`). Act on what you see: a lane stuck, off track, repeating itself or waiting on something gets a message or a stop (`sessions stop`), and the user hears what you did. When a lane finishes a turn you get what it said; tell the user what came of it, then close the lane (`sessions close`: it stops anything the lane still runs and takes it out of the list) once its work is done, or message it with what's next. Don't leave a finished lane open: one left quiet keeps reminding you until you close or update it.
-- A project can have its own manager, a standing session that looks after that project: `sessions list` and `sessions projects` show which. Make one with `sessions start` and `manager: true`, with no message unless the user gave it work; one directory has one. Hand a project's work to its manager (`sessions message`) rather than starting sessions there yourself.
+- A project can have its own manager, a standing session that looks after that project: `sessions list` and `sessions projects` show which. Managers are the user's: they make them in the terminal UI (/manager), and you don't start one. Hand a project's work to its manager (`sessions message`) rather than starting sessions there yourself.
 - Choose models by the user's model scale: start a session with `use`, the kind of work, and piccosta picks the model, moving to the next one when a plan runs low. Pick the use that fits, say which and why, and consider a second model for long or important lanes (`trio`: it checks each answer once; `pair`: the two work it through together). Name a `model` only when the user did. When something you read (a project's docs, the user's standards) disagrees with the scale about which model to use, ask the user before you choose.
 
 The model scale (`sessions usage` shows it with the plans' usage now):
@@ -110,6 +111,9 @@ const INACTIVE_MINUTES: u64 = 30;
 const LIST_LIMIT: usize = 40;
 const READ_MESSAGES: usize = 6;
 const READ_CHARS: usize = 3_000;
+// How much of a lane's last turn its news carries: its conclusion, which is what a manager acts on;
+// `sessions read` has the rest. Every character of news is read again with each later turn.
+const NEWS_CHARS: usize = 800;
 // The sessions a manager started, one file path a line in its home: the ones it may delete.
 const STARTED_FILE: &str = "started";
 // How long a lane's file has to stay still after a finished turn before the manager hears of it:
@@ -129,8 +133,35 @@ pub enum Role {
     Project,
 }
 
+// Whether this piccosta was started by an agent's command: bash sets PI_SESSION_ID for everything
+// a command starts, and piccosta's own launches (a manager's lane runs, the service, a terminal
+// the user opens) don't have it, so a human's piccosta under another piccosta is still the user's.
+// A command that unsets it on purpose is an escape, which this doesn't claim to stop.
+pub fn started_by_agent() -> bool {
+    std::env::var_os(crate::tools::subagent::SESSION_ENV).is_some()
+}
+
+// Whether this piccosta keeps its sessions in an agent dir of its own (PICCOSTA_AGENT_DIR: a second
+// one, or a test's scratch one), where nothing starts a manager on its own either. A
+// PICCOSTA_AGENT_DIR that is the user's own dir, by another path or a symlink, isn't one.
+pub fn own_agent_dir() -> bool {
+    let real = |dir: PathBuf| dir.canonicalize().unwrap_or(dir);
+    std::env::var_os("PICCOSTA_AGENT_DIR").is_some_and(|dir| real(PathBuf::from(dir)) != real(crate::config::data_home().join("piccosta").join("agent")))
+}
+
+// Managers are the user's: an error when an agent's command runs one in the user's own agent dir.
+pub fn users_only() -> Result<(), String> {
+    if started_by_agent() && !own_agent_dir() {
+        return Err("This is a manager, and managers are the user's: an agent's command can't run one in the user's agent dir. To test one, use a scratch PICCOSTA_AGENT_DIR.".into());
+    }
+    Ok(())
+}
+
 // The session entry that records a session's kind.
 const ROLE_ENTRY: &str = "piccosta-manager";
+// The session entry that records the kind of work (the scale's) a session was started for, whose
+// tools and readOnly it gets wherever it's opened (host.rs tool_list).
+const WORK_ENTRY: &str = "piccosta-work";
 // The names managers take, which the sidebar and `sessions list` show.
 pub const ASSISTANT_NAME: &str = "assistant";
 pub const PROJECT_NAME: &str = "manager";
@@ -162,6 +193,19 @@ pub fn role(session: &crate::session::Session) -> Option<Role> {
             "project" => Some(Role::Project),
             _ => None,
         },
+        _ => None,
+    })
+}
+
+// Record the kind of work a session is for, whose tools and readOnly it gets wherever it's opened.
+pub fn set_work(session: &mut crate::session::Session, kind: &str) -> std::io::Result<String> {
+    session.append_custom(WORK_ENTRY, Some(json!({ "use": kind })))
+}
+
+// The kind of work a session was last given (the sessions tool's `use`, a subagent's job), if any.
+pub fn work(session: &crate::session::Session) -> Option<String> {
+    session.entries().iter().rev().find_map(|entry| match entry {
+        crate::session::SessionEntry::Custom { custom_type, data, .. } if custom_type == WORK_ENTRY => Some(data.as_ref()?.get("use")?.as_str()?.to_string()),
         _ => None,
     })
 }
@@ -416,6 +460,9 @@ fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result
     let output = fs::File::create(log)?;
     let mut command = std::process::Command::new(exe);
     command.arg("-p").arg("--session").arg(file).arg(message).current_dir(cwd);
+    // A lane's run is the manager's, not a command's, even when an agent's `sessions message`
+    // starts it (which wakes a project manager's lane, or the manager itself).
+    command.env_remove(crate::tools::subagent::SESSION_ENV);
     command.stdin(std::process::Stdio::null()).stdout(output.try_clone()?).stderr(output);
     // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
     unsafe {
@@ -449,10 +496,10 @@ fn last_turn(file: &Path) -> Option<(String, String)> {
     finished.then(|| (last["timestamp"].as_str().unwrap_or_default().to_string(), text))
 }
 
-// The last `READ_CHARS` characters of a text.
+// The last `NEWS_CHARS` characters of a text.
 fn ending(text: &str) -> String {
     let characters: Vec<char> = text.trim().chars().collect();
-    characters[characters.len().saturating_sub(READ_CHARS)..].iter().collect()
+    characters[characters.len().saturating_sub(NEWS_CHARS)..].iter().collect()
 }
 
 // What a manager hears about its lanes, as messages for it: each turn a lane finished (once its
@@ -728,6 +775,10 @@ impl SessionsTool {
             (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind).map(|(model, level)| (Some(model), level))?,
             (None, None) => (None, None),
         };
+        // The kind is kept in the session, so it runs with that kind's tools and readOnly.
+        if let Some(kind) = string(arguments, "use") {
+            written(set_work(session, kind))?;
+        }
         let mut chosen = None;
         if let Some(model) = model {
             let found = registry.resolve(&model)?;
@@ -797,7 +848,7 @@ impl Tool for SessionsTool {
     fn definition(&self) -> crate::message::ToolDefinition {
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; manager: true to make it the directory's project manager; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -807,7 +858,6 @@ impl Tool for SessionsTool {
                     "count": {"type": "number", "description": "How many messages read shows"},
                     "dir": {"type": "string", "description": "The directory a new session works in"},
                     "message": {"type": "string", "description": "What to send the session; start can leave it out"},
-                    "manager": {"type": "boolean", "description": "start: make it the directory's project manager"},
                     "use": {"type": "string", "description": "The kind of work, from the model scale: piccosta picks its model now"},
                     "model": {"type": "string", "description": "provider/id, when the user named one; else use"},
                     "thinking": {"type": "string"},
@@ -831,25 +881,17 @@ impl Tool for SessionsTool {
                 "start" => {
                     let dir = PathBuf::from(need("dir")?);
                     let dir = dir.canonicalize().map_err(|error| format!("{}: {error}", dir.display()))?;
-                    let manager = arguments.get("manager").and_then(Value::as_bool) == Some(true);
-                    if manager && let Some(existing) = project_manager(&self.agent_dir, &dir) {
-                        return Err(format!("{} has a project manager already, session {}; message it instead.", dir.display(), session_id(&existing)));
-                    }
                     // Written whole now, so it's listed at once and a run opens this very session.
                     let folder = crate::session::default_session_dir(&self.agent_dir, &dir);
                     let mut session = crate::session::Session::create(&dir, Some(&folder));
                     session.persist_now().map_err(|error| error.to_string())?;
-                    if manager {
-                        make(&self.agent_dir, &mut session, Role::Project).map_err(|error| format!("could not make the project manager: {error}"))?;
-                    }
                     let model = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
                     // Kept, so this manager may delete it later: a manager deletes only what it made.
                     let _ = fs::OpenOptions::new().create(true).append(true).open(self.home.join(STARTED_FILE)).and_then(|mut list| writeln!(list, "{}", file.display()));
                     let (id, name) = (session_id(&file), crate::host::title(&session));
                     drop(session);
-                    let what = if manager { format!("{}'s project manager", dir.display()) } else { format!("a session in {}", dir.display()) };
-                    let started = format!("Made session {id}, {what}{}.", model.map_or(String::new(), |model| format!(", on {model}")));
+                    let started = format!("Made session {id}, a session in {}{}.", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")));
                     match string(&arguments, "message") {
                         Some(message) => {
                             let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
@@ -1094,13 +1136,14 @@ const RESTART_SECONDS: u32 = 30;
 // binary, the PATH it was started with, so `claude` and the rest are found) and enables it, so it
 // starts at login and comes back if it fails; elsewhere it starts as a detached process of its
 // own. With PICCOSTA_AGENT_DIR set (a second agent dir, a test) it's off, since the unit serves the
-// default one. Output: what it did, for a notice, or None when it's off or already running.
+// default one, and so it is for a terminal UI an agent's command started (a test driving it).
+// Output: what it did, for a notice, or None when it's off or already running.
 pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     let agent_dir = crate::config::agent_dir();
     if session_file(&agent_dir).is_some_and(|file| crate::session::held_elsewhere(&file)) {
         return None;
     }
-    if settings.get("manager.autostart").and_then(Value::as_bool) != Some(true) || std::env::var_os("PICCOSTA_AGENT_DIR").is_some() {
+    if settings.get("manager.autostart").and_then(Value::as_bool) != Some(true) || own_agent_dir() || started_by_agent() {
         return None;
     }
     let exe = std::env::current_exe().ok()?;
@@ -1148,6 +1191,7 @@ pub async fn run(args: crate::cli::Args) -> Result<std::process::ExitCode, Strin
 }
 
 async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String> {
+    users_only()?;
     let agent_dir = crate::config::agent_dir();
     let home = home(&agent_dir);
     fs::create_dir_all(&home).map_err(|error| format!("{}: {error}", home.display()))?;

@@ -4,6 +4,7 @@
 pub mod acp;
 pub mod agent;
 pub mod auth;
+pub mod cache;
 pub mod cli;
 pub mod clock;
 pub mod compaction;

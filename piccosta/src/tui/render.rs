@@ -15,7 +15,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub type Rows = Vec<Line<'static>>;
 
 // How many rows of a tool's output show while tools are folded, and the most they ever show.
-const TOOL_PREVIEW_ROWS: usize = 4;
 const TOOL_OPEN_ROWS: usize = 400;
 // Arguments a tool call is best summed up by, in the order they're looked for.
 const SUMMARY_KEYS: [&str; 8] = ["command", "path", "file_path", "pattern", "query", "url", "prompt", "description"];
@@ -73,10 +72,23 @@ pub fn user(text: &str, width: u16, tex: &mut Tex) -> Rows {
 
 // A note from outside the conversation: a background job's finish, a compaction.
 pub fn note(text: &str, width: u16, tex: &mut Tex) -> Rows {
+    news(text, width, tex, false)
+}
+
+// A notice for the model (a background job's end, a lane's news): its first line, dim, with how
+// many more it has; all of them with tools open (ctrl+o). It's for the model to read, so it stays
+// out of the way of the conversation.
+pub fn news(text: &str, width: u16, tex: &mut Tex, open: bool) -> Rows {
     let mut writer = Writer::new(tex, width);
     writer.levels.push(Level::fixed("◆ ", Style::new().fg(theme::DIM)));
-    for line in clean(text).lines().take(TOOL_PREVIEW_ROWS) {
-        writer.text(line, Style::new().fg(theme::DIM));
+    let text = clean(text);
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let shown = if open { TOOL_OPEN_ROWS } else { 1 };
+    for (index, line) in lines.iter().take(shown).enumerate() {
+        let more = if index == 0 && !open && lines.len() > 1 { format!(" · {} more lines (ctrl+o)", lines.len() - 1) } else { String::new() };
+        let room = (width as usize).saturating_sub(2 + more.width());
+        writer.text(&if open { line.to_string() } else { fit(line, room) }, Style::new().fg(theme::DIM));
+        writer.text(&more, Style::new().fg(theme::DIM));
         writer.flush_line(true);
     }
     writer.blank();
@@ -493,8 +505,9 @@ impl<'t> Writer<'t> {
         self.blank();
     }
 
-    // A tool call: a line naming it, then its output (a diff for an edit), folded to a few rows
-    // unless tools are open.
+    // A tool call: one line naming it, with how many lines of output it has hidden; with tools open
+    // (ctrl+o), its output (a diff for an edit) under it, up to TOOL_OPEN_ROWS. A run of calls stays
+    // a run of lines, so the conversation, not the commands, fills the screen.
     fn tool(&mut self, name: &str, arguments: &Map<String, Value>, view: &ToolView, flags: Flags, frame: usize) {
         let (mark, color) = match (view.running, view.is_error) {
             (true, _) => (SPINNER[frame % SPINNER.len()], theme::ACCENT),
@@ -503,16 +516,21 @@ impl<'t> Writer<'t> {
         };
         self.word(&format!("{mark} "), Style::new().fg(color));
         self.word(name, Style::new().add_modifier(Modifier::BOLD));
-        let summary = summary(arguments);
-        if !summary.is_empty() {
-            let room = self.width.saturating_sub(self.used + 2);
-            self.word(&format!("  {}", fit(&summary, room)), Style::new().fg(theme::DIM));
-        }
-        self.flush_line(false);
         let text = view.diff.as_deref().unwrap_or(&view.text);
         let text = clean(text);
         let lines: Vec<&str> = text.lines().collect();
-        let shown = if flags.tools_open { TOOL_OPEN_ROWS } else { TOOL_PREVIEW_ROWS };
+        let hidden = if flags.tools_open || lines.is_empty() { String::new() } else { format!(" · {} line{}", lines.len(), if lines.len() == 1 { "" } else { "s" }) };
+        let summary = summary(arguments);
+        if !summary.is_empty() {
+            let room = self.width.saturating_sub(self.used + 2 + hidden.width());
+            self.word(&format!("  {}", fit(&summary, room)), Style::new().fg(theme::DIM));
+        }
+        self.word(&hidden, Style::new().fg(theme::DIM));
+        self.flush_line(false);
+        if !flags.tools_open {
+            return;
+        }
+        let shown = TOOL_OPEN_ROWS;
         self.levels.push(Level { first: "  ⎿ ".into(), rest: "    ".into(), style: Style::new().fg(theme::DIM), fresh: true });
         for line in lines.iter().take(shown) {
             let style = match line.chars().next() {

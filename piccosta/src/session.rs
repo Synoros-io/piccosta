@@ -443,16 +443,31 @@ impl Session {
             Err(error) => return Err(error.into()),
         };
 
+        if text.trim().is_empty() {
+            let mut session = Session::create(cwd, None);
+            session.file = Some(path.to_path_buf());
+            session.write_whole_file()?;
+            return Ok(session);
+        }
+        let session = Session::parse(path, &text)?;
+        // A last line without its newline (a crash mid-write) gets one, so the next append starts
+        // on a fresh line instead of joining the broken one.
+        if !text.is_empty() && !text.ends_with('\n') {
+            OpenOptions::new().append(true).open(path)?.write_all(b"\n")?;
+        }
+        Ok(session)
+    }
+
+    // A session file as it is, for reading only: nothing is written, not even the repairs `open`
+    // makes, so it's safe on a file another piccosta is appending to.
+    pub fn read(path: &Path) -> Result<Session, OpenError> {
+        Session::parse(path, &String::from_utf8_lossy(&fs::read(path)?))
+    }
+
+    // A session from a file's text: the header, then every entry that parses.
+    fn parse(path: &Path, text: &str) -> Result<Session, OpenError> {
         let mut values = text.split('\n').filter_map(parse_line);
-        let Some(first) = values.next() else {
-            if text.trim().is_empty() {
-                let mut session = Session::create(cwd, None);
-                session.file = Some(path.to_path_buf());
-                session.write_whole_file()?;
-                return Ok(session);
-            }
-            return Err(OpenError::NotASession(path.to_path_buf()));
-        };
+        let Some(first) = values.next() else { return Err(OpenError::NotASession(path.to_path_buf())) };
         let header: SessionHeader = match serde_json::from_value::<SessionHeader>(first) {
             Ok(header) if header.kind == "session" => header,
             _ => return Err(OpenError::NotASession(path.to_path_buf())),
@@ -461,25 +476,11 @@ impl Session {
         if version < CURRENT_SESSION_VERSION {
             return Err(OpenError::TooOld { path: path.to_path_buf(), version });
         }
-
-        let mut session = Session {
-            header,
-            entries: Vec::new(),
-            index_by_id: HashMap::new(),
-            leaf_id: None,
-            file: Some(path.to_path_buf()),
-            flushed: true,
-            lock: None,
-        };
+        let mut session = Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.to_path_buf()), flushed: true, lock: None };
         for value in values {
             if let Some(entry) = entry_from_value(value) {
                 session.index_entry(entry);
             }
-        }
-        // A last line without its newline (a crash mid-write) gets one, so the next append starts
-        // on a fresh line instead of joining the broken one.
-        if !text.is_empty() && !text.ends_with('\n') {
-            OpenOptions::new().append(true).open(path)?.write_all(b"\n")?;
         }
         Ok(session)
     }

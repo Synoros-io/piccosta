@@ -131,6 +131,10 @@ struct Slot {
     // as last read: such a session is followed from its file, never run twice.
     elsewhere: bool,
     followed: Option<std::time::SystemTime>,
+    // Another piccosta has it open and is in the middle of a turn (mid_turn), and the file's time
+    // when that was last read.
+    working_elsewhere: bool,
+    elsewhere_read: Option<std::time::SystemTime>,
     // A manager's session (the assistant, or its project's manager), which leads its group; and,
     // for a new one, that it's to be made its project's manager when it opens (/manager).
     manager: bool,
@@ -171,6 +175,8 @@ impl Slot {
             team: Default::default(),
             elsewhere: false,
             followed: None,
+            working_elsewhere: false,
+            elsewhere_read: None,
             manager: false,
             make_manager: false,
             parent: None,
@@ -451,7 +457,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 _ => app.quit = true,
             },
             Some((slot, update)) = app.updates.recv() => app.update(slot, update),
-            _ = spinner.tick(), if app.slots.iter().any(Slot::busy) => app.frame += 1,
+            _ = spinner.tick(), if app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
             _ = agent_scan.tick() => app.scan_agents(),
         }
         // Everything else already waiting goes in before the next frame.
@@ -518,6 +524,25 @@ fn reap_inherited_children(handover: &state::Handover) {
             std::thread::spawn(move || unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) });
         }
     }
+}
+
+// How much of a session file's end is read for its last message: room for a long answer.
+const TAIL_BYTES: u64 = 1024 * 1024;
+
+// Whether a session another piccosta runs is in the middle of a turn: its last message is the
+// user's, a tool's result, a background job's notice, or the model's call for tools. Read from the
+// file's end, so a long session costs no more than a short one.
+fn mid_turn(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES))).is_err() || file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let tail = String::from_utf8_lossy(&tail);
+    let last = tail.lines().rev().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).find(|entry| entry["type"] == "message" || entry["type"] == "custom_message");
+    last.is_some_and(|entry| entry["type"] == "custom_message" || entry["message"]["role"] != "assistant" || entry["message"]["stopReason"] == "toolUse")
 }
 
 fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
@@ -769,7 +794,9 @@ impl App {
             None => self.host.session(self.slots[slot].path.as_deref(), false, self.persist)?,
         };
         // The first session ever in a directory is its project's manager, and so is one /manager
-        // asked for. Not a session kept in memory, a subagent's, the assistant's, or one in home.
+        // asked for. Not a session kept in memory, a subagent's, the assistant's, or one in home;
+        // and not the first one on its own in a piccosta an agent's command started or on a
+        // scratch agent dir, since managers are the user's (/manager still makes one there).
         let mut session = session;
         let dir = PathBuf::from(&session.header().cwd);
         let agent_dir = &self.host.agent_dir;
@@ -779,6 +806,7 @@ impl App {
         // Home isn't a project: a session started there (outside every project) is a plain one.
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let eligible = self.persist && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
+        let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
         if eligible && (first || self.slots[slot].make_manager) && crate::manager::role(&session).is_none() {
             crate::manager::make(agent_dir, &mut session, crate::manager::Role::Project).map_err(|error| format!("could not make the project manager: {error}"))?;
         }
@@ -987,8 +1015,14 @@ impl App {
         }
         let slot = self.focused();
         let Some((handle, commands)) = &slot.live else { return };
+        // While the model works, a message waits for the step it's on; commands that step is
+        // running move to the background (they carry on and report when they end), so the message
+        // isn't left waiting on them.
         if slot.busy() {
             handle.steer(text);
+            if let Some(shared) = &slot.shared {
+                shared.jobs.detach_all();
+            }
             return;
         }
         let _ = commands.send(Command::Prompt(text.clone(), Vec::new()));
@@ -1058,7 +1092,12 @@ impl App {
 
     // Stop the focused session's run; what was queued goes out at once as the next prompt, and the
     // draft stays in the editor (Claude Code's esc).
+    // Esc: the commands the turn is running move to the background, where they carry on and report
+    // when they end, and the model stops.
     fn interrupt(&mut self) {
+        if let Some(shared) = &self.focused().shared {
+            shared.jobs.detach_all();
+        }
         let Some((handle, commands)) = &self.focused().live else { return };
         handle.abort();
         let (steer, follow_up) = handle.clear();
@@ -1133,6 +1172,13 @@ impl App {
             let shown = self.panes.iter().any(|pane| pane.slot == index);
             if slot.live.is_none() && (locks_due || shown) {
                 slot.elsewhere = slot.path.as_deref().is_some_and(crate::session::held_elsewhere);
+                let modified = slot.path.as_deref().and_then(|path| path.metadata().ok()?.modified().ok());
+                if !slot.elsewhere {
+                    slot.working_elsewhere = false;
+                } else if modified != slot.elsewhere_read {
+                    slot.working_elsewhere = slot.path.as_deref().is_some_and(mid_turn);
+                    slot.elsewhere_read = modified;
+                }
             }
             if slot.followed.is_some() {
                 self.follow(index);
@@ -1326,12 +1372,15 @@ impl App {
                         let before = result.get("tokensBefore").and_then(Value::as_u64).unwrap_or(0);
                         let after = result.get("estimatedTokensAfter").and_then(Value::as_u64).unwrap_or(0);
                         view.context_tokens = after;
-                        let text = format!("Compacted: {} → about {} tokens of context", tokens(before), tokens(after));
+                        let text = format!("Compacted: {} → about {} tokens of context", crate::cache::tokens(before), crate::cache::tokens(after));
                         view.messages.push(commands::report_message(text));
                     }
                     if let Some(error) = error_message {
                         self.notice = Some(error);
                     }
+                }
+                Event::EntryAppended { entry: crate::session::SessionEntry::Custom { custom_type, data: Some(miss), .. } } if custom_type == crate::cache::MISS_TYPE => {
+                    view.messages.push(commands::report_message(crate::cache::line(&miss)));
                 }
                 _ => {}
             },
@@ -1690,6 +1739,7 @@ impl App {
                 State::Running => (render::SPINNER[self.frame % render::SPINNER.len()], theme::ACCENT),
                 State::Retrying(_) => ("↻", theme::USER),
                 State::Compacting => ("◐", theme::ACCENT),
+                State::Idle if slot.elsewhere && slot.working_elsewhere => (render::SPINNER[self.frame % render::SPINNER.len()], theme::ACCENT),
                 State::Idle if slot.elsewhere => ("◎", theme::ACCENT),
                 State::Idle if slot.unread => ("●", theme::OK),
                 State::Idle => (" ", theme::DIM),
@@ -1737,7 +1787,7 @@ impl App {
 
         let slot = &self.slots[slot_index];
         let mut spans = vec![Span::styled(render::fit(&slot.title, usize::from(width) / 2), if focused { Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) })];
-        let mut facts = format!("  {} · {} · {}/{} context", slot.model, slot.thinking, tokens(slot.context_tokens), tokens(slot.context_window));
+        let mut facts = format!("  {} · {} · {}/{} context", slot.model, slot.thinking, crate::cache::tokens(slot.context_tokens), crate::cache::tokens(slot.context_window));
         if !slot.team.models.is_empty() {
             let names: Vec<&str> = slot.team.models.iter().map(|model| model.rsplit('/').next().unwrap_or(model)).collect();
             facts.push_str(&format!(" · {} with {}", if slot.team.pair { "pair" } else { "trio" }, names.join(" and ")));
@@ -1751,6 +1801,7 @@ impl App {
         spans.push(Span::styled(facts, Style::new().fg(theme::DIM)));
         match &slot.state {
             State::Running => spans.push(Span::styled(format!("  {} working", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))),
+            State::Idle if slot.live.is_none() && slot.working_elsewhere => spans.push(Span::styled(format!("  {} working", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))),
             State::Retrying(text) => spans.push(Span::styled(format!("  ↻ {text}"), Style::new().fg(theme::USER))),
             State::Compacting => spans.push(Span::styled("  ◐ compacting", Style::new().fg(theme::ACCENT))),
             State::Idle => {}
@@ -1906,6 +1957,10 @@ fn pane_inner(index: usize, rect: Rect) -> Rect {
 
 fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut tex::Tex) -> Rows {
     match message {
+        // A manager's news (a lane's turn, a schedule) comes in as its message, "[<time>, what]",
+        // but it's for the model: shown as a notice. The user's own words through the inbox,
+        // "[<time>, from the user]", stay the user's.
+        AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags.tools_open),
         AgentMessage::User(user) => render::user(&user.content.text(), width, tex),
         AgentMessage::Assistant(assistant) => {
             render::assistant(&render::blocks(assistant), Some((&assistant.stop_reason, assistant.error_message.as_deref())), tools, flags, frame, width, tex)
@@ -1925,20 +1980,19 @@ fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags
             };
             vec![Line::default(), Line::from(Span::styled(text, Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)))]
         }
-        AgentMessage::Custom(custom) if custom.display => render::note(&custom.content.text(), width, tex),
+        AgentMessage::Custom(custom) if custom.display => render::news(&custom.content.text(), width, tex, flags.tools_open),
         AgentMessage::CompactionSummary(_) => render::note("earlier context compacted into a summary", width, tex),
         AgentMessage::BranchSummary(_) => render::note("a branch's summary", width, tex),
         _ => Vec::new(),
     }
 }
 
-// A token count the short way: 812, 12k, 1.0M.
-fn tokens(count: u64) -> String {
-    match count {
-        1_000_000.. => format!("{:.1}M", count as f64 / 1e6),
-        1_000.. => format!("{}k", count / 1_000),
-        _ => count.to_string(),
-    }
+// Whether a message is a manager's news rather than the user's words: it starts "[<ISO time>, " and
+// isn't marked as from the user.
+fn is_news(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('[') else { return false };
+    let Some((stamp, what)) = rest.split_once(", ") else { return false };
+    stamp.len() >= 16 && stamp.as_bytes()[4] == b'-' && stamp.as_bytes()[10] == b'T' && !what.starts_with("from the user")
 }
 
 // A streaming response's delta, applied to its parts (pi's assistant message events).

@@ -64,6 +64,10 @@ pub struct Held {
     pub shape: Shape,
     pub prints: Vec<String>,
     pub pending: Option<Vec<String>>,
+    // Its turn is over, stopped mid-answer (pi's abort) or answered, and it waits, as Claude Code
+    // does at its prompt, for the next message, which goes into this same query (mod.rs, interrupt
+    // and hold).
+    pub waiting: bool,
 }
 
 // --- Fingerprints ---
@@ -129,16 +133,17 @@ pub fn shape(system_prompt: &str, tools: &[ToolDefinition], cli_model: &str, eff
 
 // Input: what the live query holds (None when there is none), and this call's messages with their
 // prints and shape. Output: Ok(n) when the call's context is the held one (its first n messages)
-// plus results for exactly the calls the query is parked on, which are then delivered; otherwise
-// Err with the first reason found, and the call rewrites.
+// plus results for exactly the calls the query is parked on, or plus user messages for a query
+// that waits, which are then delivered; otherwise Err with the first reason found, and the call
+// rewrites.
 pub fn decide(live: Option<&Held>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
     let live = live.ok_or("no live query for this session")?;
-    let pending = live.pending.as_ref().ok_or("the live query is not parked at a tool call")?;
     let changed: Vec<&str> = SHAPE_PARTS.into_iter().filter(|part| shape.get(*part) != live.shape.get(*part)).collect();
     if !changed.is_empty() {
         return Err(format!("{} changed", changed.join(", ")));
     }
-    // The first differing message is the most useful reason, so it is looked for before lengths.
+    // The first differing message is the most useful reason (an edited or compacted history), so it
+    // is looked for before lengths.
     let held = live.prints.len();
     if let Some(index) = (0..held.min(messages.len())).find(|&index| prints[index] != live.prints[index]) {
         return Err(format!("message {index} ({}) differs from what Claude Code holds", role(&messages[index])));
@@ -146,6 +151,17 @@ pub fn decide(live: Option<&Held>, messages: &[Message], prints: &[String], shap
     if messages.len() <= held {
         return Err(format!("context has {} messages, Claude Code holds {held}", messages.len()));
     }
+    // A waiting query takes what comes next: its context (with its answer, when it gave one; a
+    // stopped answer pi drops), then user messages only, which include pi's custom messages (a job's
+    // notice, lane news).
+    if live.waiting {
+        let after: Vec<&Message> = messages[held..].iter().filter(visible).collect();
+        if after.is_empty() || !after.iter().all(|message| matches!(message, Message::User(_))) {
+            return Err("what came after the waiting query's turn isn't only user messages".into());
+        }
+        return Ok(held);
+    }
+    let pending = live.pending.as_ref().ok_or("the live query is not parked at a tool call")?;
     // What pi added has to be tool results and nothing else: a user message here (a steer, an
     // extension's text) reaches Claude Code as part of a rewritten context, not mid-query.
     let mut ids = Vec::new();
@@ -174,7 +190,7 @@ pub fn turn_start(messages: &[Message]) -> usize {
 }
 
 // Text and image blocks in Anthropic's shape, empty ones left out.
-fn anthropic_blocks(blocks: &[Content]) -> Vec<Value> {
+pub fn anthropic_blocks(blocks: &[Content]) -> Vec<Value> {
     blocks.iter().filter_map(|block| match block {
         Content::Text { text, .. } if !text.is_empty() => Some(json!({"type": "text", "text": text})),
         Content::Image { data, mime_type } if !data.is_empty() && !mime_type.is_empty() =>
@@ -664,16 +680,48 @@ fn is_message(record: &Value) -> bool {
     record["type"] == "user" || record["type"] == "assistant"
 }
 
-// User content from either side as what the model sees of it: short strings, empty texts left out.
+// The note Claude Code puts in the user turn after an interrupt ("[Request interrupted by user]",
+// or "... for tool use]"). pi's history has no message for it, but the stopped query sent it, so a
+// rewrite copies its record as is: matched as part of the user's prompt it ended the copy there, and
+// everything after was converted into different bytes, a whole rewrite of the cache (stand-in,
+// 2026-11-01; 9.3M tokens over a day of real sessions were turns after an abort).
+const INTERRUPT_NOTE: &str = "[Request interrupted by user";
+
+// User content from either side as what the model sees of it: short strings, empty texts and
+// Claude Code's interrupt notes left out.
 fn prompt_parts(content: &Value) -> Vec<String> {
+    let seen = |text: &&str| !text.is_empty() && !text.starts_with(INTERRUPT_NOTE);
     if let Some(text) = content.as_str() {
-        return if text.is_empty() { Vec::new() } else { vec![format!("t:{text}")] };
+        return Some(text).filter(seen).map(|text| format!("t:{text}")).into_iter().collect();
     }
     content.as_array().into_iter().flatten().filter_map(|block| match block["type"].as_str() {
-        Some("text") => block["text"].as_str().filter(|text| !text.is_empty()).map(|text| format!("t:{text}")),
+        Some("text") => block["text"].as_str().filter(seen).map(|text| format!("t:{text}")),
         Some("image") => Some(format!("i:{}", block["data"].as_str().or(block["source"]["data"].as_str()).unwrap_or_default())),
         _ => None,
     }).collect()
+}
+
+// The kept records of answers an interrupt stopped: the assistant records just before an interrupt
+// note, back to the user turn they answer. Claude Code keeps a stopped answer's finished blocks and
+// sent them on, but pi drops the answer, so they line up with no pi message and are copied with the
+// note, as the bytes the cache holds (left in as an assistant turn, they ended the copy there).
+fn stopped_answers(records: &[Value]) -> HashSet<usize> {
+    let note = |record: &Value| {
+        let content = &record["message"]["content"];
+        let texts: Vec<&str> = content.as_str().into_iter().chain(content.as_array().into_iter().flatten().filter_map(|block| block["text"].as_str())).collect();
+        texts.iter().any(|text| text.starts_with(INTERRUPT_NOTE))
+    };
+    let mut stopped = HashSet::new();
+    for index in (0..records.len()).filter(|&index| kind(&records[index]) == Kind::Prompt && note(&records[index])) {
+        let mut back = index;
+        while back > 0 && matches!(kind(&records[back - 1]), Kind::Assistant | Kind::Other) {
+            back -= 1;
+            if kind(&records[back]) == Kind::Assistant {
+                stopped.insert(back);
+            }
+        }
+    }
+    stopped
 }
 
 // Assistant blocks from either side as their text and tool call ids, enough to tell two turns apart
@@ -691,6 +739,8 @@ fn assistant_key(blocks: &[Value], sanitize: bool) -> String {
 // line up, so the list can be shorter than `count`.
 fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
     let records = &kept.records;
+    let stopped = stopped_answers(records);
+    let kind_of = |r: usize| if stopped.contains(&r) { Kind::Other } else { kind(&records[r]) };
     let content = |message: &Message| serde_json::to_value(match message {
         Message::User(user) => user.content.clone(),
         Message::Assistant(assistant) => TextOrBlocks::Blocks(assistant.content.clone()),
@@ -698,11 +748,11 @@ fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
     }).unwrap_or_default();
     let (mut ends, mut r, mut i) = (Vec::new(), 0, 0);
     while i < count {
-        while r < records.len() && kind(&records[r]) == Kind::Other {
+        while r < records.len() && kind_of(r) == Kind::Other {
             r += 1;
         }
         // The continue note a query opened with has no pi message of its own.
-        if r < records.len() && kind(&records[r]) == Kind::Prompt && role(&history[i]) != "user"
+        if r < records.len() && kind_of(r) == Kind::Prompt && role(&history[i]) != "user"
             && prompt_parts(&records[r]["message"]["content"]) == [format!("t:{CONTINUE_NOTE}")]
         {
             r += 1;
@@ -734,8 +784,8 @@ fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
                     (Kind::Results, ids)
                 };
                 let (mut got, mut last) = (Vec::new(), None);
-                while r < records.len() && matches!(kind(&records[r]), k if k == want_kind || k == Kind::Other) && (want_kind == Kind::Prompt || got.len() < want.len()) {
-                    if kind(&records[r]) == want_kind {
+                while r < records.len() && matches!(kind_of(r), k if k == want_kind || k == Kind::Other) && (want_kind == Kind::Prompt || got.len() < want.len()) {
+                    if kind_of(r) == want_kind {
                         let content = &records[r]["message"]["content"];
                         if want_kind == Kind::Prompt {
                             got.extend(prompt_parts(content));
@@ -758,14 +808,14 @@ fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
                 }
             }
             _ => {
-                if kind(&records[r]) != Kind::Assistant {
+                if kind_of(r) != Kind::Assistant {
                     break;
                 }
                 // Claude Code writes one record per content block, all under the response's id.
                 let id = records[r]["message"]["id"].clone();
                 let (mut blocks, mut last) = (Vec::new(), r);
                 while r < records.len() {
-                    match kind(&records[r]) {
+                    match kind_of(r) {
                         Kind::Assistant if records[r]["message"]["id"] == id => {
                             blocks.extend(records[r]["message"]["content"].as_array().cloned().unwrap_or_default());
                             last = r;

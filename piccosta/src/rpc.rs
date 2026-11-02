@@ -46,6 +46,8 @@ enum Input {
 struct Live {
     generation: u64,
     handle: Handle,
+    // Its tools' shared state: a steering message moves the running commands to the background.
+    shared: Arc<crate::tools::ToolShared>,
     commands: UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
     id: String,
@@ -161,6 +163,7 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     let mut live = Live {
         generation,
         handle: agent.handle(),
+        shared: shared.clone(),
         commands,
         task: tokio::task::spawn_local(async {}),
         id: agent.session.id().to_string(),
@@ -279,7 +282,10 @@ impl Rpc {
                 let message = crate::prompt::command_prompt(&message).unwrap_or(message);
                 if live.streaming {
                     match command.get("streamingBehavior").and_then(Value::as_str) {
-                        Some("steer") => live.handle.steer(message),
+                        Some("steer") => {
+                            live.handle.steer(message);
+                            live.shared.jobs.detach_all();
+                        }
                         Some("followUp") => live.handle.follow_up(message),
                         _ => return Err(BUSY.into()),
                     }

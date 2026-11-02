@@ -7,8 +7,15 @@
 // sets one kind's models.
 //
 // A kind (critical, general, review, ...) says what it's for and lists models as provider/id:level,
-// first choice first; as a job, its tools (all when it lists none) and its instructions, which go
-// on the end of the subagent's system prompt. A kind can own tools ("owns"): a session that can
+// first choice first; as a job, its tools (all when it lists none), whether it changes no files
+// ("readOnly": its commands run in a sandbox that can't, and it gets no edit or write; the sandbox
+// guards against a model's careless writes and deletes, not against one trying to escape, see
+// tools/readonly.rs) and its instructions, which go on the end of the subagent's system prompt. A
+// session the sessions tool starts for a kind gets its tools and readOnly too (host.rs). The
+// shipped defaults give the reading kinds (review, reading, search, exploration, advice) read and
+// a read-only bash, with the web tools for search and advice only; monitoring read and a bash that
+// isn't sandboxed, since ssh makes sockets (ControlMaster); bugs read and bash, tests no web
+// tools, and the rest everything. A kind can own tools ("owns"): a session that can
 // hand work to it leaves those tools to its job (host.rs), so that work runs on its models.
 // A model whose plan is running low (any of its usage windows at `lowUsagePercent` or more) goes
 // to the back of the list, so the next one takes over until the window resets.

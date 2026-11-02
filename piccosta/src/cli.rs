@@ -192,7 +192,7 @@ Usage:
   piccosta auth status
   piccosta zed [dir]     Zed, with piccosta as its agent
   piccosta t3 [dir]      T3 Code, with piccosta as its Pi provider
-  piccosta assistant     The assistant service (started for you by the terminal UI)
+  piccosta assistant     The user's assistant service (the terminal UI starts it with manager.autostart)
   piccosta tell <text>   A message for the assistant
 
 Options:

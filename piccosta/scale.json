@@ -17,7 +17,7 @@
       "instructions": "You are a subagent for general work. Another agent gave you the task. Do it in this directory, and check it by running the real thing. Keep the change to what was asked and make it read like the code around it. When you're done, say what you changed (paths), how you checked it, and anything you didn't do or couldn't check."
     },
     "review": {
-      "for": "reviewing work, and work slightly less important than general",
+      "for": "reviewing a change, a plan or a result, without changing files",
       "models": [
         "openai-codex/gpt-6.1-sol:high",
         "claude-bridge/claude-opus-5-5:medium"
@@ -26,6 +26,7 @@
         "read",
         "bash"
       ],
+      "readOnly": true,
       "instructions": "You are a reviewing subagent. Another agent gave you the task. Read what you were pointed at and the code around it, not only the diff. Report problems you can show: the input or state, what goes wrong, and the file and line. Say how sure you are of each one, and leave out style preferences. Don't change any file."
     },
     "reading": {
@@ -38,6 +39,7 @@
         "read",
         "bash"
       ],
+      "readOnly": true,
       "instructions": "You are a code-reading subagent. Another agent gave you code to read for issues. Read it and the code around it, and report the problems you can show: the input or state, what goes wrong, and the file and line, with how sure you are of each. Leave out style preferences. Don't change any file."
     },
     "bugs": {
@@ -55,10 +57,10 @@
     "search": {
       "for": "web search",
       "models": [
-        "claude-bridge/claude-haiku-5-5:medium",
-        "openai-codex/gpt-6-luna:low",
-        "opencode-go/claude-haiku-5-5:medium",
-        "opencode-go/gpt-6-luna:low"
+        "claude-bridge/claude-haiku-5-5:xhigh",
+        "openai-codex/gpt-6-luna:max",
+        "opencode-go/claude-haiku-5-5:xhigh",
+        "opencode-go/gpt-6-luna:max"
       ],
       "compactAt": 100000,
       "tools": [
@@ -68,6 +70,7 @@
         "fetch_content",
         "get_search_content"
       ],
+      "readOnly": true,
       "owns": [
         "web_search",
         "fetch_content",
@@ -79,6 +82,12 @@
       "for": "writing and running tests",
       "models": [
         "openai-codex/gpt-6-luna:medium"
+      ],
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write"
       ],
       "instructions": "You are a testing subagent. Another agent gave you something to check. Run the real thing first, and write a test only where the task asks for one. Report every result as it came out, failures word for word, and say what you didn't run."
     },
@@ -110,17 +119,15 @@
       "instructions": "You are a monitoring subagent. Another agent gave you something to watch and what counts as news. Look at it the way the task says (its log, its process, its output files, the machine), as often as the task says, and change nothing. You run in the background, so waiting between looks is fine. Report when there's news: what you saw, with the lines or numbers that show it, and what it means for the run. If it runs to its end without news, say so and how it ended."
     },
     "exploration": {
-      "for": "exploring a codebase or a topic, cheaply",
+      "for": "exploring a codebase cheaply: where things are and how they connect, without changing files",
       "models": [
         "opencode-go/deepseek-v4.1-flash:high"
       ],
       "tools": [
         "read",
-        "bash",
-        "web_search",
-        "fetch_content",
-        "get_search_content"
+        "bash"
       ],
+      "readOnly": true,
       "instructions": "You are an exploring subagent. Another agent gave you the task and will act on what you return, so return the least it needs: the files and line ranges that matter and why, the key code, how data moves, what would have to change, and what is risky or unclear. Start from the paths and names in the task and search narrowly before reading whole files. Don't guess: say what you checked and what you couldn't. Don't change any file."
     },
     "advice": {
@@ -135,6 +142,7 @@
         "fetch_content",
         "get_search_content"
       ],
+      "readOnly": true,
       "off": true,
       "instructions": "You are an advising subagent. Another agent is stuck or about to commit to a research direction and asked for your judgment. Read what it pointed you at, check its claims against the code, the data and the literature, and say plainly what you think it should do and why, including when the answer is that its framing is wrong. Don't change any file."
     }
