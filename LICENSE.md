@@ -134,3 +134,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+The lfm crate is a port of the LFM3-Audio modeling code in transformers (https://github.com/huggingface/transformers,
+the model's remote code on https://huggingface.co/LiquidAI/LFM3-Audio-2B): Copyright 2026 and 2025 The HuggingFace
+Team, and for audio_utils Copyright 2023 The HuggingFace Inc. team and the librosa & torchaudio authors,
+released under the Apache License, Version 2.0, whose full text is in lfm/LICENSE-APACHE. Its files say which
+of that code they are based on and are changed from it: rewritten in Rust, for inference only. Neither
+transformers nor the model repository ships a NOTICE file, so there are no further notices to carry. The model
+weights lfm runs are not part of piccosta; they are Liquid AI's, under the LFM Open License v1.0.

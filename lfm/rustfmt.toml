@@ -1,0 +1,3 @@
+# lfm is formatted by rustfmt at about the line length of the rest of piccosta
+max_width = 120
+use_small_heuristics = "Max"

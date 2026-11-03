@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["piccosta"]
+members = ["piccosta", "lfm"]
 
 [workspace.package]
 edition = "2024"
@@ -70,6 +70,20 @@ term-maths = "1"
 # The computer tool's accessibility tree: AT-SPI is D-Bus, and zbus speaks it in pure Rust on
 # tokio, without libdbus.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# lfm, the native LFM3-Audio: a thread pool for its matrix products (already in the tree through pdf_oxide)
+# and matrixmultiply's sgemm kernel, which picks AVX2 or AVX-512 at run time.
+rayon = "1"
+matrixmultiply = "0.3"
+
+# lfm is arithmetic: built at opt-level 0 the model runs dozens of times slower than real time, so lfm and its
+# matrix kernel build optimized in the debug profile too. Nothing piccosta depends on changes or rebuilds.
+[profile.dev.package.lfm]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.matrixmultiply]
+opt-level = 3
 
 # The everyday build (`cargo build --release`), made to rebuild quickly: piccosta is one large crate,
 # and thin LTO with one codegen unit spent about two minutes on every change. What it runs is
