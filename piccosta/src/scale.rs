@@ -18,10 +18,13 @@
 // tools, and the rest everything. A kind can own tools ("owns"): a session that can
 // hand work to it leaves those tools to its job (host.rs), so that work runs on its models.
 // A model whose plan is running low (any of its usage windows at `lowUsagePercent` or more) goes
-// to the back of the list, so the next one takes over until the window resets.
+// to the back of the list, so the next one takes over until the window resets. A model no
+// connected account serves doesn't count: the shipped kinds name models on every account
+// piccosta knows, and each user gets those of the accounts they have.
 //
 // Plans report their usage as they're used: Claude Code in its rate_limit_event messages, Codex in
-// its response headers. piccosta keeps the latest in <agent dir>/usage.json.
+// its response headers and websocket events, opencode-go only when it refuses a request past a
+// limit. piccosta keeps the latest in <agent dir>/usage.json.
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -29,7 +32,8 @@ use std::path::{Path, PathBuf};
 const DEFAULTS: &str = include_str!("../scale.json");
 // The share of a usage window past which a plan counts as running low, unless the file says.
 const LOW_USAGE_PERCENT: f64 = 80.0;
-// How long a reading that doesn't say when its window resets (Codex's) counts: long enough to
+// How long a reading that doesn't say when its window resets (opencode-go's refusal without a
+// Retry-After) counts: long enough to
 // steer the next few sessions, short enough that a plan read as low is tried again within the hour.
 const READING_SECONDS: f64 = 3600.0;
 
@@ -138,14 +142,18 @@ pub fn split(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-// The plan a model spends: the account behind its provider.
+// The plan a model spends: its account's (auth::ACCOUNTS), else its provider's own name.
 fn plan(model: &str) -> &str {
     let provider = model.split('/').next().unwrap_or_default();
-    match provider {
-        crate::provider::claude::PROVIDER => "claude",
-        "openai-codex" => "codex",
-        other => other,
-    }
+    crate::auth::account(provider).map_or(provider, |account| account.plan)
+}
+
+// Whether a scale model (provider/id:level) is one a connected account serves now. The model
+// lists hold only those (model.rs), so it's whether the registry has it; with models.json
+// invalid every model counts, and the run that uses one says what's wrong.
+fn connected(agent_dir: &Path) -> impl Fn(&str) -> bool {
+    let registry = crate::model::ModelRegistry::load(&agent_dir.join("models.json")).ok();
+    move |model| registry.as_ref().is_none_or(|registry| registry.resolve(split(model).0).is_ok())
 }
 
 fn usage_path(agent_dir: &Path) -> std::path::PathBuf {
@@ -155,23 +163,36 @@ fn usage_path(agent_dir: &Path) -> std::path::PathBuf {
 // Note a plan's usage in one of its windows: the percent used and when it resets (epoch seconds).
 // A failure to write only loses this reading.
 pub fn record(plan: &str, window: &str, used_percent: f64, resets_at: Option<f64>) {
+    store(plan, window, Some(json!({ "usedPercent": used_percent, "resetsAt": resets_at, "seenAt": crate::clock::now_ms() / 1000 })));
+}
+
+// Drop a window's reading: the plan says the window is off.
+pub fn forget(plan: &str, window: &str) {
+    store(plan, window, None);
+}
+
+fn store(plan: &str, window: &str, reading: Option<Value>) {
     let path = usage_path(&crate::config::agent_dir());
     let mut usage: Map<String, Value> = std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
     let windows = usage.entry(plan.to_string()).or_insert_with(|| json!({}));
     if let Some(windows) = windows.as_object_mut() {
-        windows.insert(window.to_string(), json!({ "usedPercent": used_percent, "resetsAt": resets_at, "seenAt": crate::clock::now_ms() / 1000 }));
+        match reading {
+            Some(reading) => windows.insert(window.to_string(), reading),
+            None => windows.remove(window),
+        };
     }
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&usage).unwrap_or_default());
 }
 
 // The highest share used of any of a plan's windows that hasn't reset (or, with no reset time,
-// gone stale) since it was read.
+// gone stale) since it was read. Codex sends a reading with every response, so one of its readings
+// with no reset time stands until the next replaces it: a weekly window can't go stale in an hour.
 fn used(agent_dir: &Path, plan: &str) -> Option<f64> {
     let usage: Value = serde_json::from_str(&std::fs::read_to_string(usage_path(agent_dir)).ok()?).ok()?;
     let now = (crate::clock::now_ms() / 1000) as f64;
     let current = |window: &&Value| match window.get("resetsAt").and_then(Value::as_f64) {
         Some(reset) => reset > now,
-        None => window.get("seenAt").and_then(Value::as_f64).is_some_and(|seen| seen + READING_SECONDS > now),
+        None => plan == "codex" || window.get("seenAt").and_then(Value::as_f64).is_some_and(|seen| seen + READING_SECONDS > now),
     };
     usage.get(plan)?.as_object()?.values().filter(current).filter_map(|window| window.get("usedPercent")?.as_f64()).reduce(f64::max)
 }
@@ -187,24 +208,44 @@ pub fn order(agent_dir: &Path, entry: &Use) -> Vec<String> {
     fine.into_iter().chain(low).collect()
 }
 
+// A use's models in the order to try them now, without those no connected account serves.
+pub fn available(agent_dir: &Path, entry: &Use) -> Vec<String> {
+    let connected = connected(agent_dir);
+    order(agent_dir, entry).into_iter().filter(|model| connected(model)).collect()
+}
+
 // The model and level a use runs on now.
 pub fn pick(agent_dir: &Path, name: &str) -> Result<(String, Option<String>), String> {
     let entry = find(agent_dir, name)?;
-    let first = order(agent_dir, &entry).into_iter().next().ok_or_else(|| format!("The \"{name}\" use lists no models"))?;
+    let first = available(agent_dir, &entry).into_iter().next().ok_or_else(|| format!("None of the \"{name}\" use's models is served by a connected account"))?;
     let (model, level) = split(&first);
     Ok((model.to_string(), level.map(str::to_string)))
 }
 
-// The scale as text, for a prompt and /scale: each use with its models (low ones marked), and
-// how much of each plan is used.
+// The scale as text, for a prompt and /scale: each use with its models (low ones and those no
+// connected account serves marked), and how much of each plan is used.
 pub fn describe(agent_dir: &Path) -> String {
     let mut lines = Vec::new();
+    let connected = connected(agent_dir);
     for entry in uses(agent_dir) {
-        let models: Vec<String> = order(agent_dir, &entry).iter().map(|model| if low(agent_dir, model) { format!("{model} (plan running low)") } else { model.clone() }).collect();
+        let mark = |model: &String| match (connected(model), low(agent_dir, model)) {
+            (false, _) => format!("{model} (not connected)"),
+            (true, true) => format!("{model} (plan running low)"),
+            (true, false) => model.clone(),
+        };
+        let models: Vec<String> = order(agent_dir, &entry).iter().map(mark).collect();
         let compact = entry.compact_at.map_or(String::new(), |tokens| format!(" · compacts at {}k tokens", tokens / 1000));
         lines.push(format!("- {}: {}. {}{compact}", entry.name, entry.purpose, models.join(", then ")));
     }
-    let plans: Vec<String> = ["claude", "codex"].iter().filter_map(|plan| used(agent_dir, plan).map(|percent| format!("{plan} {percent:.0}% used"))).collect();
+    // Each plan the scale's models spend, and how much of it is used; one with no current reading
+    // (opencode-go until it refuses a request) is unknown, which isn't the same as fine.
+    let models: Vec<String> = uses(agent_dir).into_iter().flat_map(|entry| entry.models).collect();
+    let plans: Vec<String> = crate::auth::ACCOUNTS
+        .iter()
+        .map(|account| account.plan)
+        .filter(|name| models.iter().any(|model| plan(model) == *name))
+        .map(|name| used(agent_dir, name).map_or(format!("{name} unknown"), |percent| format!("{name} {percent:.0}% used")))
+        .collect();
     if !plans.is_empty() {
         lines.push(format!("Plan usage, latest reading: {}.", plans.join(", ")));
     }

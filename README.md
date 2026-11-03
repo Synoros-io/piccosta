@@ -22,7 +22,7 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
 - **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats.
-- **New models show up on their own.** The model lists for Claude, Codex and opencode-go ship with piccosta, and are fetched again from pi.dev's catalog (the one pi reads) at most every four hours. `modelCatalog.url` in settings points elsewhere; `modelCatalog.refresh: false` keeps to the built-in lists.
+- **New models show up on their own.** piccosta offers what each connected account serves: Codex's own list for your ChatGPT login, the models Claude Code offers your Claude login, opencode-go's `/models`, and `<baseUrl>/models` for a `models.json` provider that names no models. The lists are fetched as piccosta starts and with `/models refresh`; one that can't be fetched keeps the last one, and an account you aren't logged in to offers nothing. What you set for a model goes over what its provider reports, in `models.json`'s `providers.<provider>.modelOverrides.<id>` (pi's format), e.g. `{"contextWindow": 200000, "maxTokens": 8000, "input": ["text"], "thinkingLevelMap": {"medium": "medium"}}`; an object such as `thinkingLevelMap` or `compat` changes only the keys you name.
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
 ### Model scale
@@ -62,7 +62,7 @@ The model hands a task to a kind of work on the scale (critical, general, review
 - **Starting a session anywhere.** Ctrl+N lists this directory, your home folder (`~`, outside every project), your recent projects and every git repository under home. Type to narrow it, or type any path, with flags after it: `myproject --use critical --pair openai-codex/gpt-6.1-sol --name "lane A"`.
 - **Coming back to where you were.** The terminal UI keeps what each pane shows, how far it's scrolled, what's typed and not sent, and the sessions open besides. `piccosta -c` brings it all back; `/restart` starts piccosta again on a freshly built binary, everything as it was.
 - **Finding sessions again:**
-  - Alt+↑↓ walks the list, showing earlier sessions without starting them until you type.
+  - Page Up/Down (or Alt+↑↓) walks the list, showing earlier sessions without starting them until you type.
   - Ctrl+S searches the list, and `/resume all` reaches every project's sessions.
   - `-r` resumes by id, the start of one, or a name; `-c` resumes this directory's latest.
 - **Sessions are never run twice.** A running piccosta locks its session file; another one shows that session live from its file, and what you type there goes into its inbox.
@@ -176,7 +176,7 @@ piccosta -p --mode json "..."                # one event per line, for scripts
 ```
 
 `piccosta --help` lists every flag. In the terminal UI:
-- `alt+↑↓` moves between sessions;
+- `pgup`/`pgdn` (or `alt+↑↓`) moves between sessions, and `alt+pgup`/`alt+pgdn` or the mouse wheel scrolls;
 - `^s` finds one;
 - Delete twice moves the shown session to the trash;
 - `/help` lists every key and command.
@@ -210,15 +210,15 @@ Add `--yolo` to skip permissions.
 
 ## Settings
 
-piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT_DIR`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`catalog/`).
+piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT_DIR`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`).
 
 `settings.json` uses pi's keys:
 - `defaultProvider` and `defaultModel`;
 - `defaultThinkingLevel` and `modelThinkingLevels`;
 - `compaction`, `retry`, `shellCommandPrefix` and `transport`;
-- piccosta's own `manager`, `gui` and `modelCatalog`.
+- piccosta's own `manager` and `gui`.
 
-A project's `.pi/settings.json` is merged over them.
+A project's `.piccosta/settings.json` is merged over them.
 
 ## License
 

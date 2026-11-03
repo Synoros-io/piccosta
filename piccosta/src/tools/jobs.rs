@@ -24,8 +24,8 @@
 // No new tools: the model stops a job with `kill -- -<pid>` through bash and reads the log with
 // its read or bash tools.
 //
-// Where logs go: `<session cwd>/.pi-jobs/<session id prefix>-<job id>.log`, with a `.gitignore`
-// of `*` in `.pi-jobs` so git never sees them. Not /tmp: some machines clear tmp, bench sandboxes
+// Where logs go: `<session cwd>/.piccosta-jobs/<session id prefix>-<job id>.log`, with a `.gitignore`
+// of `*` in `.piccosta-jobs` so git never sees them. Not /tmp: some machines clear tmp, bench sandboxes
 // give each run a private one, and a job log has to be readable by the same model with the same
 // tools, which always see the working directory. PICCOSTA_LONGCMD_DIR moves it (a relative path
 // is taken from the session cwd). Job logs stay after the session, so a human or a later session
@@ -54,7 +54,7 @@ use tokio_util::sync::CancellationToken;
 // $PICCOSTA_LONGCMD_SOFT_S changes it; 0 sends every command to the background.
 const DEFAULT_SOFT_LIMIT_SECONDS: f64 = 2.0;
 const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
-const DEFAULT_JOB_DIR: &str = ".pi-jobs";
+const DEFAULT_JOB_DIR: &str = ".piccosta-jobs";
 const JOB_DIR_ENV: &str = "PICCOSTA_LONGCMD_DIR";
 // Unix's null device: the log of a job whose output had nowhere to go (Jobs::start).
 const NO_LOG: &str = "/dev/null";

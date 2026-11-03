@@ -48,16 +48,18 @@ struct Compat {
 
 fn compat_of(model: &Model) -> Compat {
     let opencode = is_opencode(model);
+    // DeepSeek's own API (pi's detection), and DeepSeek's models behind opencode (pi's catalog).
+    let deepseek = model.provider == "deepseek" || model.base_url.contains("deepseek.com") || (opencode && model.id.starts_with("deepseek"));
     let flag = |key: &str, detected: bool| model.compat.as_ref().and_then(|compat| compat.get(key)).and_then(Value::as_bool).unwrap_or(detected);
     Compat {
         supports_store: flag("supportsStore", !opencode),
         supports_developer_role: flag("supportsDeveloperRole", !opencode),
         supports_reasoning_effort: flag("supportsReasoningEffort", true),
-        max_tokens_field: model.compat_str("maxTokensField").unwrap_or("max_completion_tokens").to_string(),
-        requires_reasoning_content_on_assistant_messages: flag("requiresReasoningContentOnAssistantMessages", false),
-        thinking_format: model.compat_str("thinkingFormat").unwrap_or("openai").to_string(),
-        // OpenAI compatibility alone doesn't mean strict JSON-schema tools.
-        supports_strict_mode: flag("supportsStrictMode", false),
+        max_tokens_field: model.compat_str("maxTokensField").unwrap_or(if opencode { "max_tokens" } else { "max_completion_tokens" }).to_string(),
+        requires_reasoning_content_on_assistant_messages: flag("requiresReasoningContentOnAssistantMessages", deepseek),
+        thinking_format: model.compat_str("thinkingFormat").unwrap_or(if deepseek { "deepseek" } else { "openai" }).to_string(),
+        // OpenAI compatibility alone doesn't mean strict JSON-schema tools; opencode's gateway takes them.
+        supports_strict_mode: flag("supportsStrictMode", opencode),
         supports_mid_conversation_system: flag("supportsMidConvoSystemMessages", false),
         supports_mid_conversation_tool_additions: flag("supportsMidConvoToolAdditions", false),
     }

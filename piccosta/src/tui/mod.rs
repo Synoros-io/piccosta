@@ -44,7 +44,7 @@ pub mod theme {
 
 // The status line when there's no notice: what's most used first, since a narrow screen cuts the
 // end; /help has every key and command.
-const HELP: &str = "enter send · esc stop · alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
+const HELP: &str = "enter send · esc stop · pgup/pgdn or alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
 // How many of this directory's earlier sessions the sidebar lists, and of other projects': the most
 // recently used projects, a few sessions each.
 const RECENT_SESSIONS: usize = 30;
@@ -83,6 +83,8 @@ const AGENT_SCAN: Duration = Duration::from_secs(2);
 enum Update {
     Event(Box<Event>),
     Done(Box<Done>),
+    // A command's output that came later, for the focused pane (/models refresh).
+    Report(String),
 }
 
 #[derive(PartialEq)]
@@ -218,7 +220,9 @@ impl Slot {
                 if usage.total_tokens > 0 {
                     self.context_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
                 }
-                self.cost += usage.cost.total;
+                if !crate::provider::responses::plan_billed(&assistant.provider) {
+                    self.cost += usage.cost.total;
+                }
             }
             AgentMessage::ToolResult(result) => {
                 self.tools.insert(
@@ -438,6 +442,16 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         app.notice = Some("Invalid settings; details are shown above.".into());
     }
     app.adopt_jobs(handover.sessions);
+    // What went wrong fetching the model lists as piccosta started, once they're in.
+    if let Some(refresh) = crate::model::STARTUP_REFRESH.get().cloned() {
+        let sender = app.sender.clone();
+        tokio::spawn(async move {
+            let problems: Vec<String> = refresh.await.into_iter().filter_map(Result::err).collect();
+            if !problems.is_empty() {
+                let _ = sender.send((0, Update::Report(format!("The model lists couldn't all be fetched:\n\n{}", problems.join("\n")))));
+            }
+        });
+    }
     let mut input = EventStream::new();
     let mut spinner = tokio::time::interval(FRAME);
     let mut agent_scan = tokio::time::interval(AGENT_SCAN);
@@ -606,8 +620,14 @@ impl App {
         if !((args.restore || args.continue_recent) && self.restore()) {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
-            self.load(first, self.model.clone(), args.thinking.clone(), Some(args))?;
+            let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
             self.panes.push(Pane { slot: first, scroll: 0 });
+            // With no account's models yet there's nothing to open on, but /models refresh and
+            // logging in still have to be reachable: the pane opens when something is typed.
+            match loaded {
+                Err(error) if self.host.registry().is_ok_and(|registry| registry.models().is_empty()) => self.report(error),
+                loaded => loaded?,
+            }
         }
         let first = self.panes[self.focus].slot;
         if let Some(name) = &args.name {
@@ -859,6 +879,16 @@ impl App {
     fn focused(&mut self) -> &mut Slot {
         let slot = self.panes[self.focus].slot;
         &mut self.slots[slot]
+    }
+
+    // Show the session before (`earlier`) or after the focused pane's in the sidebar's list, wrapping
+    // at the ends. Passing an earlier session only shows it, so this never adds an open session.
+    fn next_session(&mut self, earlier: bool) {
+        let listed = self.listed();
+        if let Some(at) = listed.iter().position(|&index| index == self.panes[self.focus].slot) {
+            let next = if earlier { (at + listed.len() - 1) % listed.len() } else { (at + 1) % listed.len() };
+            self.show(listed[next]);
+        }
     }
 
     // Show a slot in the focused pane. An earlier session is read from its file and nothing starts:
@@ -1312,6 +1342,7 @@ impl App {
         let visible = self.panes.iter().any(|pane| pane.slot == slot);
         let view = &mut self.slots[slot];
         match update {
+            Update::Report(text) => self.report(text),
             Update::Done(done) => {
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
@@ -1379,6 +1410,9 @@ impl App {
                 }
                 Event::EntryAppended { entry: crate::session::SessionEntry::Custom { custom_type, data: Some(miss), .. } } if custom_type == crate::cache::MISS_TYPE => {
                     view.messages.push(commands::report_message(crate::cache::line(&miss)));
+                }
+                Event::EntryAppended { entry: crate::session::SessionEntry::Custom { custom_type, data: Some(note), .. } } if custom_type == crate::provider::claude::NOTICE_TYPE => {
+                    view.messages.push(commands::report_message(note["text"].as_str().unwrap_or_default().to_string()));
                 }
                 _ => {}
             },
@@ -1548,15 +1582,11 @@ impl App {
             KeyCode::Char('n') if control => {
                 self.command("new");
             }
-            // Up and down the sidebar's list, one session at a time. Passing an earlier session only
-            // shows it, so this never adds an open session.
-            KeyCode::Up | KeyCode::Down if alt => {
-                let listed = self.listed();
-                if let Some(at) = listed.iter().position(|&index| index == self.panes[self.focus].slot) {
-                    let next = if key.code == KeyCode::Up { (at + listed.len() - 1) % listed.len() } else { (at + 1) % listed.len() };
-                    self.show(listed[next]);
-                }
-            }
+            // Up and down the sidebar's list, one session at a time: alt+↑↓, or page up and down, which
+            // get through terminals and remote links that keep alt (or ctrl and shift with the page
+            // keys) for themselves. Alt with the page keys scrolls instead, below.
+            KeyCode::Up | KeyCode::Down if alt => self.next_session(key.code == KeyCode::Up),
+            KeyCode::PageUp | KeyCode::PageDown if !alt => self.next_session(key.code == KeyCode::PageUp),
             KeyCode::Char('s') if control => self.sessions(""),
             KeyCode::Left if alt => self.focus = self.focus.saturating_sub(1),
             KeyCode::Right if alt => self.focus = (self.focus + 1).min(self.panes.len() - 1),

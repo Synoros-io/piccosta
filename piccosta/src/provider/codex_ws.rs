@@ -9,18 +9,21 @@
 //   found when it's next taken (pi's readyState check), and the 5-minute idle limit is applied
 //   then too, rather than by a timer;
 // - each event may take at most the SSE body's idle limit (300 s); pi has no limit by default;
-// - no HTTP proxy, and no debug counters.
+// - an HTTP proxy in the environment, as reqwest reads it on the SSE path, is gone through with a
+//   CONNECT tunnel; any other kind of proxy fails the connection, which moves the session to SSE;
+// - no debug counters.
 
 use super::responses::{self, ConvertOptions, StreamState};
 use super::StreamEvent;
 use crate::message::{AssistantMessage, Message};
 use crate::model::Model;
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -38,6 +41,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 // The close code a server sends for a frame over its size limit (line 66).
 const MESSAGE_TOO_BIG: u16 = 1009;
+// The most of a proxy's answer to CONNECT read before giving up on it: its status line and headers
+// are a few hundred bytes.
+const MAX_PROXY_REPLY: usize = 8192;
 // The tool-call providers Codex keeps two-part ids for, as in codex.rs.
 const TOOL_CALL_PROVIDERS: [&str; 3] = ["openai", "openai-codex", "opencode"];
 
@@ -179,6 +185,44 @@ fn close_text(code: u16, reason: &str) -> String {
     format!("WebSocket closed {code} {reason}").trim().to_string()
 }
 
+// The proxy reqwest would send this host's requests through, read by reqwest's own matcher
+// (hyper-util's): $HTTPS_PROXY (for wss://) or $HTTP_PROXY, else $ALL_PROXY, unless $NO_PROXY
+// names the host, a domain it's in (any case, with or without a leading dot), its IP or a network
+// holding it, or is *. The proxy's user and password come percent-decoded, as reqwest sends them.
+fn proxy_for(host: &str, port: u16, secure: bool) -> Option<Intercept> {
+    let uri = format!("{}://{host}:{port}", if secure { "https" } else { "http" }).parse().ok()?;
+    Matcher::from_system().intercept(&uri)
+}
+
+// A TCP connection to host:port through an HTTP proxy's CONNECT tunnel, with the proxy url's user
+// and password as basic auth. Output: the tunnel, or why the proxy wouldn't give one.
+async fn tunnel(proxy: &Intercept, host: &str, port: u16) -> Result<tokio::net::TcpStream, String> {
+    let url = proxy.uri();
+    if url.scheme_str() != Some("http") {
+        return Err(format!("the websocket can't go through a {} proxy, so this session uses SSE", url.scheme_str().unwrap_or_default()));
+    }
+    let address = (url.host().unwrap_or_default(), url.port_u16().unwrap_or(80));
+    let mut tcp = tokio::net::TcpStream::connect(address).await.map_err(|error| format!("proxy {}: {error}", address.0))?;
+    let mut connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some(auth) = proxy.basic_auth().and_then(|auth| auth.to_str().ok()) {
+        connect.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+    }
+    connect.push_str("\r\n");
+    tcp.write_all(connect.as_bytes()).await.map_err(|error| error.to_string())?;
+    // The answer up to its blank line, a byte at a time so nothing past it (the server's bytes)
+    // is taken from the stream. Anything but a 200 means no tunnel.
+    let mut reply = Vec::new();
+    let mut byte = [0u8; 1];
+    while !reply.ends_with(b"\r\n\r\n") && reply.len() < MAX_PROXY_REPLY && tcp.read(&mut byte).await.map_err(|error| error.to_string())? == 1 {
+        reply.push(byte[0]);
+    }
+    let status = String::from_utf8_lossy(&reply).lines().next().unwrap_or_default().to_string();
+    if status.split_whitespace().nth(1) != Some("200") {
+        return Err(format!("proxy {} refused CONNECT: {status}", address.0));
+    }
+    Ok(tcp)
+}
+
 // Open a socket (connectWebSocket). Input: the ws:// or wss:// url and the headers in order.
 async fn connect(url: &str, headers: &[(String, String)]) -> Result<Socket, Failure> {
     let transport = |message: String| Failure::Transport(message);
@@ -193,7 +237,10 @@ async fn connect(url: &str, headers: &[(String, String)]) -> Result<Socket, Fail
     let host = uri.host().ok_or_else(|| transport("WebSocket url has no host".into()))?.to_string();
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let opening = async {
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|error| transport(error.to_string()))?;
+        let tcp = match proxy_for(&host, port, secure) {
+            Some(proxy) => tunnel(&proxy, &host, port).await.map_err(transport)?,
+            None => tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|error| transport(error.to_string()))?,
+        };
         let _ = tcp.set_nodelay(true);
         let io: Box<dyn Io> = if secure {
             let config = tls_config().map_err(transport)?;
@@ -365,7 +412,8 @@ pub async fn stream(
             Some(Ok(_)) => continue,
         };
         let event: Value = serde_json::from_str(&text).map_err(|error| Failure::Protocol(format!("Invalid Codex WebSocket JSON: {error}")))?;
-        if event.get("type").and_then(Value::as_str).unwrap_or_default().is_empty() {
+        // A usage reading isn't part of the response, so it doesn't start it.
+        if event.get("type").and_then(Value::as_str).unwrap_or_default().is_empty() || super::codex::record_event_usage(&event) {
             continue;
         }
         if let Some((message, code)) = super::codex::api_error(&event) {

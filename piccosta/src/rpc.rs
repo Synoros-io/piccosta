@@ -25,10 +25,9 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 // (mcpExtensionSource.ts:317-334 in pingdotgg/t3code). piccosta runs no JavaScript extensions, so
 // rpc mode asks for approval itself, the same way: for every tool but the read-only ones (and
 // edit and write under auto-accept-edits), an extension_ui_request confirm titled "Allow <tool>?"
-// with the arguments as JSON, cut to APPROVAL_ARGUMENT_CHARS. piccosta's web tools only read, so
-// they join the list, as they're in ACP's.
+// with the arguments as JSON, cut to APPROVAL_ARGUMENT_CHARS. The read-only ones are the tools
+// whose read_only() says so, the same as ACP's.
 const RUNTIME_MODE_ENV: &str = "T3_PI_RUNTIME_MODE";
-const APPROVAL_FREE: [&str; 8] = ["read", "grep", "find", "ls", "tool_search", "web_search", "fetch_content", "get_search_content"];
 const APPROVAL_ARGUMENT_CHARS: usize = 4000;
 const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 
@@ -196,7 +195,7 @@ fn approval_gate(inputs: &UnboundedSender<Input>) -> Option<Gate> {
     Some(std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>| {
         let inputs = inputs.clone();
         Box::pin(async move {
-            if APPROVAL_FREE.contains(&name.as_str()) || (edits_free && matches!(name.as_str(), "edit" | "write")) {
+            if crate::tools::read_only(&name) || (edits_free && matches!(name.as_str(), "edit" | "write")) {
                 return Ok(());
             }
             let arguments = Value::Object(arguments).to_string();
@@ -668,18 +667,28 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
     let (mut users, mut assistants, mut calls, mut results, mut messages) = (0, 0, 0, 0, 0);
     let mut totals = [0u64; 5];
     let mut cost = 0.0;
-    let mut add = |usage: &crate::message::Usage| {
+    // A plan's tokens count, its cost doesn't (`plan` is whether the provider is billed by plan).
+    let mut add = |usage: &crate::message::Usage, plan: bool| {
         for (total, part) in totals.iter_mut().zip([usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens]) {
             *total += part;
         }
-        cost += usage.cost.total;
+        if !plan {
+            cost += usage.cost.total;
+        }
     };
+    // A compaction's or branch summary's usage names no provider: it was made with the session's
+    // model at the time, which the latest model change says.
+    let mut provider = String::new();
     for entry in session.entries() {
+        if let SessionEntry::ModelChange { provider: changed, .. } = entry {
+            provider = changed.clone();
+        }
         let SessionEntry::Message { message, .. } = entry else {
             let value = entry_json(entry);
             let usage = value.get("usage").filter(|_| matches!(entry, SessionEntry::Usage { .. } | SessionEntry::Compaction { .. } | SessionEntry::BranchSummary { .. }));
+            let plan = crate::provider::responses::plan_billed(value.get("provider").and_then(Value::as_str).unwrap_or(&provider));
             if let Some(usage) = usage.and_then(|usage| serde_json::from_value(usage.clone()).ok()) {
-                add(&usage);
+                add(&usage, plan);
             }
             continue;
         };
@@ -689,13 +698,13 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
             AgentMessage::ToolResult(result) => {
                 results += 1;
                 if let Some(usage) = &result.usage {
-                    add(usage);
+                    add(usage, false);
                 }
             }
             AgentMessage::Assistant(assistant) => {
                 assistants += 1;
                 calls += assistant.content.iter().filter(|block| matches!(block, Content::ToolCall { .. })).count();
-                add(&assistant.usage);
+                add(&assistant.usage, crate::provider::responses::plan_billed(&assistant.provider));
             }
             _ => {}
         }

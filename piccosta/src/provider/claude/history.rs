@@ -43,7 +43,8 @@ const TOOL_ID_MAX: usize = 64;
 // Claude Code's project dirs: the path with every non-alphanumeric UTF-16 unit made "-", cut at 200
 // with a hash of the whole path after it (cc-session-io paths.ts).
 const PROJECT_DIR_MAX: usize = 200;
-// The record fields cc-session-io writes for a session it creates.
+// The record fields cc-session-io writes for a session it creates. The version is the running
+// Claude Code's, this one (cc-session-io's) only when that couldn't be read.
 const RECORD_VERSION: &str = "2.1.83";
 const SLUG_ADJECTIVES: &str = "ancient bold bright calm clever cool crimson daring eager fast fierce gentle golden happy hidden iron keen lively mighty nimble pale proud quick rapid sharp silent smooth steady swift vivid warm wild";
 const SLUG_NOUNS: &str = "arrow badge beacon blade brook castle cedar cloud comet crest dawn drift eagle ember falcon flame forge gale grove harbor hawk jade kettle lance maple marsh needle oak pearl pine ridge river rune sage shade spark stone thorn tower wave";
@@ -492,7 +493,7 @@ impl Records {
         let uuid = Uuid::new_v4().to_string();
         let record = json!({"type": kind, "uuid": uuid, "parentUuid": self.last_uuid, "sessionId": self.session_id,
             "timestamp": clock::iso_from_ms(self.next_ms), "isSidechain": false, "cwd": self.cwd, "userType": "external",
-            "version": RECORD_VERSION, "gitBranch": "HEAD", "slug": self.slug, "entrypoint": "cli"});
+            "version": super::version().unwrap_or(RECORD_VERSION), "gitBranch": "HEAD", "slug": self.slug, "entrypoint": "cli"});
         self.next_ms += 1;
         self.last_uuid = Some(uuid);
         record.as_object().cloned().unwrap_or_default()

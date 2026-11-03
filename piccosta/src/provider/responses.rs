@@ -575,9 +575,22 @@ pub fn parse_tool_call_arguments(json: &str) -> (Map<String, Value>, Option<Stri
     }
 }
 
+// Providers billed by a plan's quota, not by the token: their responses cost no money, whatever
+// the catalog's prices say, so the footer, ACP and rpc show none, and count none for a saved
+// response from before that kept the catalog's.
+const PLAN_PROVIDERS: [&str; 3] = ["openai-codex", "opencode-go", crate::provider::claude::PROVIDER];
+
+pub fn plan_billed(provider: &str) -> bool {
+    PLAN_PROVIDERS.contains(&provider)
+}
+
 // Set a response's cost from its usage and the model's prices, with the tier for its input size
-// (models.ts:1236-1256).
+// (models.ts:1236-1256). A plan's responses cost nothing.
 pub fn calculate_cost(model: &Model, usage: &mut Usage) {
+    if plan_billed(&model.provider) {
+        usage.cost = Default::default();
+        return;
+    }
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
     let mut rates = (model.cost.input, model.cost.output, model.cost.cache_read, model.cost.cache_write);
     let mut matched_threshold: i64 = -1;

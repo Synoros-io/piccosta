@@ -108,11 +108,12 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     let cache_key: Option<String> = cache_session.map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
     let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level);
 
-    // Session affinity, by the format the provider asks for (openai-responses.ts:293-303). The
-    // catalog's opencode models ask for "openai-nosession".
+    // Session affinity, by the format the provider asks for (openai-responses.ts:293-303).
+    // opencode's models ask for "openai-nosession" (pi's catalog).
     let mut affinity = Vec::new();
     if let Some(session) = cache_session {
-        if model.compat_str("sessionAffinityFormat").unwrap_or("openai") == "openai" {
+        let format = model.compat_str("sessionAffinityFormat").unwrap_or(if super::is_opencode(model) { "openai-nosession" } else { "openai" });
+        if format == "openai" {
             affinity.push(("session_id", session.to_string()));
         }
         affinity.push(("x-client-request-id", session.to_string()));

@@ -344,14 +344,17 @@ impl Host {
         let wanted = model
             .map(str::to_string)
             .or_else(|| resumed.model.as_ref().map(|(provider, id)| format!("{provider}/{id}")))
-            .or_else(|| self.settings.default_model());
-        let wanted = wanted.ok_or_else(|| format!("no model; pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
-        // A session whose model has left the catalog opens on the default model rather than not at
-        // all (pi's "Could not restore model"); a model asked for by name still has to exist.
-        let model = match (registry.resolve(&wanted), model, self.settings.default_model()) {
-            (Ok(found), ..) => found.clone(),
-            (Err(_), None, Some(default)) if default != wanted => registry.resolve(&default)?.clone(),
-            (Err(error), ..) => return Err(error),
+            .or_else(|| self.settings.default_model())
+            .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)));
+        let wanted = wanted.ok_or_else(|| format!("no model: no connected account serves one; log in to one, or pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
+        // A session whose model is no longer offered opens on the default model, and with that gone
+        // too, on the first model a connected account serves, rather than not at all (the status
+        // line shows which). A model asked for by name still has to exist.
+        let fallback = || self.settings.default_model().and_then(|default| registry.resolve(&default).ok()).or(registry.models().first());
+        let model = match (registry.resolve(&wanted), model) {
+            (Ok(found), _) => found.clone(),
+            (Err(error), Some(_)) => return Err(error),
+            (Err(error), None) => fallback().ok_or(error)?.clone(),
         };
         let has_thinking = resumed.messages.iter().any(|message| matches!(message, AgentMessage::Assistant(_)));
         // The level asked for, else the one this model was last set to by hand (in any session, so

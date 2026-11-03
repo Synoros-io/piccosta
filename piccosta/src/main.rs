@@ -17,43 +17,24 @@ const DEFAULT_STDIN_WAIT_SECONDS: u64 = 30;
 // argument parsers use, and what pi exits with on a bad flag).
 const USAGE_EXIT_CODE: u8 = 2;
 
-// Which provider each backend's login is for, as `piccosta auth status` lists them.
-const BACKENDS: [(&str, &str); 2] = [("codex", "openai-codex"), ("opencode", "opencode-go")];
-
-// `piccosta auth status`: for each backend, whether a credential resolves and where it comes
-// from. Keys are never printed. Output: exit 1 when any backend has none.
+// `piccosta auth status`: for each account piccosta knows (auth::ACCOUNTS), whether a credential
+// resolves and where it comes from. Keys are never printed. An account with none is listed, not
+// a failure: the user has the accounts they have. Output: exit 1 when none has a credential.
 async fn auth_status() -> Result<ExitCode, String> {
     let agent_dir = config::agent_dir();
     let paths = auth::CredentialPaths::from_environment(&agent_dir);
     let registry = model::ModelRegistry::load(&agent_dir.join("models.json"))?;
-    let mut all_ok = true;
-    for (backend, provider) in BACKENDS {
-        match auth::credential_for(provider, registry.provider_config(provider), &paths).await {
-            Ok(credential) => println!("ok   {backend:<9} {}", credential.source),
-            Err(error) => {
-                all_ok = false;
-                println!("FAIL {backend:<9} {error}");
+    let mut any = false;
+    for account in &auth::ACCOUNTS {
+        match auth::credential_for(account.provider, registry.provider_config(account.provider), &paths).await {
+            Ok(credential) => {
+                any = true;
+                println!("ok   {:<12} {}", account.plan, credential.source);
             }
+            Err(error) => println!("--   {:<12} {error}", account.plan),
         }
     }
-    // Claude Code keeps its own login; ask it.
-    let claude = std::process::Command::new("claude").args(["auth", "status", "--json"]).output();
-    match claude {
-        Ok(output) if output.status.success() => {
-            let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-            let method = status.get("authMethod").and_then(|m| m.as_str()).map(|m| format!(" ({m})")).unwrap_or_default();
-            println!("ok   {:<9} Claude Code login{method}", "claude");
-        }
-        Ok(_) => {
-            all_ok = false;
-            println!("FAIL {:<9} not logged in; run: claude auth login", "claude");
-        }
-        Err(_) => {
-            all_ok = false;
-            println!("FAIL {:<9} claude not found on PATH", "claude");
-        }
-    }
-    Ok(if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+    Ok(if any { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 // Piped stdin, trimmed, or "" when it's a terminal, empty, or silent past the wait.
@@ -243,9 +224,16 @@ async fn main() -> ExitCode {
         piccosta::tools::reaper::run();
         return ExitCode::SUCCESS;
     }
-    // The model catalogs, fetched again in the background when they're stale (model.rs).
+    // Each account's model list, fetched again in the background (model.rs); a start with no list
+    // kept that reads waits for them, and says what went wrong. The terminal UI shows that too.
     let agent_dir = config::agent_dir();
-    tokio::spawn(model::refresh_catalogs(agent_dir.clone(), config::Settings::load(&agent_dir, &std::env::current_dir().unwrap_or_default())));
+    let waits = !model::has_lists(&agent_dir);
+    let refresh = model::start_refresh(agent_dir.clone());
+    if waits {
+        for problem in refresh.await.into_iter().filter_map(Result::err) {
+            eprintln!("piccosta: {problem}");
+        }
+    }
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let fail = |error: String| {
         eprintln!("piccosta: {error}");

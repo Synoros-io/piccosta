@@ -131,6 +131,34 @@ pub fn user_agent() -> String {
     format!("piccosta/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH)
 }
 
+// What piccosta calls itself to Codex and opencode (config.rs client_name), read once.
+pub fn client_name() -> &'static str {
+    static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| crate::config::client_name(&crate::config::agent_dir()));
+    &NAME
+}
+
+// How many redirects a request may follow: reqwest's own default (redirect::Policy::default).
+const MAX_REDIRECTS: usize = 10;
+
+// The client every request with a key starts from (tools/web/net.rs checks its own hops). A
+// redirect is followed only on the origin first asked of, the same scheme, host and port: reqwest
+// drops Authorization on a hop elsewhere but keeps x-api-key, x-goog-api-key and a provider's own
+// headers, so a 307 to another origin would carry the key there.
+pub fn http_client() -> reqwest::ClientBuilder {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        let (from, to) = (attempt.previous()[0].origin(), attempt.url().origin());
+        if from != to {
+            let refused = format!("refused a redirect from {} to {}", from.ascii_serialization(), to.ascii_serialization());
+            attempt.error(refused)
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    reqwest::Client::builder().user_agent(user_agent()).redirect(policy)
+}
+
 // Whether a model is served by opencode, which wants its client and session headers.
 pub fn is_opencode(model: &Model) -> bool {
     let host = model.base_url.split_once("://").map_or(model.base_url.as_str(), |(_, rest)| rest).split(['/', ':', '?']).next().unwrap_or_default();
@@ -139,7 +167,7 @@ pub fn is_opencode(model: &Model) -> bool {
 
 // reqwest's display text leaves out the connection failure. Keep its causes so the retry rules
 // can see a refused connection, DNS failure or reset, including one while reading the body.
-fn http_error(error: reqwest::Error) -> String {
+pub fn http_error(error: reqwest::Error) -> String {
     use std::error::Error;
     let mut message = error.to_string();
     let mut source = error.source();
@@ -157,8 +185,7 @@ fn http_error(error: reqwest::Error) -> String {
 // so retry rules can see a 5xx).
 pub async fn post_openai(model: &Model, url: String, credential: &Credential, session_id: Option<&str>, extra: Vec<(&str, String)>, body: &Value) -> Result<reqwest::Response, String> {
     let opencode = is_opencode(model);
-    let mut http = reqwest::Client::builder()
-        .user_agent(user_agent())
+    let mut http = http_client()
         .build()
         .map_err(http_error)?
         .post(url)
@@ -167,7 +194,7 @@ pub async fn post_openai(model: &Model, url: String, credential: &Credential, se
         .header("accept", "text/event-stream");
     // opencode attributes requests to the client that sent them (identity.ts:96-109).
     if opencode {
-        http = http.header("x-opencode-client", "pi");
+        http = http.header("x-opencode-client", client_name());
     }
     for (name, value) in model.headers.iter().flatten() {
         http = http.header(name, value);
@@ -187,7 +214,17 @@ pub async fn post_openai(model: &Model, url: String, credential: &Credential, se
     if status.is_success() {
         return Ok(response);
     }
+    let retry_after = response.headers().get("retry-after").and_then(|value| value.to_str().ok()?.trim().parse::<f64>().ok());
     let text = response.text().await.unwrap_or_default();
+    // opencode refuses a Go plan past one of its limits (5 hour, weekly or monthly) with a
+    // GoUsageLimitError naming it in metadata.limitName and when to come back in Retry-After, in
+    // seconds (opencode's packages/core/src/session/to-session-error.ts). That's the only reading
+    // Go gives: its successful responses carry no usage headers.
+    if opencode && text.contains("GoUsageLimitError") {
+        let limit = serde_json::from_str::<Value>(&text).ok().and_then(|json| json.pointer("/metadata/limitName").or(json.pointer("/error/metadata/limitName"))?.as_str().map(str::to_string));
+        let resets_at = retry_after.map(|seconds| (clock::now_ms() / 1000) as f64 + seconds);
+        crate::scale::record(&model.provider, limit.as_deref().unwrap_or("limit"), 100.0, resets_at);
+    }
     let detail = serde_json::from_str::<Value>(&text).ok().and_then(|json| json.pointer("/error/message").and_then(Value::as_str).map(str::to_string)).unwrap_or(text);
     Err(format!("{} {detail}", status.as_u16()).trim().to_string())
 }

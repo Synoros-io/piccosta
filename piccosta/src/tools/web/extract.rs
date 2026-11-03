@@ -89,7 +89,8 @@ fn is_non_recoverable(error: &str) -> bool {
 
 // Input: one URL as the model gave it. Output: what fetch_content stores for it; failures are in
 // `error`, never an Err (extract.ts:548-1141, the direct-HTTP route).
-pub async fn extract_content(url: &str, mode: Mode, force_clone: bool, web: &WebShared, cancel: &CancellationToken) -> Extracted {
+// An image is fitted to `limits`, the model's (read's ToolContext.image_limits).
+pub async fn extract_content(url: &str, mode: Mode, force_clone: bool, web: &WebShared, limits: image::Limits, cancel: &CancellationToken) -> Extracted {
     if cancel.is_cancelled() {
         return Extracted::failed(url, "Aborted");
     }
@@ -117,7 +118,7 @@ pub async fn extract_content(url: &str, mode: Mode, force_clone: bool, web: &Web
         return Extracted::failed(url, "Aborted");
     }
     let timeout = Duration::from_millis(web.settings.fetch_timeout_ms);
-    let result = extract_via_http(url, &parsed, mode, mode != Mode::Raw, timeout, web, client, cancel, 0).await;
+    let result = extract_via_http(url, &parsed, mode, mode != Mode::Raw, timeout, web, limits, client, cancel, 0).await;
     if mode == Mode::Raw || result.error.is_none() {
         return result;
     }
@@ -416,6 +417,7 @@ fn extract_via_http<'a>(
     prefer_markdown: bool,
     timeout: Duration,
     web: &'a WebShared,
+    limits: image::Limits,
     client: &'a WebClient,
     cancel: &'a CancellationToken,
     meta_hops: usize,
@@ -423,7 +425,7 @@ fn extract_via_http<'a>(
     Box::pin(async move {
         let started = Instant::now();
         tokio::select! {
-            result = tokio::time::timeout(timeout, fetch_and_extract(url, parsed, mode, prefer_markdown, timeout, started, web, client, cancel, meta_hops)) => {
+            result = tokio::time::timeout(timeout, fetch_and_extract(url, parsed, mode, prefer_markdown, timeout, started, web, limits, client, cancel, meta_hops)) => {
                 result.unwrap_or_else(|_| Extracted::failed(url, "The operation was aborted."))
             }
             () = cancel.cancelled() => Extracted::failed(url, "Aborted"),
@@ -440,6 +442,7 @@ async fn fetch_and_extract(
     timeout: Duration,
     started: Instant,
     web: &WebShared,
+    limits: image::Limits,
     client: &WebClient,
     cancel: &CancellationToken,
     meta_hops: usize,
@@ -488,7 +491,7 @@ async fn fetch_and_extract(
             Err(error) => return with_status(Extracted::failed(url, error)),
         };
         let image_type = mime.clone();
-        let prepared = tokio::task::spawn_blocking(move || image::prepare(&bytes, &image_type)).await;
+        let prepared = tokio::task::spawn_blocking(move || image::prepare(&bytes, &image_type, limits)).await;
         let Ok(Ok(prepared)) = prepared else {
             return with_status(Extracted::failed(url, format!("Could not decode image: {mime}")));
         };
@@ -547,7 +550,7 @@ async fn fetch_and_extract(
         // Short negotiated Markdown: ask again with the browser's Accept, and let that answer win
         // unless it came back empty where the Markdown didn't (extract.ts:1452-1467).
         let remaining = timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(1));
-        let normal = extract_via_http(url, parsed, mode, false, remaining, web, client, cancel, meta_hops).await;
+        let normal = extract_via_http(url, parsed, mode, false, remaining, web, limits, client, cancel, meta_hops).await;
         let normal_error = normal.error.clone().unwrap_or_default();
         if cancel.is_cancelled() || is_non_recoverable(&normal_error) || matches!(normal.status, Some(404 | 410)) || normal_error.contains("abort") || normal_error == "Aborted" {
             return normal;
@@ -568,7 +571,7 @@ async fn fetch_and_extract(
             return Extracted::failed(url, error);
         }
         let remaining = timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(1));
-        return extract_via_http(url, &target, mode, prefer_markdown, remaining, web, client, cancel, meta_hops + 1).await;
+        return extract_via_http(url, &target, mode, prefer_markdown, remaining, web, limits, client, cancel, meta_hops + 1).await;
     }
     let title_of_document = document_title(&text);
     let html = text.clone();
@@ -611,12 +614,12 @@ async fn fetch_and_extract(
 
 // Every URL of one call, three at a time across the whole session (extract.ts:1618-1633), in the
 // order given.
-pub async fn fetch_all(urls: &[String], mode: Mode, force_clone: bool, web: &WebShared, cancel: &CancellationToken) -> Vec<Extracted> {
+pub async fn fetch_all(urls: &[String], mode: Mode, force_clone: bool, web: &WebShared, limits: image::Limits, cancel: &CancellationToken) -> Vec<Extracted> {
     let jobs = urls.iter().map(|url| async move {
         let Ok(_slot) = web.fetch_slots.acquire().await else {
             return Extracted::failed(url, "Aborted");
         };
-        extract_content(url, mode, force_clone, web, cancel).await
+        extract_content(url, mode, force_clone, web, limits, cancel).await
     });
     futures_util::future::join_all(jobs).await
 }

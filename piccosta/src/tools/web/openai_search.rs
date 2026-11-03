@@ -5,13 +5,14 @@
 // Based on pi-web-access 0.44.0 (MIT, see LICENSE.md): openai-search.ts, its
 // request body, instructions, stream parsing, result order and error messages. Left out: the
 // alpha/search endpoint, api.openai.com keys, custom Responses URLs, and the picker that walks
-// every registered model; the model is `web.searchModel`, else the first default below whose
-// provider has a credential.
+// every registered model; the model is `web.searchModel`, else the first of the scale's search
+// kind's models that speaks a Responses API and whose provider has a credential.
 // - Measured 2026-10-29 (ledger.md, the 30 known-item queries SearXNG was measured on, through
 //   the opencode-go plan): gpt-6-luna put the expected page first for 26 and in the top
 //   three for all 30, median 6.4 s, max 44 s, $0.0035 of plan allowance a query. On 19 past
 //   queries it answered all 19 (SearXNG 15). claude-haiku-5-5 with Anthropic's web_search tool
-//   ranked it in the top ten for only 26 at about twice the cost, so it isn't a default.
+//   ranked it in the top ten for only 26 at about twice the cost; it speaks the Messages API, so
+//   web_search passes over it in the search kind's list.
 // - The search model can be any model the user has; the model asking needn't search itself, so a
 //   DeepSeek session searches through gpt-6-luna on the same opencode-go plan.
 
@@ -24,10 +25,8 @@ use serde_json::{json, Map, Value};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-// The models web_search asks when `web.searchModel` isn't set, in order; the first whose provider
-// has a credential is used. Both are gpt-6-luna, the model measured above, on the two plans
-// piccosta logs into.
-const DEFAULT_SEARCH_MODELS: [&str; 2] = ["opencode-go/gpt-6-luna", "openai-codex/gpt-6-luna"];
+// The scale kind whose models web_search asks when `web.searchModel` isn't set.
+const SEARCH_KIND: &str = "search";
 // The wire protocols this request speaks: Codex's backend and the Responses API as opencode-go
 // serves it.
 const CODEX_API: &str = "openai-codex-responses";
@@ -49,21 +48,33 @@ pub struct Target {
     pub config: Option<ProviderConfig>,
 }
 
-// The models web_search may ask, from `web.searchModel` or the defaults. Input: the registry and
-// the configured name. Output: the targets in order, or an error when the configured model isn't
-// known or doesn't speak a Responses API (it's reported when a search runs, not at startup).
-pub fn targets(registry: &ModelRegistry, configured: Option<&str>) -> Result<Vec<Target>, String> {
+// The models web_search may ask: `web.searchModel`, else the search kind's models, in the scale's
+// order. Input: the registry, the configured name and the agent dir. Output: the targets in order,
+// or an error when the configured model isn't known or doesn't speak a Responses API, or none of
+// the kind's does (it's reported when a search runs, not at startup), naming each one left out.
+pub fn targets(registry: &ModelRegistry, configured: Option<&str>, agent_dir: &std::path::Path) -> Result<Vec<Target>, String> {
     let target = |model: &Model| Target { model: model.clone(), config: registry.provider_config(&model.provider).cloned() };
-    match configured {
-        Some(name) => {
-            let model = registry.resolve(name).map_err(|error| format!("web.searchModel: {error}"))?;
-            if model.api != CODEX_API && model.api != RESPONSES_API {
-                return Err(format!("web.searchModel: {}/{} speaks {}; web search needs a model on an OpenAI Responses API ({CODEX_API} or {RESPONSES_API})", model.provider, model.id, model.api));
-            }
-            Ok(vec![target(model)])
+    let responses = |model: &Model| model.api == CODEX_API || model.api == RESPONSES_API;
+    if let Some(name) = configured {
+        let model = registry.resolve(name).map_err(|error| format!("web.searchModel: {error}"))?;
+        if !responses(model) {
+            return Err(format!("web.searchModel: {}/{} speaks {}; web search needs a model on an OpenAI Responses API ({CODEX_API} or {RESPONSES_API})", model.provider, model.id, model.api));
         }
-        None => Ok(DEFAULT_SEARCH_MODELS.iter().filter_map(|name| registry.resolve(name).ok()).map(target).collect()),
+        return Ok(vec![target(model)]);
     }
+    let kind = crate::scale::find(agent_dir, SEARCH_KIND)?;
+    let (mut targets, mut skipped) = (Vec::new(), Vec::new());
+    for name in crate::scale::order(agent_dir, &kind) {
+        match registry.resolve(crate::scale::split(&name).0) {
+            Ok(model) if responses(model) => targets.push(target(model)),
+            Ok(model) => skipped.push(format!("{name} (speaks {})", model.api)),
+            Err(_) => skipped.push(format!("{name} (no connected account serves it)")),
+        }
+    }
+    if targets.is_empty() {
+        return Err(format!("None of the {SEARCH_KIND} kind's models can search: web search needs one on an OpenAI Responses API ({CODEX_API} or {RESPONSES_API}); left out {}. Add one with /scale {SEARCH_KIND}, set web.searchModel, or set web.searxngBaseUrl to your own SearXNG", skipped.join(", ")));
+    }
+    Ok(targets)
 }
 
 // The first target whose provider has a credential, with that credential.
@@ -76,7 +87,7 @@ async fn pick<'a>(targets: &'a [Target], paths: &CredentialPaths) -> Result<(&'a
         }
     }
     let tried = if tried.is_empty() { String::new() } else { format!(" (no credential for {})", tried.join(", ")) };
-    Err(format!("No search model available{tried}. Log in to opencode-go or Codex, set web.searchModel to a provider/model on an OpenAI Responses API, or set web.searxngBaseUrl to your own SearXNG"))
+    Err(format!("No search model available{tried}. Log in to one of the {SEARCH_KIND} kind's accounts, set web.searchModel to a provider/model on an OpenAI Responses API, or set web.searxngBaseUrl to your own SearXNG"))
 }
 
 // The number of sources asked for, when the call gave one (pi passes numResults through only when
@@ -149,14 +160,14 @@ pub fn request_body(model_id: &str, query: &str, options: &SearchOptions<'_>) ->
 // openai_responses.rs). Output: the response, or the transport error.
 async fn send(target: &Target, credential: &Credential, session_id: &str, body: &Value) -> Result<reqwest::Response, String> {
     let model = &target.model;
-    let client = reqwest::Client::builder().user_agent(provider::user_agent()).timeout(SEARCH_TIMEOUT).build().map_err(|error| error.to_string())?;
+    let client = provider::http_client().timeout(SEARCH_TIMEOUT).build().map_err(|error| error.to_string())?;
     let mut http = if model.api == CODEX_API {
         let account_id = credential.account_id.as_deref().ok_or("Failed to extract accountId from token")?;
-        client.post(codex::endpoint(&model.base_url)).header("chatgpt-account-id", account_id).header("originator", "pi")
+        client.post(codex::endpoint(&model.base_url)).header("chatgpt-account-id", account_id).header("originator", provider::client_name())
     } else {
         let mut http = client.post(format!("{}/responses", model.base_url.trim_end_matches('/')));
         if provider::is_opencode(model) {
-            http = http.header("x-opencode-client", "pi").header("x-opencode-session", session_id);
+            http = http.header("x-opencode-client", provider::client_name()).header("x-opencode-session", session_id);
         }
         http
     };

@@ -6,8 +6,8 @@
 // - The shell is settings' shellPath, else /bin/bash, else bash on PATH, else sh, run as
 //   `<shell> -c "<shellCommandPrefix>\n<command>"`, in its own session (setsid), stdin closed,
 //   stdout and stderr on one pipe, read as one stream.
-// - PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL and PI_REASONING_LEVEL describe the
-//   session; the agent dir's bin/ goes on the front of PATH.
+// - PICCOSTA_SESSION_ID, PICCOSTA_SESSION_FILE, PICCOSTA_PROVIDER, PICCOSTA_MODEL and
+//   PICCOSTA_REASONING_LEVEL describe the session; the agent dir's bin/ goes on the front of PATH.
 // - A timeout or an abort SIGKILLs a bash command's whole process group. Subagents get SIGTERM
 //   first so their own shell groups are cleaned up. After the shell exits, output is
 //   still read until the pipe closes or nothing arrives for 100 ms, so a descendant that keeps
@@ -59,8 +59,9 @@ const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 // four seconds (provider/claude/mod.rs); leave another second for shell cleanup and scheduling.
 pub(super) const SUBAGENT_STOP_GRACE: Duration = Duration::from_secs(5);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
-// The environment variables that describe the session to commands (bash.ts:186-212).
-const SESSION_VARIABLES: [&str; 5] = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
+// The environment variables that describe the session to commands (bash.ts:186-212, under
+// piccosta's own names).
+const SESSION_VARIABLES: [&str; 5] = [super::subagent::SESSION_ENV, "PICCOSTA_SESSION_FILE", "PICCOSTA_PROVIDER", "PICCOSTA_MODEL", "PICCOSTA_REASONING_LEVEL"];
 
 enum Event {
     Data(Vec<u8>),
@@ -99,12 +100,12 @@ impl Tool for BashTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Execute bash commands (ls, grep, find, etc.)")
+        Some("run a shell command in the project directory")
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[
-            "You can inspect PI_* environment variables for current model and session details.",
+            "Commands see this session's id, file, provider, model and thinking level as PICCOSTA_SESSION_ID, PICCOSTA_SESSION_FILE, PICCOSTA_PROVIDER, PICCOSTA_MODEL and PICCOSTA_REASONING_LEVEL",
             "A command still running after a minute moves to the background on its own, and its result comes to you as a message when it ends: don't wait on it, sleep or poll. A timeout only stops a command that must not run longer; leave it out otherwise.",
         ]
     }
@@ -305,11 +306,11 @@ fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), S
     for name in SESSION_VARIABLES {
         process.env_remove(name);
     }
-    process.env("PI_SESSION_ID", &context.session_id);
-    if let Some(file) = &context.session_file {
-        process.env("PI_SESSION_FILE", file);
+    let [id, file, provider, model, level] = SESSION_VARIABLES;
+    process.env(id, &context.session_id).env(provider, &context.provider).env(model, &context.model_id).env(level, &context.thinking_level);
+    if let Some(path) = &context.session_file {
+        process.env(file, path);
     }
-    process.env("PI_PROVIDER", &context.provider).env("PI_MODEL", &context.model_id).env("PI_REASONING_LEVEL", &context.thinking_level);
 
     // Its own session, as Node's detached spawn does: a process group we can kill as one, and no
     // controlling terminal, so nothing it runs can grab the TUI's keyboard. A read-only job's

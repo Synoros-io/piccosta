@@ -69,12 +69,14 @@ impl SubagentTool {
         (!jobs.is_empty()).then(|| SubagentTool { jobs, agent_dir: agent_dir.to_path_buf() })
     }
 
-    // The job's models that are in the registry and have a login, in its order (the calling
-    // session's own model for a job that lists none), and a line for each one left out and why.
+    // The job's models that a connected account serves and that have a login, in its order, and a
+    // line for each one left out and why. A job that lists none, or none of whose models can run,
+    // runs on the calling session's own model.
     async fn available(&self, job: &Job, context: &ToolContext) -> Result<(Vec<String>, Vec<String>), String> {
         let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name)?);
+        let own = format!("{}/{}", context.provider, context.model_id);
         if models.is_empty() {
-            return Ok((vec![format!("{}/{}", context.provider, context.model_id)], Vec::new()));
+            return Ok((vec![own], Vec::new()));
         }
         let registry = ModelRegistry::load(&self.agent_dir.join("models.json"))?;
         let paths = CredentialPaths::from_environment(&self.agent_dir);
@@ -84,7 +86,7 @@ impl SubagentTool {
             let (id, level) = crate::scale::split(name);
             let level = level.map_or(String::new(), |level| format!(":{level}"));
             let Ok(model) = registry.resolve(id) else {
-                skipped.push(format!("[subagent {}: skipped {name}, which is not in models.json]", job.name));
+                skipped.push(format!("[subagent {}: skipped {name}, which no connected account serves]", job.name));
                 continue;
             };
             match credential_for(&model.provider, registry.provider_config(&model.provider), &paths).await {
@@ -93,7 +95,8 @@ impl SubagentTool {
             }
         }
         if found.is_empty() {
-            return Err(format!("None of the {} job's models can run: {}. Log in to one, or change its models in {} (/scale edit).", job.name, skipped.join(" "), crate::scale::path(&self.agent_dir).display()));
+            skipped.push(format!("[subagent {}: none of its models can run, so it runs on {own}; /scale edit changes them]", job.name));
+            found.push(own);
         }
         Ok((found, skipped))
     }
@@ -132,7 +135,7 @@ impl SubagentTool {
         self.jobs
             .iter()
             .map(|job| {
-                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| entry.models.join(", else ")).unwrap_or_default();
+                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| crate::scale::available(&self.agent_dir, &entry).join(", else ")).unwrap_or_default();
                 let models = if models.is_empty() { "your own model".to_string() } else { models };
                 let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
                 let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
@@ -191,7 +194,7 @@ impl Tool for SubagentTool {
 // The program name a piccosta process has in /proc/<pid>/comm.
 pub const PROCESS_NAME: &str = "piccosta";
 // The variable bash sets to the session that ran a command, which everything it starts inherits.
-pub const SESSION_ENV: &str = "PI_SESSION_ID";
+pub const SESSION_ENV: &str = "PICCOSTA_SESSION_ID";
 // How a piccosta is pointed at another agent dir (config.rs agent_dir).
 const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
 // Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the

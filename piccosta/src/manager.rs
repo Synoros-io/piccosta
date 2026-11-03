@@ -77,12 +77,23 @@ const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold fro
 // a subagent above all, goes to the background so the manager stays free for the user. The usual
 // limit is a minute.
 pub const SOFT_LIMIT: Duration = Duration::from_secs(3);
-const QUOTA_ASK: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.";
-const QUOTA_FREE: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans, as piccosta is meant to; the user has let you use them as you judge best, so watch `sessions usage`.";
 
-// The model and thinking level the manager runs on unless `manager.model`/`manager.thinking`
-// say otherwise: a model that writes few tokens and holds 1M of context, at a medium level.
-const DEFAULT_MODEL: &str = "claude-bridge/claude-opus-5-5";
+// What a manager is told about the user's paid plans (auth::ACCOUNTS' ask_first ones): ask before
+// spending them on its own, or use them as it judges best.
+fn quota(ask: bool) -> String {
+    let paid: Vec<&crate::auth::Account> = crate::auth::ACCOUNTS.iter().filter(|account| account.ask_first).collect();
+    let models = paid.iter().map(|account| format!("{}/*", account.provider)).collect::<Vec<_>>().join(" and ");
+    let plans = paid.iter().map(|account| account.plan_name).collect::<Vec<_>>().join(" and ");
+    if ask {
+        format!("Models on {models} run on the user's own {plans} plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.")
+    } else {
+        format!("Models on {models} run on the user's own {plans} plans, as piccosta is meant to; the user has let you use them as you judge best, so watch `sessions usage`.")
+    }
+}
+
+// What the manager runs on unless `manager.model`/`manager.thinking` say otherwise: the scale's
+// kind for managing a main lane (critical), first at its level, else at a medium one.
+const MANAGER_KIND: &str = "critical";
 const DEFAULT_THINKING: &str = "medium";
 // The command `notify` runs with the message as its last argument, unless `manager.notifyCommand`
 // names another (a list of words).
@@ -133,7 +144,7 @@ pub enum Role {
     Project,
 }
 
-// Whether this piccosta was started by an agent's command: bash sets PI_SESSION_ID for everything
+// Whether this piccosta was started by an agent's command: bash sets PICCOSTA_SESSION_ID for everything
 // a command starts, and piccosta's own launches (a manager's lane runs, the service, a terminal
 // the user opens) don't have it, so a human's piccosta under another piccosta is still the user's.
 // A command that unsets it on purpose is an escape, which this doesn't claim to stop.
@@ -822,7 +833,9 @@ impl SessionsTool {
         for summary in all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
             let Ok(session) = crate::session::Session::open(&summary.path, &summary.cwd) else { continue };
             for message in session.context().messages {
-                if let AgentMessage::Assistant(assistant) = message {
+                if let AgentMessage::Assistant(assistant) = message
+                    && !crate::provider::responses::plan_billed(&assistant.provider)
+                {
                     let total = totals.entry(assistant.provider.clone()).or_default();
                     total.1 += assistant.usage.cost.total;
                     if now - assistant.timestamp < DAY_MS {
@@ -831,7 +844,7 @@ impl SessionsTool {
                 }
             }
         }
-        let mut lines: Vec<String> = totals.iter().map(|(provider, (day, week))| format!("{provider}: ${day:.2} in the last day, ${week:.2} in the last week (catalog prices; plans bill by quota, not these)")).collect();
+        let mut lines: Vec<String> = totals.iter().map(|(provider, (day, week))| format!("{provider}: ${day:.2} in the last day, ${week:.2} in the last week (catalog prices for keys billed by the token; plans bill by quota, below)")).collect();
         if lines.is_empty() {
             lines.push("Nothing spent this week.".into());
         }
@@ -1081,11 +1094,12 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
             "\n- Its sessions are yours to watch and direct. The assistant, the user's lead director, may message you too; answer it as you would the user.\n- For real work, start sessions with a second model (`sessions start` with `trio` to have it check each answer, `pair` to have the two work it through together); ask the user before you start them. Manage the reviewing and the builds yourself, and leave long, large arms of work and plans to subsessions.".to_string(),
         ),
     };
-    let scale = crate::scale::uses(&crate::config::agent_dir()).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, entry.models.join(", then "))).collect::<Vec<_>>().join("\n");
+    let agent_dir = crate::config::agent_dir();
+    let scale = crate::scale::uses(&agent_dir).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, crate::scale::available(&agent_dir, entry).join(", then "))).collect::<Vec<_>>().join("\n");
     let home = home_for(&crate::config::agent_dir(), role, cwd);
     let memory = fs::read_to_string(home.join("memory.md")).unwrap_or_default();
     let memory = if role != Role::Assistant { String::new() } else if memory.trim().is_empty() { "\n\nYour memory: nothing yet.".into() } else { format!("\n\nYour memory:\n{}", memory.trim_end()) };
-    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", if ask { QUOTA_ASK } else { QUOTA_FREE })
+    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", &quota(ask))
         .replace("{ledger}", &home.join("ledger.md").display().to_string())
         .replace("{scope}", if role == Role::Assistant { "across the projects" } else { "in the project" })
         .replace("{memory_line}", &if role == Role::Assistant { ASSISTANT_MEMORY.replace("{path}", &home.join("memory.md").display().to_string()) } else { String::new() })
@@ -1209,8 +1223,11 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     let file = session.file().ok_or("the manager needs a session file")?.to_path_buf();
     fs::write(home.join("session"), file.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
     let (model, thinking) = host.launch(&args)?;
-    let model = model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| DEFAULT_MODEL.into());
-    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| DEFAULT_THINKING.into());
+    let (model, level) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
+        Some(model) => (model, None),
+        None => crate::scale::pick(&agent_dir, MANAGER_KIND).map_err(|error| format!("{error}; set manager.model in settings"))?,
+    };
+    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).or(level).unwrap_or_else(|| DEFAULT_THINKING.into());
     let busy = Arc::new(AtomicBool::new(false));
     let marks = busy.clone();
     let emit: crate::agent::EventSink = Box::new(move |event: &crate::agent::Event| match event {

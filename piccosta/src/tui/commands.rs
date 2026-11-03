@@ -4,7 +4,7 @@
 // here. A command's output goes into the pane as a report: shown there, never sent to the model,
 // gone when the session is reopened.
 
-use super::{App, Command, State};
+use super::{App, Command, State, Update};
 use crate::message::{AgentMessage, Content, CustomMessage, TextOrBlocks};
 use crate::session::{Session, SessionEntry};
 use serde_json::Value;
@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 39] = [
+const COMMANDS: [(&str, &str); 40] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -55,6 +55,7 @@ const COMMANDS: [(&str, &str); 39] = [
     ("/rewind", "go back to before one of your prompts, in a copy, with that prompt in the editor"),
     ("/rename, /name <name>", "name this session"),
     ("/model [name]", "switch the model; new sessions start on it too"),
+    ("/models refresh", "fetch each account's model list again now"),
     ("/pair [model|off]", "work with a second model as a pair: the two answer each other in turn until one says it's done, then you speak"),
     ("/trio [model|off]", "work with a second model as a trio: it checks each answer once, then you speak"),
     ("/thinking, /effort [level|auto]", "set the thinking level, saved for the model; auto forgets it"),
@@ -80,8 +81,8 @@ const COMMANDS: [(&str, &str); 39] = [
     ("keys", "enter send · alt+enter newline · esc stop · ^c quit"),
     ("", "^backspace deletes a word · ^shift+delete clears what's typed (↑ brings it back)"),
     ("", "running: enter queues · ^x^s or ^enter sends now · ↑ takes back · esc stops, queue goes next"),
-    ("", "^n new · ^s sessions · alt+↑↓ through the sidebar (shown, started when you type) · ^b sidebar"),
-    ("", "^\\ split · ^] close pane · alt+←→ panes · ^o tools · ^t thinking"),
+    ("", "^n new · ^s sessions · pgup/pgdn or alt+↑↓ through the sidebar (shown, started when you type) · ^b sidebar"),
+    ("", "^\\ split · ^] close pane · alt+←→ panes · alt+pgup/pgdn or the wheel scrolls · ^o tools · ^t thinking"),
     ("copy", "drag to select (double-click a word, triple-click a row); it copies when you let go · ^c copies a selection · shift+arrows extend it"),
     ("paste", "right-click pastes the clipboard, middle-click the last selection, ^v the clipboard · shift+arrows select in the editor"),
 ];
@@ -218,6 +219,15 @@ impl App {
             }
             "fork" | "branch" => self.fork(None, argument.to_string(), String::new()),
             "rewind" => self.rewind(),
+            // The lists come in the background; their report lands when they have.
+            "models" => {
+                let (agent_dir, sender) = (self.host.agent_dir.clone(), self.sender.clone());
+                tokio::spawn(async move {
+                    let lines = crate::model::refresh_models(agent_dir, true).await;
+                    let _ = sender.send((0, Update::Report(format!("The model lists, as each account serves them now:\n\n{}", lines.into_iter().map(|line| line.unwrap_or_else(|problem| problem)).collect::<Vec<_>>().join("\n")))));
+                });
+                self.notice = Some("Fetching each account's model list…".into());
+            }
             // Both pickers start on what the session runs now, so a stray enter changes nothing (a
             // level picked is saved for the model).
             "model" => {

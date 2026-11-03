@@ -457,8 +457,9 @@ impl Agent {
     // 11.9M tokens written in a day, 2026-11-01). So it's brought up to date only when it has none
     // yet, at a compaction or a model change (which start a new cache anyway), or when what it's
     // built from changed: its context files (prompt::INPUT_SECTIONS) or what a tool can be called
-    // with, its name and parameters (a subagent job added or removed changes the job enum in the
-    // subagent tool's parameters). A tool's description, like the prompt's wording, waits.
+    // with, its name and parameters less their descriptions (a subagent job added or removed
+    // changes the job enum in the subagent tool's parameters). A tool's wording, like the prompt's,
+    // waits: the tools that stayed keep the definitions and tool-list lines the session has.
     fn system_update(&self) -> Option<SystemMessage> {
         let messages = crate::message::to_model_messages(&self.session.context().messages);
         let current = transcript::current_system_message(&messages);
@@ -469,31 +470,75 @@ impl Agent {
             .unwrap_or_default();
         let current_tools: Vec<ToolDefinition> = current.and_then(|system| system.tools_added).unwrap_or_default();
         let desired: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
-        let callable = |tool: &ToolDefinition| current_tools.iter().any(|held| (&held.name, &held.parameters) == (&tool.name, &tool.parameters));
-        let tools_changed = desired.len() != current_tools.len() || !desired.iter().all(callable);
-        let inputs_changed = crate::prompt::INPUT_SECTIONS.iter().any(|name| previous.get(*name) != self.config.sections.get(*name)) || tools_changed;
-        // The newest of a system message, a compaction or a model change, walking back from the leaf.
+        let stayed = |tool: &ToolDefinition| {
+            current_tools.iter().any(|held| held.name == tool.name && callable_schema(&held.parameters) == callable_schema(&tool.parameters))
+        };
+        let tools_changed = desired.len() != current_tools.len() || !desired.iter().all(stayed);
+        // An input section is the same when its files are: piccosta's header line above them is
+        // wording, which waits like any other.
+        let same_input = |name: &str| match (previous.get(name), self.config.sections.get(name)) {
+            (Some(held), Some(new)) => below_header(held).map_or(held.as_str(), |(_, files)| files) == below_header(new).map_or(new.as_str(), |(_, files)| files),
+            (held, new) => held == new,
+        };
+        let inputs_changed = crate::prompt::INPUT_SECTIONS.iter().any(|name| !same_input(name)) || tools_changed;
+        // The newest of a system message, a reply, a compaction or a model change, walking back from
+        // the leaf. A reset is free only until the first request after it: once a reply follows it,
+        // the cache has been written again with the prompt as it was, and the chance has passed.
         let since_reset = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
-            SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
+            SessionEntry::Message { message: AgentMessage::System(_) | AgentMessage::Assistant(_), .. } => Some(false),
             SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
             _ => None,
         });
-        if !previous.is_empty() && since_reset != Some(true) && !inputs_changed {
+        let reset = previous.is_empty() || since_reset == Some(true);
+        if !reset && !inputs_changed {
             return None;
         }
+        // After a reset every section is brought up to date. Otherwise only what the prompt is built
+        // from goes in: the input sections whose files changed, under the header the session already
+        // has, and the tool list when the tools did. The rest of the wording stays as it was.
+        let refreshed = |name: &str| reset || (crate::prompt::INPUT_SECTIONS.contains(&name) && !same_input(name)) || (name == "tools" && tools_changed);
         let mut patch: IndexMap<String, Option<String>> = IndexMap::new();
         for (name, text) in &self.config.sections {
-            if previous.get(name) != Some(text) {
-                patch.insert(name.clone(), Some(text.clone()));
+            if !refreshed(name) {
+                continue;
+            }
+            let text = match (previous.get(name).and_then(|held| below_header(held)), below_header(text)) {
+                _ if reset => text.clone(),
+                (Some((header, _)), Some((_, files))) => format!("{header}\n\n{files}"),
+                // The tool list the session has, less the lines of tools that went or changed, with
+                // the lines of the new ones after its last tool, or after its opening line when none
+                // stayed, so its own frame is kept. With no list held, the new one.
+                _ if name == "tools" => {
+                    let tool_of = |line: &str| line.strip_prefix("- ").and_then(|rest| rest.split_once(": ")).map(|(tool, _)| tool.to_string());
+                    let kept = |line: &&str| tool_of(line).is_none_or(|tool| desired.iter().any(|wanted| wanted.name == tool && stayed(wanted)));
+                    let mut lines: Vec<&str> = previous.get(name).map_or("", String::as_str).lines().filter(kept).collect();
+                    let at = lines.iter().rposition(|line| tool_of(line).is_some()).map(|last| last + 1).or((!lines.is_empty()).then_some(1));
+                    match at {
+                        Some(at) => {
+                            lines.splice(at..at, text.lines().filter(|line| tool_of(line).is_some() && !kept(line)));
+                            lines.join("\n")
+                        }
+                        None => text.clone(),
+                    }
+                }
+                _ => text.clone(),
+            };
+            if previous.get(name) != Some(&text) {
+                patch.insert(name.clone(), Some(text));
             }
         }
+        // A section the new prompt doesn't have goes only at a reset, or when it's an input whose
+        // files went. The tool list, when the new prompt has none (a SYSTEM.md replaced it), stays
+        // as held until a reset, like any other wording.
         for name in previous.keys() {
-            if !self.config.sections.contains_key(name) {
+            if !self.config.sections.contains_key(name) && refreshed(name) && (reset || name != "tools") {
                 patch.insert(name.clone(), None);
             }
         }
 
-        let added: Vec<ToolDefinition> = desired.iter().filter(|tool| !current_tools.contains(tool)).cloned().collect();
+        // After a reset any tool whose definition differs goes in; otherwise only the ones added or
+        // with new parameters.
+        let added: Vec<ToolDefinition> = desired.iter().filter(|tool| if reset { !current_tools.contains(tool) } else { !stayed(tool) }).cloned().collect();
         let removed: Vec<ToolReference> = current_tools
             .iter()
             .filter(|tool| !desired.iter().any(|wanted| wanted.name == tool.name))
@@ -903,6 +948,12 @@ impl Agent {
             self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
             (self.emit)(&Event::EntryAppended { entry });
         }
+        // The bridge's one notice, that Claude Code is newer than the version it was checked against.
+        if let Some(text) = provider::claude::take_notice() {
+            let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: provider::claude::NOTICE_TYPE.into(), data: Some(json!({"text": text})) };
+            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+            (self.emit)(&Event::EntryAppended { entry });
+        }
         // A response that neither failed nor ran out of room ends any overflow recovery.
         if !matches!(message.stop_reason, StopReason::Error | StopReason::Length) {
             self.overflow_recovery_attempted = false;
@@ -1215,6 +1266,7 @@ impl Agent {
             model_id: self.config.model.id.clone(),
             thinking_level: self.config.thinking_level.clone(),
             model_accepts_images: self.config.model.input.iter().any(|kind| kind == "image"),
+            image_limits: tools::image::Limits::of(self.config.model.input_limits.as_ref()),
             cancel: self.cancel.clone(),
             updates: None,
             shared: self.config.tool_shared.clone(),
@@ -1358,4 +1410,22 @@ fn tool_result_message(run: ToolRun) -> ToolResultMessage {
         timestamp: clock::now_ms(),
         duration_ms: run.duration_ms.map(|ms| ms as f64),
     }
+}
+
+// What a tool can be called with: its parameter schema with the "description" strings taken out at
+// every depth, since they're wording. Only string values go, so a parameter named description stays.
+fn callable_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.iter().filter(|(key, value)| !(*key == "description" && value.is_string())).map(|(key, value)| (key.clone(), callable_schema(value))).collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(callable_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+// A project_context section split at its header line: the header (piccosta's wording, with the
+// opening tag) and the files below it. None for other sections.
+fn below_header(text: &str) -> Option<(&str, &str)> {
+    text.starts_with("<project_context>\n").then(|| text.split_once("\n\n")).flatten()
 }

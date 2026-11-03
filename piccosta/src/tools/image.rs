@@ -12,12 +12,36 @@ use std::io::Cursor;
 // Bytes read from the start of a file to decide whether it's an image (mime.ts:3).
 pub const SNIFF_BYTES: usize = 4100;
 
-// pi's inline limits: 2000x2000 pixels and 4.5 MB of base64, under Anthropic's 5 MB per image
-// (image-resize-core.ts:31-38). JPEG starts at quality 80 and steps down through these.
-const MAX_WIDTH: u32 = 2000;
-const MAX_HEIGHT: u32 = 2000;
-const MAX_BASE64_BYTES: usize = 4_718_592;
-const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+// What an image is fitted to before it goes inline: a box in pixels, a size in base64 bytes, and
+// the JPEG quality tried first, after which JPEG steps through JPEG_QUALITIES.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_bytes: usize,
+    pub jpeg_quality: u8,
+}
+
+// Anthropic's: 2000x2000 pixels and 4.5 MB of base64, under its 5 MB per image (pi's
+// image-resize-core.ts:31-38). The limits for a model whose catalog entry gives none.
+const ANTHROPIC_LIMITS: Limits = Limits { max_width: 2000, max_height: 2000, max_bytes: 4_718_592, jpeg_quality: 80 };
+const JPEG_QUALITIES: [u8; 4] = [85, 70, 55, 40];
+
+impl Limits {
+    // A model's own limits, from its catalog `inputLimits` (`images.resize`: maxWidth, maxHeight,
+    // maxBytes, jpegQuality); each one it doesn't give is Anthropic's.
+    pub fn of(input_limits: Option<&serde_json::Value>) -> Limits {
+        let resize = input_limits.and_then(|limits| limits.pointer("/images/resize"));
+        let field = |key: &str| resize.and_then(|resize| resize.get(key)).and_then(serde_json::Value::as_u64);
+        let fallback = ANTHROPIC_LIMITS;
+        Limits {
+            max_width: field("maxWidth").and_then(|value| value.try_into().ok()).unwrap_or(fallback.max_width),
+            max_height: field("maxHeight").and_then(|value| value.try_into().ok()).unwrap_or(fallback.max_height),
+            max_bytes: field("maxBytes").and_then(|value| value.try_into().ok()).unwrap_or(fallback.max_bytes),
+            jpeg_quality: field("jpegQuality").and_then(|value| value.try_into().ok()).unwrap_or(fallback.jpeg_quality),
+        }
+    }
+}
 // Each pass that still doesn't fit shrinks both sides to three quarters.
 const SHRINK_FACTOR: f64 = 0.75;
 
@@ -137,11 +161,12 @@ fn decode(bytes: &[u8]) -> Option<DynamicImage> {
     Some(image)
 }
 
-// Input: an image file's bytes and its sniffed type. Output: the image as it goes to the model,
+// Input: an image file's bytes, its sniffed type and the limits to fit. Output: the image as it goes to the model,
 // or the note that replaces it when it can't be made small enough (image-process.ts:75-110).
 // BMP isn't an inline type anywhere, so it's always re-encoded. An image already within both
 // limits goes out as it was.
-pub fn prepare(bytes: &[u8], mime_type: &str) -> Result<Prepared, String> {
+pub fn prepare(bytes: &[u8], mime_type: &str, limits: Limits) -> Result<Prepared, String> {
+    let Limits { max_width, max_height, max_bytes, jpeg_quality } = limits;
     let mut hints = Vec::new();
     let converted_from = (mime_type == "image/bmp").then_some(mime_type);
     let image = decode(bytes).ok_or_else(|| {
@@ -153,7 +178,7 @@ pub fn prepare(bytes: &[u8], mime_type: &str) -> Result<Prepared, String> {
     })?;
     let (width, height) = (image.width(), image.height());
 
-    if converted_from.is_none() && width <= MAX_WIDTH && height <= MAX_HEIGHT && base64_len(bytes.len()) < MAX_BASE64_BYTES {
+    if converted_from.is_none() && width <= max_width && height <= max_height && base64_len(bytes.len()) < max_bytes {
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         return Ok(Prepared { data, mime_type: mime_type.to_string(), hints, width, height });
     }
@@ -161,13 +186,13 @@ pub fn prepare(bytes: &[u8], mime_type: &str) -> Result<Prepared, String> {
     // Fit inside the box first, keeping the aspect ratio, then try PNG and every JPEG quality at
     // that size, and shrink by a quarter until something fits (image-resize-core.ts:113-161).
     let (mut target_width, mut target_height) = (width, height);
-    if target_width > MAX_WIDTH {
-        target_height = ((target_height as f64 * MAX_WIDTH as f64) / target_width as f64).round() as u32;
-        target_width = MAX_WIDTH;
+    if target_width > max_width {
+        target_height = ((target_height as f64 * max_width as f64) / target_width as f64).round() as u32;
+        target_width = max_width;
     }
-    if target_height > MAX_HEIGHT {
-        target_width = ((target_width as f64 * MAX_HEIGHT as f64) / target_height as f64).round() as u32;
-        target_height = MAX_HEIGHT;
+    if target_height > max_height {
+        target_width = ((target_width as f64 * max_height as f64) / target_height as f64).round() as u32;
+        target_height = max_height;
     }
     let (mut current_width, mut current_height) = (target_width.max(1), target_height.max(1));
     loop {
@@ -177,9 +202,9 @@ pub fn prepare(bytes: &[u8], mime_type: &str) -> Result<Prepared, String> {
             image.resize_exact(current_width, current_height, image::imageops::FilterType::Lanczos3)
         };
         let candidates = std::iter::once(encode_png(&resized).map(|png| (png, "image/png")))
-            .chain(JPEG_QUALITIES.iter().map(|quality| encode_jpeg(&resized, *quality).map(|jpeg| (jpeg, "image/jpeg"))));
+            .chain(std::iter::once(jpeg_quality).chain(JPEG_QUALITIES.into_iter().filter(|quality| *quality != jpeg_quality)).map(|quality| encode_jpeg(&resized, quality).map(|jpeg| (jpeg, "image/jpeg"))));
         for (encoded, encoded_type) in candidates.flatten() {
-            if base64_len(encoded.len()) < MAX_BASE64_BYTES {
+            if base64_len(encoded.len()) < max_bytes {
                 if let Some(from) = converted_from
                     && from != encoded_type
                 {

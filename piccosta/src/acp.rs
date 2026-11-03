@@ -55,8 +55,6 @@ const TOOL_OUTPUT_CHARS: usize = 8000;
 // The largest file a prompt's link is read in for, and the largest an edit's before/after is
 // shown for; past that the model gets the path, the client the plain output.
 const FILE_MAX_BYTES: u64 = 1024 * 1024;
-// Tools that only read, which no mode asks about.
-const READ_ONLY: [&str; 4] = ["read", "web_search", "fetch_content", "get_search_content"];
 // JSON-RPC error codes (ACP v1 ErrorCode).
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -83,8 +81,9 @@ const MODES: [(Mode, &str, &str, &str); 3] = [
 fn needs_approval(mode: Mode, tool: &str) -> bool {
     match mode {
         Mode::Auto => false,
-        Mode::Edits => !READ_ONLY.contains(&tool) && !matches!(tool, "edit" | "write"),
-        Mode::Ask => !READ_ONLY.contains(&tool),
+        // Tools that only read no mode asks about.
+        Mode::Edits => !crate::tools::read_only(tool) && !matches!(tool, "edit" | "write"),
+        Mode::Ask => !crate::tools::read_only(tool),
     }
 }
 
@@ -163,7 +162,12 @@ struct Live {
 
 // Tell the client how full the context is and what the session has cost.
 fn usage_update(session: &str, live: &Live) {
-    update(session, json!({"sessionUpdate": "usage_update", "used": live.used, "size": live.model.context_window, "cost": {"amount": live.cost, "currency": "USD"}}));
+    // A plan's usage costs no money, so it goes without a cost.
+    let mut usage = json!({"sessionUpdate": "usage_update", "used": live.used, "size": live.model.context_window});
+    if live.cost > 0.0 {
+        usage["cost"] = json!({"amount": live.cost, "currency": "USD"});
+    }
+    update(session, usage);
 }
 
 struct Acp {
@@ -517,7 +521,9 @@ impl Acp {
             Event::MessageEnd { message: AgentMessage::Assistant(assistant), .. } => {
                 let usage = &assistant.usage;
                 let used = usage.input + usage.output + usage.cache_read + usage.cache_write;
-                live.cost += usage.cost.total;
+                if !crate::provider::responses::plan_billed(&assistant.provider) {
+                    live.cost += usage.cost.total;
+                }
                 if used > 0 {
                     live.used = used;
                     usage_update(session, live);
@@ -704,7 +710,10 @@ impl Acp {
         let (mode, always) = (Rc::new(Cell::new(first_mode)), Rc::new(RefCell::new(HashSet::new())));
         agent.set_gate(gate(self.inputs.clone(), id.clone(), serial, mode.clone(), always.clone()));
         let titled = crate::host::name(&agent.session).is_some() || agent.session.context().messages.iter().any(|message| matches!(message, AgentMessage::User(_)));
-        let cost = agent.session.context().messages.iter().filter_map(|message| if let AgentMessage::Assistant(assistant) = message { Some(assistant.usage.cost.total) } else { None }).sum();
+        let cost = agent.session.context().messages.iter().filter_map(|message| match message {
+            AgentMessage::Assistant(assistant) if !crate::provider::responses::plan_billed(&assistant.provider) => Some(assistant.usage.cost.total),
+            _ => None,
+        }).sum();
         let used = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
         let (handle, live_model, live_thinking) = (agent.handle(), agent.model().clone(), agent.thinking_level().to_string());
         runs.lock().unwrap().handle = handle.clone();

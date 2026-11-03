@@ -76,16 +76,11 @@ impl Tool for EditTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Make precise file edits with exact text replacement, including multiple disjoint edits in one call")
+        Some("replace exact pieces of a file's text, several in one call")
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
-        &[
-            "Use edit for precise changes (edits[].oldText must match exactly)",
-            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-            "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-            "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-        ]
+        &["Each oldText in an edit call must appear exactly once in the file as it was before the call, kept just long enough to be unique; changes to one file go in one call, and changes that touch or overlap go in one entry"]
     }
 
     // Shapes models send instead of an `edits` array (edit.ts:103-134): the array as a JSON string

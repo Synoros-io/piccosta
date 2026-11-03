@@ -47,11 +47,15 @@ impl Tool for ReadTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Read file contents")
+        Some("show a file's text, or an image")
+    }
+
+    fn read_only(&self) -> bool {
+        true
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
-        &["Use read to examine files instead of cat or sed."]
+        &["Look at files with read, not cat or sed in bash"]
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
@@ -81,7 +85,7 @@ fn read_file(arguments: &Arguments, absolute: &std::path::Path, context: &ToolCo
         // The line under the heading: the resize hints, or why the image couldn't be prepared,
         // then the note for a model without vision.
         let note = (!context.model_accepts_images).then_some(NON_VISION_NOTE);
-        let (heading, extra, image) = match image::prepare(&bytes, mime_type) {
+        let (heading, extra, image) = match image::prepare(&bytes, mime_type, context.image_limits) {
             Ok(prepared) => (prepared.mime_type.clone(), prepared.hints, Some(Content::Image { data: prepared.data, mime_type: prepared.mime_type })),
             Err(message) => (mime_type.to_string(), vec![message], None),
         };

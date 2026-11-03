@@ -1,31 +1,28 @@
-// The system prompt: pi's sections, with piccosta's changes made as the sections are built.
+// The system prompt: piccosta's own text, in sections.
 //
-// Based on pi 1.4.0 (MIT, see LICENSE.md): packages/coding-agent/src/core/system-prompt.ts
-// (the sections) and resource-loader.ts (which AGENTS.md / CLAUDE.md files load). The sections are
-// what a session's system message stores, rendered joined by blank lines; each one but the
-// preamble is wrapped in a tag of its own name, so a later change can name what it replaces.
+// The sections, and which AGENTS.md / CLAUDE.md files load, are based on pi 1.4.0 (MIT, see
+// LICENSE.md): packages/coding-agent/src/core/system-prompt.ts and resource-loader.ts. None of
+// pi's wording is kept. A session's system message stores the sections, rendered joined by blank
+// lines; each one but the preamble is wrapped in a tag of its own name, so a later change can name
+// what it replaces. In order: a short preamble, the tools (each tool's own line), the rules (each
+// tool's guidelines and piccosta's own), the addendum (APPEND_SYSTEM.md, --append-system-prompt,
+// a manager's part), the project's context files, the cwd, and the constitution when it's on.
 //
-// piccosta's changes, which pi did as extensions rewriting the finished prompt:
-// - lean: no "Pi documentation" section. It points the model at pi's own README and examples,
-//   which matter only when you're building pi, and it was about 40% of pi 0.85's system text
-//   (bench/results/overhead/report.md).
-// - lean: a line in a context file that is only `@some/file.md` is replaced by that file, the way
+// - A line in a context file that is only `@some/file.md` is replaced by that file, the way
 //   Claude Code does. Paths are relative to the importing file, `~/` is home. One level deep: an
 //   imported file's own imports stay as written. A file never imports itself or a context file
 //   already in the prompt, and an import that can't be read keeps its `@` line, so nothing
 //   disappears silently.
-// - constitution: piccosta's constitution (prompts/constitution.md) goes last, as plain text after the tagged sections, once,
-//   the same every request, so after the first call it comes from the prompt cache.
-// In pi these forced the whole prompt every run, so the session stored one prompt and sent
-// another; built here as sections, the session holds exactly what the model gets.
+// - The constitution (prompts/constitution.md) goes last, as plain text after the tagged sections,
+//   once, the same every request, so after the first call it comes from the prompt cache.
 
 use crate::tools::Tool;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// pi's opening line, when no SYSTEM.md replaces it (system-prompt.ts:156-157).
-const PREAMBLE: &str = "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+// The opening line, when no SYSTEM.md replaces it.
+const PREAMBLE: &str = "You are a coding agent in piccosta. You work in the user's project: read its code, run its commands and change its files.";
 // The context files a directory can hold, first one found wins (resource-loader.ts:185).
 const CONTEXT_FILE_NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 // The largest import inlined: pi's read cap. Anything the model couldn't read in one read call
@@ -259,7 +256,7 @@ pub struct PromptInputs<'a> {
     pub cwd: &'a Path,
     pub agent_dir: &'a Path,
     pub tools: &'a [Arc<dyn Tool>],
-    // The agent dir's SYSTEM.md (replaces pi's preamble, tool list and rules) and APPEND_SYSTEM.md.
+    // The agent dir's SYSTEM.md (replaces the preamble, tool list and rules) and APPEND_SYSTEM.md.
     pub custom_prompt: Option<String>,
     pub append_prompt: Option<String>,
     pub constitution: Option<String>,
@@ -269,29 +266,16 @@ pub struct PromptInputs<'a> {
     pub held_context: Option<String>,
 }
 
-// pi's rules: one line for shell file work, each tool's guidelines in tool order, then two of its
-// own, each once (system-prompt.ts:93-128).
+// The rules: each tool's guidelines in tool order, then piccosta's own, each once.
 fn rules(tools: &[Arc<dyn Tool>]) -> String {
-    let mut rules: Vec<String> = Vec::new();
-    let mut add = |rule: &str| {
-        let rule = crate::js::trim(rule);
-        if !rule.is_empty() && !rules.iter().any(|seen| seen == rule) {
-            rules.push(rule.to_string());
-        }
-    };
-    let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    if names.contains(&"bash") && !names.iter().any(|name| matches!(*name, "grep" | "find" | "ls")) {
-        add("Use bash for file operations like ls, rg, find");
-    }
-    for tool in tools {
-        for guideline in tool.prompt_guidelines() {
-            add(guideline);
-        }
-    }
+    let mut rules: Vec<&str> = Vec::new();
     // People watch a session work: a run of tool calls with no word between them reads as a hang.
-    add("Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first");
-    add("Be concise in your responses");
-    add("Show file paths clearly when working with files");
+    let talk = "Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first";
+    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([talk]) {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
     rules.iter().map(|rule| format!("- {rule}")).collect::<Vec<_>>().join("\n")
 }
 
@@ -307,7 +291,7 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
             let listed: Vec<String> =
                 inputs.tools.iter().filter_map(|tool| tool.prompt_snippet().map(|snippet| format!("- {}: {snippet}", tool.name()))).collect();
             let list = if listed.is_empty() { "(none)".to_string() } else { listed.join("\n") };
-            raw.insert("tools".into(), format!("{list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."));
+            raw.insert("tools".into(), list);
             raw.insert("rules".into(), rules(inputs.tools));
         }
     }
@@ -349,7 +333,7 @@ fn tagged(name: &str, content: &str) -> String {
 fn project_context(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Option<String> {
     let files = context_files(cwd, agent_dir, reads);
     let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
-    let mut parts = vec!["Project-specific instructions and guidelines:".to_string()];
+    let mut parts = vec!["The user's instructions for this project, from its AGENTS.md and CLAUDE.md files, outermost first:".to_string()];
     for file in &files {
         parts.push(format!("<project_instructions path=\"{}\">\n{}\n</project_instructions>", file.path.display(), expand_imports(file, &in_prompt, reads)));
     }
@@ -386,8 +370,7 @@ pub fn reload_context_files(sections: &mut IndexMap<String, String>, cwd: &Path,
 }
 
 // The agent dir's SYSTEM.md and APPEND_SYSTEM.md, when present (resource-loader.ts:1213-1239).
-// pi also reads them from a trusted project's .pi/; piccosta has no project trust, so only the
-// agent dir's count.
+// Only the agent dir's count: piccosta has no project trust to let a repo replace its prompt.
 pub fn custom_prompts(agent_dir: &Path) -> (Option<String>, Option<String>) {
     let read = |name: &str| std::fs::read_to_string(agent_dir.join(name)).ok();
     (read("SYSTEM.md"), read("APPEND_SYSTEM.md"))

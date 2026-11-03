@@ -26,22 +26,33 @@
 //   rate-limit notices (no UI yet), and the flattening of root anyOf/oneOf tool schemas (no
 //   piccosta tool has one).
 //
-// Settings, all from the environment:
-//   CLAUDE_BRIDGE_CLAUDE_PATH      the claude executable (default `claude` on PATH)
-//   CLAUDE_BRIDGE_CONFIG_DIR       a Claude Code config dir for the children only (their
+// Settings, each from the environment or else from the agent dir's settings.json, its "claudeBridge"
+// object (so the assistant service, which gets no terminal's environment, sees the same ones). Never
+// from a project's settings: they pick the account and the binary, which belong to the user, not to
+// a project, and one piccosta process serves sessions in many projects at once.
+//   CLAUDE_BRIDGE_CLAUDE_PATH, claudePath   the claude executable (default `claude` on PATH)
+//   CLAUDE_BRIDGE_CONFIG_DIR, configDir     a Claude Code config dir for the children only (their
 //                                  CLAUDE_CONFIG_DIR, and where their session files go); one with no
 //                                  account record keeps the account's email out of the prompt, and
 //                                  then needs CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
-//   CLAUDE_BRIDGE_KEEP_SESSIONS=0  don't keep Claude Code's records between queries (history.rs)
-//   CLAUDE_BRIDGE_HOLD_SECONDS     how long a query whose turn is over waits for the next message
-//                                  (default CACHE_TTL; 0 ends it with each turn)
-//   CLAUDE_BRIDGE_HOLD_MAX         how many such queries may wait at once in this piccosta process
-//                                  (default HOLD_MAX); past it the longest idle one closes
-//   CLAUDE_BRIDGE_STRICT_MCP=0     let Claude Code load MCP servers from ~/.claude.json and .mcp.json
-//   CLAUDE_BRIDGE_PLAN=max, CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE=1, CLAUDE_BRIDGE_FORCE_200K=id,id
-//                                  which models get 1M context (runtime_model)
-//   CLAUDE_BRIDGE_DEBUG_PATH       append a debug log here
-//   CLAUDE_BRIDGE_RECORD_STREAM    append every line Claude Code writes here (fixtures, diagnosis)
+//   CLAUDE_BRIDGE_KEEP_SESSIONS, keepSessions   off: don't keep Claude Code's records between
+//                                  queries (history.rs)
+//   CLAUDE_BRIDGE_HOLD_SECONDS, holdSeconds     how long a query whose turn is over waits for the
+//                                  next message (default the login's cache life, hold_time; 0 ends
+//                                  it with each turn)
+//   CLAUDE_BRIDGE_HOLD_MAX, holdMax         how many such queries may wait at once in this piccosta
+//                                  process (default HOLD_MAX); past it the longest idle one closes
+//   CLAUDE_BRIDGE_STRICT_MCP, strictMcp     off: let Claude Code load MCP servers from
+//                                  ~/.claude.json and .mcp.json
+//   CLAUDE_BRIDGE_ONE_M, oneM; CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE, longContextExtraUsage;
+//   CLAUDE_BRIDGE_FORCE_200K, force200k     which models get 1M context (runtime_model); lists
+//                                  are comma-separated in the environment, arrays in settings.json
+//   CLAUDE_BRIDGE_NO_THINKING_OFF, noThinkingOff   models that can't turn thinking off
+//   CLAUDE_BRIDGE_DEBUG_PATH, debugPath     append a debug log here
+//   CLAUDE_BRIDGE_RECORD_STREAM, recordStream   append every line Claude Code writes here
+// The plan (Max opens 1M on opus-4-6) and whether the login is an API key (the hold time) come
+// from Claude Code itself: `claude auth status --json`, asked once per process (AUTH), given
+// PROBE_DEADLINE like `claude --version`.
 
 mod history;
 pub use history::SIDECAR_SUFFIX;
@@ -57,10 +68,10 @@ use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, timeout, Instant};
@@ -78,9 +89,9 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
 const MCP_RESULT_MAX_CHARS: u64 = 500_000;
 // The file a resumed query reads pi's prompt from, in the session's own dir (deleted with it).
 const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
-// The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan; a new
-// model serves 200K until someone measures it). An unentitled [1m] fails every turn, so the default
-// is the bare id at 200K.
+// The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan by
+// 2026-11-02; a newer model serves 200K until it's measured and added to `claudeBridge.oneM`). An
+// unentitled [1m] fails every turn, so the default is the bare id at 200K.
 const MEASURED_ONE_M: [&str; 9] = ["claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
     "claude-opus-4-7", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
 const ONE_M: u64 = 1_000_000;
@@ -89,6 +100,7 @@ const TWO_HUNDRED_K: u64 = 200_000;
 // adaptive thinking at its default effort (2.1.300 and 2.1.312 against a local mock API,
 // 2026-10-29; the 4.5 models do send thinking disabled). The catalog fetched that day lets them
 // turn it off, pi 1.2's didn't; marked off here, pi clamps "off" up to their lowest level instead.
+// The default for `claudeBridge.noThinkingOff`.
 const NO_THINKING_OFF: [&str; 1] = ["claude-haiku-5-5"];
 // Claude Code refuses a prompt at window - min(max output, 20,000) - 3,000 tokens before sending it
 // (2.1.300, read in the binary), so that is the window pi is given to compact against.
@@ -149,23 +161,45 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 // 1 h cache on a subscription (ttl "1h", reason "subscriber", read in the binary) and 5 min with
 // an API key; every cache write in 30 h of real claude-bridge sessions (2026-11-02) was a 1 h one.
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const API_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 // How many answered queries may wait at once. Each is an idle Claude Code process of about 200 MB
-// RSS (2.1.316, measured 2026-11-02), and the machine is short on memory. Counted in this piccosta
-// process only: another piccosta's waiting queries are its own.
+// RSS (2.1.316, measured 2026-11-02), so four is under 1 GB: enough to keep the caches of the few
+// sessions one person switches between warm, small enough not to matter on an ordinary laptop. A
+// machine with more to spare raises it. Counted in this piccosta process only: another piccosta's
+// waiting queries are its own.
 const HOLD_MAX: usize = 4;
+// The last Claude Code release the bridge was checked against: CHILD_ENV, RESUME_ENV and
+// MCP_RESULT_MAX_CHARS were read in this binary. A newer one gets a notice, since any of them
+// could have been renamed.
+const VERIFIED_VERSION: &str = "2.1.316";
+// How much of a child's stderr is kept for a failure message: its last lines, where a refused
+// option or a failed login is reported, without carrying a long log into the session.
+const STDERR_TAIL: usize = 4096;
+// How long `claude auth status` or `claude --version` gets before it's killed and taken as no
+// answer: a normal one is done well inside it, and a hung one holds up registry loading or a turn
+// for no longer. PROBE_POLL is how often its output and exit are checked; PROBE_OUTPUT_MAX is how
+// much of its output is kept, far more than a version or a login status takes, so something it
+// started that keeps writing can't grow it.
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+const PROBE_POLL: Duration = Duration::from_millis(10);
+const PROBE_OUTPUT_MAX: usize = 64 * 1024;
+// The custom entry the newer-than-verified notice is shown as (never part of the model's context).
+pub const NOTICE_TYPE: &str = "piccosta-claude-notice";
 // Claude Code's own wording for a failed connection, which pi's retry rules don't know; such a
 // failure is led by pi's "Connection error" so it is retried.
 const CONNECTION_FAILURES: [&str; 6] = ["Unable to connect to API", "Connection dropped (", "Connection refused \u{2014}", "Can't reach the API server",
     "No internet route", "Couldn't connect through your proxy"];
 
 pub struct Settings {
-    claude: String,
-    config_dir: Option<PathBuf>,
+    pub claude: String,
+    pub config_dir: Option<PathBuf>,
     keep: bool,
-    hold: Duration,
+    // None: the login's cache life (hold_time).
+    hold: Option<Duration>,
     hold_max: usize,
     strict_mcp: bool,
-    plan_max: bool,
+    one_m: Vec<String>,
+    no_thinking_off: Vec<String>,
     extra_usage: bool,
     force_200k: Vec<String>,
     debug: Option<PathBuf>,
@@ -177,27 +211,122 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn flag(name: &str) -> bool {
-    env(name).is_some_and(|value| ["1", "true", "yes", "on"].contains(&value.to_lowercase().as_str()))
+    env(name).is_some_and(|value| is_on(&value))
+}
+
+fn is_on(value: &str) -> bool {
+    ["1", "true", "yes", "on"].contains(&value.to_lowercase().as_str())
 }
 
 pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
+    // One bridge setting as text: CLAUDE_BRIDGE_<name> in the environment, else settings.json's
+    // claudeBridge.<key> (a list comes back comma-separated, as the environment writes it).
+    let file: Value = std::fs::read_to_string(crate::config::agent_dir().join("settings.json")).ok()
+        .and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    let setting = |name: &str, key: &str| env(&format!("CLAUDE_BRIDGE_{name}")).or_else(|| match file.get("claudeBridge")?.get(key)? {
+        Value::String(text) => Some(text.trim().to_string()).filter(|text| !text.is_empty()),
+        Value::Array(items) => Some(items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")),
+        other => Some(other.to_string()),
+    });
+    let list = |name: &str, key: &str, default: &[&str]| setting(name, key)
+        .map_or_else(|| default.iter().map(|id| id.to_string()).collect(), |ids| ids.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect());
     // No room for a waiting query is the same as no wait: each query ends with its turn.
-    let hold_max = env("CLAUDE_BRIDGE_HOLD_MAX").and_then(|count| count.parse().ok()).unwrap_or(HOLD_MAX);
-    let hold = env("CLAUDE_BRIDGE_HOLD_SECONDS").and_then(|seconds| seconds.parse().ok()).map_or(CACHE_TTL, Duration::from_secs);
+    let hold_max = setting("HOLD_MAX", "holdMax").and_then(|count| count.parse().ok()).unwrap_or(HOLD_MAX);
+    let hold = setting("HOLD_SECONDS", "holdSeconds").and_then(|seconds| seconds.parse().ok()).map(Duration::from_secs);
     Settings {
-        claude: env("CLAUDE_BRIDGE_CLAUDE_PATH").unwrap_or_else(|| "claude".into()),
-        config_dir: env("CLAUDE_BRIDGE_CONFIG_DIR").map(PathBuf::from),
-        keep: env("CLAUDE_BRIDGE_KEEP_SESSIONS").as_deref() != Some("0"),
-        hold: if hold_max == 0 { Duration::ZERO } else { hold },
+        claude: setting("CLAUDE_PATH", "claudePath").unwrap_or_else(|| "claude".into()),
+        config_dir: setting("CONFIG_DIR", "configDir").map(PathBuf::from),
+        keep: setting("KEEP_SESSIONS", "keepSessions").is_none_or(|keep| is_on(&keep)),
+        hold: if hold_max == 0 { Some(Duration::ZERO) } else { hold },
         hold_max,
-        strict_mcp: env("CLAUDE_BRIDGE_STRICT_MCP").as_deref() != Some("0"),
-        plan_max: env("CLAUDE_BRIDGE_PLAN").is_some_and(|plan| plan.eq_ignore_ascii_case("max")),
-        extra_usage: flag("CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE"),
-        force_200k: env("CLAUDE_BRIDGE_FORCE_200K").map(|ids| ids.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()).unwrap_or_default(),
-        debug: env("CLAUDE_BRIDGE_DEBUG_PATH").map(PathBuf::from),
-        record: env("CLAUDE_BRIDGE_RECORD_STREAM").map(PathBuf::from),
+        strict_mcp: setting("STRICT_MCP", "strictMcp").is_none_or(|strict| is_on(&strict)),
+        one_m: list("ONE_M", "oneM", &MEASURED_ONE_M),
+        no_thinking_off: list("NO_THINKING_OFF", "noThinkingOff", &NO_THINKING_OFF),
+        extra_usage: setting("LONG_CONTEXT_EXTRA_USAGE", "longContextExtraUsage").is_some_and(|extra| is_on(&extra)),
+        force_200k: list("FORCE_200K", "force200k", &[]),
+        debug: setting("DEBUG_PATH", "debugPath").map(PathBuf::from),
+        record: setting("RECORD_STREAM", "recordStream").map(PathBuf::from),
     }
 });
+
+// A claude command as the children run it: the bridge's executable and config dir.
+fn claude_command() -> std::process::Command {
+    let mut command = std::process::Command::new(&SETTINGS.claude);
+    if let Some(dir) = &SETTINGS.config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    command
+}
+
+// Input: the arguments of a quick claude command. Output: what it wrote to stdout, None when it
+// couldn't be started or wasn't done (its output closed and it exited) within PROBE_DEADLINE.
+// Either way it's killed if still running and reaped before this returns. Its stdout is read here,
+// non-blocking, so nothing reads it after this returns, and something it started that holds stdout
+// open or keeps writing can't hold this past the deadline.
+fn probe(args: &[&str]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut child = claude_command().args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // SAFETY: fcntl on a pipe descriptor this function owns.
+    unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) | libc::O_NONBLOCK) };
+    let deadline = std::time::Instant::now() + PROBE_DEADLINE;
+    let (mut output, mut chunk, mut closed) = (Vec::new(), [0u8; 4096], false);
+    // Until its output has closed and it has exited, or the deadline.
+    while std::time::Instant::now() < deadline && (!closed || matches!(child.try_wait(), Ok(None))) {
+        // A read that gave something is followed by another at once, until the cap; anything else
+        // (nothing yet, closed, or full) waits a poll.
+        match stdout.read(&mut chunk) {
+            Ok(0) => closed = true,
+            Ok(read) if output.len() < PROBE_OUTPUT_MAX => {
+                output.extend_from_slice(&chunk[..read.min(PROBE_OUTPUT_MAX - output.len())]);
+                continue;
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => closed = true,
+            _ => {}
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
+    // A kill after it exited does nothing; the wait reaps it.
+    let _ = child.kill();
+    let _ = child.wait();
+    if !closed {
+        debug(&format!("`{} {}` gave no answer within {} s", SETTINGS.claude, args.join(" "), PROBE_DEADLINE.as_secs()));
+    }
+    closed.then_some(output)
+}
+
+// Claude Code's own account of its login (`claude auth status --json`: authMethod, subscriptionType,
+// loggedIn), asked once per process. None when claude couldn't be run, didn't answer in time or said
+// nothing readable; a logged-out one still answers, with loggedIn false.
+pub static AUTH: LazyLock<Option<Value>> = LazyLock::new(|| {
+    let status: Value = serde_json::from_slice(&probe(&["auth", "status", "--json"])?).ok()?;
+    debug(&format!("auth: method {}, plan {}", status["authMethod"], status["subscriptionType"]));
+    Some(status)
+});
+
+// The running Claude Code's version (`claude --version`), asked once per process when the bridge
+// first starts a child, and logged. None when it couldn't be read in time.
+static VERSION: OnceLock<Option<String>> = OnceLock::new();
+static NOTICED: AtomicBool = AtomicBool::new(false);
+
+fn version() -> Option<&'static str> {
+    VERSION.get_or_init(|| {
+        let version = String::from_utf8_lossy(&probe(&["--version"])?).split_whitespace().next()?.to_string();
+        debug(&format!("Claude Code {version} (last verified {VERIFIED_VERSION})"));
+        Some(version)
+    }).as_deref()
+}
+
+// Once per process, when the Claude Code the bridge ran is newer than VERIFIED_VERSION: a line for
+// the user saying so. Never asks for the version itself, so a process that never ran the bridge
+// gets nothing.
+pub fn take_notice() -> Option<String> {
+    let version = VERSION.get()?.as_deref()?;
+    let numbers = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    (numbers(version) > numbers(VERIFIED_VERSION) && !NOTICED.swap(true, Ordering::Relaxed)).then(|| format!(
+        "Claude Code {version} is newer than {VERIFIED_VERSION}, the last version the bridge was checked against; if tool results arrive cut short, look there first"))
+}
 
 fn append(path: &PathBuf, line: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -211,10 +340,11 @@ pub fn debug(line: &str) {
     }
 }
 
-// How long an answered query waits for the next message, for the cache monitor: a miss after a
-// longer gap is one the cache had already lapsed for.
+// How long an answered query waits for the next message, also for the cache monitor: a miss after
+// a longer gap is one the cache had already lapsed for. Unset, it's the life of the cache Claude
+// Code asks for: 5 minutes on an API key, an hour on a subscription.
 pub fn hold_time() -> Duration {
-    SETTINGS.hold
+    SETTINGS.hold.unwrap_or_else(|| if AUTH.as_ref().is_some_and(|auth| auth["authMethod"] == "api_key") { API_KEY_CACHE_TTL } else { CACHE_TTL })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -229,11 +359,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn runtime_model(id: &str) -> (String, u64) {
     let settings = &*SETTINGS;
     let gated = match id {
-        "claude-opus-4-6" => settings.plan_max || settings.extra_usage,
+        "claude-opus-4-6" => settings.extra_usage || AUTH.as_ref().is_some_and(|auth| auth["subscriptionType"] == "max"),
         "claude-sonnet-4-6" => settings.extra_usage,
         _ => false,
     };
-    if !settings.force_200k.iter().any(|forced| forced == id) && (MEASURED_ONE_M.contains(&id) || gated) {
+    if !settings.force_200k.iter().any(|forced| forced == id) && (settings.one_m.iter().any(|one_m| one_m == id) || gated) {
         (format!("{id}[1m]"), ONE_M)
     } else {
         (id.to_string(), TWO_HUNDRED_K)
@@ -251,16 +381,50 @@ fn effective_window(window: u64, max_tokens: u64) -> u64 {
     served.saturating_sub(max_tokens.min(OUTPUT_RESERVE_CAP) + BLOCKING_MARGIN)
 }
 
-// Input: the anthropic catalog. Output: the bridge's models, the catalog's own fields that matter
-// here and nothing that would make piccosta treat them as an Anthropic API (no compat, no prompt
-// cache warming). Dated snapshot ids are left out; cost is 0, the plan pays.
-pub fn catalog_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
+// How long Claude Code may take to answer an initialize request (it took 0.5 s, 2026-11-03).
+const OFFERED_WAIT: Duration = Duration::from_secs(30);
+
+// The models Claude Code offers this account: its answer to an initialize request sent alone, which
+// lists them (Claude Code 2.1.317, 2026-11-03; against a stand-in API it sent nothing but a
+// connectivity check, so no prompt and no plan use). It starts as a plain `claude` does, without
+// CHILD_ENV: with non-essential traffic or GrowthBook off it lists only its five built-in entries,
+// not the account's (13 on a Max plan that day). Output: its entries as it gives them (value,
+// resolvedModel, displayName, supportedEffortLevels, supportsThinkingOff, ...), or why there are none.
+pub async fn offered_models() -> Result<Vec<Value>, String> {
+    let mut command = tokio::process::Command::new(&SETTINGS.claude);
+    command.args(base_args(false, None)).args(["--tools=", "--setting-sources=", "--strict-mcp-config", "--no-session-persistence"]);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    for name in PARENT_ENV {
+        command.env_remove(name);
+    }
+    if let Some(dir) = &SETTINGS.config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    // Tracked like a query's child, so piccosta's shutdown stops it too, and killed and waited for
+    // here however the answer went.
+    let mut child = start(command)?;
+    let id = request_id();
+    child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": "initialize"}})).await;
+    let answer = timeout(OFFERED_WAIT, async {
+        while let Ok(Some(line)) = child.lines.next_line().await {
+            let message: Value = serde_json::from_str(&line).unwrap_or_default();
+            if message["type"] == "control_response" && message["response"]["request_id"] == id.as_str() {
+                return Some(message);
+            }
+        }
+        None
+    }).await;
+    let _ = child.process.kill().await;
+    let answer = answer.map_err(|_| "Claude Code didn't answer initialize".to_string())?.ok_or("Claude Code ended before answering initialize")?;
+    answer["response"]["response"]["models"].as_array().cloned().ok_or_else(|| format!("Claude Code's initialize answer lists no models: {}", answer["response"]["error"]))
+}
+
+// Input: the models Claude Code offers (model.rs). Output: the bridge's models,
+// the fields that matter here and nothing that would make piccosta treat them as an Anthropic API
+// (no compat, no prompt cache warming); cost is 0, the plan pays.
+pub fn bridge_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
     anthropic.into_iter().filter_map(|model| {
         let id = model.get("id")?.as_str()?.to_string();
-        let tail = id.len().checked_sub(9).map(|start| &id[start..]).unwrap_or_default();
-        if tail.starts_with("-20") && tail[3..].bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
         let (_, window) = runtime_model(&id);
         let max_tokens = model.get("maxTokens").and_then(Value::as_u64).unwrap_or(OUTPUT_RESERVE_CAP);
         let name = model.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
@@ -272,7 +436,7 @@ pub fn catalog_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Val
         if let Some(map) = model.get("thinkingLevelMap") {
             out["thinkingLevelMap"] = map.clone();
         }
-        if NO_THINKING_OFF.contains(&id.as_str()) {
+        if SETTINGS.no_thinking_off.contains(&id) {
             out["thinkingLevelMap"]["off"] = Value::Null;
         }
         out.as_object().cloned()
@@ -303,11 +467,16 @@ struct Child {
     lines: Lines<BufReader<ChildStdout>>,
     // Its entry in CHILDREN.
     pidfd: Option<RawFd>,
+    // The last STDERR_TAIL bytes of its stderr, and the task keeping them, stopped by stderr_tail or
+    // when the child is dropped, so a descendant holding stderr open can't keep it alive.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String> {
-    let mut command = tokio::process::Command::new(&SETTINGS.claude);
-    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    version();
+    let mut command = tokio::process::Command::from(claude_command());
+    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     for name in PARENT_ENV {
         command.env_remove(name);
     }
@@ -315,9 +484,12 @@ fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String
     if resumes_turn {
         command.envs(RESUME_ENV);
     }
-    if let Some(dir) = &SETTINGS.config_dir {
-        command.env("CLAUDE_CONFIG_DIR", dir);
-    }
+    debug(&format!("spawn: {} {}", SETTINGS.claude, args.join(" ")));
+    start(command)
+}
+
+// Start a claude, kept in CHILDREN until it's dropped.
+fn start(mut command: tokio::process::Command) -> Result<Child, String> {
     let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
     // SAFETY: pidfd_open on our own child, not reaped yet, so the descriptor (close-on-exec) is
     // that process's for as long as it's open, whatever later takes its pid.
@@ -330,9 +502,21 @@ fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String
     };
     // SAFETY: a descriptor pidfd_open just returned, owned by nothing else.
     lock(&CHILDREN).insert(fd, unsafe { OwnedFd::from_raw_fd(fd) });
-    debug(&format!("spawn: {} {}", SETTINGS.claude, args.join(" ")));
     let stdout = process.stdout.take().ok_or("Claude Code started without a stdout")?;
-    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), pidfd })
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let stderr_reader = process.stderr.take().map(|mut pipe| {
+        let tail = stderr.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; STDERR_TAIL];
+            while let Ok(read) = pipe.read(&mut chunk).await && read > 0 {
+                let mut tail = lock(&tail);
+                tail.extend_from_slice(&chunk[..read]);
+                let excess = tail.len().saturating_sub(STDERR_TAIL);
+                tail.drain(..excess);
+            }
+        })
+    });
+    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), pidfd, stderr, stderr_reader })
 }
 
 // However a child ends, closed or dropped mid-close (a summary whose task was aborted; tokio kills
@@ -341,6 +525,9 @@ impl Drop for Child {
     fn drop(&mut self) {
         if let Some(fd) = self.pidfd {
             lock(&CHILDREN).remove(&fd);
+        }
+        if let Some(reader) = &self.stderr_reader {
+            reader.abort();
         }
     }
 }
@@ -370,6 +557,33 @@ impl Child {
         }
         status
     }
+
+    // What it last wrote to stderr, once it has exited, for a failure message and the debug log:
+    // empty when it wrote nothing. Something it started that keeps stderr open past CLOSE_GRACE gets
+    // its reader stopped, and what was read by then is the tail. The reader stays in the child while
+    // it's waited on, so a summary aborted during the wait still has it stopped by the drop.
+    async fn stderr_tail(&mut self) -> String {
+        if let Some(reader) = &mut self.stderr_reader {
+            let _ = timeout(CLOSE_GRACE, &mut *reader).await;
+            reader.abort();
+            self.stderr_reader = None;
+        }
+        let tail = self.stderr_so_far();
+        if !tail.is_empty() {
+            debug(&format!("Claude Code's stderr: {tail}"));
+        }
+        tail
+    }
+
+    // What it has written to stderr so far, without waiting for more.
+    fn stderr_so_far(&self) -> String {
+        String::from_utf8_lossy(&lock(&self.stderr)).trim().to_string()
+    }
+}
+
+// A failure with the child's stderr after it, when it wrote any.
+fn with_stderr(failure: String, tail: &str) -> String {
+    if tail.is_empty() { failure } else { format!("{failure}\nClaude Code's stderr: {tail}") }
 }
 
 // Every claude child not dropped yet, as a pidfd keyed by its number, for the exit on a signal. A
@@ -649,7 +863,7 @@ fn make_room(key: &str) {
     let over = (waiting.len() + 1).saturating_sub(SETTINGS.hold_max);
     for (_, other) in waiting.into_iter().take(over) {
         if let Some(live) = all.remove(&other) {
-            let_go(live, &format!("more than {} queries waiting (CLAUDE_BRIDGE_HOLD_MAX)", SETTINGS.hold_max));
+            let_go(live, &format!("more than {} queries waiting (claudeBridge.holdMax)", SETTINGS.hold_max));
         }
     }
 }
@@ -1118,7 +1332,9 @@ impl Query {
         if silent < BODY_IDLE_TIMEOUT {
             return;
         }
-        let message = format!("Claude Code stream timed out: no event for {} s (limit {} ms)", silent.as_secs_f64().round(), BODY_IDLE_TIMEOUT.as_millis());
+        // pi gets this failure now, before finish, so what Claude Code wrote to stderr by now goes with it.
+        let message = with_stderr(format!("Claude Code stream timed out: no event for {} s (limit {} ms)", silent.as_secs_f64().round(), BODY_IDLE_TIMEOUT.as_millis()),
+            &self.child.stderr_so_far());
         self.end_open(StopReason::Error, &message);
         self.discard(&message).await;
     }
@@ -1166,7 +1382,7 @@ impl Query {
         // message has already started a turn. And it's marked waiting before pi gets the stopped
         // answer (end_open, below): pi's run then ends at once, and end_run lets go of a query
         // that isn't waiting.
-        (self.settle_at, self.interrupting, self.hold_until) = (None, true, Some(Instant::now() + SETTINGS.hold));
+        (self.settle_at, self.interrupting, self.hold_until) = (None, true, Some(Instant::now() + hold_time()));
         {
             let mut state = lock(&self.state);
             state.held.pending = None;
@@ -1362,7 +1578,7 @@ impl Query {
     // Whether the turn ending now leaves the query waiting: holding is on, and pi's turn ended with
     // an answer, not on tool calls it was handed.
     fn holds(&self) -> bool {
-        !SETTINGS.hold.is_zero() && self.turn.is_some() && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)
+        !hold_time().is_zero() && self.turn.is_some() && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)
             && lock(&self.state).held.pending.is_none()
     }
 
@@ -1378,8 +1594,8 @@ impl Query {
             state.idle_since = Instant::now();
         }
         make_room(&self.key);
-        self.hold_until = Some(Instant::now() + SETTINGS.hold);
-        debug(&format!("sync: waiting for the next message for {} s (session {})", SETTINGS.hold.as_secs(), self.key));
+        self.hold_until = Some(Instant::now() + hold_time());
+        debug(&format!("sync: waiting for the next message for {} s (session {})", hold_time().as_secs(), self.key));
         self.reply();
     }
 
@@ -1649,6 +1865,7 @@ impl Query {
             self.flush_settle();
         }
         let status = self.child.close().await;
+        let stderr = self.child.stderr_tail().await;
         // A child that ended before the open turn's result, or failed, failed that turn: what it
         // streamed is a partial answer, not one (result_seen is per turn, so an earlier turn's
         // result doesn't vouch for this one).
@@ -1663,6 +1880,9 @@ impl Query {
                 None => "Claude Code process had to be killed".into(),
             });
         }
+        // Whatever failed the query (its exit, a refused session, an error result), what Claude Code
+        // wrote to stderr goes with it.
+        self.failure = self.failure.take().map(|failure| with_stderr(failure, &stderr));
         if let Some(failure) = self.failure.clone() {
             if !self.closed || self.aborted {
                 self.end_open(if self.aborted { StopReason::Aborted } else { StopReason::Error }, &failure);
@@ -1757,6 +1977,7 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
         }
     };
     let status = child.close().await;
+    let stderr = child.stderr_tail().await;
     if request.cancel.is_cancelled() {
         return failed(model, StopReason::Aborted, "Operation aborted");
     }
@@ -1776,8 +1997,8 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
         None => Some("Claude Code summary process did not exit successfully".into()),
     });
     match error {
-        Some(failure) => output.error_message = Some(failure),
-        None if text.trim().is_empty() => output.error_message = Some("Claude Code summary returned empty text".into()),
+        Some(failure) => output.error_message = Some(with_stderr(failure, &stderr)),
+        None if text.trim().is_empty() => output.error_message = Some(with_stderr("Claude Code summary returned empty text".into(), &stderr)),
         None => {
             output.content.push(Content::text(text));
             output.stop_reason = StopReason::Stop;

@@ -65,6 +65,10 @@ pub trait Tool: Send + Sync {
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[]
     }
+    // Whether the tool only reads, so rpc and ACP run it without asking the user.
+    fn read_only(&self) -> bool {
+        false
+    }
     // Repair argument shapes models are known to send, before validation (pi's prepareArguments).
     fn prepare_arguments(&self, arguments: Map<String, Value>) -> Map<String, Value> {
         arguments
@@ -129,10 +133,17 @@ pub struct ToolContext {
     pub thinking_level: String,
     // Whether the current model takes images; read says so beside an image when it doesn't.
     pub model_accepts_images: bool,
+    // What an image read or fetched is fitted to: the model's own limits, or Anthropic's.
+    pub image_limits: image::Limits,
     // Set when the user aborts the turn.
     pub cancel: CancellationToken,
     pub updates: Option<mpsc::UnboundedSender<ToolUpdate>>,
     pub shared: Arc<ToolShared>,
+}
+
+// Whether the built-in tool called `name` only reads (Tool::read_only); no other tool does.
+pub fn read_only(name: &str) -> bool {
+    builtin().iter().any(|tool| tool.name() == name && tool.read_only())
 }
 
 // The built-in tools, in the order pi lists them, then the web tools.

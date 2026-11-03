@@ -8,11 +8,12 @@
 // 1. piccosta's own login store, <login dir>/auth.json, written by the TypeScript piccosta's
 //    `piccosta auth login` (this one has no login command yet). A Codex
 //    login there is refreshed here, in-process, when it nears expiry.
-// 2. The tool that owns the account: the Codex CLI's token for openai-codex ($CODEX_HOME/auth.json,
-//    read only, never refreshed or written here, since that file is the Codex CLI's), and
-//    opencode's key file for opencode-go.
+// 2. The tool that owns the account (ACCOUNTS): the Codex CLI's token for openai-codex
+//    ($CODEX_HOME/auth.json, read only, never refreshed or written here, since that file is the
+//    Codex CLI's), and opencode's key file for opencode-go.
 // 3. models.json's `apiKey` for the provider: a literal key, `$VAR`, or `!command`.
 // 4. The provider's environment variable, e.g. OPENCODE_API_KEY.
+// Claude has none of these: Claude Code keeps its own login, which is checked by asking it.
 // pi gets the first of these by starting a second pi through a models.json `!` command on every
 // request (about 0.2 s each); here it's a file read, and a refresh only when one is due.
 
@@ -42,8 +43,76 @@ const LOCK_STALE: Duration = Duration::from_secs(30);
 const LOCK_FIRST_WAIT: Duration = Duration::from_millis(10);
 const LOCK_LONGEST_WAIT: Duration = Duration::from_secs(1);
 const LOCK_DEADLINE: Duration = Duration::from_secs(30);
-// What a provider's key is called in the environment, when it has one (ai/src/env-api-keys.ts).
-const ENVIRONMENT_KEYS: [(&str, &str); 2] = [("opencode-go", "OPENCODE_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")];
+// How an error begins when a provider has no login here at all, as against one that couldn't be
+// read or refreshed just now (offline, a timeout, a failing command): model.rs drops a provider's
+// list for the first only.
+pub const NO_CREDENTIAL: &str = "No credential for";
+
+// The tool that owns an account's login.
+#[derive(PartialEq)]
+pub enum Owner {
+    CodexCli,
+    Opencode,
+    ClaudeCode,
+}
+
+// The accounts piccosta logs into, one row each, which everything that names a provider reads:
+// the provider id; the plan its use counts against, as usage.json, /scale and `auth status` call
+// it; the plan as the user knows it; whether a manager asks before spending it on its own (the
+// two paid plans); the tool that owns the login and how to log in with it; and the environment
+// variable its key can come from (ai/src/env-api-keys.ts).
+pub struct Account {
+    pub provider: &'static str,
+    pub plan: &'static str,
+    pub plan_name: &'static str,
+    pub ask_first: bool,
+    pub owner: Owner,
+    pub login: &'static str,
+    pub env_key: Option<&'static str>,
+}
+
+pub const ACCOUNTS: [Account; 3] = [
+    Account { provider: "openai-codex", plan: "codex", plan_name: "ChatGPT", ask_first: true, owner: Owner::CodexCli, login: "codex login", env_key: None },
+    Account { provider: "opencode-go", plan: "opencode-go", plan_name: "opencode Go", ask_first: false, owner: Owner::Opencode, login: "opencode auth login", env_key: Some("OPENCODE_API_KEY") },
+    Account { provider: crate::provider::claude::PROVIDER, plan: "claude", plan_name: "Claude", ask_first: true, owner: Owner::ClaudeCode, login: "claude auth login", env_key: None },
+];
+
+// A provider's row, when it's one of the accounts piccosta knows.
+pub fn account(provider: &str) -> Option<&'static Account> {
+    ACCOUNTS.iter().find(|account| account.provider == provider)
+}
+
+// Claude Code's login, from the bridge's own once-per-process `claude auth status` (bounded by its
+// deadline, the child killed and reaped). Output: how it's logged in, or why Claude can't run: not
+// installed or explicitly logged out (no login), or no answer (a failure, which keeps the list).
+async fn claude_login() -> Result<Credential, String> {
+    let settings = &*crate::provider::claude::SETTINGS;
+    let provider = crate::provider::claude::PROVIDER;
+    let status = tokio::task::spawn_blocking(|| crate::provider::claude::AUTH.clone()).await.ok().flatten();
+    let Some(status) = status else {
+        return Err(match installed(&settings.claude) {
+            true => format!("Claude Code ({}) didn't say whether it's logged in", settings.claude),
+            false => format!("{NO_CREDENTIAL} \"{provider}\": Claude Code ({}) isn't installed", settings.claude),
+        });
+    };
+    // Only an explicit false is a logout; an answer without it ({}, an error) is a failure.
+    if status["loggedIn"] == false {
+        return Err(format!("{NO_CREDENTIAL} \"{provider}\": Claude Code ({}) isn't logged in; run: claude auth login", settings.claude));
+    }
+    if status["loggedIn"] != true {
+        return Err(format!("Claude Code ({}) didn't say whether it's logged in: {status}", settings.claude));
+    }
+    let method = status["authMethod"].as_str().map_or(String::new(), |method| format!(" ({method})"));
+    Ok(Credential { key: "not-used".into(), account_id: None, source: format!("Claude Code's own login{method}") })
+}
+
+// Whether a command name or path is a file that exists: a path as given, a bare name on PATH.
+fn installed(command: &str) -> bool {
+    match command.contains('/') {
+        true => std::path::Path::new(command).is_file(),
+        false => std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file())),
+    }
+}
 
 // A credential ready for a request: the bearer key, and for Codex the account it belongs to.
 #[derive(Debug, Clone)]
@@ -77,16 +146,13 @@ impl CredentialPaths {
     }
 }
 
-// A JSON file's object, or an empty one when the file is missing or isn't an object.
-fn read_json_object(path: &Path) -> Map<String, Value> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| match value {
-            Value::Object(object) => Some(object),
-            _ => None,
-        })
-        .unwrap_or_default()
+// A JSON file's object, an empty one when the file doesn't exist, or why it couldn't be read: a
+// login file that's there but doesn't read is a failure, not a missing login.
+fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        text => serde_json::from_str(&text.map_err(|error| format!("{}: {error}", path.display()))?).map_err(|error| format!("{}: {error}", path.display())),
+    }
 }
 
 // The account id inside a Codex access token. Input: the JWT. Output: its chatgpt_account_id
@@ -141,16 +207,18 @@ pub async fn credential_for(
     config: Option<&ProviderConfig>,
     paths: &CredentialPaths,
 ) -> Result<Credential, String> {
-    // Claude Code keeps its own login; the bridge never sees a key.
-    if provider == crate::provider::claude::PROVIDER {
-        return Ok(Credential { key: "not-used".into(), account_id: None, source: "Claude Code's own login".into() });
+    let account = account(provider);
+    let owner = account.map(|account| &account.owner);
+    // Claude Code keeps its own login; the bridge never sees a key, but the login has to be there.
+    if owner == Some(&Owner::ClaudeCode) {
+        return claude_login().await;
     }
     let login_file = paths.login_dir.join("auth.json");
 
     // 1. piccosta's own login.
-    if let Some(stored) = read_json_object(&login_file).get(provider) {
+    if let Some(stored) = read_json_object(&login_file)?.get(provider) {
         match stored.get("type").and_then(Value::as_str) {
-            Some("oauth") if provider == "openai-codex" => return fresh_codex_login(&login_file).await,
+            Some("oauth") if owner == Some(&Owner::CodexCli) => return fresh_codex_login(&login_file).await,
             Some("api_key") => {
                 if let Some(key) = stored.get("key").and_then(Value::as_str) {
                     let key = resolve_configured_key(key).await?;
@@ -162,11 +230,18 @@ pub async fn credential_for(
     }
 
     // 2. The account owner's own file.
-    if provider == "openai-codex" {
+    if owner == Some(&Owner::CodexCli) {
         let codex_file = paths.codex_home.join("auth.json");
-        let codex = read_json_object(&codex_file);
+        let codex = read_json_object(&codex_file)?;
         let tokens = codex.get("tokens");
         if let Some(access) = tokens.and_then(|tokens| tokens.get("access_token")).and_then(Value::as_str) {
+            // The token's `exp` claim (epoch seconds): piccosta can't refresh this login, so an
+            // expired one fails here, saying how to fix it, rather than as a bare 401 from Codex.
+            let expires = access.split('.').nth(1).and_then(|payload| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok());
+            let expires = expires.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).and_then(|claims| claims.get("exp")?.as_f64());
+            if expires.is_some_and(|exp| exp * 1000.0 <= crate::clock::now_ms() as f64) {
+                return Err(format!("the Codex CLI's login expired; run `codex` once ({})", codex_file.display()));
+            }
             let account_id = tokens
                 .and_then(|tokens| tokens.get("account_id"))
                 .and_then(Value::as_str)
@@ -179,9 +254,9 @@ pub async fn credential_for(
             });
         }
     }
-    if provider == "opencode-go" {
+    if owner == Some(&Owner::Opencode) {
         let opencode_file = paths.opencode_dir.join("auth.json");
-        if let Some(key) = read_json_object(&opencode_file).get("opencode-go").and_then(|entry| entry.get("key")).and_then(Value::as_str) {
+        if let Some(key) = read_json_object(&opencode_file)?.get(provider).and_then(|entry| entry.get("key")).and_then(Value::as_str) {
             return Ok(Credential { key: key.to_string(), account_id: None, source: format!("{}", opencode_file.display()) });
         }
     }
@@ -189,18 +264,19 @@ pub async fn credential_for(
     // 3. models.json.
     if let Some(value) = config.and_then(|config| config.api_key.as_deref()) {
         let key = resolve_configured_key(value).await?;
-        let account_id = if provider == "openai-codex" { codex_account_id(&key) } else { None };
+        let account_id = if owner == Some(&Owner::CodexCli) { codex_account_id(&key) } else { None };
         return Ok(Credential { key, account_id, source: "models.json apiKey".to_string() });
     }
 
     // 4. The environment.
-    if let Some((_, variable)) = ENVIRONMENT_KEYS.iter().find(|(id, _)| *id == provider)
+    if let Some(variable) = account.and_then(|account| account.env_key)
         && let Ok(key) = std::env::var(variable) {
             return Ok(Credential { key, account_id: None, source: format!("${variable}") });
         }
 
-    let variable = ENVIRONMENT_KEYS.iter().find(|(id, _)| *id == provider).map_or(String::new(), |(_, variable)| format!(", or set ${variable}"));
-    Err(format!("No credential for \"{provider}\". Log in with the account's own tool (codex login, opencode auth login){variable}"))
+    let variable = account.and_then(|account| account.env_key).map_or(String::new(), |variable| format!(", or set ${variable}"));
+    let how = account.map_or("set its apiKey in models.json".to_string(), |account| format!("log in with {}{variable}", account.login));
+    Err(format!("{NO_CREDENTIAL} \"{provider}\": {how}"))
 }
 
 // The Codex login from piccosta's store, refreshed first when it has under REFRESH_MARGIN_MS left.
@@ -208,7 +284,7 @@ pub async fn credential_for(
 // while this one waited; refreshing twice would spend the refresh token and log one of them out.
 async fn fresh_codex_login(login_file: &Path) -> Result<Credential, String> {
     let read_login = || -> Option<(String, String, i64, Option<String>)> {
-        let stored = read_json_object(login_file);
+        let stored = read_json_object(login_file).ok()?;
         let entry = stored.get("openai-codex")?;
         Some((
             entry.get("access")?.as_str()?.to_string(),
@@ -237,7 +313,7 @@ async fn fresh_codex_login(login_file: &Path) -> Result<Credential, String> {
     let account_id = codex_account_id(&refreshed.access).ok_or("Failed to extract accountId from token")?;
 
     // Write back only our entry, keeping every other provider's login in the file as it was.
-    let mut stored = read_json_object(login_file);
+    let mut stored = read_json_object(login_file)?;
     let mut entry = stored.get("openai-codex").and_then(Value::as_object).cloned().unwrap_or_default();
     entry.insert("type".into(), "oauth".into());
     entry.insert("access".into(), refreshed.access.clone().into());
@@ -265,7 +341,9 @@ async fn refresh_codex_token(refresh_token: &str) -> Result<RefreshedToken, Stri
         .map(|(name, value)| format!("{name}={}", percent_encode(value)))
         .collect::<Vec<_>>()
         .join("&");
-    let response = reqwest::Client::new()
+    let response = crate::provider::http_client()
+        .build()
+        .map_err(|error| format!("OpenAI Codex token refresh error: {error}"))?
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)

@@ -54,6 +54,9 @@ encoding_rs = "0.8"
 sha2 = "0.11"
 # WHATWG URL parsing, as JavaScript's URL does it; already in the tree through reqwest.
 url = "2"
+# The proxy rules reqwest reads from the environment (its own matcher), for Codex's websocket;
+# already in the tree through reqwest, with this feature.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 # The terminal UI: ratatui draws and diffs the screen, crossterm talks to the terminal (its
 # event stream feeds the async loop), pulldown-cmark reads the models' Markdown (with $..$ math).
 ratatui = "0.30"

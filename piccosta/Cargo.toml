@@ -28,6 +28,7 @@ htmd.workspace = true
 pdf_oxide.workspace = true
 encoding_rs.workspace = true
 url.workspace = true
+hyper-util.workspace = true
 sha2.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

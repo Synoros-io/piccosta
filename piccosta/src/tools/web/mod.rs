@@ -53,7 +53,7 @@ impl WebShared {
     // where credentials live.
     pub fn new(settings: WebSettings, agent_dir: &Path, registry: &crate::model::ModelRegistry, credentials: crate::auth::CredentialPaths) -> WebShared {
         let clones = github::Clones::new(agent_dir, settings.github_clone_path.as_deref());
-        let search_targets = openai_search::targets(registry, settings.search_model.as_deref());
+        let search_targets = openai_search::targets(registry, settings.search_model.as_deref(), agent_dir);
         WebShared { settings, client: OnceLock::new(), fetch_slots: Semaphore::new(FETCH_CONCURRENCY), store: store::Store::new(agent_dir), clones, search_targets, credentials }
     }
 
@@ -221,8 +221,12 @@ impl Tool for WebSearchTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.")
+        Some("search the web; two to four differently worded `queries` find more than one")
     }
 
     // A list sent as a JSON string becomes the list (tool-arguments.ts parseStringifiedArrays).
@@ -288,7 +292,7 @@ impl Tool for WebSearchTool {
                     }
                 }
             }
-            let inline_content = if include_content && !all_urls.is_empty() { Some(extract::fetch_all(&all_urls, Mode::Readable, false, web, &context.cancel).await) } else { None };
+            let inline_content = if include_content && !all_urls.is_empty() { Some(extract::fetch_all(&all_urls, Mode::Readable, false, web, context.image_limits, &context.cancel).await) } else { None };
             if context.cancel.is_cancelled() {
                 return Err("Operation aborted".to_string());
             }
@@ -404,8 +408,12 @@ impl Tool for FetchContentTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use to fetch URL content, direct images, GitHub repos, and PDFs.")
+        Some("get what a URL holds: a page, an image, a GitHub repo or a PDF")
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
@@ -435,7 +443,7 @@ impl Tool for FetchContentTool {
                 return Ok(text_output("Error: No URL provided. Use the 'url' parameter, or 'urls' for parallel fetches.".into(), json!({"error": "No URL provided"}), false));
             }
             send_update(context, format!("Fetching {} URL(s)...", url_list.len()), json!({"phase": "fetch", "progress": 0}));
-            let results = extract::fetch_all(&url_list, mode, force_clone, web, &context.cancel).await;
+            let results = extract::fetch_all(&url_list, mode, force_clone, web, context.image_limits, &context.cancel).await;
             if context.cancel.is_cancelled() {
                 return Err("Operation aborted".to_string());
             }
@@ -556,8 +564,12 @@ impl Tool for GetSearchContentTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use after web_search or fetch_content to retrieve stored content via responseId. Use findText to locate passages without paging through the full content.")
+        Some("read more of a stored web_search or fetch_content result by its responseId; findText finds passages in it")
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {

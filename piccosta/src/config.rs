@@ -12,8 +12,14 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// The folder in a project that holds its own settings (pi's CONFIG_DIR_NAME).
-pub const PROJECT_CONFIG_DIR: &str = ".pi";
+// The folder in a project that holds its own settings. pi's own `.pi/` is never read: its
+// settings are pi's, and a repo that also uses pi would hand them to piccosta.
+pub const PROJECT_CONFIG_DIR: &str = ".piccosta";
+
+// What piccosta calls itself to a service that asks which client sent a request: Codex's
+// `originator` and opencode's `x-opencode-client`. settings.json's `clientName` replaces it, for a
+// service that stops taking this one.
+const CLIENT_NAME: &str = "piccosta";
 
 // Defaults from settings-defaults.ts, used when neither settings file sets the key.
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
@@ -42,7 +48,7 @@ pub fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local/share"))
 }
 
-// Settings from the agent dir's settings.json, with a project's .pi/settings.json merged over it.
+// Settings from the agent dir's settings.json, with a project's .piccosta/settings.json merged over it.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
     merged: Map<String, Value>,
@@ -124,6 +130,15 @@ pub fn remember_model(agent_dir: &Path, provider: &str, model_id: &str) -> Resul
         settings.insert("defaultProvider".into(), provider.into());
         settings.insert("defaultModel".into(), model_id.into());
     })
+}
+
+// The client name (CLIENT_NAME, or `clientName`), from the agent dir's settings.json only. It's what
+// this install calls itself, not a project's choice, and one process serves many projects (ACP
+// opens a host per project directory), so like the Claude bridge settings it's read once for the
+// whole process.
+pub fn client_name(agent_dir: &Path) -> String {
+    let global = read_settings_file(&agent_dir.join("settings.json")).unwrap_or_default();
+    global.get("clientName").and_then(Value::as_str).unwrap_or(CLIENT_NAME).to_string()
 }
 
 impl Settings {
