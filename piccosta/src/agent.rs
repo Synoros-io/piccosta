@@ -639,6 +639,7 @@ impl Agent {
             let outcome = self.run(std::mem::take(&mut starting)).await?;
             // The end of a run, which a Claude query still parked on tool calls doesn't outlive.
             provider::claude::end_run(self.session.id());
+            crate::scale::after_turn();
             if outcome.aborted {
                 aborted = true;
                 break;

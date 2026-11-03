@@ -258,6 +258,9 @@ struct Pane {
     // working line) at the last draw, so rows added under the view raise the scroll by as much and
     // the view stays on what the user was reading.
     anchor: Option<(usize, usize)>,
+    // The slot it showed at the last draw and the row its view ended on, so a mouse selection over
+    // it moves with the text when the text moves.
+    drawn: Option<(usize, usize)>,
 }
 
 struct App {
@@ -392,6 +395,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut term = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
     let host = Arc::new(Host::for_args(&args));
+    crate::scale::watch();
     // After /restart: the reaper and the background jobs the image before handed over.
     let handover = if args.restore { state::take_handover(&host.agent_dir) } else { state::Handover::default() };
     if let Some((fd, pid)) = handover.reaper {
@@ -632,7 +636,7 @@ impl App {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
-            self.panes.push(Pane { slot: first, scroll: 0, anchor: None });
+            self.panes.push(Pane { slot: first, scroll: 0, anchor: None, drawn: None });
             // With no account's models yet there's nothing to open on, but /models refresh and
             // logging in still have to be reachable: the pane opens when something is typed.
             match loaded {
@@ -705,7 +709,7 @@ impl App {
             // Panes that showed one session come back on one slot, sharing its draft.
             if let Some(slot) = path.as_ref().and_then(|path| self.slots.iter().position(|slot| slot.path.as_ref() == Some(path))) {
                 if index < on_screen {
-                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
+                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None, drawn: None });
                 }
                 continue;
             }
@@ -721,14 +725,14 @@ impl App {
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
-                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
+                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None, drawn: None });
             }
         }
         // With no pane left, one holding a draft takes the screen, so the draft isn't lost.
         if self.panes.is_empty()
             && let Some(slot) = self.slots.iter().position(|slot| !slot.draft.text.is_empty())
         {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None });
+            self.panes.push(Pane { slot, scroll: 0, anchor: None, drawn: None });
         }
         if self.panes.is_empty() {
             self.slots.clear();
@@ -943,7 +947,7 @@ impl App {
             self.follow(slot);
         }
         self.slots[slot].unread = false;
-        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None };
+        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None, drawn: None };
         self.put_away(leaving);
     }
 
@@ -1153,7 +1157,7 @@ impl App {
             return;
         }
         if let Some(slot) = self.new_session() {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None });
+            self.panes.push(Pane { slot, scroll: 0, anchor: None, drawn: None });
             self.focus = self.panes.len() - 1;
         }
     }
@@ -1394,7 +1398,7 @@ impl App {
             if self.panes.len() > 1 {
                 self.panes.remove(pane);
             } else {
-                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None };
+                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None, drawn: None };
             }
         }
         self.focus = self.focus.min(self.panes.len() - 1);
@@ -1891,6 +1895,12 @@ impl App {
             facts.push_str(&format!(" · {}", slot.cost.dollars(2)));
         }
         spans.push(Span::styled(facts, Style::new().fg(theme::DIM)));
+        // The session's plan's windows, a window at the scale's lowUsagePercent or past it coloured.
+        let plan = crate::scale::plan_usage(&self.host.agent_dir, slot.model.split('/').next().unwrap_or_default());
+        for window in plan["windows"].as_array().into_iter().flatten() {
+            let style = if window["low"] == true { Style::new().fg(theme::USER) } else { Style::new().fg(theme::DIM) };
+            spans.push(Span::styled(format!(" · {} {:.0}%", window["label"].as_str().unwrap_or_default(), window["usedPercent"].as_f64().unwrap_or_default()), style));
+        }
         match &slot.state {
             State::Running => spans.push(Span::styled(format!("  {} working", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))),
             State::Idle if slot.live.is_none() && slot.working_elsewhere => spans.push(Span::styled(format!("  {} working", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))),
@@ -1939,6 +1949,22 @@ impl App {
         };
         self.panes[index].anchor = (scroll > 0).then_some((count, tail));
         let end = rows.len() - scroll;
+        // A mouse selection is held in screen cells: when this pane's text moves under it (rows
+        // added below while it follows, a scroll), it moves by as much, and it goes once it leaves
+        // the pane or the pane shows another session.
+        let moved = match self.panes[index].drawn {
+            Some((slot, before)) if slot == slot_index => Some(end as isize - before as isize),
+            _ => None,
+        };
+        self.panes[index].drawn = Some((slot_index, end));
+        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.rect == pane_inner(index, rect)) {
+            let (top, bottom) = (selection.rect.y as isize, selection.rect.bottom() as isize);
+            let shift = |y: u16| moved.map(|by| y as isize - by).filter(|y| (top..bottom).contains(y));
+            match (shift(selection.anchor.y), shift(selection.head.y)) {
+                (Some(anchor), Some(head)) => (selection.anchor.y, selection.head.y) = (anchor as u16, head as u16),
+                _ => self.selection = None,
+            }
+        }
         let start = end.saturating_sub(height);
         // Rows sit at the bottom, as a chat does, until they fill the pane.
         let top = body.y + (height - (end - start)) as u16;

@@ -216,6 +216,35 @@ pub(super) fn record_usage(header: impl Fn(&str) -> Option<String>) {
     }
 }
 
+// Ask Codex how much of the plan is used, as the Codex CLI's /status does: GET <base>/wham/usage
+// (codex-rs/backend-client/src/client.rs), which spends nothing. Its rate_limit has a
+// primary_window and a secondary_window (null when the plan has one), each with used_percent,
+// limit_window_seconds and reset_at (epoch seconds); credits has_credits, unlimited and a balance.
+pub async fn ask_usage(model: &Model, credential: &crate::auth::Credential) -> Result<(), String> {
+    let base = endpoint(&model.base_url);
+    let url = format!("{}/wham/usage", base.trim_end_matches("/codex/responses"));
+    let response = super::http_client().build().map_err(|error| error.to_string())?.get(url)
+        .header("originator", super::client_name())
+        .header("Authorization", format!("Bearer {}", credential.key))
+        .header("chatgpt-account-id", credential.account_id.as_deref().unwrap_or_default())
+        .timeout(HEADER_TIMEOUT).send().await.map_err(|error| error.to_string())?;
+    let answer: Value = response.error_for_status().map_err(|error| error.to_string())?.json().await.map_err(|error| error.to_string())?;
+    let mut windows = Map::new();
+    for window in ["primary", "secondary"] {
+        let reading = &answer["rate_limit"][format!("{window}_window")];
+        if let Some(used) = reading["used_percent"].as_f64() {
+            windows.insert(window.into(), json!({"usedPercent": used, "resetsAt": reading["reset_at"], "windowMinutes": reading["limit_window_seconds"].as_u64().map(|seconds| seconds / 60)}));
+        }
+    }
+    let credits = &answer["credits"];
+    if credits["unlimited"] == true || credits["has_credits"] == true {
+        let balance = if credits["unlimited"] == true { "unlimited".into() } else { credits["balance"].as_str().unwrap_or("0").to_string() };
+        windows.insert("extra".into(), json!({"note": format!("credits {balance}")}));
+    }
+    crate::scale::replace("codex", windows);
+    Ok(())
+}
+
 // The same reading from a websocket event: Codex sends `codex.rate_limits` with each response
 // (rate_limits.<window>.used_percent, window_minutes, reset_at), and an error event may carry the
 // response headers it would have had (`headers`). Output: whether the event was a reading only.

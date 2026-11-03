@@ -392,6 +392,13 @@ const OFFERED_WAIT: Duration = Duration::from_secs(30);
 // not the account's (13 on a Max plan that day). Output: its entries as it gives them (value,
 // resolvedModel, displayName, supportedEffortLevels, supportsThinkingOff, ...), or why there are none.
 pub async fn offered_models() -> Result<Vec<Value>, String> {
+    let answer = ask_alone("initialize").await?;
+    answer["response"]["response"]["models"].as_array().cloned().ok_or_else(|| format!("Claude Code's initialize answer lists no models: {}", answer["response"]["error"]))
+}
+
+// A control request sent alone to a Claude Code started for it, which asks no model. Input: its
+// subtype. Output: Claude Code's control_response.
+async fn ask_alone(subtype: &str) -> Result<Value, String> {
     let mut command = tokio::process::Command::new(&SETTINGS.claude);
     command.args(base_args(false, None)).args(["--tools=", "--setting-sources=", "--strict-mcp-config", "--no-session-persistence"]);
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
@@ -405,7 +412,7 @@ pub async fn offered_models() -> Result<Vec<Value>, String> {
     // here however the answer went.
     let mut child = start(command)?;
     let id = request_id();
-    child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": "initialize"}})).await;
+    child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": subtype}})).await;
     let answer = timeout(OFFERED_WAIT, async {
         while let Ok(Some(line)) = child.lines.next_line().await {
             let message: Value = serde_json::from_str(&line).unwrap_or_default();
@@ -416,8 +423,43 @@ pub async fn offered_models() -> Result<Vec<Value>, String> {
         None
     }).await;
     let _ = child.process.kill().await;
-    let answer = answer.map_err(|_| "Claude Code didn't answer initialize".to_string())?.ok_or("Claude Code ended before answering initialize")?;
-    answer["response"]["response"]["models"].as_array().cloned().ok_or_else(|| format!("Claude Code's initialize answer lists no models: {}", answer["response"]["error"]))
+    answer.map_err(|_| format!("Claude Code didn't answer {subtype}"))?.ok_or_else(|| format!("Claude Code ended before answering {subtype}"))
+}
+
+// Ask Claude Code how much of the plan is used (get_usage, a query that asks no model): through a
+// waiting query when there is one, whose answer is noted when it comes (Query::line), else through a
+// Claude Code started for it (1.3 s, 2026-11-03).
+pub async fn ask_usage() -> Result<(), String> {
+    let waiting = lock(&LIVE).values().find(|live| lock(&live.state).waiting).map(|live| live.commands.clone());
+    if let Some(commands) = waiting {
+        return commands.send(Command::Usage).map_err(|_| "the waiting query ended".to_string());
+    }
+    note_usage(&ask_alone("get_usage").await?["response"]["response"]);
+    Ok(())
+}
+
+// Note get_usage's answer for the model scale. Its rate_limits names each window (five_hour,
+// seven_day, seven_day_opus, ...; null when the plan doesn't have it) with its utilization in
+// percent and resets_at in ISO 8601; extra_usage says whether usage past the plan is bought. Only
+// the five_hour and seven_day windows are kept: the rest are names Claude Code doesn't explain
+// (one, priced in dollars, read 100% on a plan that worked, 2026-11-03).
+fn note_usage(answer: &Value) {
+    let Some(limits) = answer["rate_limits"].as_object() else { return };
+    let mut windows = Map::new();
+    for (name, window) in limits.iter().filter(|(name, _)| name.as_str() == "five_hour" || name.starts_with("seven_day")) {
+        let Some(used) = window["utilization"].as_f64() else { continue };
+        let resets_at = window["resets_at"].as_str().and_then(|time| crate::clock::ms_from_iso(&time.replace("+00:00", "Z"))).map(|ms| ms / 1000);
+        windows.insert(name.clone(), json!({"usedPercent": used, "resetsAt": resets_at}));
+    }
+    let extra = &limits["extra_usage"];
+    if extra["is_enabled"] == true {
+        let cents = 10f64.powi(extra["decimal_places"].as_i64().unwrap_or(2) as i32);
+        let money = |field: &str| extra[field].as_f64().map(|amount| format!("{:.2}", amount / cents));
+        let limit = money("monthly_limit").map_or(String::new(), |limit| format!(" of {limit}"));
+        let note = format!("extra usage {}{limit} {} this month", money("used_credits").unwrap_or("0".into()), extra["currency"].as_str().unwrap_or_default());
+        windows.insert("extra".into(), json!({"note": note}));
+    }
+    crate::scale::replace("claude", windows);
 }
 
 // Input: the models Claude Code offers (model.rs). Output: the bridge's models,
@@ -608,6 +650,9 @@ pub async fn shutdown() {
     }
 }
 
+// How a waiting query's get_usage request id begins, so its answer is told from the session's own.
+const USAGE_REQUEST: &str = "usage-";
+
 fn request_id() -> String {
     Uuid::new_v4().simple().to_string()[..13].to_string()
 }
@@ -785,6 +830,8 @@ enum Command {
     // The next message for a waiting query, and its stream.
     Prompt(Vec<Value>, Turn),
     Discard(String),
+    // Ask Claude Code for the plan's usage (ask_usage).
+    Usage,
 }
 
 // One provider call's stream: where its events go, the message it ends with, and its abort.
@@ -1217,6 +1264,7 @@ impl Query {
                 Wake::Command(Some(Command::Deliver(results, turn))) => self.deliver(results, turn).await,
                 Wake::Command(Some(Command::Prompt(content, turn))) => self.prompt(content, turn).await,
                 Wake::Command(Some(Command::Discard(reason))) => self.discard(&reason).await,
+                Wake::Command(Some(Command::Usage)) => self.child.send(&json!({"type": "control_request", "request_id": format!("{USAGE_REQUEST}{}", request_id()), "request": {"subtype": "get_usage"}})).await,
                 Wake::Command(None) => self.discard("the bridge let go of it").await,
                 Wake::Idle => self.idle().await,
                 Wake::Settle => self.end_turn_on_tool_use(),
@@ -1448,6 +1496,8 @@ impl Query {
         self.last_activity = Instant::now();
         match message["type"].as_str().unwrap_or_default() {
             "control_request" => self.control(&message).await,
+            // A usage answer, or its failure, which is no fault of the session's.
+            "control_response" if message["response"]["request_id"].as_str().is_some_and(|id| id.starts_with(USAGE_REQUEST)) => note_usage(&message["response"]["response"]),
             "control_response" if message["response"]["subtype"] == "error" => {
                 self.failure = Some(format!("Claude Code refused the session: {}", message["response"]["error"].as_str().unwrap_or("no reason given")));
             }

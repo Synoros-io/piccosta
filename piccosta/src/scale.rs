@@ -25,8 +25,12 @@
 // none of those accounts works as it is, and its own scale.json names the models it would rather.
 //
 // Plans report their usage as they're used: Claude Code in its rate_limit_event messages, Codex in
-// its response headers and websocket events, opencode-go only when it refuses a request past a
-// limit. piccosta keeps the latest in <agent dir>/usage.json.
+// its response headers and websocket events, opencode-go when it refuses a request past a limit.
+// A piccosta that stays up (the TUI, rpc, ACP) also asks each connected plan, as its own tools do
+// (ask): at start, every `usage.refreshSeconds`, and after a turn ends. piccosta keeps the latest
+// in <agent dir>/usage.json, by plan, each window with usedPercent, resetsAt (epoch seconds),
+// seenAt and, when known, windowMinutes; an "extra" entry notes usage bought past the plan.
+// The pane header, /usage, rpc's stats and ACP's usage_update show it (plan_usage).
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -38,6 +42,18 @@ const LOW_USAGE_PERCENT: f64 = 80.0;
 // Retry-After) counts: long enough to
 // steer the next few sessions, short enough that a plan read as low is tried again within the hour.
 const READING_SECONDS: f64 = 3600.0;
+// How often a piccosta that stays up asks the plans, unless settings say `usage.refreshSeconds`:
+// the Codex CLI and Claude Code refresh their own displays about this often.
+const REFRESH_SECONDS: u64 = 300;
+// The least time between two asks a turn's end starts, so a run of short turns asks once.
+const AFTER_TURN_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+// opencode's Go plan usage, unless settings say `usage.opencodeGoUrl`: GET with the API key, which
+// answers {"usage": {"rolling" | "weekly" | "monthly": {"percent", "resetsAt" (ISO 8601)}}}
+// (opencode issue #44189; read 2026-11-03).
+const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+// opencode's 5-hour and weekly windows, in minutes (opencode.ai/docs/go); its monthly one follows
+// the subscription's day, so it has no fixed length.
+const OPENCODE_WINDOW_MINUTES: [(&str, u64); 2] = [("rolling", 300), ("weekly", 10080)];
 
 pub struct Use {
     pub name: String,
@@ -173,35 +189,181 @@ pub fn forget(plan: &str, window: &str) {
     store(plan, window, None);
 }
 
+// A reading's fields go over the window's (its windowMinutes, from an ask, stays).
 fn store(plan: &str, window: &str, reading: Option<Value>) {
+    update(|usage| {
+        let windows = usage.entry(plan.to_string()).or_insert_with(|| json!({}));
+        if let Some(windows) = windows.as_object_mut() {
+            match reading.and_then(|reading| reading.as_object().cloned()) {
+                Some(reading) => windows.entry(window.to_string()).or_insert_with(|| json!({})).as_object_mut().into_iter().for_each(|old| old.extend(reading.clone())),
+                None => drop(windows.remove(window)),
+            };
+        }
+    });
+}
+
+// Put what a plan said when asked in place of everything known about it.
+pub fn replace(plan: &str, mut windows: Map<String, Value>) {
+    let seen = crate::clock::now_ms() / 1000;
+    windows.values_mut().filter_map(Value::as_object_mut).for_each(|window| drop(window.insert("seenAt".into(), seen.into())));
+    update(|usage| drop(usage.insert(plan.to_string(), Value::Object(windows))));
+}
+
+fn update(change: impl FnOnce(&mut Map<String, Value>)) {
     let path = usage_path(&crate::config::agent_dir());
     let mut usage: Map<String, Value> = std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-    let windows = usage.entry(plan.to_string()).or_insert_with(|| json!({}));
-    if let Some(windows) = windows.as_object_mut() {
-        match reading {
-            Some(reading) => windows.insert(window.to_string(), reading),
-            None => windows.remove(window),
-        };
-    }
+    change(&mut usage);
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&usage).unwrap_or_default());
 }
 
-// The highest share used of any of a plan's windows that hasn't reset (or, with no reset time,
-// gone stale) since it was read. Codex sends a reading with every response, so one of its readings
-// with no reset time stands until the next replaces it: a weekly window can't go stale in an hour.
-fn used(agent_dir: &Path, plan: &str) -> Option<f64> {
-    let usage: Value = serde_json::from_str(&std::fs::read_to_string(usage_path(agent_dir)).ok()?).ok()?;
+// usage.json as it is, read again only when it has changed: the pane header asks on every draw.
+fn readings(agent_dir: &Path) -> Map<String, Value> {
+    static READ: std::sync::Mutex<Option<(std::time::SystemTime, Map<String, Value>)>> = std::sync::Mutex::new(None);
+    let path = usage_path(agent_dir);
+    let Ok(changed) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else { return Map::new() };
+    let mut read = READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if read.as_ref().is_none_or(|(when, _)| *when != changed) {
+        let usage = std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+        *read = Some((changed, usage));
+    }
+    read.as_ref().map(|(_, usage)| usage.clone()).unwrap_or_default()
+}
+
+// A plan's windows that haven't reset (or, with no reset time, gone stale) since they were read,
+// by name. Codex sends a reading with every response, so one of its readings with no reset time
+// stands until the next replaces it: a weekly window can't go stale in an hour.
+fn windows(agent_dir: &Path, plan: &str) -> Vec<(String, Value)> {
     let now = (crate::clock::now_ms() / 1000) as f64;
-    let current = |window: &&Value| match window.get("resetsAt").and_then(Value::as_f64) {
+    let current = |window: &Value| match window.get("resetsAt").and_then(Value::as_f64) {
         Some(reset) => reset > now,
         None => plan == "codex" || window.get("seenAt").and_then(Value::as_f64).is_some_and(|seen| seen + READING_SECONDS > now),
     };
-    usage.get(plan)?.as_object()?.values().filter(current).filter_map(|window| window.get("usedPercent")?.as_f64()).reduce(f64::max)
+    let usage = readings(agent_dir);
+    usage.get(plan).and_then(Value::as_object).into_iter().flatten().filter(|(_, window)| current(window)).map(|(name, window)| (name.clone(), window.clone())).collect()
+}
+
+// The highest share used of any of a plan's current windows.
+fn used(agent_dir: &Path, plan: &str) -> Option<f64> {
+    windows(agent_dir, plan).iter().filter_map(|(_, window)| window.get("usedPercent")?.as_f64()).reduce(f64::max)
+}
+
+fn low_usage_percent(agent_dir: &Path) -> f64 {
+    merged(agent_dir).get("lowUsagePercent").and_then(Value::as_f64).unwrap_or(LOW_USAGE_PERCENT)
+}
+
+// What a provider's plan has used now, for the pane header, /usage, rpc and ACP: null for a
+// provider with no plan, else {plan, windows: [{name, label, usedPercent, resetsAt, low}], extra}
+// (windows empty while the plan's usage is unknown).
+pub fn plan_usage(agent_dir: &Path, provider: &str) -> Value {
+    let Some(account) = crate::auth::account(provider) else { return Value::Null };
+    let limit = low_usage_percent(agent_dir);
+    let current = windows(agent_dir, account.plan);
+    let extra = current.iter().find_map(|(_, window)| window.get("note").cloned());
+    let windows: Vec<Value> = current.into_iter().filter_map(|(name, window)| {
+        let used = window.get("usedPercent")?.as_f64()?;
+        // A window's length names it (5h, 7d) when it's known, else its own name, shortened.
+        let label = match window.get("windowMinutes").and_then(Value::as_u64) {
+            Some(minutes) if minutes % 1440 == 0 => format!("{}d", minutes / 1440),
+            Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+            Some(minutes) => format!("{minutes}m"),
+            None => name.replace("five_hour", "5h").replace("seven_day", "7d").replace('_', " "),
+        };
+        Some(json!({"name": name, "label": label, "usedPercent": used, "resetsAt": window.get("resetsAt"), "low": used >= limit}))
+    }).collect();
+    json!({"plan": account.plan_name, "windows": windows, "extra": extra})
+}
+
+// /usage's lines for every connected plan: each window, its share used and when it resets (local
+// time), and what's bought past the plan where the plan says.
+pub fn report(agent_dir: &Path) -> String {
+    let registry = crate::model::ModelRegistry::load(&agent_dir.join("models.json")).ok();
+    let offset = crate::clock::local_now().1;
+    let mut lines = Vec::new();
+    for account in crate::auth::ACCOUNTS.iter().filter(|account| registry.as_ref().is_some_and(|registry| registry.models().iter().any(|model| model.provider == account.provider))) {
+        let usage = plan_usage(agent_dir, account.provider);
+        let windows = usage["windows"].as_array().cloned().unwrap_or_default();
+        if windows.is_empty() {
+            lines.push(format!("{:<12}unknown", account.plan_name));
+        }
+        for (index, window) in windows.iter().enumerate() {
+            let resets = window["resetsAt"].as_i64().map_or(String::new(), |at| format!(", resets {}", crate::clock::iso_from_ms((at + offset) * 1000)[..16].replace('T', " ")));
+            let name = if index == 0 { account.plan_name } else { "" };
+            lines.push(format!("{name:<12}{:<8}{:>3.0}% used{resets}", window["label"].as_str().unwrap_or_default(), window["usedPercent"].as_f64().unwrap_or_default()));
+        }
+        if let Some(extra) = usage["extra"].as_str() {
+            lines.push(format!("{:<12}{extra}", ""));
+        }
+    }
+    lines.join("\n")
+}
+
+// Whether this process asks the plans (watch), and when it last did.
+static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_ASKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+// Ask the plans now and every `usage.refreshSeconds` after, in the background.
+pub fn watch() {
+    WATCHING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let settings = crate::config::Settings::load(&crate::config::agent_dir(), None);
+    let period = settings.get("usage.refreshSeconds").and_then(Value::as_u64).unwrap_or(REFRESH_SECONDS).max(1);
+    tokio::spawn(async move {
+        loop {
+            ask().await;
+            tokio::time::sleep(std::time::Duration::from_secs(period)).await;
+        }
+    });
+}
+
+// A turn ended: ask the plans again, unless they were asked in the last minute or this process
+// doesn't watch them (print mode).
+pub fn after_turn() {
+    let recent = LAST_ASKED.lock().ok().and_then(|last| *last).is_some_and(|last| last.elapsed() < AFTER_TURN_GAP);
+    if WATCHING.load(std::sync::atomic::Ordering::Relaxed) && !recent {
+        tokio::spawn(ask());
+    }
+}
+
+// Ask each connected plan how much of it is used, noting what each says. One that can't be asked
+// keeps what was known.
+async fn ask() {
+    if let Ok(mut last) = LAST_ASKED.lock() {
+        *last = Some(std::time::Instant::now());
+    }
+    let agent_dir = crate::config::agent_dir();
+    let Ok(registry) = crate::model::ModelRegistry::load(&agent_dir.join("models.json")) else { return };
+    let paths = crate::auth::CredentialPaths::from_environment(&agent_dir);
+    for account in &crate::auth::ACCOUNTS {
+        let Some(model) = registry.models().iter().find(|model| model.provider == account.provider) else { continue };
+        let _ = match account.owner {
+            crate::auth::Owner::ClaudeCode => crate::provider::claude::ask_usage().await,
+            _ => match crate::auth::credential_for(account.provider, registry.provider_config(account.provider), &paths).await {
+                Ok(credential) if account.owner == crate::auth::Owner::CodexCli => crate::provider::codex::ask_usage(model, &credential).await,
+                Ok(credential) => ask_opencode(&agent_dir, &credential).await,
+                Err(error) => Err(error),
+            },
+        };
+    }
+}
+
+async fn ask_opencode(agent_dir: &Path, credential: &crate::auth::Credential) -> Result<(), String> {
+    let settings = crate::config::Settings::load(agent_dir, None);
+    let url = settings.get("usage.opencodeGoUrl").and_then(Value::as_str).unwrap_or(OPENCODE_GO_USAGE_URL);
+    let client = crate::provider::http_client().build().map_err(|error| error.to_string())?;
+    let response = client.get(url).bearer_auth(&credential.key).timeout(crate::provider::HEADER_TIMEOUT).send().await.map_err(|error| error.to_string())?;
+    let answer: Value = response.error_for_status().map_err(|error| error.to_string())?.json().await.map_err(|error| error.to_string())?;
+    let mut windows = Map::new();
+    for (name, window) in answer["usage"].as_object().ok_or("no usage in opencode's answer")? {
+        let Some(used) = window["percent"].as_f64() else { continue };
+        let resets_at = window["resetsAt"].as_str().and_then(crate::clock::ms_from_iso).map(|ms| ms / 1000);
+        let minutes = OPENCODE_WINDOW_MINUTES.iter().find(|(known, _)| known == name).map(|(_, minutes)| minutes);
+        windows.insert(name.clone(), json!({"usedPercent": used, "resetsAt": resets_at, "windowMinutes": minutes}));
+    }
+    replace("opencode-go", windows);
+    Ok(())
 }
 
 fn low(agent_dir: &Path, model: &str) -> bool {
-    let limit = merged(agent_dir).get("lowUsagePercent").and_then(Value::as_f64).unwrap_or(LOW_USAGE_PERCENT);
-    used(agent_dir, plan(model)).is_some_and(|percent| percent >= limit)
+    used(agent_dir, plan(model)).is_some_and(|percent| percent >= low_usage_percent(agent_dir))
 }
 
 // A use's models in the order to try them now: those whose plan isn't running low, then the rest.

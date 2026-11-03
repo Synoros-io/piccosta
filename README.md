@@ -28,7 +28,7 @@ It stores no credentials of its own: it uses each account's existing login, and 
 ### Model scale
 
 Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
-- piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and once one passes 80% of a window (`lowUsagePercent` in `scale.json`), the scale's next picks prefer another plan's model. A session already running stays on its model.
+- piccosta records how much of your Claude, Codex and opencode Go plans is used: as the plans report it with each response, and by asking each one, as its own tools do, when piccosta starts, every 5 minutes (`usage.refreshSeconds` in settings) and after a turn ends. The pane header shows the session's plan (`· 5h 19% · 7d 66%`), and `/usage` every plan with when each window resets. Once one passes 80% of a window (`lowUsagePercent` in `scale.json`), the scale's next picks prefer another plan's model. A session already running stays on its model.
 - The defaults ship with piccosta. Your changes go in one file, `scale.json` in piccosta's folder: `/scale edit` writes all of it there and opens it in your editor, and `/scale <kind> <model[:level]> …` sets one kind's models. A kind you change keeps the rest of its defaults; `"off": true` turns one off.
 - `/scale` shows it all with the plans' usage. `--use <kind>` starts a session on its pick, on the command line, in `/new` and in Ctrl+N's box.
 

@@ -540,19 +540,20 @@ impl App {
         format!("context    {} of {} tokens ({:.1}%)\n           {}{}", slot.context_tokens, slot.context_window, share * 100.0, "█".repeat(filled), "░".repeat(bar_cells - filled))
     }
 
-    // Tokens and cost over every response this pane has shown.
+    // Every connected plan's usage, then the tokens and cost over every response this pane has shown.
     // The session file's whole count, as rpc's get_session_stats gives it (compactions and earlier
     // branches included); an unsaved session has only what this pane holds.
     fn usage(&self) -> String {
         let slot = self.current();
+        let plans = Some(crate::scale::report(&self.host.agent_dir)).filter(|plans| !plans.is_empty()).map_or(String::new(), |plans| plans + "\n\n");
         let Some(session) = slot.path.as_deref().and_then(|path| Session::open(path, &slot.cwd).ok()) else {
-            return format!("nothing saved yet; this pane's responses cost {}", slot.cost.dollars(4));
+            return format!("{plans}nothing saved yet; this pane's responses cost {}", slot.cost.dollars(4));
         };
         let stats = crate::rpc::session_stats(&session);
         let number = |key: &str| stats.get(key).and_then(Value::as_u64).unwrap_or(0);
         let tokens = |key: &str| stats.get("tokens").and_then(|tokens| tokens.get(key)).and_then(Value::as_u64).unwrap_or(0);
         format!(
-            "responses   {}\ntool calls  {}\ninput       {}\noutput      {}\ncache read  {}\ncache write {}\ncost        {}",
+            "{plans}responses   {}\ntool calls  {}\ninput       {}\noutput      {}\ncache read  {}\ncache write {}\ncost        {}",
             number("assistantMessages"), number("toolCalls"), tokens("input"), tokens("output"), tokens("cacheRead"), tokens("cacheWrite"),
             crate::provider::responses::dollars(stats.get("cost").and_then(Value::as_f64).unwrap_or(0.0), stats.contains_key("costUnknown"), 4)
         )

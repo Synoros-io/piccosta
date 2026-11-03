@@ -95,6 +95,7 @@ pub async fn run(args: crate::cli::Args) -> Result<ExitCode, String> {
 async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     let host = Arc::new(Host::for_args(&args));
     host.show_settings_errors();
+    crate::scale::watch();
     let (inputs, mut received) = unbounded_channel();
     // stdin on a plain thread, as print mode reads it (main.rs read_piped_stdin says why).
     let lines = inputs.clone();
@@ -672,6 +673,7 @@ impl Rpc {
         stats.insert("contextUsage".into(), if window > 0 { context_usage(&session, window) } else { Value::Null });
         stats.insert("sessionFile".into(), json!(self.live.file));
         stats.insert("sessionId".into(), json!(self.live.id));
+        stats.insert("planUsage".into(), crate::scale::plan_usage(&self.host.agent_dir, &self.live.model.provider));
         Ok(Value::Object(stats))
     }
 }

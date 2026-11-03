@@ -160,7 +160,7 @@ struct Live {
     cost: crate::provider::responses::Tally,
 }
 
-// Tell the client how full the context is and what the session has cost.
+// Tell the client how full the context is, what the session has cost and how much of its plan is used.
 fn usage_update(session: &str, live: &Live) {
     // A plan's usage costs no money, so it goes without a cost. When some responses' cost isn't
     // known, `amount` leaves them out and _meta.costUnknown says so.
@@ -169,7 +169,12 @@ fn usage_update(session: &str, live: &Live) {
         usage["cost"] = json!({"amount": live.cost.total, "currency": "USD"});
     }
     if live.cost.unknown() {
-        usage["_meta"] = json!({"costUnknown": true});
+        usage["_meta"]["costUnknown"] = json!(true);
+    }
+    // What the session's plan has used, in its own windows (scale::plan_usage).
+    let plan = crate::scale::plan_usage(&live.host.agent_dir, &live.model.provider);
+    if !plan.is_null() {
+        usage["_meta"]["planUsage"] = plan;
     }
     update(session, usage);
 }
@@ -230,6 +235,7 @@ pub async fn run(args: crate::cli::Args) -> Result<ExitCode, String> {
 }
 
 async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
+    crate::scale::watch();
     let (inputs, mut received) = unbounded_channel();
     // stdin on a plain thread, as rpc mode reads it.
     let lines = inputs.clone();
