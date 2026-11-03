@@ -136,7 +136,7 @@ To install the release binary:
 
 ```sh
 mkdir -p ~/.local/bin
-curl -fL https://github.com/Synoros-io/piccosta/releases/download/v0.10.2/piccosta-x86_64-linux -o ~/.local/bin/piccosta
+curl -fL https://github.com/Synoros-io/piccosta/releases/latest/download/piccosta-x86_64-linux -o ~/.local/bin/piccosta
 chmod +x ~/.local/bin/piccosta   # or put it anywhere on your PATH
 ```
 
