@@ -15,7 +15,7 @@
 use super::transcript::{self, ToolSupport};
 use super::transform;
 use super::StreamEvent;
-use crate::message::{AssistantMessage, Content, Message, StopReason, SystemMessage, ToolDefinition, Usage};
+use crate::message::{AssistantMessage, Content, Cost, CostState, Message, StopReason, SystemMessage, ToolDefinition, Usage};
 use crate::model::Model;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -575,20 +575,77 @@ pub fn parse_tool_call_arguments(json: &str) -> (Map<String, Value>, Option<Stri
     }
 }
 
-// Providers billed by a plan's quota, not by the token: their responses cost no money, whatever
-// the catalog's prices say, so the footer, ACP and rpc show none, and count none for a saved
-// response from before that kept the catalog's.
-const PLAN_PROVIDERS: [&str; 3] = ["openai-codex", "opencode-go", crate::provider::claude::PROVIDER];
-
+// Whether a provider's responses are billed by a plan's quota now, not by the token: then they cost
+// no money, whatever the list's prices say. So are the accounts piccosta knows (auth::ACCOUNTS),
+// Claude only while Claude Code is logged in to a plan (claude::billed_by_token). Each response
+// records the answer as it was made (Cost::plan); totals go by that, never by today's login.
 pub fn plan_billed(provider: &str) -> bool {
-    PLAN_PROVIDERS.contains(&provider)
+    match provider {
+        crate::provider::claude::PROVIDER => !crate::provider::claude::billed_by_token(),
+        provider => crate::auth::account(provider).is_some(),
+    }
 }
 
+// A cost as people read it: the dollars known, to `places` decimals, and "unknown" for responses
+// billed by the token at prices nobody gave (models.json can give them).
+pub fn dollars(known: f64, unknown: bool, places: usize) -> String {
+    match (unknown, known > 0.0) {
+        (false, _) => format!("${known:.places$}"),
+        (true, false) => "unknown".into(),
+        (true, true) => format!("${known:.places$} + unknown"),
+    }
+}
+
+// What responses cost, added up in the order they were made from what each recorded then. A plan's
+// add nothing: by their record, or for one saved before responses kept it, by the provider (the
+// accounts piccosta knows and Claude were plans then). A cost nobody knew, or a pending one no later
+// turn paid for, leaves the total partly unknown. One per session: a turn settles its own query's.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tally {
+    pub total: f64,
+    unknown: bool,
+    pending: u32,
+}
+
+impl Tally {
+    pub fn add(&mut self, usage: &Usage, provider: &str) {
+        let old_plan = || provider == crate::provider::claude::PROVIDER || crate::auth::account(provider).is_some();
+        if usage.cost.plan.unwrap_or_else(old_plan) {
+            return;
+        }
+        self.total += usage.cost.total;
+        self.unknown |= usage.cost.state == CostState::Unknown;
+        self.pending = (self.pending + u32::from(usage.cost.state == CostState::Pending)).saturating_sub(usage.cost.settles);
+    }
+
+    // Another session's tally, its pending turns now for good unknown.
+    pub fn merge(&mut self, other: Tally) {
+        self.total += other.total;
+        self.unknown |= other.unknown();
+    }
+
+    pub fn unknown(&self) -> bool {
+        self.unknown || self.pending > 0
+    }
+
+    pub fn dollars(&self, places: usize) -> String {
+        dollars(self.total, self.unknown(), places)
+    }
+}
+
+// Anthropic prices a cache write kept for an hour at twice the base input rate (platform.claude.com's
+// prompt caching docs, read 2026-11-03): what an hour's write costs when the model's prices give no
+// cacheWrite1h.
+const HOUR_WRITE_INPUT_MULTIPLIER: f64 = 2.0;
+
 // Set a response's cost from its usage and the model's prices, with the tier for its input size
-// (models.ts:1236-1256). A plan's responses cost nothing.
+// (models.ts:1236-1256). A plan's responses cost nothing; one billed by the token at prices nobody
+// gave has an unknown cost, not a zero one.
 pub fn calculate_cost(model: &Model, usage: &mut Usage) {
-    if plan_billed(&model.provider) {
-        usage.cost = Default::default();
+    let plan = plan_billed(&model.provider);
+    let state = if plan || model.cost.supplied { CostState::Known } else { CostState::Unknown };
+    usage.cost = Cost { plan: Some(plan), state, ..Default::default() };
+    if plan || !model.cost.supplied {
         return;
     }
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
@@ -607,8 +664,8 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) {
     usage.cost.input = input_rate / PER_MILLION * usage.input as f64;
     usage.cost.output = output_rate / PER_MILLION * usage.output as f64;
     usage.cost.cache_read = cache_read_rate / PER_MILLION * usage.cache_read as f64;
-    // Anthropic charges twice the input rate for hour-long cache writes.
-    usage.cost.cache_write = (cache_write_rate * short_write + input_rate * 2.0 * long_write) / PER_MILLION;
+    let long_write_rate = model.cost.cache_write_1h.unwrap_or(input_rate * HOUR_WRITE_INPUT_MULTIPLIER);
+    usage.cost.cache_write = (cache_write_rate * short_write + long_write_rate * long_write) / PER_MILLION;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 

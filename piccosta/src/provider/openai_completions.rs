@@ -65,6 +65,12 @@ fn compat_of(model: &Model) -> Compat {
     }
 }
 
+// The field thinking streamed as `reasoning` goes back in: opencode's gateway streams `reasoning`
+// but takes it back only as `reasoning_content`; a model's compat reasoningReplayField names another.
+fn reasoning_replay_field(model: &Model) -> &str {
+    model.compat_str("reasoningReplayField").unwrap_or(if is_opencode(model) { "reasoning_content" } else { "reasoning" })
+}
+
 fn tool_support(compat: &Compat) -> ToolSupport {
     if compat.supports_mid_conversation_system && compat.supports_mid_conversation_tool_additions { ToolSupport::Additions } else { ToolSupport::None }
 }
@@ -227,10 +233,9 @@ fn convert_assistant(model: &Model, assistant: &AssistantMessage, compat: &Compa
         message.insert("content".into(), text.into());
     }
     if let Some((_, signature)) = thinking.first() {
-        // The field the thinking streamed in; opencode-go streams `reasoning` but takes it back as
-        // `reasoning_content`.
+        // The field the thinking streamed in, or the one `reasoning` goes back as.
         let field = match *signature {
-            Some("reasoning") if model.provider == "opencode-go" => Some("reasoning_content"),
+            Some("reasoning") => Some(reasoning_replay_field(model)),
             Some(field) if REASONING_FIELDS.contains(&field) => Some(field),
             _ => None,
         };
@@ -396,9 +401,8 @@ fn handle_chunk(chunk: &Value, model: &Model, output: &mut AssistantMessage, bui
 
     // Reasoning before content: some proxies put both in one delta, and thinking comes first.
     if let Some((field, piece)) = REASONING_FIELDS.iter().find_map(|field| delta.get(*field).and_then(Value::as_str).filter(|text| !text.is_empty()).map(|text| (*field, text))) {
-        let signature = if model.provider == "opencode-go" && field == "reasoning" { "reasoning_content" } else { field };
         let index = *building.thinking.get_or_insert_with(|| {
-            output.content.push(Content::Thinking { thinking: String::new(), thinking_signature: Some(signature.to_string()), redacted: None });
+            output.content.push(Content::Thinking { thinking: String::new(), thinking_signature: Some(field.to_string()), redacted: None });
             let index = output.content.len() - 1;
             send(StreamEvent::ThinkingStart { index });
             index

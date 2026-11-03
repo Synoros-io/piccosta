@@ -62,7 +62,6 @@
         "opencode-go/claude-haiku-5-5:xhigh",
         "opencode-go/gpt-6-luna:max"
       ],
-      "compactAt": 100000,
       "tools": [
         "read",
         "bash",

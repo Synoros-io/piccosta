@@ -117,7 +117,7 @@ struct Slot {
     unread: bool,
     // The context the last response filled, and what the session has cost.
     context_tokens: u64,
-    cost: f64,
+    cost: crate::provider::responses::Tally,
     draft: Editor,
     // Each message's rows, by the width and flags they were drawn for.
     cache: HashMap<usize, (u16, Flags, Rows)>,
@@ -168,7 +168,7 @@ impl Slot {
             state: State::Idle,
             unread: false,
             context_tokens: 0,
-            cost: 0.0,
+            cost: Default::default(),
             draft: Editor::default(),
             cache: HashMap::new(),
             agents: Vec::new(),
@@ -220,9 +220,7 @@ impl Slot {
                 if usage.total_tokens > 0 {
                     self.context_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
                 }
-                if !crate::provider::responses::plan_billed(&assistant.provider) {
-                    self.cost += usage.cost.total;
-                }
+                self.cost.add(usage, &assistant.provider);
             }
             AgentMessage::ToolResult(result) => {
                 self.tools.insert(
@@ -247,6 +245,10 @@ struct Pane {
     slot: usize,
     // Rows scrolled up from the bottom; 0 follows the newest.
     scroll: usize,
+    // While scrolled up: the message count and the rows below them (the answer being written, the
+    // working line) at the last draw, so rows added under the view raise the scroll by as much and
+    // the view stays on what the user was reading.
+    anchor: Option<(usize, usize)>,
 }
 
 struct App {
@@ -387,8 +389,15 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         reap_inherited_children(&handover);
     }
     // --use becomes the model and level the scale picks, before anything opens.
-    (args.model, args.thinking) = host.launch(&args)?;
+    let note;
+    (args.model, args.thinking, note) = host.launch(&args)?;
     args.provider = None;
+    // The model it opens on may still be being listed: waited for before the screen is taken, and
+    // before any input is read. The session looked at is only read here (a fork would be made).
+    let opening = if args.fork.is_none() && !args.restore { host.opening(&args).ok() } else { None };
+    if let Some(listing) = host.listing(opening.as_ref(), crate::cli::model_name(&args).as_deref()) {
+        listing.await;
+    }
     let mut terminal = setup().map_err(|error| format!("could not set up the terminal: {error}"))?;
     let (sender, updates) = unbounded_channel();
     let mut app = App {
@@ -436,6 +445,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         restore();
         host.show_settings_errors();
         return Err(error);
+    }
+    // Shown in the pane, where the notices that come with starting don't replace it.
+    if let Some(note) = note {
+        app.report(crate::scale::fell_back(&note, &app.current().model));
     }
     if !host.settings.load_errors.is_empty() {
         app.report(format!("Invalid settings file:\n{}", host.settings.load_errors.join("\n")));
@@ -621,7 +634,7 @@ impl App {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
-            self.panes.push(Pane { slot: first, scroll: 0 });
+            self.panes.push(Pane { slot: first, scroll: 0, anchor: None });
             // With no account's models yet there's nothing to open on, but /models refresh and
             // logging in still have to be reachable: the pane opens when something is typed.
             match loaded {
@@ -697,7 +710,7 @@ impl App {
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
-                self.panes.push(Pane { slot, scroll: kept.scroll });
+                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
             }
         }
         if self.panes.is_empty() {
@@ -901,7 +914,7 @@ impl App {
             self.follow(slot);
         }
         self.slots[slot].unread = false;
-        self.panes[self.focus] = Pane { slot, scroll: 0 };
+        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None };
         self.put_away(leaving);
     }
 
@@ -1107,7 +1120,7 @@ impl App {
             return;
         }
         if let Some(slot) = self.new_session() {
-            self.panes.push(Pane { slot, scroll: 0 });
+            self.panes.push(Pane { slot, scroll: 0, anchor: None });
             self.focus = self.panes.len() - 1;
         }
     }
@@ -1331,7 +1344,7 @@ impl App {
             if self.panes.len() > 1 {
                 self.panes.remove(pane);
             } else {
-                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0 };
+                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None };
             }
         }
         self.focus = self.focus.min(self.panes.len() - 1);
@@ -1823,8 +1836,8 @@ impl App {
         if slot.live.is_none() && slot.elsewhere {
             facts.push_str(" · running in another piccosta, followed here");
         }
-        if slot.cost > 0.0 {
-            facts.push_str(&format!(" · ${:.2}", slot.cost));
+        if slot.cost.total > 0.0 || slot.cost.unknown() {
+            facts.push_str(&format!(" · {}", slot.cost.dollars(2)));
         }
         spans.push(Span::styled(facts, Style::new().fg(theme::DIM)));
         match &slot.state {
@@ -1837,7 +1850,19 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), header);
 
         let height = usize::from(body.height);
-        let mut rows = self.transcript(slot_index, width, height + self.panes[index].scroll);
+        // Scrolled up, the rows added below the view since the last draw (the answer being written,
+        // new messages, the working line) raise the scroll by as much, before the transcript is cut
+        // to the window, so the view stays on what the user was reading. At the bottom it follows.
+        let busy_rows = usize::from(self.slots[slot_index].busy()) * 2;
+        let mut below = None;
+        if let Some((count, before)) = self.panes[index].anchor
+            && self.panes[index].scroll > 0
+        {
+            let now = self.transcript(slot_index, width, 0, count).1 + busy_rows;
+            self.panes[index].scroll += now.saturating_sub(before);
+            below = (count == self.slots[slot_index].messages.len()).then_some(now);
+        }
+        let (mut rows, _) = self.transcript(slot_index, width, height + self.panes[index].scroll, usize::MAX);
         // While it works, a line under the conversation says so, its dots moving and its time
         // counting, so it's plain the model is still at it.
         let slot = &self.slots[slot_index];
@@ -1855,6 +1880,13 @@ impl App {
         }
         let scroll = self.panes[index].scroll.min(rows.len().saturating_sub(height));
         self.panes[index].scroll = scroll;
+        let count = self.slots[slot_index].messages.len();
+        let tail = match below {
+            Some(now) => now,
+            None if scroll > 0 => self.transcript(slot_index, width, 0, count).1 + busy_rows,
+            None => 0,
+        };
+        self.panes[index].anchor = (scroll > 0).then_some((count, tail));
         let end = rows.len() - scroll;
         let start = end.saturating_sub(height);
         // Rows sit at the bottom, as a chat does, until they fill the pane.
@@ -1907,19 +1939,23 @@ impl App {
     }
 
     // A session's rows, drawn from the bottom up until `wanted` are there (or the session's start).
-    fn transcript(&mut self, slot_index: usize, width: u16, wanted: usize) -> Rows {
+    // The last `wanted` rows of a slot's conversation, and how many rows come from the answer being
+    // written and the messages from index `since` on.
+    fn transcript(&mut self, slot_index: usize, width: u16, wanted: usize, since: usize) -> (Rows, usize) {
         let flags = self.flags;
         let frame = self.frame;
         let slot = &mut self.slots[slot_index];
         let mut chunks: Vec<Rows> = Vec::new();
         let mut count = 0;
+        let mut below = 0;
         if let Some(parts) = &slot.partial {
             let rows = render::assistant(parts, None, &slot.tools, flags, frame, width, &mut self.tex);
             count += rows.len();
+            below += rows.len();
             chunks.push(rows);
         }
         for index in (0..slot.messages.len()).rev() {
-            if count >= wanted {
+            if count >= wanted && index < since {
                 break;
             }
             let cached = slot.cache.get(&index).filter(|(cached_width, cached_flags, _)| *cached_width == width && *cached_flags == flags);
@@ -1944,9 +1980,12 @@ impl App {
                 }
             };
             count += rows.len();
+            if index >= since {
+                below += rows.len();
+            }
             chunks.push(rows);
         }
-        chunks.into_iter().rev().flatten().collect()
+        (chunks.into_iter().rev().flatten().collect(), below)
     }
 
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {

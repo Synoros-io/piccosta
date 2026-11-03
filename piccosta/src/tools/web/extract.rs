@@ -30,8 +30,6 @@ const MIN_USEFUL_CONTENT: usize = 500;
 // How many <meta http-equiv="refresh"> pages are followed for one URL, the same budget as HTTP
 // redirects (ssrf-protection.ts:6).
 const MAX_META_REFRESH_HOPS: usize = 5;
-// A response larger than this is refused, unless it's a PDF (extract.ts:1328, `?? 5`).
-const DEFAULT_MAX_RESPONSE_MB: u64 = 5;
 const SUPPORTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 // Errors that end a fetch: retrying elsewhere can't help (extract.ts:69, 142-158).
 const NON_RECOVERABLE_ERRORS: [&str; 4] = ["Unsupported content type", "Response too large", "PDF extraction is disabled", "Image fetching is disabled"];
@@ -461,7 +459,7 @@ async fn fetch_and_extract(
     let content_type = response_headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
     let mime = mime_of(&content_type);
     let pdf = is_pdf(parsed, &content_type);
-    let max_response_bytes = (if pdf { web.settings.pdf_max_size_mb } else { DEFAULT_MAX_RESPONSE_MB } * 1024 * 1024) as usize;
+    let max_response_bytes = (if pdf { web.settings.pdf_max_size_mb } else { web.settings.max_response_size_mb } * 1024 * 1024) as usize;
     let pdf_too_large = || format!("PDF exceeds configured pdf.maxSizeMB limit ({} MB)", web.settings.pdf_max_size_mb);
     if let Some(length) = response_headers.get(CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.trim().parse::<u64>().ok())
         && length as usize > max_response_bytes

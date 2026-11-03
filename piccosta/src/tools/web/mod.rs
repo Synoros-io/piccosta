@@ -555,7 +555,7 @@ impl Tool for GetSearchContentTool {
                     "url": {"type": "string", "description": "Get content for this URL"},
                     "urlIndex": {"type": "integer", "minimum": 0, "description": "Get content for URL at index"},
                     "offset": {"type": "integer", "minimum": 0, "description": "Character offset in stored search or fetched URL content (default 0). Ignored when findText is supplied."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": GET_CONTENT_LIMIT_MAX, "description": "Requested maximum stored-content characters (default and max use maxInlineContentChars). Search-page continuation guidance shares the global output cap and may reduce returnedChars. Ignored when findText is supplied."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Requested maximum stored-content characters (default and max use maxInlineContentChars). Search-page continuation guidance shares the global output cap and may reduce returnedChars. Ignored when findText is supplied."},
                     "findText": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 500}, {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500}, "minItems": 1, "maxItems": 10}], "description": "Text or texts to find in the selected stored content. When supplied, offset and limit are ignored."},
                     "findMode": {"type": "string", "enum": ["exact", "case-insensitive", "fuzzy"], "description": "Matching mode for findText (default: case-insensitive). Requires findText."}
                 }
@@ -576,10 +576,6 @@ impl Tool for GetSearchContentTool {
         Box::pin(async move { Ok(get_search_content(&context.shared.web, arguments)) })
     }
 }
-
-// The schema's ceiling for limit: the default output cap. A session that raises
-// web.maxInlineContentChars can still ask for up to its own cap; validation uses this schema.
-const GET_CONTENT_LIMIT_MAX: usize = 30_000;
 
 // An index argument as a position. Validation hands numbers on as floats, so 0 arrives as 0.0.
 fn as_index(value: &Value) -> Option<usize> {

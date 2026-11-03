@@ -110,8 +110,9 @@ impl App {
             // /new <dir> [flags]: the flags are the command line's, those that shape one session.
             "new" if !argument.is_empty() => {
                 let mut args = crate::cli::parse(&words(argument));
+                let note;
                 match self.host.launch(&args) {
-                    Ok(launch) => (args.model, args.thinking) = launch,
+                    Ok(launch) => (args.model, args.thinking, note) = launch,
                     Err(error) => {
                         self.notice = Some(error);
                         return true;
@@ -138,6 +139,9 @@ impl App {
                         let flags = (words(argument).len() > args.messages.len()).then_some(args);
                         if let Some(slot) = self.new_session_in(Some(dir), flags) {
                             self.show(slot);
+                            if let Some(note) = note {
+                                self.report(crate::scale::fell_back(&note, &self.current().model));
+                            }
                         }
                     }
                     Err(error) => self.notice = Some(error),
@@ -407,8 +411,10 @@ impl App {
         if let Some(picker) = &mut self.picker {
             picker.selected = if filter.is_empty() { listed.iter().position(|&index| index == current).unwrap_or(0) } else { 0 };
             picker.delete = Some(|app, choice| {
-                if let Some(slot) = number(&choice).and_then(|place| app.listed().get(place).copied()) {
-                    app.delete(slot);
+                if let Some(slot) = number(&choice).and_then(|place| app.listed().get(place).copied())
+                    && let Some(error) = app.delete(slot)
+                {
+                    app.report(error);
                 }
                 app.sessions("");
             });
@@ -474,35 +480,38 @@ impl App {
         let listed = self.listed();
         let at = listed.iter().position(|&index| index == slot);
         let next = at.and_then(|at| listed.get(at + 1).or_else(|| at.checked_sub(1).and_then(|before| listed.get(before)))).copied();
-        self.delete(slot);
+        let failed = self.delete(slot);
         if let Some(next) = next.filter(|&next| !self.slots[next].gone() && self.panes[self.focus].slot != next) {
             self.show(next);
         }
+        if let Some(error) = failed {
+            self.report(error);
+        }
     }
 
-    // Close a session and move its file to the trash, so a mistake can be undone, or remove it
-    // where it can't go there. A running session is left alone.
-    fn delete(&mut self, slot: usize) {
+    // Close a session and move its file to the trash, so a mistake can be undone. Where it can't
+    // go there it stays where it was. A running session is left alone. Output: why the trash
+    // failed, which names where each file is, for the caller to report in the pane left showing
+    // (too long for the status line).
+    fn delete(&mut self, slot: usize) -> Option<String> {
         let (path, title) = (self.slots[slot].path.clone().filter(|path| path.exists()), self.slots[slot].title.clone());
         // A session another piccosta is running would lose its file from under it. One open here
         // is held by this piccosta's own lock, which reads as held from a second look.
         if self.slots[slot].live.is_none() && path.as_deref().is_some_and(crate::session::held_elsewhere) {
             self.notice = Some(format!("“{title}” is open in another piccosta; quit it there first."));
-            return;
+            return None;
         }
         if !self.close(slot) {
-            return;
+            return None;
         }
         self.slots[slot].path = None;
         let Some(path) = path else {
             self.notice = Some(format!("Closed “{title}”: it was never saved."));
-            return;
+            return None;
         };
-        self.notice = Some(match trash_session(&path) {
-            Some(true) => format!("Moved “{title}” to the trash."),
-            Some(false) => format!("Deleted “{title}”."),
-            None => format!("Could not delete {}.", path.display()),
-        });
+        let trashed = trash_session(&path);
+        self.notice = Some(if trashed.is_ok() { format!("Moved “{title}” to the trash.") } else { format!("“{title}” wasn't trashed; see above.") });
+        trashed.err()
     }
 
     // Put a command's output in the focused pane.
@@ -517,8 +526,8 @@ impl App {
         let file = slot.path.as_ref().map_or("not saved yet".to_string(), |path| path.display().to_string());
         let tex = if self.tex.images() { "typeset images" } else { "Unicode text" };
         format!(
-            "model      {}\nthinking   {}\nsession    {}\nfile       {file}\ncwd        {}\n{}\ncost       ${:.4}\nagent dir  {}\nTeX        {tex}",
-            slot.model, slot.thinking, slot.title, slot.cwd.display(), self.context(), slot.cost, self.host.agent_dir.display()
+            "model      {}\nthinking   {}\nsession    {}\nfile       {file}\ncwd        {}\n{}\ncost       {}\nagent dir  {}\nTeX        {tex}",
+            slot.model, slot.thinking, slot.title, slot.cwd.display(), self.context(), slot.cost.dollars(4), self.host.agent_dir.display()
         )
     }
 
@@ -537,15 +546,15 @@ impl App {
     fn usage(&self) -> String {
         let slot = self.current();
         let Some(session) = slot.path.as_deref().and_then(|path| Session::open(path, &slot.cwd).ok()) else {
-            return format!("nothing saved yet; this pane's responses cost ${:.4}", slot.cost);
+            return format!("nothing saved yet; this pane's responses cost {}", slot.cost.dollars(4));
         };
         let stats = crate::rpc::session_stats(&session);
         let number = |key: &str| stats.get(key).and_then(Value::as_u64).unwrap_or(0);
         let tokens = |key: &str| stats.get("tokens").and_then(|tokens| tokens.get(key)).and_then(Value::as_u64).unwrap_or(0);
         format!(
-            "responses   {}\ntool calls  {}\ninput       {}\noutput      {}\ncache read  {}\ncache write {}\ncost        ${:.4}",
+            "responses   {}\ntool calls  {}\ninput       {}\noutput      {}\ncache read  {}\ncache write {}\ncost        {}",
             number("assistantMessages"), number("toolCalls"), tokens("input"), tokens("output"), tokens("cacheRead"), tokens("cacheWrite"),
-            stats.get("cost").and_then(Value::as_f64).unwrap_or(0.0)
+            crate::provider::responses::dollars(stats.get("cost").and_then(Value::as_f64).unwrap_or(0.0), stats.contains_key("costUnknown"), 4)
         )
     }
 
@@ -803,34 +812,46 @@ fn markdown(messages: &[AgentMessage]) -> String {
     out
 }
 
+// A session's file to the trash, with the files beside it (the Claude bridge's record of it, its
+// inbox). The session's own file goes last, so a piccosta stopped partway leaves the session listed
+// where it was. When one can't go, the ones already moved come back; nothing is ever deleted
+// outright. Output: Ok when they all went, else what happened, naming any file that couldn't come
+// back and where it is.
+pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
+    let beside = [crate::provider::claude::SIDECAR_SUFFIX, ".inbox"].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
+    let mut moved: Vec<(&Path, (std::path::PathBuf, std::path::PathBuf))> = Vec::new();
+    for file in beside.iter().map(|file| file.as_path()).filter(|file| file.exists()).chain(std::iter::once(path)) {
+        let Some(went) = trash(file) else {
+            let stuck: Vec<String> = moved
+                .into_iter()
+                .filter_map(|(file, (into, info))| match std::fs::rename(&into, file) {
+                    Ok(()) => std::fs::remove_file(&info).err().map(|_| format!("{} has a stale trash entry {}", file.display(), info.display())),
+                    Err(error) => Some(format!("{} is in the trash as {} ({error})", file.display(), into.display())),
+                })
+                .collect();
+            let left = if stuck.is_empty() { String::new() } else { format!(", but {}", stuck.join(", and ")) };
+            return Err(format!("Could not move {} to the trash; it's left where it was{left}.", path.display()));
+        };
+        moved.push((file, went));
+    }
+    Ok(())
+}
+
 // Move a file to the user's trash the way the freedesktop spec has it ($XDG_DATA_HOME/Trash), so a
 // file manager shows it and can put it back: the file goes into files/, and info/ gets a
 // <name>.trashinfo saying where it came from and when. The info file is claimed first with
 // create_new, as the spec asks, so two deletes never take one name; a name already taken gets .2,
-// .3 and so on. Output: whether the file is in the trash. It isn't when the rename would cross file
-// systems (the spec's per-volume trash folders aren't done), and the caller deletes it instead.
-// A session's file to the trash, with the files beside it (the Claude bridge's record of it, its
-// inbox), each deleted instead where it can't go there. Output: Some(true) when the session's file
-// is in the trash, Some(false) when it was deleted, None when it's still there.
-pub(crate) fn trash_session(path: &Path) -> Option<bool> {
-    for suffix in [crate::provider::claude::SIDECAR_SUFFIX, ".inbox"] {
-        let beside = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
-        if beside.exists() && !trash(&beside) {
-            let _ = std::fs::remove_file(&beside);
-        }
-    }
-    let trashed = trash(path);
-    (trashed || std::fs::remove_file(path).is_ok()).then_some(trashed)
-}
-
-fn trash(file: &Path) -> bool {
+// .3 and so on. Output: where the file and its info file went, or None when it's still where it
+// was. It is when the rename would cross file systems (the spec's per-volume trash folders aren't
+// done) or the trash can't be written.
+fn trash(file: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     use std::os::unix::fs::DirBuilderExt;
     let trash = crate::config::data_home().join("Trash");
-    let (Ok(path), Some(name)) = (std::path::absolute(file), file.file_name()) else { return false };
-    let Ok(url) = url::Url::from_file_path(&path) else { return false };
+    let (Ok(path), Some(name)) = (std::path::absolute(file), file.file_name()) else { return None };
+    let url = url::Url::from_file_path(&path).ok()?;
     // The spec has the trash readable by its owner only.
     if ["files", "info"].iter().any(|folder| std::fs::DirBuilder::new().recursive(true).mode(0o700).create(trash.join(folder)).is_err()) {
-        return false;
+        return None;
     }
     // Path is percent-encoded as in a URL; the date is local time, to the second.
     let info_text = format!("[Trash Info]\nPath={}\nDeletionDate={}\n", url.path(), &crate::clock::local_now().0[..19]);
@@ -848,14 +869,14 @@ fn trash(file: &Path) -> bool {
         let mut claim = match std::fs::OpenOptions::new().write(true).create_new(true).open(&info) {
             Ok(claim) => claim,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         if claim.write_all(info_text.as_bytes()).is_ok() && std::fs::rename(&path, &into).is_ok() {
-            return true;
+            return Some((into, info));
         }
         // An info file with no file behind it would show in the trash as a ghost.
         let _ = std::fs::remove_file(&info);
-        return false;
+        return None;
     }
-    false
+    None
 }

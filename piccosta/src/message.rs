@@ -142,6 +142,38 @@ pub struct Cost {
     pub cache_write: f64,
     #[serde(serialize_with = "json_number::serialize")]
     pub total: f64,
+    // How it was billed when it was made: by a plan's quota (true), or by the token. None in a
+    // response saved before piccosta kept it (responses::Tally says what that counts as).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<bool>,
+    #[serde(default, skip_serializing_if = "CostState::is_known")]
+    pub state: CostState,
+    // How many pending turns before this one its total pays for: Claude Code reckons a tool turn's
+    // cost on the turn that answers it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub settles: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
+// Whether a cost's numbers are what the response cost: known; unknown, billed by the token at prices
+// nobody gave (responses::calculate_cost), so they're zero and mean nothing; or pending, zero until
+// a later turn's `settles` pays for it, and unknown if none ever does (its query was stopped first).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostState {
+    #[default]
+    Known,
+    Pending,
+    Unknown,
+}
+
+impl CostState {
+    fn is_known(&self) -> bool {
+        *self == CostState::Known
+    }
 }
 
 // Why a response ended. `Pending` and `Deferred` belong to pi's deferred batch requests, which

@@ -9,7 +9,7 @@ piccosta is one agent harness for every model you use:
 - the opencode and opencode go models
 - BYO or connect
 
-It stores no credentials, it uses existing pathways to never store any keys or auth. It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). The idea is to allow the user to customize the frontend with any pre-existing one, or with a custom one their agents build, on top of the existing minimal tui or otherwise. It is written in Rust, initially based on the [pi coding agent](https://github.com/earendil-works/pi) and then tested, substantially improved, rewritten and repackaged.
+It stores no credentials of its own: it uses each account's existing login, and reads those files without writing them. The one exception is a login already in piccosta's own `login/auth.json` (the TypeScript piccosta kept them there), which it reads first, refreshing a Codex login there and saving it back. It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). The idea is to allow the user to customize the frontend with any pre-existing one, or with a custom one their agents build, on top of the existing minimal tui or otherwise. It is written in Rust, initially based on the [pi coding agent](https://github.com/earendil-works/pi) and then tested, substantially improved, rewritten and repackaged.
 
 *To install see below, or paste this to your coding agent:*
 
@@ -28,7 +28,7 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 ### Model scale
 
 Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
-- piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and moves to the next model once one passes 80% of a window.
+- piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and once one passes 80% of a window (`lowUsagePercent` in `scale.json`), the scale's next picks prefer another plan's model. A session already running stays on its model.
 - The defaults ship with piccosta. Your changes go in one file, `scale.json` in piccosta's folder: `/scale edit` writes all of it there and opens it in your editor, and `/scale <kind> <model[:level]> …` sets one kind's models. A kind you change keeps the rest of its defaults; `"off": true` turns one off.
 - `/scale` shows it all with the plans' usage. `--use <kind>` starts a session on its pick, on the command line, in `/new` and in Ctrl+N's box.
 
@@ -59,14 +59,14 @@ The model hands a task to a kind of work on the scale (critical, general, review
 ### A terminal UI for many sessions at once
 
 - **Projects and panes.** The sidebar groups sessions by project, with each project's manager first. Up to four panes run side by side.
-- **Starting a session anywhere.** Ctrl+N lists this directory, your home folder (`~`, outside every project), your recent projects and every git repository under home. Type to narrow it, or type any path, with flags after it: `myproject --use critical --pair openai-codex/gpt-6.1-sol --name "lane A"`.
+- **Starting a session anywhere.** Ctrl+N lists this directory, your home folder (`~`, outside every project), your recent projects and the git repositories up to three folders under home (hidden and build folders skipped, and none inside another repository). Type to narrow it, or type any path, with flags after it: `myproject --use critical --pair openai-codex/gpt-6.1-sol --name "lane A"`.
 - **Coming back to where you were.** The terminal UI keeps what each pane shows, how far it's scrolled, what's typed and not sent, and the sessions open besides. `piccosta -c` brings it all back; `/restart` starts piccosta again on a freshly built binary, everything as it was.
 - **Finding sessions again:**
   - Page Up/Down (or Alt+↑↓) walks the list, showing earlier sessions without starting them until you type.
   - Ctrl+S searches the list, and `/resume all` reaches every project's sessions.
   - `-r` resumes by id, the start of one, or a name; `-c` resumes this directory's latest.
 - **Sessions are never run twice.** A running piccosta locks its session file; another one shows that session live from its file, and what you type there goes into its inbox.
-- **Cleaning up.** Delete twice moves the shown session to the trash, where a file manager can restore it. A session you leave that's idle closes on its own, and an empty one goes away.
+- **Cleaning up.** Delete twice moves the shown session to the trash, where a file manager can restore it. If it can't go to the trash (it's on another disk, say), the session stays where it is and piccosta says so. A session you leave that's idle closes on its own, and an empty one goes away.
 - **The keys Claude Code taught you:**
   - Enter queues a message while a run goes, and Esc stops the run.
   - Ctrl+X Ctrl+S sends the queue now. Running commands move to the background so the model reads it straight away.
@@ -83,17 +83,17 @@ The model hands a task to a kind of work on the scale (critical, general, review
 
 ### An agent loop that doesn't get stuck
 
-- **Long commands go to the background.** A command still running after a minute moves there by itself, and its result comes back as a message when it ends. A timeout only ever stops a command; it never holds the session.
+- **Long commands go to the background.** A command still running after two seconds (three in a manager) moves there by itself (`PICCOSTA_LONGCMD_SOFT_S` sets the seconds, and 0 sends every command there), and its result comes back as a message when it ends. A timeout only ever stops a command; it never holds the session.
 - **Loop guards.** piccosta stops a response that keeps repeating itself, and a run that makes the same tool call five times in a row.
 - **Nothing left running.** If piccosta is killed outright, as an editor stops an agent, a watcher process stops the commands it started.
 - **Retries.** Overloads and dropped connections are retried with backoff. Used-up limits and withdrawn models fail straight away.
 - **Compaction keeps your words.** When the context fills, older turns are summarized, and everything you typed before the cut stays word for word on top of the summary.
 - **Failed edits say why.** A failed edit tells the model where the closest match is, or what changed since it last read the file. A missing path gets "did you mean" suggestions.
-- **A working prompt.** piccosta's own system prompt carries working rules: research before building, verify by running, nothing hardcoded, clean up after yourself. Your `AGENTS.md` and `CLAUDE.md` files load from the project and the folders above it.
+- **A working prompt.** piccosta ships a constitution with working rules: research before building, verify by running, nothing hardcoded, clean up after yourself. It's off unless you turn it on: `PICCOSTA_CONSTITUTION_FILE=built-in` for the one piccosta ships, `PICCOSTA_CONSTITUTION_FILE=<path>` for your own file, or `PICCOSTA_CONSTITUTION` holding the text itself. Your `AGENTS.md` and `CLAUDE.md` files load from the project and the folders above it.
 
 ### Web tools
 
-- **Search** goes through your own SearXNG, or through a search-capable model on an account you already have, so it needs no search API key.
+- **Search** goes through your own SearXNG, or through a model on an account you already have that speaks the OpenAI Responses API (GPT through your Codex login, for one), so it needs no search API key. Claude models can't search for it, so with only a Claude login, use SearXNG.
 - **Pages** come back as Markdown, read with Readability. PDFs come back as text. GitHub URLs become shallow clones the model can read.
 - **Long results** are stored, so the model can page through them later instead of fetching again.
 
@@ -105,6 +105,8 @@ The model hands a task to a kind of work on the scale (critical, general, review
 - **One session format.** Sessions are saved in pi's JSONL format, so the terminal, Zed, T3 Code and print mode all open the same sessions.
 
 ## Performance
+
+Measured on piccosta 0.2.0.
 
 | | piccosta 0.2.0 | pi 1.2.0 | Claude Code 2.1.316 |
 |---|---|---|---|
@@ -130,9 +132,12 @@ The model hands a task to a kind of work on the scale (critical, general, review
 
 piccosta runs on Linux, any distribution. A release is one static binary with no libraries to
 match, tried on Arch, Alpine 3.24, Debian 12 and Ubuntu 24.04. It needs a CA certificate bundle
-(the `ca-certificates` package) to reach the models.
+(the `ca-certificates` package) to reach the models. The scale's read-only kinds (review, reading,
+search and exploration) run their commands in a Landlock sandbox, which needs Linux 6.12 or newer
+(Landlock ABI 6); on an older kernel their commands don't run, unless the kind has
+`"readOnly": false` in `scale.json`.
 
-To install the release binary:
+The release binary is for x86-64. To install it:
 
 ```sh
 mkdir -p ~/.local/bin
@@ -141,7 +146,8 @@ chmod +x ~/.local/bin/piccosta   # or put it anywhere on your PATH
 ```
 
 To build it you need a recent stable Rust, and musl-gcc (the `musl`
-package on Arch, `musl-tools` on Debian and Ubuntu) for the TLS library's C code:
+package on Arch, `musl-tools` on Debian and Ubuntu) for the TLS library's C code. This builds
+the x86-64 binary; on other architectures, use `cargo build --release` below:
 
 ```sh
 git clone https://github.com/Synoros-io/piccosta && cd piccosta
@@ -153,7 +159,7 @@ ln -s "$PWD/target/x86_64-unknown-linux-musl/dist/piccosta" ~/.local/bin/piccost
 `cargo build --release` builds faster against your own glibc, and runs only on a glibc at least
 as new.
 
-Log in with each account's own tool, check that piccosta finds the logins, and set the model it starts on (`defaultProvider` and `defaultModel` in `~/.local/share/piccosta/agent/settings.json`, or `/model` in the terminal UI):
+Log in with each account's own tool, check that piccosta finds the logins, and set the model it starts on (`defaultProvider` and `defaultModel` in `settings.json` in piccosta's folder, `~/.local/share/piccosta/agent` unless Settings below says otherwise, or `/model` in the terminal UI):
 
 ```sh
 claude auth login        # Claude Code (claude.ai/code), for claude-bridge/* models
@@ -162,7 +168,7 @@ opencode auth login      # or set OPENCODE_API_KEY, for opencode-go/* models
 piccosta auth status
 ```
 
-Claude's login stays inside Claude Code, and piccosta never sees it. For Codex, piccosta reads the token the Codex CLI keeps in `~/.codex/auth.json`, read-only, and sends it only to OpenAI. For opencode-go, it reads the key from opencode's own key file or from `OPENCODE_API_KEY`, and sends it only to opencode. piccosta stores no keys and never prints one.
+Claude's login stays inside Claude Code, and piccosta never sees it. For Codex, piccosta reads the token the Codex CLI keeps in `~/.codex/auth.json` (`$CODEX_HOME/auth.json` when that's set), read-only, and sends it only to OpenAI. For opencode-go, it reads the key from opencode's own key file or from `OPENCODE_API_KEY`, and sends it only to opencode. piccosta stores no keys, apart from refreshing a Codex login already in its own `login/auth.json`, and never prints one.
 
 ## Use
 
@@ -178,7 +184,7 @@ piccosta -p --mode json "..."                # one event per line, for scripts
 `piccosta --help` lists every flag. In the terminal UI:
 - `pgup`/`pgdn` (or `alt+↑↓`) moves between sessions, and `alt+pgup`/`alt+pgdn` or the mouse wheel scrolls;
 - `^s` finds one;
-- Delete twice moves the shown session to the trash;
+- Delete twice moves the shown session to the trash, or leaves it and says so when it can't go there;
 - `/help` lists every key and command.
 
 Inside tmux, add these to `~/.tmux.conf` so images, Shift+Enter and focus changes get through:
@@ -192,7 +198,7 @@ set -g focus-events on
 
 ## In an editor or GUI
 
-`piccosta zed [dir]` opens Zed on a directory with piccosta as its agent, adding piccosta to Zed's settings first if it isn't there (a copy of the file as it was is kept). `piccosta t3 [dir]` starts T3 Code with its Pi provider running piccosta, telemetry off; the first time, turn the Pi provider on in T3's settings. If either isn't on your PATH, `"gui": {"zed": "/path/to/zed", "t3": "/path/to/t3"}` in piccosta's `settings.json` says where it is.
+`piccosta zed [dir]` opens Zed on a directory with piccosta as its agent, adding piccosta to Zed's settings first if it isn't there (a copy of the file as it was is kept). `piccosta t3 [dir]` starts T3 Code with its Pi provider running piccosta, telemetry off unless your environment already sets `T3CODE_TELEMETRY_ENABLED` or `DO_NOT_TRACK`; the first time, turn the Pi provider on in T3's settings. If either isn't on your PATH, `"gui": {"zed": "/path/to/zed", "t3": "/path/to/t3"}` in piccosta's `settings.json` says where it is.
 
 By hand, **Zed**, in `settings.json`:
 
@@ -210,7 +216,7 @@ Add `--yolo` to skip permissions.
 
 ## Settings
 
-piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT_DIR`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`).
+piccosta keeps its files in `$PICCOSTA_AGENT_DIR` when it's set, else `$XDG_DATA_HOME/piccosta/agent`, else `~/.local/share/piccosta/agent`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`).
 
 `settings.json` uses pi's keys:
 - `defaultProvider` and `defaultModel`;
@@ -218,7 +224,16 @@ piccosta keeps its files in `~/.local/share/piccosta/agent`, or `$PICCOSTA_AGENT
 - `compaction`, `retry`, `shellCommandPrefix` and `transport`;
 - piccosta's own `manager` and `gui`.
 
-A project's `.piccosta/settings.json` is merged over them.
+A project's `.piccosta/settings.json` is merged over them, except the model lists' settings, which only the agent dir's file sets:
+- `models.freshSeconds`: a list fetched more recently than this isn't fetched again at start (900);
+- `models.timeoutSeconds`: how long one list may take (10);
+- `models.codexClientVersion`: the Codex version piccosta asks Codex's list as, since the list leaves out models newer than that. Without it, piccosta asks as the Codex CLI last did, else as `codex --version` says.
+
+`web.fetch.maxSizeMB` is the largest page the web tools fetch, a PDF aside (5).
+
+In `models.json`, a model's `compat.reasoningReplayField` names the field its thinking goes back to it in, when the server streams it as `reasoning` but wants it back under another name (opencode's gateway gets `reasoning_content` already).
+
+A ChatGPT login in piccosta's `login/auth.json` is refreshed with OpenAI's client and token endpoint; `clientId` and `tokenUrl` in its `openai-codex` entry replace them.
 
 ## License
 

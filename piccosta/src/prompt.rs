@@ -271,7 +271,9 @@ fn rules(tools: &[Arc<dyn Tool>]) -> String {
     let mut rules: Vec<&str> = Vec::new();
     // People watch a session work: a run of tool calls with no word between them reads as a hang.
     let talk = "Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first";
-    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([talk]) {
+    // Late in long sessions models write notes, reports and plans nobody asked for, and leave them.
+    let files = "Don't create documents (notes, reports, plans, summaries) unless the user asked for one; put what you found in your reply. Delete files you made for your own use before you finish";
+    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([talk, files]) {
         if !rules.contains(&rule) {
             rules.push(rule);
         }

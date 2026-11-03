@@ -17,21 +17,26 @@ const DEFAULT_STDIN_WAIT_SECONDS: u64 = 30;
 // argument parsers use, and what pi exits with on a bad flag).
 const USAGE_EXIT_CODE: u8 = 2;
 
-// `piccosta auth status`: for each account piccosta knows (auth::ACCOUNTS), whether a credential
-// resolves and where it comes from. Keys are never printed. An account with none is listed, not
-// a failure: the user has the accounts they have. Output: exit 1 when none has a credential.
+// `piccosta auth status`: for each account piccosta knows (auth::ACCOUNTS), then each other
+// provider models.json configures, whether a credential resolves and where it comes from. Keys are
+// never printed. A provider with none is listed, not a failure: the user has the accounts they
+// have. A provider is ok exactly when credential_for, which its runs use, accepts it. Output: exit
+// 1 when none is ok.
 async fn auth_status() -> Result<ExitCode, String> {
     let agent_dir = config::agent_dir();
     let paths = auth::CredentialPaths::from_environment(&agent_dir);
     let registry = model::ModelRegistry::load(&agent_dir.join("models.json"))?;
+    let accounts = auth::ACCOUNTS.iter().map(|account| (account.provider, account.plan));
+    let serves = |provider: &str| registry.provider_config(provider).is_some_and(|config| config.base_url.is_some() || !config.models.is_empty());
+    let configured = registry.configured().filter(|provider| auth::account(provider).is_none() && serves(provider)).map(|provider| (provider, provider));
     let mut any = false;
-    for account in &auth::ACCOUNTS {
-        match auth::credential_for(account.provider, registry.provider_config(account.provider), &paths).await {
+    for (provider, name) in accounts.chain(configured).collect::<Vec<_>>() {
+        match auth::credential_for(provider, registry.provider_config(provider), &paths).await {
             Ok(credential) => {
                 any = true;
-                println!("ok   {:<12} {}", account.plan, credential.source);
+                println!("ok   {name:<12} {}", credential.source);
             }
-            Err(error) => println!("--   {:<12} {error}", account.plan),
+            Err(error) => println!("--   {name:<12} {error}"),
         }
     }
     Ok(if any { ExitCode::SUCCESS } else { ExitCode::FAILURE })
@@ -98,8 +103,14 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     } else {
         Box::new(|_event: &Event| {})
     };
-    let (model, thinking) = host.launch(&args)?;
+    let (model, thinking, note) = host.launch(&args)?;
+    if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+        listing.await;
+    }
     let (mut agent, tool_shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, true)?;
+    if let Some(note) = note {
+        eprintln!("{}", piccosta::scale::fell_back(&note, &format!("{}/{}", agent.model().provider, agent.model().id)));
+    }
     if let Some(name) = &args.name {
         agent.set_name(name).map_err(|error| format!("could not write the session: {error}"))?;
     }

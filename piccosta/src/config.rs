@@ -154,6 +154,12 @@ impl Settings {
         settings
     }
 
+    // The agent dir's settings.json alone, for what belongs to the install rather than a project
+    // (the model lists, kept in the agent dir for every project).
+    pub fn global(agent_dir: &Path) -> Settings {
+        Settings { merged: read_settings_file(&agent_dir.join("settings.json")).unwrap_or_default(), load_errors: Vec::new() }
+    }
+
     // A value by dotted path, e.g. "retry.maxRetries".
     pub fn get(&self, dotted: &str) -> Option<&Value> {
         let mut parts = dotted.split('.');
@@ -283,6 +289,7 @@ impl Settings {
             allow_ranges: strings("web.ssrf.allowRanges"),
             domain_allow: strings("web.fetchContent.domainPolicy.allow"),
             domain_deny: strings("web.fetchContent.domainPolicy.deny"),
+            max_response_size_mb: self.get_u64("web.fetch.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_MAX_RESPONSE_MB),
             pdf_max_size_mb: self.get_u64("web.pdf.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_SIZE_MB),
             pdf_max_pages: self.get_u64("web.pdf.maxPages").filter(|pages| *pages > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_PAGES) as usize,
             github_clone_enabled: self.get_bool("web.githubClone.enabled").unwrap_or(true),
@@ -294,8 +301,9 @@ impl Settings {
 }
 
 // pi-web-access's defaults: extract.ts:32 (timeout), web-tool-core.ts:291-293 (inline content),
-// pdf-extract.ts:67-70 (PDF size and pages).
+// extract.ts:1339 (any response but a PDF, `?? 5`), pdf-extract.ts:67-70 (PDF size and pages).
 const DEFAULT_WEB_FETCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WEB_MAX_RESPONSE_MB: u64 = 5;
 const DEFAULT_WEB_INLINE_CONTENT_CHARS: u64 = 30_000;
 const MIN_WEB_INLINE_CONTENT_CHARS: u64 = 1_000;
 const MAX_WEB_INLINE_CONTENT_CHARS: u64 = 200_000;
@@ -321,6 +329,8 @@ pub struct WebSettings {
     pub allow_ranges: Vec<String>,
     pub domain_allow: Vec<String>,
     pub domain_deny: Vec<String>,
+    // `web.fetch.maxSizeMB`: the largest response fetched that isn't a PDF.
+    pub max_response_size_mb: u64,
     pub pdf_max_size_mb: u64,
     pub pdf_max_pages: usize,
     // `web.githubClone.*`: GitHub repo URLs as shallow clones.

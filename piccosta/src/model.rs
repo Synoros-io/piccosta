@@ -28,8 +28,9 @@ pub const LISTS_DIR: &str = "models";
 // session header too, 2026-11-03).
 const OPENCODE_GO_MODELS: &str = "https://opencode.ai/zen/go/v1/models";
 // Codex's list, under its backend. It leaves out a model newer than the client_version asked with,
-// so piccosta asks as the Codex CLI last did ($CODEX_HOME/models_cache.json), else as the CLI
-// installed here on 2026-11-03 did.
+// so piccosta asks as settings.json's `models.codexClientVersion` says, else as the Codex CLI last
+// did ($CODEX_HOME/models_cache.json), else as the one installed says it is (`codex --version`),
+// else as the CLI installed here on 2026-11-03 did.
 const CODEX_MODELS_PATH: &str = "/codex/models";
 const CODEX_CLIENT_VERSION: &str = "0.166.0";
 // What Codex's list leaves out: the output limit, and the transcript features, both what pi's
@@ -37,9 +38,52 @@ const CODEX_CLIENT_VERSION: &str = "0.166.0";
 const CODEX_MAX_TOKENS: u64 = 128_000;
 const CODEX_COMPAT: &str = r#"{"supportsMidConvoSystemMessages": true, "supportsAdditionalTools": true}"#;
 // A copy younger than this isn't fetched again at start, so the piccostas a session starts in a
-// burst (subagents, tell) don't each ask; /models refresh always asks. And how long one list may take.
-const LISTS_FRESH: Duration = Duration::from_secs(15 * 60);
-const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+// burst (subagents, tell) don't each ask; /models refresh always asks. And how long one list may
+// take. settings.json's `models.freshSeconds` and `models.timeoutSeconds` replace them.
+const LISTS_FRESH_S: u64 = 15 * 60;
+const LIST_TIMEOUT_S: u64 = 10;
+
+// A `models.*` setting in seconds, else its default.
+fn list_seconds(settings: &crate::config::Settings, key: &str, default: u64) -> Duration {
+    Duration::from_secs(settings.get(key).and_then(Value::as_u64).unwrap_or(default))
+}
+
+// The most of `codex --version` that's read. It says "codex-cli 0.166.0"; a wrapper that says more
+// than this isn't saying a version.
+const CODEX_VERSION_MAX_BYTES: u64 = 256;
+
+// The version the installed Codex CLI says it is. Input: how long it may take. Output: its last
+// word, or None when it isn't there, takes too long or says too much. The child is killed and
+// reaped either way, and what it writes to stderr is thrown away.
+async fn installed_codex_version(timeout: Duration) -> Option<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("codex").arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().ok()?;
+    let mut said = Vec::new();
+    let read = tokio::time::timeout(timeout, child.stdout.take()?.take(CODEX_VERSION_MAX_BYTES + 1).read_to_end(&mut said)).await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    read.ok()?.ok()?;
+    (said.len() as u64 <= CODEX_VERSION_MAX_BYTES).then(|| String::from_utf8_lossy(&said).split_whitespace().last().map(str::to_string))?
+}
+
+// The refresh piccosta started with while it's still running, as a wait bounded by the list
+// timeout, for a model asked for that isn't listed yet: a start with some list kept doesn't wait,
+// and the model's own list may still be coming. It's awaited, never blocked on, since the
+// frontends run on one thread (a LocalSet). None once the refresh is done, or once a wait for it
+// has run out, so a request asked again after waiting isn't made to wait again.
+pub fn listing(agent_dir: &Path) -> Option<futures_util::future::BoxFuture<'static, ()>> {
+    use futures_util::FutureExt;
+    use std::sync::atomic::Ordering;
+    let refresh = STARTUP_REFRESH.get().filter(|refresh| refresh.peek().is_none() && !LISTING_WAITED_OUT.load(Ordering::Relaxed))?.clone();
+    let timeout = list_seconds(&crate::config::Settings::global(agent_dir), "models.timeoutSeconds", LIST_TIMEOUT_S);
+    Some(async move {
+        if tokio::time::timeout(timeout, refresh).await.is_err() {
+            LISTING_WAITED_OUT.store(true, Ordering::Relaxed);
+        }
+    }.boxed())
+}
+static LISTING_WAITED_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn list_copy(agent_dir: &Path, provider: &str) -> PathBuf {
     agent_dir.join(LISTS_DIR).join(format!("{provider}.json"))
@@ -138,7 +182,7 @@ fn listed_model(raw: &Value, config: &ProviderConfig) -> Option<Value> {
 // One provider's list as its account serves it now, checked as load will read it. Output: its
 // models and a note for each one left out, or why there's none (beginning auth::NO_CREDENTIAL when
 // the provider has no login here).
-async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&ProviderConfig>, paths: &crate::auth::CredentialPaths) -> Result<(Vec<Value>, Vec<String>), String> {
+async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&ProviderConfig>, paths: &crate::auth::CredentialPaths, settings: &crate::config::Settings) -> Result<(Vec<Value>, Vec<String>), String> {
     type Convert = Box<dyn Fn(&Value) -> Option<Value> + Send>;
     use crate::auth::Owner;
     let credential = crate::auth::credential_for(provider, config, paths).await;
@@ -157,23 +201,22 @@ async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&Pr
         Some(Owner::CodexCli) => {
             let base = config.and_then(|config| config.base_url.clone()).unwrap_or(crate::provider::codex::DEFAULT_BASE_URL.into());
             let cache: Value = fs::read_to_string(paths.codex_home.join("models_cache.json")).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-            let version = cache["client_version"].as_str().unwrap_or(CODEX_CLIENT_VERSION).to_string();
+            let version = match settings.get("models.codexClientVersion").and_then(Value::as_str).or(cache["client_version"].as_str()) {
+                Some(version) => version.to_string(),
+                None => installed_codex_version(list_seconds(settings, "models.timeoutSeconds", LIST_TIMEOUT_S)).await.unwrap_or(CODEX_CLIENT_VERSION.into()),
+            };
             (format!("{}{CODEX_MODELS_PATH}?client_version={version}", base.trim_end_matches('/')), Some(credential?), "/models", Box::new(move |raw: &Value| codex_model(raw, &base)))
         }
-        // A configured provider: a local server may want no key, but a key that couldn't be had
-        // just now (a failing command) is an error, not a reason to ask without one.
+        // A configured provider, asked with no key when it has none (auth.rs).
         _ => {
             let config = config.ok_or("no settings in models.json")?.clone();
-            let credential = match credential {
-                Err(error) if error.starts_with(crate::auth::NO_CREDENTIAL) => None,
-                credential => Some(credential?),
-            };
+            let credential = Some(credential?);
             (format!("{}/models", config.base_url.as_deref().ok_or("no baseUrl")?.trim_end_matches('/')), credential, "/data", Box::new(move |raw: &Value| listed_model(raw, &config)))
         }
     };
     // Authorized as inference is: the key, then the provider's own headers from models.json.
     let mut request = client.get(&url);
-    if let Some(credential) = credential {
+    if let Some(credential) = credential.filter(|credential| !credential.key.is_empty()) {
         request = request.bearer_auth(credential.key);
         if let Some(account) = credential.account_id {
             request = request.header("chatgpt-account-id", account);
@@ -270,7 +313,9 @@ pub fn start_refresh(agent_dir: PathBuf) -> Refresh {
 pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<String, String>> {
     let file = models_file(&agent_dir);
     let paths = crate::auth::CredentialPaths::from_environment(&agent_dir);
-    let client = match crate::provider::http_client().timeout(LIST_TIMEOUT).build() {
+    let settings = crate::config::Settings::global(&agent_dir);
+    let lists_fresh = list_seconds(&settings, "models.freshSeconds", LISTS_FRESH_S);
+    let client = match crate::provider::http_client().timeout(list_seconds(&settings, "models.timeoutSeconds", LIST_TIMEOUT_S)).build() {
         Ok(client) => client,
         Err(error) => return vec![Err(format!("couldn't fetch the model lists: {error}"))],
     };
@@ -281,7 +326,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
     let mut providers = Vec::new();
     for provider in listed_providers(&file) {
         let age = list_copy(&agent_dir, &provider).metadata().and_then(|metadata| metadata.modified()).ok().and_then(|modified| modified.elapsed().ok());
-        if force || age.is_none_or(|age| age >= LISTS_FRESH) {
+        if force || age.is_none_or(|age| age >= lists_fresh) {
             providers.push(provider);
         } else if crate::auth::account(&provider).is_some()
             && let Err(error) = crate::auth::credential_for(&provider, file.providers.get(&provider), &paths).await
@@ -294,7 +339,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
             }
         }
     }
-    let lists = futures_util::future::join_all(providers.iter().map(|provider| fetch_list(&client, provider, file.providers.get(provider), &paths))).await;
+    let lists = futures_util::future::join_all(providers.iter().map(|provider| fetch_list(&client, provider, file.providers.get(provider), &paths, &settings))).await;
     for (provider, list) in providers.iter().zip(lists) {
         let copy = list_copy(&agent_dir, provider);
         match list {
@@ -345,8 +390,19 @@ pub struct ModelCost {
     pub cache_read: f64,
     #[serde(serialize_with = "json_number::serialize", default)]
     pub cache_write: f64,
+    // Writes kept in the cache for an hour, when they cost other than responses.rs's fallback.
+    #[serde(rename = "cacheWrite1h", serialize_with = "json_number::serialize_option", default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<CostTier>,
+    // Whether the model's list or models.json gave prices at all, so a $0 given is $0 and none given
+    // is unknown: true for any `cost` read, false for a model without one (Model's default).
+    #[serde(skip, default = "supplied")]
+    pub supplied: bool,
+}
+
+fn supplied() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -570,6 +626,11 @@ impl ModelRegistry {
     // A provider's models.json settings, if it has any.
     pub fn provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
         self.providers.get(provider)
+    }
+
+    // The providers models.json names, in its order.
+    pub fn configured(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
     }
 
     // Find one model by name. Input: "provider/id", or a bare id. Output: the model, or an error

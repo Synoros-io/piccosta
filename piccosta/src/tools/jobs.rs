@@ -4,7 +4,7 @@
 // This is piccosta's longcmd (extensions/longcmd.ts, FSL-1.1-ALv2, Synoros), which gave pi's bash
 // DeepSeek Harness's long-command behaviour (notes/research-2026-10-15.md, "Long-running commands"):
 // - With an explicit `timeout`, a command is killed at that limit, as in pi.
-// - Without one, a command that ends within the soft limit (60 s by default) returns exactly what
+// - Without one, a command that ends within the soft limit (DEFAULT_SOFT_LIMIT_SECONDS) returns exactly what
 //   pi's bash returns.
 // - One still running at the soft limit keeps running. Its whole output (the part so far and
 //   everything after) goes to a log, and the call returns the output tail, job id, pid and log
@@ -53,7 +53,7 @@ use tokio_util::sync::CancellationToken;
 // (ls, cat, rg, git status) to answer in place, short enough that nothing holds a session up.
 // $PICCOSTA_LONGCMD_SOFT_S changes it; 0 sends every command to the background.
 const DEFAULT_SOFT_LIMIT_SECONDS: f64 = 2.0;
-const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
+pub const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
 const DEFAULT_JOB_DIR: &str = ".piccosta-jobs";
 const JOB_DIR_ENV: &str = "PICCOSTA_LONGCMD_DIR";
 // Unix's null device: the log of a job whose output had nowhere to go (Jobs::start).
@@ -74,11 +74,11 @@ const COMMAND_PREVIEW_CHARS: usize = 200;
 // customType of the finish message in the session.
 pub const NOTICE_TYPE: &str = "longcmd";
 
-// Input: an env var holding seconds. Output: that duration, or the fallback when it's unset or
-// not a positive number.
-fn seconds_from_env(name: &str, fallback: Option<f64>) -> Option<Duration> {
-    let seconds = std::env::var(name).ok().and_then(|raw| raw.trim().parse::<f64>().ok()).filter(|seconds| seconds.is_finite() && *seconds > 0.0);
-    seconds.or(fallback).map(Duration::from_secs_f64)
+// Input: an env var holding seconds. Output: that duration, zero included, or None when it's unset
+// or not a number of seconds.
+fn seconds_from_env(name: &str) -> Option<Duration> {
+    let seconds = std::env::var(name).ok().and_then(|raw| raw.trim().parse::<f64>().ok()).filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+    seconds.map(Duration::from_secs_f64)
 }
 
 // "61.2 s": tenths, as longcmd printed durations.
@@ -209,8 +209,9 @@ impl Jobs {
     // Input: where finish messages go. Settings come from the environment (see the constants).
     pub fn new(notices: mpsc::UnboundedSender<CustomMessage>) -> Jobs {
         Jobs {
-            soft_limit: seconds_from_env(SOFT_LIMIT_ENV, Some(DEFAULT_SOFT_LIMIT_SECONDS)).unwrap_or(Duration::from_secs_f64(DEFAULT_SOFT_LIMIT_SECONDS)),
-            hold: seconds_from_env(HOLD_ENV, None),
+            soft_limit: seconds_from_env(SOFT_LIMIT_ENV).unwrap_or(Duration::from_secs_f64(DEFAULT_SOFT_LIMIT_SECONDS)),
+            // A hold of 0 would kill every job the moment the model is done, so it counts as unset.
+            hold: seconds_from_env(HOLD_ENV).filter(|hold| !hold.is_zero()),
             path_hints: std::env::var(PATH_HINTS_ENV).map_or(true, |value| value != "0"),
             job_dir_override: std::env::var(JOB_DIR_ENV).ok().filter(|dir| !dir.is_empty()),
             next_id: AtomicU64::new(1),

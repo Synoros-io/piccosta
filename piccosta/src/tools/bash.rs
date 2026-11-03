@@ -106,7 +106,7 @@ impl Tool for BashTool {
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[
             "Commands see this session's id, file, provider, model and thinking level as PICCOSTA_SESSION_ID, PICCOSTA_SESSION_FILE, PICCOSTA_PROVIDER, PICCOSTA_MODEL and PICCOSTA_REASONING_LEVEL",
-            "A command still running after a minute moves to the background on its own, and its result comes to you as a message when it ends: don't wait on it, sleep or poll. A timeout only stops a command that must not run longer; leave it out otherwise.",
+            "A command that runs long moves to the background on its own, and its result comes to you as a message when it ends: don't wait on it, sleep or poll. A timeout only stops a command that must not run longer; leave it out otherwise.",
         ]
     }
 
@@ -529,8 +529,13 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     // when the user sends a message now. A timeout only kills a command (watch enforces it there
     // too); it never holds one in the foreground, where a long one would block the session.
     // longcmd kept commands with a timeout in the foreground.
+    // With no wait at all (background: true, or a soft limit of 0) it goes now: a zero sleep fires
+    // on the timer's next tick, by which time a quick command's output has won the loop below.
+    if arguments.background || shared.jobs.soft_limit.is_zero() {
+        return Ok(Run::Background(to_background(arguments, context, &mut output, pid, kill.clone(), started, Tail::default(), events)));
+    }
     let mut tail = Tail::default();
-    let soft_limit = tokio::time::sleep(if arguments.background { Duration::ZERO } else { shared.jobs.soft_limit });
+    let soft_limit = tokio::time::sleep(shared.jobs.soft_limit);
     tokio::pin!(soft_limit);
     let _detachable = shared.jobs.detachable();
     let detach = shared.jobs.detach.notified();

@@ -157,15 +157,19 @@ struct Live {
     // The context the last response filled and the session's cost so far, for usage_update
     // (ACP's `used` is tokens in context now, its `cost` the whole session's).
     used: u64,
-    cost: f64,
+    cost: crate::provider::responses::Tally,
 }
 
 // Tell the client how full the context is and what the session has cost.
 fn usage_update(session: &str, live: &Live) {
-    // A plan's usage costs no money, so it goes without a cost.
+    // A plan's usage costs no money, so it goes without a cost. When some responses' cost isn't
+    // known, `amount` leaves them out and _meta.costUnknown says so.
     let mut usage = json!({"sessionUpdate": "usage_update", "used": live.used, "size": live.model.context_window});
-    if live.cost > 0.0 {
-        usage["cost"] = json!({"amount": live.cost, "currency": "USD"});
+    if live.cost.total > 0.0 {
+        usage["cost"] = json!({"amount": live.cost.total, "currency": "USD"});
+    }
+    if live.cost.unknown() {
+        usage["_meta"] = json!({"costUnknown": true});
     }
     update(session, usage);
 }
@@ -335,8 +339,17 @@ impl Acp {
             "session/new" => {
                 let host = self.host(params)?;
                 let session = host.session(None, false, true).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
-                let (model, thinking) = host.launch(&self.args).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
+                let (model, thinking, note) = host.launch(&self.args).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
+                if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+                    return Ok(self.later(listing, method, params, id));
+                }
                 let id = self.start(host.clone(), session, model.as_deref(), thinking.as_deref())?;
+                // A kind with none of its models served: the user hears which model it runs on, as a
+                // notice where the client takes them, else as the agent's words.
+                if let Some(note) = note.map(|note| crate::scale::fell_back(&note, &format!("{}/{}", self.sessions[&id].model.provider, self.sessions[&id].model.id))) {
+                    let shown = if self.notices { json!({"sessionUpdate": "notice", "severity": "warning", "title": "Model fallback", "description": note}) } else { json!({"sessionUpdate": "agent_message_chunk", "content": text_block(&note)}) };
+                    self.after.push((id.clone(), shown));
+                }
                 let state = self.state(&id).await;
                 self.after.push((id.clone(), commands()));
                 self.session_notices(params, &id, &host);
@@ -348,6 +361,9 @@ impl Acp {
                 let session = Session::open(&file, &host.cwd).map_err(|error| Failure(INTERNAL_ERROR, error.to_string(), None))?;
                 if Path::new(&session.header().cwd) != host.cwd {
                     return Err(invalid("cwd does not match the session"));
+                }
+                if let Some(listing) = host.listing(Some(&session), None).filter(|_| !self.sessions.contains_key(&session_id)) {
+                    return Ok(self.later(listing, method, params, id));
                 }
                 replay(&session_id, &session, &host.cwd, self.terminals);
                 if !self.sessions.contains_key(&session_id) {
@@ -443,6 +459,18 @@ impl Acp {
         }
     }
 
+    // A request opening a session on a model whose list is still coming: this loop is asked it
+    // again once the lists are in, and serves the other sessions meanwhile. Output: None, since
+    // it's answered then.
+    fn later(&self, listing: futures_util::future::BoxFuture<'static, ()>, method: &str, params: &Value, id: Value) -> Option<Value> {
+        let (inputs, again) = (self.inputs.clone(), json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string());
+        tokio::task::spawn_local(async move {
+            listing.await;
+            let _ = inputs.send(Input::Line(again));
+        });
+        None
+    }
+
     fn notification(&mut self, method: &str, params: &Value) {
         // Cancel: stop the run, and answer the prompt when it has stopped, or after CANCEL_WAIT if
         // it hasn't.
@@ -521,9 +549,7 @@ impl Acp {
             Event::MessageEnd { message: AgentMessage::Assistant(assistant), .. } => {
                 let usage = &assistant.usage;
                 let used = usage.input + usage.output + usage.cache_read + usage.cache_write;
-                if !crate::provider::responses::plan_billed(&assistant.provider) {
-                    live.cost += usage.cost.total;
-                }
+                live.cost.add(usage, &assistant.provider);
                 if used > 0 {
                     live.used = used;
                     usage_update(session, live);
@@ -710,10 +736,12 @@ impl Acp {
         let (mode, always) = (Rc::new(Cell::new(first_mode)), Rc::new(RefCell::new(HashSet::new())));
         agent.set_gate(gate(self.inputs.clone(), id.clone(), serial, mode.clone(), always.clone()));
         let titled = crate::host::name(&agent.session).is_some() || agent.session.context().messages.iter().any(|message| matches!(message, AgentMessage::User(_)));
-        let cost = agent.session.context().messages.iter().filter_map(|message| match message {
-            AgentMessage::Assistant(assistant) if !crate::provider::responses::plan_billed(&assistant.provider) => Some(assistant.usage.cost.total),
-            _ => None,
-        }).sum();
+        let mut cost = crate::provider::responses::Tally::default();
+        for message in agent.session.context().messages {
+            if let AgentMessage::Assistant(assistant) = message {
+                cost.add(&assistant.usage, &assistant.provider);
+            }
+        }
         let used = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
         let (handle, live_model, live_thinking) = (agent.handle(), agent.model().clone(), agent.thinking_level().to_string());
         runs.lock().unwrap().handle = handle.clone();

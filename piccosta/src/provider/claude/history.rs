@@ -43,9 +43,7 @@ const TOOL_ID_MAX: usize = 64;
 // Claude Code's project dirs: the path with every non-alphanumeric UTF-16 unit made "-", cut at 200
 // with a hash of the whole path after it (cc-session-io paths.ts).
 const PROJECT_DIR_MAX: usize = 200;
-// The record fields cc-session-io writes for a session it creates. The version is the running
-// Claude Code's, this one (cc-session-io's) only when that couldn't be read.
-const RECORD_VERSION: &str = "2.1.83";
+// The record fields cc-session-io writes for a session it creates.
 const SLUG_ADJECTIVES: &str = "ancient bold bright calm clever cool crimson daring eager fast fierce gentle golden happy hidden iron keen lively mighty nimble pale proud quick rapid sharp silent smooth steady swift vivid warm wild";
 const SLUG_NOUNS: &str = "arrow badge beacon blade brook castle cedar cloud comet crest dawn drift eagle ember falcon flame forge gale grove harbor hawk jade kettle lance maple marsh needle oak pearl pine ridge river rune sage shade spark stone thorn tower wave";
 // The kept records' sidecar next to pi's session file (pi lists only *.jsonl, so it's left alone).
@@ -459,6 +457,9 @@ pub struct Records {
     cwd: String,
     model: String,
     slug: String,
+    // The checkout's branch as Claude Code records it (`git rev-parse --abbrev-ref HEAD`), read once
+    // for the record set; None outside a git repo.
+    git_branch: Option<String>,
     last_uuid: Option<String>,
     next_ms: i64,
     pub records: Vec<Value>,
@@ -482,6 +483,8 @@ impl Records {
             cwd: cwd.to_string(),
             model: model.to_string(),
             slug: format!("{}-{}-{}", pick(&adjectives, first), pick(&adjectives, second), pick(&nouns, third)),
+            git_branch: std::process::Command::new("git").arg("-C").arg(cwd).args(["rev-parse", "--abbrev-ref", "HEAD"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+                .filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|branch| !branch.is_empty()),
             last_uuid: None,
             next_ms: clock::now_ms(),
             records: Vec::new(),
@@ -489,14 +492,15 @@ impl Records {
     }
 
     // The fields every record starts with, in cc-session-io's order; the new record joins the chain.
+    // The Claude Code version and the branch are left out when they aren't known, never made up.
     fn base(&mut self, kind: &str) -> Map<String, Value> {
         let uuid = Uuid::new_v4().to_string();
-        let record = json!({"type": kind, "uuid": uuid, "parentUuid": self.last_uuid, "sessionId": self.session_id,
+        let Value::Object(record) = json!({"type": kind, "uuid": uuid, "parentUuid": self.last_uuid, "sessionId": self.session_id,
             "timestamp": clock::iso_from_ms(self.next_ms), "isSidechain": false, "cwd": self.cwd, "userType": "external",
-            "version": super::version().unwrap_or(RECORD_VERSION), "gitBranch": "HEAD", "slug": self.slug, "entrypoint": "cli"});
+            "version": super::version(), "gitBranch": self.git_branch, "slug": self.slug, "entrypoint": "cli"}) else { return Map::new() };
         self.next_ms += 1;
         self.last_uuid = Some(uuid);
-        record.as_object().cloned().unwrap_or_default()
+        record.into_iter().filter(|(key, value)| !(value.is_null() && ["version", "gitBranch"].contains(&key.as_str()))).collect()
     }
 
     fn user(&mut self, content: Value) {

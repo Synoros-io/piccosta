@@ -35,98 +35,80 @@ const ESTIMATED_IMAGE_CHARS: usize = 4800;
 // The most of one tool result the summarizer sees (utils.ts:94).
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
-pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You write the checkpoint a coding session continues from after its earlier messages are dropped. You read the conversation and write the summary in the format asked for. You don't answer anything in the conversation or carry on with its work.";
 
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const SUMMARIZATION_PROMPT: &str = "The messages above are the conversation so far. Write the checkpoint the session will continue from, in this format:
 
-const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-
-Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or \"(none)\" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [Ordered list of what should happen next]
-
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or \"(none)\" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.";
-
-// pi builds this from UPDATE_SUMMARIZATION_INSTRUCTIONS behind a one-paragraph lead-in
-// (compaction.ts:540-579); here it's one string.
-const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed
-- UPDATE \"Next Steps\" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
-
-Use this EXACT format:
+## The user's instructions
+Every instruction, rule or preference the user gave that still applies, each quoted in the user's own words. Never paraphrase or shorten these, and leave none out: they are the user's standing orders for the rest of the session.
 
 ## Goal
-[Preserve existing goals, add new ones if the task expanded]
+What the user wants done. More than one item if the session covers several things.
 
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
+## Done
+- What's finished, with the exact files, functions and commands.
 
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
+## In progress
+- What was being worked on when the conversation was cut, and how far it got.
 
-### In Progress
-- [ ] [Current work - update based on progress]
+## Blocked
+- What's stopping progress, if anything.
 
-### Blocked
-- [Current blockers - remove if resolved]
+## Decisions
+- Each decision and the reason for it.
 
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+## Next
+1. What comes next, in order.
 
-## Next Steps
-1. [Update based on current state]
+## Facts needed to continue
+- Paths, names, numbers, error messages and references, exactly as they appeared.
 
-## Critical Context
-- [Preserve important context, add new if needed]
+Keep the rest short, but keep paths, names and error messages exact.";
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.";
+// Updating a checkpoint: the same sections, keeping what still holds.
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are new since the checkpoint in <previous-summary> tags. Write the updated checkpoint: keep everything in the old one that still holds, add what's new, move finished work to Done, update Next, and drop only what no longer matters. The user's instructions are never dropped while they still apply. Use this format:
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
+## The user's instructions
+Every instruction, rule or preference the user gave that still applies, each quoted in the user's own words. Never paraphrase or shorten these, and leave none out: they are the user's standing orders for the rest of the session.
 
-Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
+## Goal
+What the user wants done. More than one item if the session covers several things.
 
-## Original Request
-[What did the user ask for?]
+## Done
+- What's finished, with the exact files, functions and commands.
 
-## Progress So Far
-- [Key decisions and work completed in these messages]
+## In progress
+- What was being worked on when the conversation was cut, and how far it got.
 
-## Context Needed to Continue
-- [Information from these messages needed to understand the later work]
+## Blocked
+- What's stopping progress, if anything.
 
-Only summarize information explicitly present above. Do not infer or recreate later messages.";
+## Decisions
+- Each decision and the reason for it.
+
+## Next
+1. What comes next, in order.
+
+## Facts needed to continue
+- Paths, names, numbers, error messages and references, exactly as they appeared.
+
+Keep the rest short, but keep paths, names and error messages exact.";
+
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are the start of a turn whose later messages are kept as they are. Write a short checkpoint of this part only, placed before those later messages:
+
+## The user's instructions
+Every instruction or rule the user gave here, quoted in their own words.
+
+## The request
+What the user asked for.
+
+## Done so far
+- Decisions and work in these messages.
+
+## Needed to continue
+- What from these messages the later ones depend on.
+
+Only what's in the messages above; don't guess at what comes later.";
 
 // What set a compaction off, as pi's events name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -773,6 +755,9 @@ fn combine_usage(first: &Usage, second: &Usage) -> Usage {
             cache_read: first.cost.cache_read + second.cost.cache_read,
             cache_write: first.cost.cache_write + second.cost.cache_write,
             total: first.cost.total + second.cost.total,
+            plan: first.cost.plan.or(second.cost.plan),
+            state: first.cost.state.max(second.cost.state),
+            settles: first.cost.settles + second.cost.settles,
         },
     }
 }

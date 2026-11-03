@@ -20,7 +20,9 @@
 // A model whose plan is running low (any of its usage windows at `lowUsagePercent` or more) goes
 // to the back of the list, so the next one takes over until the window resets. A model no
 // connected account serves doesn't count: the shipped kinds name models on every account
-// piccosta knows, and each user gets those of the accounts they have.
+// piccosta knows as first choices, and each user gets those of the accounts they have. A kind none
+// of whose models is served runs on the session's or the default model (pick), so an install with
+// none of those accounts works as it is, and its own scale.json names the models it would rather.
 //
 // Plans report their usage as they're used: Claude Code in its rate_limit_event messages, Codex in
 // its response headers and websocket events, opencode-go only when it refuses a request past a
@@ -214,12 +216,24 @@ pub fn available(agent_dir: &Path, entry: &Use) -> Vec<String> {
     order(agent_dir, entry).into_iter().filter(|model| connected(model)).collect()
 }
 
-// The model and level a use runs on now.
-pub fn pick(agent_dir: &Path, name: &str) -> Result<(String, Option<String>), String> {
+// A model, its level, and a line for the user about the choice, each when there is one.
+pub type Pick = (Option<String>, Option<String>, Option<String>);
+
+// The model and level a use runs on now: its first available model, or None for the model and a
+// line saying so when no connected account serves any of them, so the caller runs on the session's
+// or the default model. An error only for a use the scale doesn't have.
+pub fn pick(agent_dir: &Path, name: &str) -> Result<Pick, String> {
     let entry = find(agent_dir, name)?;
-    let first = available(agent_dir, &entry).into_iter().next().ok_or_else(|| format!("None of the \"{name}\" use's models is served by a connected account"))?;
+    let Some(first) = available(agent_dir, &entry).into_iter().next() else {
+        return Ok((None, None, Some(format!("None of the \"{name}\" kind's models is served by a connected account, so it runs on the session's model, or the default one; /scale {name} <model> sets one"))));
+    };
     let (model, level) = split(&first);
-    Ok((model.to_string(), level.map(str::to_string)))
+    Ok((Some(model.to_string()), level.map(str::to_string), None))
+}
+
+// pick's line, with the model (provider/id) the session started on in the end.
+pub fn fell_back(note: &str, model: &str) -> String {
+    format!("{note}. This session runs on {model}.")
 }
 
 // The scale as text, for a prompt and /scale: each use with its models (low ones and those no

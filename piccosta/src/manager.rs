@@ -78,12 +78,18 @@ const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold fro
 // limit is a minute.
 pub const SOFT_LIMIT: Duration = Duration::from_secs(3);
 
-// What a manager is told about the user's paid plans (auth::ACCOUNTS' ask_first ones): ask before
-// spending them on its own, or use them as it judges best.
-fn quota(ask: bool) -> String {
-    let paid: Vec<&crate::auth::Account> = crate::auth::ACCOUNTS.iter().filter(|account| account.ask_first).collect();
-    let models = paid.iter().map(|account| format!("{}/*", account.provider)).collect::<Vec<_>>().join(" and ");
-    let plans = paid.iter().map(|account| account.plan_name).collect::<Vec<_>>().join(" and ");
+// What a manager is told about the providers the user wants asked about (`manager.askFirst`, a
+// list of providers; unset, auth::ACCOUNTS' ask_first ones, the Claude and ChatGPT plans): ask
+// before spending them on its own, or use them as it judges best.
+fn quota(settings: &crate::config::Settings, ask: bool) -> String {
+    let default = || crate::auth::ACCOUNTS.iter().filter(|account| account.ask_first).map(|account| account.provider.to_string()).collect();
+    let listed: Option<Vec<String>> = settings.get("manager.askFirst").and_then(|list| serde_json::from_value(list.clone()).ok());
+    let paid = listed.unwrap_or_else(default);
+    if paid.is_empty() {
+        return "The user has let you use every model as you judge best, so watch `sessions usage`.".into();
+    }
+    let models = paid.iter().map(|provider| format!("{provider}/*")).collect::<Vec<_>>().join(" and ");
+    let plans = paid.iter().map(|provider| crate::auth::account(provider).map_or(provider.as_str(), |account| account.plan_name)).collect::<Vec<_>>().join(" and ");
     if ask {
         format!("Models on {models} run on the user's own {plans} plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.")
     } else {
@@ -776,15 +782,16 @@ impl SessionsTool {
 
     // Write a session's model, level, partners and name into its file before anything runs it, so
     // it opens the same in a run, the terminal UI or an editor. `use` picks from the model scale
-    // unless a model is named. Input: a session nobody is running. Output: its model, when set.
-    fn configure(&self, session: &mut crate::session::Session, arguments: &Map<String, Value>) -> Result<Option<String>, String> {
+    // unless a model is named. Input: a session nobody is running. Output: its model, when set, and
+    // a line saying so when `use` found none of the kind's models served (it runs on the default).
+    fn configure(&self, session: &mut crate::session::Session, arguments: &Map<String, Value>) -> Result<(Option<String>, Option<String>), String> {
         use crate::session::SessionEntry;
         let registry = crate::model::ModelRegistry::load(&self.agent_dir.join("models.json"))?;
         let written = |result: std::io::Result<String>| result.map(drop).map_err(|error| error.to_string());
-        let (model, scale_level) = match (string(arguments, "model"), string(arguments, "use")) {
-            (Some(model), _) => (Some(model.to_string()), None),
-            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind).map(|(model, level)| (Some(model), level))?,
-            (None, None) => (None, None),
+        let (model, scale_level, note) = match (string(arguments, "model"), string(arguments, "use")) {
+            (Some(model), _) => (Some(model.to_string()), None, None),
+            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind)?,
+            (None, None) => (None, None, None),
         };
         // The kind is kept in the session, so it runs with that kind's tools and readOnly.
         if let Some(kind) = string(arguments, "use") {
@@ -806,7 +813,7 @@ impl SessionsTool {
         if let Some(name) = string(arguments, "name") {
             written(session.append(SessionEntry::SessionInfo { base: session.next_base(), name: Some(name.to_string()) }))?;
         }
-        Ok(chosen)
+        Ok((chosen, note))
     }
 
     // The directories that have sessions, the latest used first: how many, when last used, and
@@ -829,22 +836,30 @@ impl SessionsTool {
     // What the sessions of the last day and week cost, by provider, from their own records.
     fn usage(&self) -> String {
         let now = crate::clock::now_ms();
-        let mut totals: std::collections::BTreeMap<String, (f64, f64)> = std::collections::BTreeMap::new();
+        type Tallies = std::collections::BTreeMap<String, (crate::provider::responses::Tally, crate::provider::responses::Tally)>;
+        // The day's and the week's, by provider; each session's tallied alone first, so a turn
+        // settles only its own session's pending ones.
+        let mut totals = Tallies::new();
         for summary in all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
             let Ok(session) = crate::session::Session::open(&summary.path, &summary.cwd) else { continue };
+            let mut tallies = Tallies::new();
             for message in session.context().messages {
-                if let AgentMessage::Assistant(assistant) = message
-                    && !crate::provider::responses::plan_billed(&assistant.provider)
-                {
-                    let total = totals.entry(assistant.provider.clone()).or_default();
-                    total.1 += assistant.usage.cost.total;
+                if let AgentMessage::Assistant(assistant) = message {
+                    let (day, week) = tallies.entry(assistant.provider.clone()).or_default();
+                    week.add(&assistant.usage, &assistant.provider);
                     if now - assistant.timestamp < DAY_MS {
-                        total.0 += assistant.usage.cost.total;
+                        day.add(&assistant.usage, &assistant.provider);
                     }
                 }
             }
+            for (provider, (day, week)) in tallies {
+                let total = totals.entry(provider).or_default();
+                total.0.merge(day);
+                total.1.merge(week);
+            }
         }
-        let mut lines: Vec<String> = totals.iter().map(|(provider, (day, week))| format!("{provider}: ${day:.2} in the last day, ${week:.2} in the last week (catalog prices for keys billed by the token; plans bill by quota, below)")).collect();
+        let spent = totals.iter().filter(|(_, (_, week))| week.total > 0.0 || week.unknown());
+        let mut lines: Vec<String> = spent.map(|(provider, (day, week))| format!("{provider}: {} in the last day, {} in the last week (the model's prices, or Claude Code's reckoning, for keys billed by the token; plans bill by quota, below)", day.dollars(2), week.dollars(2))).collect();
         if lines.is_empty() {
             lines.push("Nothing spent this week.".into());
         }
@@ -898,13 +913,13 @@ impl Tool for SessionsTool {
                     let folder = crate::session::default_session_dir(&self.agent_dir, &dir);
                     let mut session = crate::session::Session::create(&dir, Some(&folder));
                     session.persist_now().map_err(|error| error.to_string())?;
-                    let model = self.configure(&mut session, &arguments)?;
+                    let (model, note) = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
                     // Kept, so this manager may delete it later: a manager deletes only what it made.
                     let _ = fs::OpenOptions::new().create(true).append(true).open(self.home.join(STARTED_FILE)).and_then(|mut list| writeln!(list, "{}", file.display()));
                     let (id, name) = (session_id(&file), crate::host::title(&session));
                     drop(session);
-                    let started = format!("Made session {id}, a session in {}{}.", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")));
+                    let started = format!("Made session {id}, a session in {}{}.{}", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")), note.map_or(String::new(), |note| format!(" {note}.")));
                     match string(&arguments, "message") {
                         Some(message) => {
                             let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
@@ -919,11 +934,12 @@ impl Tool for SessionsTool {
                 "message" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
                     let changes = ["use", "model", "thinking", "pair", "trio", "name"].iter().any(|key| arguments.contains_key(*key));
+                    let mut note = None;
                     if changes && !crate::session::held_elsewhere(&summary.path) {
                         let mut session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
-                        self.configure(&mut session, &arguments)?;
+                        note = self.configure(&mut session, &arguments)?.1.map(|note| format!("{note}. "));
                     }
-                    text(self.run(&summary.path, &summary.cwd, need("message")?, &summary.title)?)
+                    text(format!("{}{}", note.unwrap_or_default(), self.run(&summary.path, &summary.cwd, need("message")?, &summary.title)?))
                 }
                 // Stop a lane's run: the headless piccosta (print mode) holding its session, which
                 // stops its own commands as it goes. A session open in someone's terminal or editor
@@ -967,14 +983,12 @@ impl Tool for SessionsTool {
                     if crate::session::held_elsewhere(&summary.path) {
                         return Err(format!("\"{}\" is running; stop it (`sessions stop`) or close it first, then delete it.", summary.title));
                     }
+                    // The lane goes only once its session is in the trash, so a failed delete keeps it.
+                    crate::tui::commands::trash_session(&summary.path)?;
                     let mut lanes = load_lanes(&self.home);
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
-                    text(match crate::tui::commands::trash_session(&summary.path) {
-                        Some(true) => format!("Moved \"{}\" to the trash.", summary.title),
-                        Some(false) => format!("Deleted \"{}\".", summary.title),
-                        None => return Err(format!("Could not delete {}.", summary.path.display())),
-                    })
+                    text(format!("Moved \"{}\" to the trash.", summary.title))
                 }
                 other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close, delete or usage")),
             }
@@ -1099,7 +1113,7 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
     let home = home_for(&crate::config::agent_dir(), role, cwd);
     let memory = fs::read_to_string(home.join("memory.md")).unwrap_or_default();
     let memory = if role != Role::Assistant { String::new() } else if memory.trim().is_empty() { "\n\nYour memory: nothing yet.".into() } else { format!("\n\nYour memory:\n{}", memory.trim_end()) };
-    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", &quota(ask))
+    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", &quota(settings, ask))
         .replace("{ledger}", &home.join("ledger.md").display().to_string())
         .replace("{scope}", if role == Role::Assistant { "across the projects" } else { "in the project" })
         .replace("{memory_line}", &if role == Role::Assistant { ASSISTANT_MEMORY.replace("{path}", &home.join("memory.md").display().to_string()) } else { String::new() })
@@ -1143,11 +1157,47 @@ fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
 // starting it again after it fails (a missing login would otherwise restart it in a tight loop).
 const UNIT: &str = "piccosta-assistant.service";
 const RESTART_SECONDS: u32 = 30;
+// The environment the unit carries over from the terminal that wrote it: the paths piccosta and the
+// tools it runs find their files by, where set. Never a key: keys go in ENV_FILE, which the user
+// writes and the unit only names.
+const UNIT_PATHS: [&str; 5] = ["PATH", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PICCOSTA_AGENT_DIR"];
+const ENV_FILE: &str = "assistant.env";
+
+// A value as one quoted word of a unit file (systemd.syntax(7)): backslashes, quotes and newlines
+// escaped, and % doubled, since systemd reads %x as a specifier.
+fn unit_word(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('%', "%%"))
+}
+
+// The EnvironmentFile= line for `path`, its leading - making the file optional. systemd takes that
+// path as written, unquoted, expanding only specifiers (so % is doubled), after cutting the line at
+// a line break, trimming its end and joining a line that ends in a backslash to the next
+// (load-fragment.c config_parse_unit_env_file, systemd 260), and then glob-expanding it. A path that
+// can't survive that (a control character, a trailing space or backslash, a glob character) has no
+// line, and the comment says so.
+fn env_file_line(path: &str) -> Option<String> {
+    let whole = !path.contains(char::is_control) && !path.contains(['*', '?', '[']) && !path.ends_with(char::is_whitespace) && !path.ends_with('\\');
+    whole.then(|| format!("EnvironmentFile=-{}\n", path.replace('%', "%%")))
+}
+
+// The unit's text. Input: this binary and the agent dir. ExecStart expands $ only in arguments, not
+// in the command (systemd-analyze verify, systemd 260). The comment names the keys file with Rust's
+// escapes, quoted, so no character of it can end the comment's line.
+fn unit_text(exe: &str, agent_dir: &Path) -> String {
+    let environment: String = UNIT_PATHS.iter().filter_map(|name| Some(format!("Environment={}\n", unit_word(&format!("{name}={}", std::env::var(name).ok()?))))).collect();
+    let env_file = agent_dir.join(ENV_FILE).display().to_string();
+    let (line, unread) = env_file_line(&env_file).map_or((String::new(), " (its name can't be written in a unit, so it isn't read)"), |line| (line, ""));
+    format!(
+        "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n# Keys the assistant needs that the terminal has only in its environment (OPENCODE_API_KEY, say) go in \"{}\"{unread}, one NAME=value a line, readable by you alone (chmod 600); none are written here.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={} assistant\n{environment}{line}Restart=on-failure\nRestartSec={RESTART_SECONDS}\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
+        env_file.escape_debug(),
+        unit_word(exe)
+    )
+}
 
 // With `manager.autostart: true` in settings, make sure the assistant is running, from the terminal
 // UI, so it needn't be set up by hand. Off unless asked for: it's a background service, on a login
-// the user may not have. Where systemd runs the user's session, piccosta writes its unit (this
-// binary, the PATH it was started with, so `claude` and the rest are found) and enables it, so it
+// the user may not have. Where systemd runs the user's session, piccosta writes its unit (unit_text:
+// this binary, and the PATH and paths it was started with, so `claude` and the rest are found) and enables it, so it
 // starts at login and comes back if it fails; elsewhere it starts as a detached process of its
 // own. With PICCOSTA_AGENT_DIR set (a second agent dir, a test) it's off, since the unit serves the
 // default one, and so it is for a terminal UI an agent's command started (a test driving it).
@@ -1165,10 +1215,7 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     let systemctl = |words: &[&str]| std::process::Command::new("systemctl").arg("--user").args(words).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success());
     let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     if systemctl(&["show-environment"]) {
-        let unit = format!(
-            "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={exe} assistant\nEnvironment=PATH={}\nRestart=on-failure\nRestartSec={RESTART_SECONDS}\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let unit = unit_text(&exe, &agent_dir);
         let path = config.join("systemd/user").join(UNIT);
         if fs::read_to_string(&path).ok().as_deref() != Some(unit.as_str()) {
             fs::create_dir_all(path.parent()?).ok()?;
@@ -1222,11 +1269,15 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     session.persist_now().map_err(|error| error.to_string())?;
     let file = session.file().ok_or("the manager needs a session file")?.to_path_buf();
     fs::write(home.join("session"), file.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
-    let (model, thinking) = host.launch(&args)?;
-    let (model, level) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
-        Some(model) => (model, None),
-        None => crate::scale::pick(&agent_dir, MANAGER_KIND).map_err(|error| format!("{error}; set manager.model in settings"))?,
+    // Its notes (a kind with no model served) go to the assistant's log.
+    let (model, thinking, note) = host.launch(&args)?;
+    let (model, level, note) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
+        Some(model) => (Some(model), None, note),
+        None => crate::scale::pick(&agent_dir, MANAGER_KIND)?,
     };
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
     let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).or(level).unwrap_or_else(|| DEFAULT_THINKING.into());
     let busy = Arc::new(AtomicBool::new(false));
     let marks = busy.clone();
@@ -1235,7 +1286,10 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
         crate::agent::Event::AgentSettled { .. } => marks.store(false, Ordering::SeqCst),
         _ => {}
     });
-    let (agent, shared) = host.open(session, Some(&model), Some(&thinking), emit, false)?;
+    if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+        listing.await;
+    }
+    let (agent, shared) = host.open(session, model.as_deref(), Some(&thinking), emit, false)?;
     let handle = agent.handle();
     let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
     let task = host.clone().spawn(agent, shared.clone(), true, receiver, |done| {

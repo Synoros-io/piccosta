@@ -59,7 +59,7 @@ pub use history::SIDECAR_SUFFIX;
 
 use super::{new_output, transcript, Request, StreamEvent, BODY_IDLE_TIMEOUT};
 use crate::clock;
-use crate::message::{AssistantMessage, Content, Message, StopReason, TextOrBlocks, ToolDefinition, Usage};
+use crate::message::{AssistantMessage, Content, Cost, CostState, Message, StopReason, TextOrBlocks, ToolDefinition, Usage};
 use crate::model::Model;
 use history::{fingerprint, Held, Shape};
 use serde_json::{json, Map, Value};
@@ -305,6 +305,22 @@ pub static AUTH: LazyLock<Option<Value>> = LazyLock::new(|| {
     Some(status)
 });
 
+// Whether Claude Code bills by the token: logged in with no plan (an API key, or a cloud's), as
+// its auth status says. When it couldn't be asked, the plan, as a Claude Code login most often is.
+pub fn billed_by_token() -> bool {
+    AUTH.as_ref().is_some_and(|auth| auth["loggedIn"] == true && auth["subscriptionType"].as_str().is_none())
+}
+
+// Price a turn's usage (responses::calculate_cost): on a plan nothing, at the user's own prices for
+// the model when models.json gives some, else at what Claude Code reckoned it cost (`reported`),
+// else unknown.
+fn price(model: &Model, usage: &mut Usage, reported: Option<f64>) {
+    match reported.filter(|_| billed_by_token() && !model.cost.supplied) {
+        Some(total) => usage.cost = Cost { total, plan: Some(false), ..Default::default() },
+        None => super::responses::calculate_cost(model, usage),
+    }
+}
+
 // The running Claude Code's version (`claude --version`), asked once per process when the bridge
 // first starts a child, and logged. None when it couldn't be read in time.
 static VERSION: OnceLock<Option<String>> = OnceLock::new();
@@ -421,7 +437,8 @@ pub async fn offered_models() -> Result<Vec<Value>, String> {
 
 // Input: the models Claude Code offers (model.rs). Output: the bridge's models,
 // the fields that matter here and nothing that would make piccosta treat them as an Anthropic API
-// (no compat, no prompt cache warming); cost is 0, the plan pays.
+// (no compat, no prompt cache warming); no prices, so a turn billed by the token costs what Claude
+// Code says, or what models.json's modelOverrides price it at (price).
 pub fn bridge_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
     anthropic.into_iter().filter_map(|model| {
         let id = model.get("id")?.as_str()?.to_string();
@@ -432,7 +449,7 @@ pub fn bridge_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Valu
         let name = if window > TWO_HUNDRED_K && !says_1m { format!("{name} 1M") } else { name };
         let mut out = json!({"id": id, "name": name, "api": PROVIDER, "provider": PROVIDER, "baseUrl": PROVIDER,
             "reasoning": model.get("reasoning").cloned().unwrap_or(json!(false)), "input": model.get("input").cloned().unwrap_or(json!(["text"])),
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": effective_window(window, max_tokens), "maxTokens": max_tokens});
+            "contextWindow": effective_window(window, max_tokens), "maxTokens": max_tokens});
         if let Some(map) = model.get("thinkingLevelMap") {
             out["thinkingLevelMap"] = map.clone();
         }
@@ -1181,6 +1198,12 @@ struct Query {
     next_prompt: Option<Vec<Value>>,
     // When a waiting query's prompt cache lapses and it ends.
     hold_until: Option<Instant>,
+    // Claude Code's running total of what this query cost (total_cost_usd, in dollars) at its last
+    // result, and at this turn's, if it had one.
+    cost_seen: f64,
+    result_cost: Option<f64>,
+    // This query's tool turns handed to pi with their cost pending since its last priced turn.
+    pending_turns: u32,
 }
 
 impl Query {
@@ -1192,7 +1215,7 @@ impl Query {
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
-            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, aborted: false, interrupting: false, next_prompt: None, hold_until: None }
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, aborted: false, interrupting: false, next_prompt: None, hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0 }
     }
 
     async fn run(mut self, opening: Vec<Value>) {
@@ -1239,6 +1262,7 @@ impl Query {
         (self.stream_id, self.stream_open, self.stream_delta, self.stream_start, self.fallback_id) = (None, false, false, 0, None);
         self.turn_requests.clear();
         self.result_seen = false;
+        self.result_cost = None;
     }
 
     fn emit(&self, event: StreamEvent) {
@@ -1279,6 +1303,7 @@ impl Query {
         if let Some(turn) = self.turn.take() {
             self.out.stop_reason = reason;
             self.out.error_message.get_or_insert_with(|| message.to_string());
+            price(&self.model, &mut self.out.usage, None);
             let _ = turn.reply.send(self.out.clone());
         }
     }
@@ -1288,6 +1313,13 @@ impl Query {
         self.settle_at = None;
         let Some(turn) = self.turn.take() else { return };
         self.out.stop_reason = StopReason::ToolUse;
+        // Claude Code reckons cost only at a result: a turn it would price is pending until the turn
+        // that answers pays for it (reply), and stays unknown if the query ends first.
+        price(&self.model, &mut self.out.usage, None);
+        if self.out.usage.cost.state == CostState::Unknown {
+            self.out.usage.cost.state = CostState::Pending;
+            self.pending_turns += 1;
+        }
         let _ = turn.reply.send(self.out.clone());
         self.handed.extend(self.tool_call_ids());
         let mut state = lock(&self.state);
@@ -1390,7 +1422,18 @@ impl Query {
             state.idle_since = Instant::now();
         }
         make_room(&self.key);
-        self.end_open(StopReason::Aborted, "Operation aborted");
+        // The stopped answer's cost comes with the kept query's next result, which Claude Code
+        // reckons for everything since the last one, so it's pending there, not unknown.
+        if let Some(turn) = self.turn.take() {
+            self.out.stop_reason = StopReason::Aborted;
+            self.out.error_message.get_or_insert_with(|| "Operation aborted".to_string());
+            price(&self.model, &mut self.out.usage, None);
+            if self.out.usage.cost.state == CostState::Unknown {
+                self.out.usage.cost.state = CostState::Pending;
+                self.pending_turns += 1;
+            }
+            let _ = turn.reply.send(self.out.clone());
+        }
         self.child.send(&json!({"type": "control_request", "request_id": request_id(), "request": {"subtype": "interrupt"}})).await;
     }
 
@@ -1559,6 +1602,7 @@ impl Query {
             "assistant" => self.assistant(&message["message"]),
             "result" => {
                 self.add_unstreamed_usage(&message["usage"]);
+                self.result_cost = message["total_cost_usd"].as_f64();
                 if !self.saw_stream_event && message["subtype"] == "success" {
                     self.whole_text(message["result"].as_str().unwrap_or_default());
                 }
@@ -1615,6 +1659,11 @@ impl Query {
     // Hand pi the turn's message, if a turn is open.
     fn reply(&mut self) {
         if let Some(turn) = self.turn.take() {
+            let reported = self.result_cost.map(|total| total - std::mem::replace(&mut self.cost_seen, total));
+            price(&self.model, &mut self.out.usage, reported);
+            if self.out.usage.cost.state == CostState::Known {
+                self.out.usage.cost.settles = std::mem::take(&mut self.pending_turns);
+            }
             if !self.started {
                 let _ = turn.events.send(StreamEvent::Start);
             }
@@ -1934,7 +1983,7 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
     child.send(&json!({"request_id": request_id(), "type": "control_request", "request": {"subtype": "initialize", "systemPrompt": [system_prompt], "skills": []}})).await;
     child.send(&json!({"type": "user", "session_id": "", "message": {"role": "user", "content": [{"type": "text", "text": prompt.join("\n")}]}, "parent_tool_use_id": null})).await;
     let mut output = new_output(model, PROVIDER);
-    let (mut text, mut final_text, mut result_usage) = (String::new(), String::new(), None);
+    let (mut text, mut final_text, mut result_usage, mut result_cost) = (String::new(), String::new(), None, None);
     let mut requests: HashMap<String, Counters> = HashMap::new();
     let mut last_activity = Instant::now();
     let ended: Result<(), String> = loop {
@@ -1964,6 +2013,7 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
             "result" => {
                 child.stdin = None;
                 result_usage = message["usage"].is_object().then(|| message["usage"].clone());
+                result_cost = message["total_cost_usd"].as_f64();
                 let error = result_error(&message);
                 if error.is_none() {
                     final_text = message["result"].as_str().filter(|result| !result.is_empty()).map_or_else(|| text.clone(), String::from);
@@ -1990,6 +2040,7 @@ async fn summary(request: &Request<'_>, messages: &[Message], system_prompt: &st
         }
         None => usage_of(requests.values()),
     };
+    price(model, &mut output.usage, result_cost);
     let text = if final_text.is_empty() { text } else { final_text };
     let error = ended.err().or_else(|| match status {
         Some(status) if status.success() => None,

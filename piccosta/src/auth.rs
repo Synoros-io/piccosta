@@ -26,7 +26,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-// OpenAI's OAuth client for Codex, and its token endpoint (openai-codex.ts:22-24).
+// OpenAI's OAuth client for Codex, and its token endpoint (openai-codex.ts:22-24). A login in
+// piccosta's store that names its own `clientId` or `tokenUrl` is refreshed with those instead.
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 // The JWT claim holding the ChatGPT account id that Codex requests send (openai-codex.ts:35).
@@ -201,12 +202,21 @@ async fn resolve_configured_key(value: &str) -> Result<String, String> {
 }
 
 // The credential for a provider. Input: the provider id, its models.json settings, and the paths.
-// Output: the first credential the sources above give, or an error saying what was tried.
-pub async fn credential_for(
-    provider: &str,
-    config: Option<&ProviderConfig>,
-    paths: &CredentialPaths,
-) -> Result<Credential, String> {
+// Output: the first credential the sources above give, or an error saying what was tried. A key
+// that's there and empty (an apiKey of "", an empty variable or stored key) is an error: only a
+// models.json server with no apiKey at all is asked with no key.
+pub async fn credential_for(provider: &str, config: Option<&ProviderConfig>, paths: &CredentialPaths) -> Result<Credential, String> {
+    let credential = first_credential(provider, config, paths).await?;
+    if credential.key.is_empty() && credential.source != NO_KEY_NEEDED {
+        return Err(format!("the key for \"{provider}\" from {} is empty", credential.source));
+    }
+    Ok(credential)
+}
+
+// What a keyless server's credential says it came from.
+const NO_KEY_NEEDED: &str = "none needed (models.json has its baseUrl and no apiKey)";
+
+async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths: &CredentialPaths) -> Result<Credential, String> {
     let account = account(provider);
     let owner = account.map(|account| &account.owner);
     // Claude Code keeps its own login; the bridge never sees a key, but the login has to be there.
@@ -274,6 +284,12 @@ pub async fn credential_for(
             return Ok(Credential { key, account_id: None, source: format!("${variable}") });
         }
 
+    // 5. None: a server of the user's own in models.json (a local one) with no apiKey wants no key,
+    // and is asked with no Authorization header.
+    if account.is_none() && config.is_some_and(|config| config.base_url.is_some()) {
+        return Ok(Credential { key: String::new(), account_id: None, source: NO_KEY_NEEDED.to_string() });
+    }
+
     let variable = account.and_then(|account| account.env_key).map_or(String::new(), |variable| format!(", or set ${variable}"));
     let how = account.map_or("set its apiKey in models.json".to_string(), |account| format!("log in with {}{variable}", account.login));
     Err(format!("{NO_CREDENTIAL} \"{provider}\": {how}"))
@@ -306,7 +322,9 @@ async fn fresh_codex_login(login_file: &Path) -> Result<Credential, String> {
         return Ok(Credential { account_id: account_id.or_else(|| codex_account_id(&access)), key: access, source });
     }
 
-    let refreshed = tokio::time::timeout(REFRESH_TIMEOUT, refresh_codex_token(&refresh))
+    let stored = read_json_object(login_file)?;
+    let named = |field: &str, default: &'static str| stored.get("openai-codex").and_then(|entry| entry.get(field)).and_then(Value::as_str).unwrap_or(default).to_string();
+    let refreshed = tokio::time::timeout(REFRESH_TIMEOUT, refresh_codex_token(&refresh, &named("clientId", CODEX_CLIENT_ID), &named("tokenUrl", CODEX_TOKEN_URL)))
         .await
         .map_err(|_| "OAuth refresh failed for openai-codex: timed out".to_string())?
         .map_err(|error| format!("OAuth refresh failed for openai-codex: {error}"))?;
@@ -334,8 +352,8 @@ struct RefreshedToken {
 
 // Trade a refresh token for new tokens (openai-codex.ts:122-185). OpenAI rotates the refresh token,
 // so the old one is dead once this succeeds and the new one must be saved.
-async fn refresh_codex_token(refresh_token: &str) -> Result<RefreshedToken, String> {
-    let form = [("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", CODEX_CLIENT_ID)];
+async fn refresh_codex_token(refresh_token: &str, client_id: &str, token_url: &str) -> Result<RefreshedToken, String> {
+    let form = [("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", client_id)];
     let body: String = form
         .iter()
         .map(|(name, value)| format!("{name}={}", percent_encode(value)))
@@ -344,7 +362,7 @@ async fn refresh_codex_token(refresh_token: &str) -> Result<RefreshedToken, Stri
     let response = crate::provider::http_client()
         .build()
         .map_err(|error| format!("OpenAI Codex token refresh error: {error}"))?
-        .post(CODEX_TOKEN_URL)
+        .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()

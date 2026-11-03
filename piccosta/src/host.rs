@@ -332,6 +332,25 @@ impl Host {
         Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: &tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
     }
 
+    // The model a session (None: a new one) opens on: the one asked for, else the one it last used,
+    // else the default, else the first a connected account serves.
+    fn wanted(&self, session: Option<&Session>, model: Option<&str>, registry: &ModelRegistry) -> Option<String> {
+        model
+            .map(str::to_string)
+            .or_else(|| session.and_then(|session| session.context().model).map(|(provider, id)| format!("{provider}/{id}")))
+            .or_else(|| self.settings.default_model())
+            .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)))
+    }
+
+    // What to await before opening a session on a model, when the model it would open on isn't
+    // listed yet and the lists piccosta started fetching are still coming (model::listing). open
+    // never waits itself; its callers await this outside their input dispatch, then open.
+    pub fn listing(&self, session: Option<&Session>, model: Option<&str>) -> Option<futures_util::future::BoxFuture<'static, ()>> {
+        let registry = self.registry().ok()?;
+        let wanted = self.wanted(session, model, &registry)?;
+        registry.resolve(&wanted).is_err().then(|| crate::model::listing(&self.agent_dir))?
+    }
+
     // A session ready to run. Input: the model and thinking level asked for, if any (else what
     // the session last used, else the level that model was last set to, else the settings'
     // defaults), where events go, and whether a run
@@ -341,11 +360,7 @@ impl Host {
         session.claim()?;
         let registry = self.registry()?;
         let resumed = session.context();
-        let wanted = model
-            .map(str::to_string)
-            .or_else(|| resumed.model.as_ref().map(|(provider, id)| format!("{provider}/{id}")))
-            .or_else(|| self.settings.default_model())
-            .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)));
+        let wanted = self.wanted(Some(&session), model, &registry);
         let wanted = wanted.ok_or_else(|| format!("no model: no connected account serves one; log in to one, or pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
         // A session whose model is no longer offered opens on the default model, and with that gone
         // too, on the first model a connected account serves, rather than not at all (the status
@@ -353,6 +368,7 @@ impl Host {
         let fallback = || self.settings.default_model().and_then(|default| registry.resolve(&default).ok()).or(registry.models().first());
         let model = match (registry.resolve(&wanted), model) {
             (Ok(found), _) => found.clone(),
+            (Err(error), Some(_)) if crate::model::listing(&self.agent_dir).is_some() => return Err(format!("{error} (the model lists are still being fetched; try again in a moment)")),
             (Err(error), Some(_)) => return Err(error),
             (Err(error), None) => fallback().ok_or(error)?.clone(),
         };
@@ -375,7 +391,8 @@ impl Host {
         let (notice_sender, notices) = tokio::sync::mpsc::unbounded_channel();
         let credentials = auth::CredentialPaths::from_environment(&self.agent_dir);
         let mut tool_shared = ToolShared::new(&self.settings, &self.agent_dir, notice_sender, &registry, credentials.clone());
-        if role.is_some() {
+        // A manager's commands get its own shorter default, unless the environment sets one.
+        if role.is_some() && std::env::var_os(crate::tools::jobs::SOFT_LIMIT_ENV).is_none() {
             tool_shared.jobs.soft_limit = crate::manager::SOFT_LIMIT;
         }
         tool_shared.read_only |= self.work(&session).1;
@@ -409,14 +426,15 @@ impl Host {
 
 impl Host {
     // The model and level a command line asks for: --model and --thinking as given, else what the
-    // scale picks for --use (its level unless --thinking says otherwise).
-    pub fn launch(&self, args: &crate::cli::Args) -> Result<(Option<String>, Option<String>), String> {
+    // scale picks for --use (its level unless --thinking says otherwise), and a line for the user
+    // when --use found none of its models served and leaves the model to the session's default.
+    pub fn launch(&self, args: &crate::cli::Args) -> Result<crate::scale::Pick, String> {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
-                let (model, level) = crate::scale::pick(&self.agent_dir, name)?;
-                Ok((Some(model), args.thinking.clone().or(level)))
+                let (model, level, note) = crate::scale::pick(&self.agent_dir, name)?;
+                Ok((model, args.thinking.clone().or(level), note))
             }
-            (model, _) => Ok((model, args.thinking.clone())),
+            (model, _) => Ok((model, args.thinking.clone(), None)),
         }
     }
 

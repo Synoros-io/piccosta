@@ -189,9 +189,12 @@ pub async fn post_openai(model: &Model, url: String, credential: &Credential, se
         .build()
         .map_err(http_error)?
         .post(url)
-        .header("Authorization", format!("Bearer {}", credential.key))
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
+    // A server that wants no key (auth.rs) gets no Authorization header at all.
+    if !credential.key.is_empty() {
+        http = http.header("Authorization", format!("Bearer {}", credential.key));
+    }
     // opencode attributes requests to the client that sent them (identity.ts:96-109).
     if opencode {
         http = http.header("x-opencode-client", client_name());

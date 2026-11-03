@@ -3,7 +3,8 @@
 // this way (T3 Code's pi provider) drives piccosta. A response is {id, type: "response", command,
 // success, data | error}, without an id when the command had none; events are json mode's. One
 // session is served at a time; new_session, switch_session, fork and clone replace it. piccosta
-// has no extensions, so it never sends extension_ui_request and ignores extension_ui_response.
+// has no extensions: it sends extension_ui_request only to ask approval (confirm) and to tell the
+// user something (notify), and reads extension_ui_response only for its confirms.
 
 use crate::agent::{Event, EventSink, Gate, Handle};
 use crate::host::{Command, Done, Host};
@@ -107,8 +108,17 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         let _ = lines.send(Input::Closed);
     });
     let session = host.opening(&args)?;
-    let (model, thinking) = host.launch(&args)?;
+    let (model, thinking, note) = host.launch(&args)?;
+    if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+        listing.await;
+    }
     let live = start(&host, &inputs, 0, session, model.as_deref(), thinking.as_deref())?;
+    // A kind with none of its models served: the frontend shows which model it runs on, as pi's
+    // notify (an extension_ui_request no response answers).
+    if let Some(note) = note {
+        let note = crate::scale::fell_back(&note, &format!("{}/{}", live.model.provider, live.model.id));
+        write_line(&json!({"type": "extension_ui_request", "id": uuid::Uuid::new_v4().to_string(), "method": "notify", "message": note, "notifyType": "warning"}));
+    }
     let mut rpc = Rpc { host, inputs, live, generations: 1, steering_mode: "one-at-a-time".into(), follow_up_mode: "one-at-a-time".into(), asks: HashMap::new(), persist: !args.no_session };
     if let Some(name) = args.name.clone().filter(|name| !name.trim().is_empty()) {
         rpc.live.name = Some(name.clone());
@@ -588,7 +598,13 @@ impl Rpc {
         let (model, thinking) = if keep_model { (Some(model.as_str()), Some(thinking.as_str())) } else { (None, None) };
         let generation = self.generations;
         self.generations += 1;
-        let started = session(self).and_then(|session| start(&self.host, &self.inputs, generation, session, model, thinking));
+        // A switched-to session's model may still be being listed; there's no session to serve
+        // meanwhile, so what comes in waits its turn.
+        let session = session(self);
+        if let Some(listing) = session.as_ref().ok().and_then(|session| self.host.listing(Some(session), model)) {
+            listing.await;
+        }
+        let started = session.and_then(|session| start(&self.host, &self.inputs, generation, session, model, thinking));
         match started {
             Ok(live) => {
                 live.handle.set_steering_mode(&self.steering_mode);
@@ -666,15 +682,13 @@ impl Rpc {
 pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
     let (mut users, mut assistants, mut calls, mut results, mut messages) = (0, 0, 0, 0, 0);
     let mut totals = [0u64; 5];
-    let mut cost = 0.0;
-    // A plan's tokens count, its cost doesn't (`plan` is whether the provider is billed by plan).
-    let mut add = |usage: &crate::message::Usage, plan: bool| {
+    let mut cost = crate::provider::responses::Tally::default();
+    // A plan's tokens count, its cost doesn't (the Tally knows which are a plan's).
+    let mut add = |usage: &crate::message::Usage, provider: &str| {
         for (total, part) in totals.iter_mut().zip([usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens]) {
             *total += part;
         }
-        if !plan {
-            cost += usage.cost.total;
-        }
+        cost.add(usage, provider);
     };
     // A compaction's or branch summary's usage names no provider: it was made with the session's
     // model at the time, which the latest model change says.
@@ -686,9 +700,8 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
         let SessionEntry::Message { message, .. } = entry else {
             let value = entry_json(entry);
             let usage = value.get("usage").filter(|_| matches!(entry, SessionEntry::Usage { .. } | SessionEntry::Compaction { .. } | SessionEntry::BranchSummary { .. }));
-            let plan = crate::provider::responses::plan_billed(value.get("provider").and_then(Value::as_str).unwrap_or(&provider));
             if let Some(usage) = usage.and_then(|usage| serde_json::from_value(usage.clone()).ok()) {
-                add(&usage, plan);
+                add(&usage, value.get("provider").and_then(Value::as_str).unwrap_or(&provider));
             }
             continue;
         };
@@ -698,13 +711,13 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
             AgentMessage::ToolResult(result) => {
                 results += 1;
                 if let Some(usage) = &result.usage {
-                    add(usage, false);
+                    add(usage, "");
                 }
             }
             AgentMessage::Assistant(assistant) => {
                 assistants += 1;
                 calls += assistant.content.iter().filter(|block| matches!(block, Content::ToolCall { .. })).count();
-                add(&assistant.usage, crate::provider::responses::plan_billed(&assistant.provider));
+                add(&assistant.usage, &assistant.provider);
             }
             _ => {}
         }
@@ -717,9 +730,14 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
         "toolResults": results,
         "totalMessages": messages,
         "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write, "total": total},
-        "cost": cost,
+        "cost": cost.total,
     });
-    stats.as_object().cloned().unwrap_or_default()
+    let mut stats = stats.as_object().cloned().unwrap_or_default();
+    // Beyond pi's fields: some responses' cost isn't known, so `cost` leaves them out.
+    if cost.unknown() {
+        stats.insert("costUnknown".into(), true.into());
+    }
+    stats
 }
 
 // pi's ContextUsage (agent-session.ts getContextUsage): the projected context's size, or null
