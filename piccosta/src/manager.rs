@@ -260,25 +260,32 @@ fn inbox_path(session_file: &Path) -> PathBuf {
     PathBuf::from(format!("{}.inbox", session_file.display()))
 }
 
-// Leave a message for whoever runs the session in `session_file`.
-pub fn deliver(session_file: &Path, text: &str) -> std::io::Result<()> {
+// Leave a message for whoever runs the session in `session_file`, `spoken` when the user said it.
+pub fn deliver(session_file: &Path, text: &str, spoken: bool) -> std::io::Result<()> {
     if let Some(dir) = session_file.parent() {
         fs::create_dir_all(dir)?;
     }
     let mut file = fs::OpenOptions::new().create(true).append(true).open(inbox_path(session_file))?;
     file.lock()?;
-    writeln!(file, "{}", json!({ "text": text }))
+    writeln!(file, "{}", json!({ "text": text, "spoken": spoken }))
 }
 
-// Take every message waiting for this session, oldest first, and empty its inbox.
-pub fn take_inbox(session_file: &Path) -> Vec<String> {
+// Whether messages are waiting in this session's inbox.
+pub fn waiting(session_file: &Path) -> bool {
+    inbox_path(session_file).metadata().is_ok_and(|meta| meta.len() > 0)
+}
+
+// Take every message waiting for this session, oldest first, each with whether it was spoken, and
+// empty its inbox.
+pub fn take_inbox(session_file: &Path) -> Vec<(String, bool)> {
     let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(inbox_path(session_file)) else { return Vec::new() };
     if file.lock().is_err() {
         return Vec::new();
     }
     let lines: Vec<String> = std::io::BufReader::new(&file).lines().map_while(Result::ok).collect();
     let _ = file.set_len(0);
-    lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()?.get("text")?.as_str().map(str::to_string)).collect()
+    let records = lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok());
+    records.filter_map(|record| Some((record.get("text")?.as_str()?.to_string(), record.get("spoken").and_then(Value::as_bool).unwrap_or(false)))).collect()
 }
 
 // --- The ledger ---
@@ -755,7 +762,7 @@ impl SessionsTool {
     fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
         if crate::session::held_elsewhere(file) {
             take_lane(&self.home, file, title, None);
-            deliver(file, message).map_err(|error| error.to_string())?;
+            deliver(file, message, false).map_err(|error| error.to_string())?;
             return Ok("It's open in another piccosta, which takes the message in after its current step; read the session later to see what came of it.".into());
         }
         let pid = launch(file, cwd, message, &run_log(&self.home, file)).map_err(|error| format!("Couldn't start its run: {error}"))?;
@@ -1096,7 +1103,7 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
 // when a piccosta runs it, else a run of its own (launch). Its answer stays in its session.
 fn wake(home: &Path, file: &Path, cwd: &Path, text: &str) {
     if crate::session::held_elsewhere(file) {
-        let _ = deliver(file, text);
+        let _ = deliver(file, text, false);
         return;
     }
     let _ = launch(file, cwd, text, &home.join("runs").join("manager.log"));
@@ -1112,7 +1119,7 @@ fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
         let Some(file) = pointer(&home) else { continue };
         let mut messages: Vec<String> = due_schedules(&home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)).collect();
         if !crate::session::held_elsewhere(&file) {
-            messages.extend(take_inbox(&file));
+            messages.extend(take_inbox(&file).into_iter().map(|(text, _)| text));
         }
         if messages.is_empty() {
             continue;
@@ -1227,21 +1234,27 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
         }
     });
     use tokio::signal::unix::{signal, SignalKind};
+    // A stop by systemd, Ctrl-C in a terminal, or the terminal closing all end the loop the same
+    // way, so the speech worker below is shut down on each.
     let mut term = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+    let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
     let mut poll = tokio::time::interval(POLL);
     let wait_minutes = host.settings.get("manager.inactiveMinutes").and_then(Value::as_u64).unwrap_or(INACTIVE_MINUTES);
     let mut ticks = 0u64;
     loop {
         tokio::select! {
             _ = term.recv() => break,
+            _ = interrupt.recv() => break,
+            _ = hangup.recv() => break,
             _ = poll.tick() => {
-                let mut incoming: Vec<String> = take_inbox(&file).into_iter().map(|text| format!("[{}, from the user]\n{text}", now_text())).collect();
-                incoming.extend(due_schedules(&home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)));
+                let mut incoming: Vec<(String, bool)> = take_inbox(&file).into_iter().map(|(text, spoken)| (format!("[{}, from the user]\n{text}", now_text()), spoken)).collect();
+                incoming.extend(due_schedules(&home).into_iter().map(|schedule| (format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text), false)));
                 // The managers' lanes: runs that ended, every second, and quiet lanes, every
                 // minute. The assistant's come here, a project manager's go to it.
                 ticks += 1;
                 let remind = ticks.is_multiple_of(LANE_SCAN_SECONDS);
-                incoming.extend(lane_news(&home, wait_minutes, remind));
+                incoming.extend(lane_news(&home, wait_minutes, remind).into_iter().map(|news| (news, false)));
                 for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
                     let news = lane_news(&project_home, wait_minutes, remind);
                     if let (false, Some(manager)) = (news.is_empty(), pointer(&project_home)) {
@@ -1252,12 +1265,12 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
                 for (project_home, file, cwd, message) in project_work(&agent_dir) {
                     wake(&project_home, &file, &cwd, &message);
                 }
-                for message in incoming {
+                for (message, spoken) in incoming {
                     if busy.load(Ordering::SeqCst) {
-                        handle.steer(message);
+                        handle.steer(message, spoken);
                     } else {
                         busy.store(true, Ordering::SeqCst);
-                        let _ = commands.send(Command::Prompt(message, Vec::new()));
+                        let _ = commands.send(Command::Prompt(message, Vec::new(), spoken));
                     }
                 }
             }
@@ -1267,6 +1280,7 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     drop(commands);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     shared.jobs.shutdown("SIGTERM");
+    crate::voice::shutdown(false).await;
     crate::provider::claude::shutdown().await;
     Ok(std::process::ExitCode::SUCCESS)
 }

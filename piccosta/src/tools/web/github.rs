@@ -362,7 +362,7 @@ async fn gh(clones: &Clones, args: &[&str], timeout: Duration) -> Option<String>
 
 // This process's owner record for its runtime directory: pid, boot id and the process's start
 // time, so a later process can tell a reused pid from a live owner.
-fn process_start_time(pid: u32) -> Option<String> {
+pub(crate) fn process_start_time(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_name = &stat[stat.rfind(')')? + 2..];
     // Field 22 of stat is the start time; after the name, the state is field 3.

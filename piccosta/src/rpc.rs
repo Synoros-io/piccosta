@@ -136,6 +136,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     live.handle.abort();
     drop(live.commands);
     let _ = tokio::time::timeout(STOP_WAIT, live.task).await;
+    crate::voice::shutdown(false).await;
     crate::provider::claude::shutdown().await;
     crate::tools::bash::kill_all_running();
     Ok(ExitCode::from(code))
@@ -280,7 +281,7 @@ impl Rpc {
                 if live.streaming {
                     match command.get("streamingBehavior").and_then(Value::as_str) {
                         Some("steer") => {
-                            live.handle.steer(message);
+                            live.handle.steer(message, false);
                             live.shared.jobs.detach_all();
                         }
                         Some("followUp") => live.handle.follow_up(message),
@@ -293,12 +294,12 @@ impl Rpc {
                 // The response goes before the run's first event, as pi's preflight answers.
                 respond(id, "prompt", Ok(Some(json!({"disposition": "started"}))));
                 live.streaming = true;
-                self.send(Command::Prompt(message, images), None);
+                self.send(Command::Prompt(message, images, false), None);
                 return Ok(Reply::Later);
             }
             "steer" | "follow_up" => {
                 let message = text("message");
-                if kind == "steer" { live.handle.steer(message) } else { live.handle.follow_up(message) }
+                if kind == "steer" { live.handle.steer(message, false) } else { live.handle.follow_up(message) }
                 self.announce_queue();
                 Some(json!({"disposition": "queued"}))
             }

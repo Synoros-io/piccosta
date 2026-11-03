@@ -717,6 +717,7 @@ impl App {
             .map(|index| kept(&self.slots[index], 0))
             .collect();
         let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, open }).unwrap_or_default();
+        crate::voice::focus(&self.host.agent_dir, self.current().path.as_deref());
         if text != self.saved && state::save(&self.host.agent_dir, &text).is_ok() {
             self.saved = text;
         }
@@ -1037,7 +1038,7 @@ impl App {
         // that piccosta takes in; typing into one shown from its file opens it here.
         if self.current().live.is_none() && self.current().elsewhere {
             let Some(path) = self.current().path.clone() else { return };
-            self.notice = Some(match crate::manager::deliver(&path, &text) {
+            self.notice = Some(match crate::manager::deliver(&path, &text, false) {
                 Ok(()) => "Sent: the piccosta running this session takes it in after its current step.".into(),
                 Err(error) => format!("Couldn't leave the message: {error}"),
             });
@@ -1053,13 +1054,13 @@ impl App {
         // running move to the background (they carry on and report when they end), so the message
         // isn't left waiting on them.
         if slot.busy() {
-            handle.steer(text);
+            handle.steer(text, false);
             if let Some(shared) = &slot.shared {
                 shared.jobs.detach_all();
             }
             return;
         }
-        let _ = commands.send(Command::Prompt(text.clone(), Vec::new()));
+        let _ = commands.send(Command::Prompt(text.clone(), Vec::new(), false));
         slot.state = State::Running;
         if slot.title == NEW_TITLE {
             slot.title = render::fit(text.lines().next().unwrap_or(""), 80);
@@ -1135,7 +1136,7 @@ impl App {
         let (steer, follow_up) = handle.clear();
         let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
         if !queued.is_empty() {
-            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new()));
+            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new(), false));
         }
     }
 
@@ -1152,7 +1153,7 @@ impl App {
         if !text.trim().is_empty() {
             self.history.push(text.clone());
             if let Some((handle, _)) = &self.current().live {
-                handle.steer(text);
+                handle.steer(text, false);
             }
         }
         let detached = self.current().shared.as_ref().is_some_and(|shared| shared.jobs.detach_all());
@@ -1187,17 +1188,22 @@ impl App {
     fn scan_agents(&mut self) {
         self.scans += 1;
         let locks_due = self.scans.is_multiple_of(LOCK_SCAN_EVERY);
+        // A message left for the focused session while it's shown from its file (push-to-talk sends
+        // there) opens it, as typing into it would.
+        if self.current().live.is_none() && !self.current().elsewhere && self.current().path.as_deref().is_some_and(crate::manager::waiting) {
+            self.ensure_open();
+        }
         for index in 0..self.slots.len() {
             let slot = &mut self.slots[index];
             // Messages other piccostas left for a session open here: queued while it runs, else
             // the next prompt.
             if let (Some((handle, commands)), Some(path)) = (&slot.live, &slot.path) {
-                for text in crate::manager::take_inbox(path) {
+                for (text, spoken) in crate::manager::take_inbox(path) {
                     if slot.state == State::Idle {
-                        let _ = commands.send(Command::Prompt(text, Vec::new()));
+                        let _ = commands.send(Command::Prompt(text, Vec::new(), spoken));
                         slot.state = State::Running;
                     } else {
-                        handle.steer(text);
+                        handle.steer(text, spoken);
                     }
                 }
             }
@@ -1713,6 +1719,7 @@ impl App {
         crate::tools::bash::kill_all_running();
         let tasks = std::mem::take(&mut self.tasks);
         let _ = tokio::time::timeout(SHUTDOWN_WAIT, futures_util::future::join_all(tasks)).await;
+        crate::voice::shutdown(false).await;
         crate::provider::claude::shutdown().await;
         crate::tools::bash::kill_all_running();
     }

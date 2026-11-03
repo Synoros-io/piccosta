@@ -41,7 +41,8 @@ pub struct Host {
 
 // What a live session's task is asked to do, one at a time.
 pub enum Command {
-    Prompt(String, Vec<crate::message::Content>),
+    // The text, its images, and whether the user said it.
+    Prompt(String, Vec<crate::message::Content>, bool),
     Model(String),
     Thinking(String),
     Name(String),
@@ -401,6 +402,7 @@ impl Host {
             hold_for_jobs,
             manager_home,
         };
+        let emit = crate::voice::speaking(&self.settings, &config, &session, emit);
         let agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
         Ok((agent, tool_shared))
     }
@@ -434,6 +436,7 @@ impl Host {
     pub fn spawn(self: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: bool, mut commands: UnboundedReceiver<Command>, mut done: impl FnMut(Done) + 'static) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_local(async move {
             let mut team = team(&agent.session);
+            let mut spent = crate::voice::spent_changes();
             loop {
                 let (result, notice) = tokio::select! {
                     command = commands.recv() => match command {
@@ -447,10 +450,18 @@ impl Host {
                         }
                         (agent.take_notice(notice).await, true)
                     }
+                    // A quick answer's cost (voice.rs), counted when it comes, the session idle.
+                    Ok(()) = spent.changed() => {
+                        if let Err(error) = agent.record_spent() {
+                            crate::voice::note(&error);
+                        }
+                        continue;
+                    }
                 };
                 done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
             }
             // The session is closed: a Claude query waiting for its next message goes too.
+            let _ = agent.record_spent();
             crate::provider::claude::close(agent.session.id());
             shared.jobs.shutdown("quit");
             shared.web.shutdown();
@@ -461,7 +472,7 @@ impl Host {
     async fn obey(&self, agent: &mut Agent, command: Command, team: &mut Team) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         match command {
-            Command::Prompt(text, images) => self.answer(agent, team, &text, images).await,
+            Command::Prompt(text, images, spoken) => self.answer(agent, team, &text, images, spoken).await,
             Command::Team(asked) => {
                 *team = record_team(&self.registry()?, &mut agent.session, &asked)?;
                 Ok(())
@@ -498,7 +509,7 @@ impl Host {
     // turns until one ends its reply with the done line, or the round limit. Each turn is the
     // speaker's model on the session for one run, opened by its note; the session model takes it
     // back for the user's next message. A failed or stopped turn ends the exchange.
-    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>) -> Result<(), String> {
+    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>, spoken: bool) -> Result<(), String> {
         let lead = format!("{}/{}", agent.model().provider, agent.model().id);
         let speakers: Vec<String> = std::iter::once(lead.clone()).chain(team.models.iter().filter(|model| **model != lead).cloned()).collect();
         let rounds = self.settings.get("pairRounds").and_then(Value::as_u64).unwrap_or(PAIR_ROUNDS).max(1);
@@ -510,7 +521,7 @@ impl Host {
         if turns > 1 {
             agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
-        agent.prompt_with_images(text, images).await?;
+        agent.prompt_with_images(text, images, spoken).await?;
         let mut result = Ok(());
         for turn in 1..turns {
             if agent.aborted() || exchange_over(&agent.session, team.pair && turn > 1) {

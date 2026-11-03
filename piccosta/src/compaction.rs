@@ -656,7 +656,7 @@ async fn request_once(request: &SummaryRequest<'_>, prompt_text: &str) -> Assist
             tools_removed: None,
             timestamp: 0,
         }),
-        Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(prompt_text)]), timestamp: clock::now_ms() }),
+        Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(prompt_text)]), timestamp: clock::now_ms(), spoken: false }),
     ];
     let session_id = uuid::Uuid::now_v7().to_string();
     let thinking_level = if request.model.reasoning && request.thinking_level != "off" { request.thinking_level } else { "off" };

@@ -144,6 +144,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
             _ = hangup.recv() => 129,
         };
         abort.abort();
+        piccosta::voice::shutdown(false).await;
         piccosta::provider::claude::shutdown().await;
         shutdown.jobs.shutdown(if code == 129 { "SIGHUP" } else { "SIGTERM" });
         // A foreground command whose tool call hasn't seen the abort yet.
@@ -170,13 +171,13 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     };
     // Then whatever was left in the session's inbox meanwhile (another piccosta's messages for it),
     // until it's empty.
-    let mut queue: std::collections::VecDeque<String> = prompts.into();
-    while let Some(text) = queue.pop_front().or_else(|| agent.session.file().map(piccosta::manager::take_inbox).and_then(|more| {
+    let mut queue: std::collections::VecDeque<(String, bool)> = prompts.into_iter().map(|text| (text, false)).collect();
+    while let Some((text, spoken)) = queue.pop_front().or_else(|| agent.session.file().map(piccosta::manager::take_inbox).and_then(|more| {
         queue.extend(more);
         queue.pop_front()
     })) {
         let before = agent.session.context().messages.len();
-        let answered = host.answer(&mut agent, &team, &text, Vec::new()).await;
+        let answered = host.answer(&mut agent, &team, &text, Vec::new(), spoken).await;
         // With a team, every reply of the exchange is printed under the model that wrote it, so
         // the conversation reads as it happened; alone, only the last message is (below).
         if !json && !team.models.is_empty() {
@@ -192,12 +193,16 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
             }
         }
         if let Err(error) = answered {
+            piccosta::voice::shutdown(false).await;
             piccosta::provider::claude::shutdown().await;
             tool_shared.jobs.shutdown("error");
             tool_shared.web.shutdown();
             return Err(error);
         }
     }
+    // What's still being said is, within a bound, and what its quick answers cost is counted.
+    piccosta::voice::shutdown(true).await;
+    agent.record_spent()?;
     // The last answer's Claude query waits for a next message that won't come here.
     piccosta::provider::claude::shutdown().await;
     tool_shared.jobs.shutdown("quit");
@@ -262,10 +267,12 @@ async fn main() -> ExitCode {
             print!("{}", piccosta::cache::report(&config::agent_dir(), arguments.get(1).map(String::as_str)));
             return ExitCode::SUCCESS;
         }
+        // `piccosta voice start|stop`: push-to-talk (voice.rs).
+        Some("voice") => return piccosta::voice::run(&arguments[1..]).await.map_or_else(fail, |()| ExitCode::SUCCESS),
         Some("tell") => {
             let text = arguments[1..].join(" ");
             let Some(file) = piccosta::manager::session_file(&config::agent_dir()) else { return fail("no assistant yet: start it with `piccosta assistant`".into()) };
-            return match piccosta::manager::deliver(&file, &text) {
+            return match piccosta::manager::deliver(&file, &text, false) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(format!("{}: {error}", file.display())),
             };

@@ -166,7 +166,8 @@ struct Inbox {
     // The token of the run in progress; each prompt puts in a fresh one, so a handle taken before
     // the prompt still aborts it.
     cancel: CancellationToken,
-    steer: Vec<String>,
+    // Each with whether it was spoken (voice.rs).
+    steer: Vec<(String, bool)>,
     follow_up: Vec<String>,
     steering_all: bool,
     follow_up_all: bool,
@@ -185,8 +186,8 @@ impl Handle {
         self.abort();
     }
 
-    pub fn steer(&self, text: String) {
-        self.lock().steer.push(text);
+    pub fn steer(&self, text: String, spoken: bool) {
+        self.lock().steer.push((text, spoken));
     }
 
     pub fn follow_up(&self, text: String) {
@@ -204,13 +205,13 @@ impl Handle {
     // What's queued and not sent yet: steering, then follow-ups.
     pub fn queued(&self) -> (Vec<String>, Vec<String>) {
         let inbox = self.lock();
-        (inbox.steer.clone(), inbox.follow_up.clone())
+        (inbox.steer.iter().map(|(text, _)| text.clone()).collect(), inbox.follow_up.clone())
     }
 
     // Take back everything queued (pi's clear_queue), e.g. to put it back in the editor on abort.
     pub fn clear(&self) -> (Vec<String>, Vec<String>) {
         let mut inbox = self.lock();
-        (std::mem::take(&mut inbox.steer), std::mem::take(&mut inbox.follow_up))
+        (std::mem::take(&mut inbox.steer).into_iter().map(|(text, _)| text).collect(), std::mem::take(&mut inbox.follow_up))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
@@ -218,20 +219,17 @@ impl Handle {
     }
 }
 
-fn dequeue(queue: &mut Vec<String>, all: bool) -> Vec<String> {
+fn dequeue<T>(queue: &mut Vec<T>, all: bool) -> Vec<T> {
     let count = if all { queue.len() } else { queue.len().min(1) };
     queue.drain(..count).collect()
 }
 
-fn user_message(text: &str) -> AgentMessage {
-    with_images(text, Vec::new())
-}
-
-// The user's text, then any images they attached (pi puts them after the text).
-fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
+// The user's text, then any images they attached (pi puts them after the text), and whether they
+// said it.
+fn user_message(text: &str, images: Vec<Content>, spoken: bool) -> AgentMessage {
     let mut blocks = vec![Content::text(text)];
     blocks.extend(images);
-    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms() })
+    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms(), spoken })
 }
 
 // A stream event in pi's json form (json-event.ts:16-35): its type and content index, the delta or
@@ -541,16 +539,16 @@ impl Agent {
     // it waits on). Output: an error only when the session can't be written; model failures end
     // up in the session as failed assistant messages, as in pi.
     pub async fn prompt(&mut self, text: &str) -> Result<(), String> {
-        self.run_from(user_message(text)).await
+        self.run_from(user_message(text, Vec::new(), false)).await
     }
 
-    // A prompt with images attached (rpc mode's `images`).
-    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>) -> Result<(), String> {
+    // A prompt with images attached (rpc mode's `images`), and whether the user said it.
+    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>, spoken: bool) -> Result<(), String> {
         // A prompt in a closed session opens it again.
         if let Some(file) = self.session.file() {
             crate::session::set_closed(&crate::config::agent_dir(), file, false);
         }
-        self.run_from(with_images(text, images)).await
+        self.run_from(user_message(text, images, spoken)).await
     }
 
     pub fn set_gate(&mut self, gate: Gate) {
@@ -626,7 +624,7 @@ impl Agent {
                 let mut inbox = self.handle.lock();
                 if inbox.steer.is_empty() {
                     let all = inbox.follow_up_all;
-                    dequeue(&mut inbox.follow_up, all)
+                    dequeue(&mut inbox.follow_up, all).into_iter().map(|text| (text, false)).collect()
                 } else {
                     let all = inbox.steering_all;
                     dequeue(&mut inbox.steer, all)
@@ -634,7 +632,7 @@ impl Agent {
             };
             if !queued.is_empty() {
                 self.announce_queue();
-                starting.extend(queued.iter().map(|text| user_message(text)));
+                starting.extend(queued.into_iter().map(|(text, spoken)| user_message(&text, Vec::new(), spoken)));
                 continue;
             }
             if self.config.hold_for_jobs && self.config.tool_shared.jobs.running_count() > 0 {
@@ -651,7 +649,19 @@ impl Agent {
             }
             break;
         }
+        self.record_spent()?;
         (self.emit)(&Event::AgentSettled { aborted });
+        Ok(())
+    }
+
+    // What was spent for this session outside the conversation meanwhile (voice's quick answers),
+    // written as usage entries: counted in its statistics, never part of its context.
+    pub fn record_spent(&mut self) -> Result<(), String> {
+        for (_, provider, model, usage) in crate::voice::spent(self.session.id()) {
+            let entry = SessionEntry::Usage { base: self.session.next_base(), kind: crate::voice::QUICK_KIND.into(), provider, model, usage, note: None };
+            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+            (self.emit)(&Event::EntryAppended { entry });
+        }
         Ok(())
     }
 
@@ -798,7 +808,7 @@ impl Agent {
             let all = inbox.steering_all;
             dequeue(&mut inbox.steer, all)
         };
-        messages.extend(steer.iter().map(|text| user_message(text)));
+        messages.extend(steer.into_iter().map(|(text, spoken)| user_message(&text, Vec::new(), spoken)));
         messages
     }
 

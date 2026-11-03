@@ -26,3 +26,4 @@ pub mod scale;
 pub mod session;
 pub mod tools;
 pub mod tui;
+pub mod voice;

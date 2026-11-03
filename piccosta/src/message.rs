@@ -207,6 +207,10 @@ pub enum SystemSnapshot {
 pub struct UserMessage {
     pub content: TextOrBlocks,
     pub timestamp: i64,
+    // Whether the user said it rather than typed it (voice.rs): the session keeps it, the model
+    // never sees it, and the answer to it is spoken.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spoken: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -367,7 +371,7 @@ pub fn bash_execution_text(execution: &BashExecutionMessage) -> String {
 
 // A user message holding one text block, the form all of pi's own roles take for the model.
 fn user_text(text: String, timestamp: i64) -> Message {
-    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp })
+    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp, spoken: false })
 }
 
 // What the model sees of a conversation (core/messages.ts:148-196). Input: the session's messages
@@ -390,6 +394,7 @@ pub fn to_model_messages(messages: &[AgentMessage]) -> Vec<Message> {
             AgentMessage::Custom(custom) => Message::User(UserMessage {
                 content: TextOrBlocks::Blocks(custom.content.clone().into_blocks()),
                 timestamp: custom.timestamp,
+                spoken: false,
             }),
             AgentMessage::BranchSummary(branch) => user_text(
                 format!("{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}", branch.summary),
