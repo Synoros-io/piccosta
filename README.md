@@ -17,8 +17,6 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 
 ## Features
 
-### Every model on the plans you already pay for
-
 - **Claude through Claude Code.** A Claude plan only works inside Claude Code, so piccosta runs Claude Code as a pipe. piccosta's own prompt goes in, with your AGENTS.md and CLAUDE.md files in it, and piccosta's own tools; Claude Code adds none of its builtins or settings, and doesn't load CLAUDE.md a second time. When a turn ends on tool calls, the query stays open for the results, so the prompt cache carries from turn to turn. Rate-limit messages name the limit and when it resets.
 - **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn, and falls back to plain HTTP streaming when it can't be used.
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
@@ -27,7 +25,7 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 - **New models show up on their own.** The model lists for Claude, Codex and opencode-go ship with piccosta, and are fetched again from pi.dev's catalog (the one pi reads) at most every four hours. `modelCatalog.url` in settings points elsewhere; `modelCatalog.refresh: false` keeps to the built-in lists.
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
-### The model scale
+### model scale
 
 Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. Each has a first choice and the models that take over when a plan runs low.
 - piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and moves to the next model once one passes 80% of a window.
