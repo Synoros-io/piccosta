@@ -141,6 +141,13 @@ const TAIL_BYTES: u64 = 1024 * 1024;
 // How much `ledger search` returns.
 const SEARCH_CHARS: usize = 12_000;
 const DAY_MS: i64 = 86_400_000;
+// Stopping a lane's run: how long it and what it started get after SIGTERM to write their last
+// messages (bash.rs's grace for a subagent), how long SIGKILL then gets before what's left is
+// reported (STOP_DEADLINE, the whole stop), and how often it's looked at meanwhile.
+const STOP_GRACE: Duration = crate::tools::bash::SUBAGENT_STOP_GRACE;
+const KILL_WAIT: Duration = Duration::from_secs(2);
+const STOP_DEADLINE: Duration = STOP_GRACE.saturating_add(KILL_WAIT);
+const STOP_POLL: Duration = Duration::from_millis(100);
 
 // --- The kinds of manager, their homes and their files ---
 
@@ -277,23 +284,100 @@ fn inbox_path(session_file: &Path) -> PathBuf {
     PathBuf::from(format!("{}.inbox", session_file.display()))
 }
 
-// Leave a message for whoever runs the session in `session_file`.
-pub fn deliver(session_file: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(dir) = session_file.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(inbox_path(session_file))?;
+// What became of a message (send).
+pub enum Sent {
+    Left,
+    Started(u32),
+    Free,
+}
+
+// A session's inbox, open and locked. Its lock is the one every message, every run record
+// (publish) and the end of a run (release_and_take) is made under. `create`: made when it isn't
+// there.
+fn inbox(session_file: &Path, create: bool) -> std::io::Result<fs::File> {
+    let file = fs::OpenOptions::new().read(true).append(true).create(create).open(inbox_path(session_file))?;
     file.lock()?;
-    writeln!(file, "{}", json!({ "text": text }))
+    Ok(file)
+}
+
+// Send a message to the session in `session_file`. It goes into the inbox, and when nothing runs
+// the session (no piccosta holds it, no recorded run of it is going or starting) and `start` gives
+// a directory and log, a run of its own starts and takes it from there (launch), so a message
+// never lives only in a run's arguments. A manager's or the assistant's session never starts
+// here: its run spends its model, so the message waits for the service or a terminal UI. The
+// check, the message and the start are made under the inbox's lock, as a run's end
+// (release_and_take) lets the session go, drops its record and takes its last messages: a message
+// is either taken there or finds the session free, and two senders never both start a run.
+// Output: Left in the inbox, Started with the run's pid, or Free (nothing written) when nothing
+// runs it and nothing was to start.
+pub fn send(session_file: &Path, text: &str, start: Option<(&Path, &Path)>) -> std::io::Result<Sent> {
+    let mut file = inbox(session_file, true)?;
+    let busy = crate::session::held_elsewhere(session_file) || !recorded_runs(session_file).0.is_empty();
+    if !busy && start.is_none() {
+        return Ok(Sent::Free);
+    }
+    writeln!(file, "{}", json!({ "text": text }))?;
+    let manager = || crate::session::Session::open(session_file, session_file.parent().unwrap_or(Path::new("."))).is_ok_and(|session| role(&session).is_some());
+    match start.filter(|_| !busy && !manager()) {
+        Some((cwd, log)) => launch(session_file, cwd, log).map(Sent::Started),
+        None => Ok(Sent::Left),
+    }
+}
+
+// Whether a piccosta other than this one runs the session in `session_file`, or a run of it is
+// starting: the file is held, or a run recorded beside it (publish) is still going. With no inbox
+// there's no record either, as records are made under its lock.
+pub fn busy(session_file: &Path) -> bool {
+    crate::session::held_elsewhere(session_file) || inbox(session_file, false).is_ok_and(|_locked| !recorded_runs(session_file).0.is_empty())
 }
 
 // Take every message waiting for this session, oldest first, and empty its inbox.
 pub fn take_inbox(session_file: &Path) -> Vec<String> {
-    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(inbox_path(session_file)) else { return Vec::new() };
-    if file.lock().is_err() {
+    inbox(session_file, false).map(|file| taken(&file)).unwrap_or_default()
+}
+
+// Put back messages a stopping run took from its inbox and never used, ahead of any that came in
+// after them, under the inbox's lock, so the next run answers them in the order they were sent.
+pub fn requeue(session_file: &Path, texts: &[String]) -> std::io::Result<()> {
+    if texts.is_empty() {
+        return Ok(());
+    }
+    let mut file = inbox(session_file, true)?;
+    let later = taken(&file);
+    for text in texts.iter().chain(&later) {
+        writeln!(file, "{}", json!({ "text": text }))?;
+    }
+    Ok(())
+}
+
+// The start of a print-mode run that holds its session: record it (publish) and take what waits in
+// its inbox (a launch's message is there), both under the inbox's lock. Output: the record's path,
+// which the run removes when it ends, and the messages, oldest first.
+pub fn start_run(session_file: &Path) -> std::io::Result<(PathBuf, Vec<String>)> {
+    let file = inbox(session_file, true)?;
+    Ok((publish(session_file, std::process::id())?, taken(&file)))
+}
+
+// The end of a run, under the inbox's lock (send): let its session go, then look at the inbox once
+// more. A message there was sent as the run ended, and the run takes the session back to answer
+// it; when another piccosta took it meanwhile, the message stays for that one. Output: the messages
+// to answer, none when the session is let go, and then its record (publish) goes too, still
+// under the lock. The inbox stays where it is, emptied rather than removed: a sender waiting on its
+// lock then writes to the file every run reads.
+pub fn release_and_take(session: &crate::session::Session) -> Vec<String> {
+    let Some(session_file) = session.file() else { return Vec::new() };
+    let Ok(file) = inbox(session_file, true) else { return Vec::new() };
+    session.release();
+    if file.metadata().is_ok_and(|metadata| metadata.len() == 0) || !session.reclaim() {
+        let _ = fs::remove_file(run_record(session_file, std::process::id()));
         return Vec::new();
     }
-    let lines: Vec<String> = std::io::BufReader::new(&file).lines().map_while(Result::ok).collect();
+    taken(&file)
+}
+
+// The messages in an inbox file this holds the lock of, which is emptied.
+fn taken(file: &fs::File) -> Vec<String> {
+    let lines: Vec<String> = std::io::BufReader::new(file).lines().map_while(Result::ok).collect();
     let _ = file.set_len(0);
     lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()?.get("text")?.as_str().map(str::to_string)).collect()
 }
@@ -468,15 +552,17 @@ fn running(pid: u32, file: &Path) -> bool {
 // Run a message in a session in a piccosta of its own (print mode), apart from whoever starts it:
 // in a session and process group of its own, so it carries on when the manager, its terminal or
 // its service stops (the service's unit has KillMode=process for this). What it prints goes to
-// `log`. Output: its process id.
-fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result<u32> {
+// `log`. Its message is in the inbox already (send), which it takes once it has the session
+// (start_run). It's recorded as the session's run from the start, as it records itself only then.
+// Input: the inbox's lock, held by the caller. Output: its process id.
+fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<u32> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
     fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
     let output = fs::File::create(log)?;
     let mut command = std::process::Command::new(exe);
-    command.arg("-p").arg("--session").arg(file).arg(message).current_dir(cwd);
+    command.arg("-p").arg("--session").arg(file).current_dir(cwd);
     // A lane's run is the manager's, not a command's, even when an agent's `sessions message`
     // starts it (which wakes a project manager's lane, or the manager itself).
     command.env_remove(crate::tools::subagent::SESSION_ENV);
@@ -490,6 +576,8 @@ fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result
     }
     let mut child = command.spawn()?;
     let pid = child.id();
+    // Read before it can be reaped, so its pid is still its own.
+    let _ = publish(file, pid);
     // Waited for, so it isn't left a zombie while this piccosta runs; if this one ends first, init
     // takes it over.
     std::thread::spawn(move || child.wait());
@@ -585,19 +673,230 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
     reminders
 }
 
-// The headless piccostas (print mode) that have `file` open: a lane's background run.
-fn headless_runs(file: &Path) -> Vec<i32> {
-    let Ok(entries) = fs::read_dir("/proc") else { return Vec::new() };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            let arguments = fs::read(entry.path().join("cmdline")).ok()?;
-            let printing = arguments.split(|byte| *byte == 0).any(|argument| argument == b"-p");
-            let holds = fs::read_dir(entry.path().join("fd")).ok()?.flatten().any(|fd| fs::read_link(fd.path()).ok().as_deref() == Some(file));
-            (printing && holds).then_some(pid)
-        })
-        .collect()
+// --- Runs ---
+
+// Where a print-mode run of a session is recorded while it runs: a file beside the session named
+// for its pid, holding the boot it runs in and its start time. A stop signals only what's
+// recorded (stop_run), never a terminal or editor that has the file open. One file a run, so runs
+// coming and going never write over each other's record.
+fn run_record(session_file: &Path, pid: u32) -> PathBuf {
+    PathBuf::from(format!("{}.run.{pid}", session_file.display()))
+}
+
+// The kernel's id for this boot (random(4)): a pid and a start time name a process only within
+// one boot, and a record left by a crash names nothing after the next.
+const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
+
+fn boot_id() -> String {
+    fs::read_to_string(BOOT_ID_FILE).unwrap_or_default().trim().to_string()
+}
+
+// Record process `pid` as a run of the session in `session_file`, under the inbox's lock (inbox),
+// which the caller holds. Input: a process that is still its own (alive, or not yet reaped by
+// whoever started it). Written whole to a file of its own and renamed into place, so a reader
+// finds all of it or none. Output: the record's path, which the run removes when it ends.
+fn publish(session_file: &Path, pid: u32) -> std::io::Result<PathBuf> {
+    let start = stat(pid as i32).ok_or_else(|| std::io::Error::other(format!("process {pid} is gone")))?.start;
+    let path = run_record(session_file, pid);
+    let partial = PathBuf::from(format!("{}.partial", path.display()));
+    fs::write(&partial, format!("{} {start}", boot_id()))?;
+    fs::rename(partial, &path)?;
+    Ok(path)
+}
+
+// The recorded runs of a session, under the inbox's lock, which the caller holds: those still
+// going, each known for sure from here on (Known) with its stat then, and the pids of those gone
+// this boot. The records of those gone are removed, and so is one from another boot, which is
+// never looked up: its pid could be anything's now.
+fn recorded_runs(session_file: &Path) -> (Vec<(Known, Stat)>, Vec<i32>) {
+    let (mut runs, mut gone, boot) = (Vec::new(), Vec::new(), boot_id());
+    let prefix = format!("{}.run.", session_file.file_name().unwrap_or_default().to_string_lossy());
+    for entry in fs::read_dir(session_file.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.strip_prefix(&prefix)?.parse::<i32>().ok()) else { continue };
+        let text = fs::read_to_string(entry.path()).unwrap_or_default();
+        let Some(start) = text.trim().split_once(' ').filter(|(its_boot, _)| !boot.is_empty() && *its_boot == boot).and_then(|(_, start)| start.parse().ok()) else {
+            let _ = fs::remove_file(entry.path());
+            continue;
+        };
+        match Known::open(pid, start) {
+            Some(run) => runs.push(run),
+            None => {
+                gone.push(pid);
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    (runs, gone)
+}
+
+// A process as /proc/<pid>/stat has it (proc_pid_stat(5): fields 4, 6 and 22).
+#[derive(Clone, Copy)]
+struct Stat {
+    parent: i32,
+    session: i32,
+    start: u64,
+}
+
+// None once it's gone, or a zombie, which is as good as gone.
+fn stat(pid: i32) -> Option<Stat> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
+    let number = |index: usize| fields.get(index)?.parse().ok();
+    (*fields.first()? != "Z").then_some(())?;
+    Some(Stat { parent: number(1)?, session: number(3)?, start: fields.get(crate::tools::subagent::STAT_STARTTIME_AFTER_NAME)?.parse().ok()? })
+}
+
+// One process, known for sure: a pidfd, which keeps naming it after its pid passes to another, and
+// its pid for reading /proc.
+struct Known {
+    fd: std::os::fd::OwnedFd,
+    pid: i32,
+}
+
+impl Known {
+    // Input: a pid and the start time it was seen with. Output: it, with its stat now; None when
+    // it's gone, or isn't that one.
+    fn open(pid: i32, start: u64) -> Option<(Known, Stat)> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor (close-on-exec) or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        // SAFETY: that descriptor, just made and owned from here on.
+        let known = (fd >= 0).then(|| Known { fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, pid })?;
+        known.look().filter(|now| now.start == start).map(|now| (known, now))
+    }
+
+    // Its stat now. Read before the pidfd shows it still alive: a pid passes on only once its
+    // process is reaped, so a stat read while it lives is its own. None once it's gone.
+    fn look(&self) -> Option<Stat> {
+        stat(self.pid).filter(|_| self.signal(0))
+    }
+
+    fn signal(&self, signal: i32) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: pidfd_send_signal on a descriptor this owns, with no siginfo.
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) == 0 }
+    }
+}
+
+// A process of a run being stopped: known for sure, the session it was in when it was found, and
+// whether that session was the run's then.
+struct Member {
+    process: Known,
+    session: i32,
+    ours: bool,
+}
+
+// What came of a stop: how many processes it stopped, the pids still there, the pids found in one
+// of the runs' sessions that couldn't be shown to be theirs still (left alone), the runs gone
+// before the first look through /proc took what they started, and whether the last look got to
+// its end.
+struct Stopped {
+    count: usize,
+    left: Vec<i32>,
+    unsure: Vec<i32>,
+    lost: Vec<i32>,
+    finished: bool,
+}
+
+// Stop a session's recorded runs (`runs`, recorded_runs) for sure, with everything they started,
+// all as one. A process is theirs when its parent is, or when it's in a session of theirs: a run
+// started by launch leads a session of its own, and the bash tool starts each command in one too
+// (bash.rs), whose `&` jobs stay in it after their shell exits. Ownership is shown, never assumed
+// from a number: /proc is walked first, then each member is looked at through its pidfd. A parent
+// still there at that look was there when the process's stat was read, so it's that parent's
+// child; and a session is still the one it was while a member leads it (even as a zombie not yet
+// reaped, whose pid can't pass on) or a member found in it is still in it. A process in a session
+// that was theirs but that nobody vouches for now (its id could have passed on), and the sessions
+// of runs already gone (`gone`), is reported, not signalled. A run is taken with the session it
+// was in when it was found (`runs`, recorded_runs), so one gone by the first walk still has its
+// session looked through; but what it started in sessions of their own can't be found by parent
+// any more, so the stop can't show it's whole (`lost`). /proc is walked again every
+// STOP_POLL, for what forked meanwhile: SIGTERM to each one found while STOP_GRACE lasts, SIGKILL
+// to what's left after, until a walk finds nothing, or STOP_DEADLINE passes, which also cuts a
+// walk short. Each process is signalled through its pidfd.
+async fn stop_run(runs: Vec<(Known, Stat)>, gone: Vec<i32>) -> Stopped {
+    use std::collections::{HashMap, HashSet};
+    let started = std::time::Instant::now();
+    let (kill_from, deadline) = (started + STOP_GRACE, started + STOP_DEADLINE);
+    let mut members: HashMap<i32, Member> = runs.into_iter().map(|(process, stat)| (process.pid, Member { session: stat.session, ours: stat.session == process.pid, process })).collect();
+    let mut seen: HashSet<i32> = gone.into_iter().chain(members.values().filter(|member| member.ours).map(|member| member.session)).collect();
+    let (mut unsure, mut warned, mut lost) = (HashMap::new(), HashSet::new(), None);
+    loop {
+        let mut finished = true;
+        let mut found: Vec<(i32, Stat)> = Vec::new();
+        for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            if std::time::Instant::now() >= deadline {
+                finished = false;
+                break;
+            }
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()).filter(|pid| !members.contains_key(pid)) else { continue };
+            found.extend(stat(pid).filter(|stat| members.contains_key(&stat.parent) || seen.contains(&stat.session)).map(|stat| (pid, stat)));
+        }
+        let live: HashMap<i32, Stat> = members.values().filter_map(|member| Some((member.process.pid, member.process.look()?))).collect();
+        lost.get_or_insert_with(|| members.keys().filter(|pid| !live.contains_key(pid)).copied().collect::<Vec<i32>>());
+        let vouched: HashSet<i32> = members
+            .values()
+            .filter_map(|member| match live.get(&member.process.pid) {
+                Some(stat) => (stat.session == member.process.pid || (member.ours && stat.session == member.session)).then_some(stat.session),
+                None => (member.session == member.process.pid && member.process.signal(0)).then_some(member.session),
+            })
+            .collect();
+        seen.extend(&vouched);
+        let mut admitted = Vec::new();
+        for (pid, stat) in found {
+            if !live.contains_key(&stat.parent) && !vouched.contains(&stat.session) {
+                unsure.insert(pid, stat.start);
+                continue;
+            }
+            unsure.remove(&pid);
+            let ours = stat.session == pid || vouched.contains(&stat.session);
+            admitted.extend(Known::open(pid, stat.start).map(|(process, _)| Member { process, session: stat.session, ours }));
+        }
+        let left: Vec<&Known> = members.values().map(|member| &member.process).filter(|process| live.contains_key(&process.pid)).chain(admitted.iter().map(|member| &member.process)).collect();
+        if (left.is_empty() && finished) || std::time::Instant::now() >= deadline {
+            let unsure = unsure.into_iter().filter(|(pid, start)| stat(*pid).is_some_and(|stat| stat.start == *start)).map(|(pid, _)| pid).collect();
+            return Stopped { count: members.len() + admitted.len(), left: left.iter().map(|process| process.pid).collect(), unsure, lost: lost.unwrap_or_default(), finished };
+        }
+        let killing = std::time::Instant::now() >= kill_from;
+        for process in left {
+            if killing {
+                process.signal(libc::SIGKILL);
+            } else if warned.insert(process.pid) {
+                process.signal(libc::SIGTERM);
+            }
+        }
+        // Straight to another walk when this one found more, for what they started.
+        if admitted.is_empty() {
+            tokio::time::sleep(STOP_POLL).await;
+        }
+        members.extend(admitted.into_iter().map(|member| (member.process.pid, member)));
+    }
+}
+
+// Stop a session's recorded runs (stop_run). Output: what came of it, for the reply; None when no
+// run of it is going and nothing was left of one. The records are read under the inbox's lock,
+// which goes before the stop, so senders don't wait on it.
+async fn stop_recorded(file: &Path) -> Option<String> {
+    let (runs, gone) = inbox(file, true).map(|_locked| recorded_runs(file)).unwrap_or_default();
+    let pids = |pids: &[i32]| pids.iter().map(i32::to_string).collect::<Vec<_>>().join(", ");
+    let runs_text = pids(&runs.iter().map(|(run, _)| run.pid).collect::<Vec<_>>());
+    let had_runs = !runs.is_empty();
+    let stopped = stop_run(runs, gone).await;
+    let processes = format!("{} process{}", stopped.count, if stopped.count == 1 { "" } else { "es" });
+    let mut said = match (had_runs, stopped.left.is_empty()) {
+        (false, _) if stopped.unsure.is_empty() => return None,
+        (false, _) => "its run had already ended".to_string(),
+        (true, true) if stopped.lost.is_empty() => format!("its run (pid {runs_text}) stopped, {processes} in all"),
+        (true, true) => format!("its run (pid {runs_text}) is incomplete: pid {} ended before what it started could be found, so what it started in sessions of its own may still run; {processes} stopped", pids(&stopped.lost)),
+        (true, false) => format!("its run (pid {runs_text}) couldn't be stopped: pid {} still there", pids(&stopped.left)),
+    };
+    if !stopped.unsure.is_empty() {
+        said += &format!("; pid {} in a session of its run's weren't stopped, as they couldn't be shown to be its still", pids(&stopped.unsure));
+    }
+    if !stopped.finished {
+        said += " (the last look through /proc didn't finish in time, so there may be more)";
+    }
+    Some(said)
 }
 
 // --- Schedules ---
@@ -766,18 +1065,20 @@ impl SessionsTool {
         Ok(format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n")))
     }
 
-    // Send a message to a session: into its inbox when another piccosta runs it (that one takes it
-    // in after its current step), else in a run of its own (launch). Either way it's one of this
+    // Send a message to a session (send): into its inbox when another piccosta runs it (that one
+    // takes it in after its current step), else in a run of its own. Either way it's one of this
     // manager's lanes from then on. Output: what happened, for the reply.
     fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
-        if crate::session::held_elsewhere(file) {
-            take_lane(&self.home, file, title, None);
-            deliver(file, message).map_err(|error| error.to_string())?;
-            return Ok("It's open in another piccosta, which takes the message in after its current step; read the session later to see what came of it.".into());
+        match send(file, message, Some((cwd, &run_log(&self.home, file)))).map_err(|error| format!("Couldn't send it: {error}"))? {
+            Sent::Started(pid) => {
+                take_lane(&self.home, file, title, Some(pid));
+                Ok(format!("Its run started (pid {pid}) in a process of its own; when its turn ends you get a message with what it said."))
+            }
+            _ => {
+                take_lane(&self.home, file, title, None);
+                Ok("It's in its inbox: another piccosta has it open or its run is starting, which takes the message in after its current step, or it's a manager, whose messages wait for the service or a terminal UI to open it; read the session later to see what came of it.".into())
+            }
         }
-        let pid = launch(file, cwd, message, &run_log(&self.home, file)).map_err(|error| format!("Couldn't start its run: {error}"))?;
-        take_lane(&self.home, file, title, Some(pid));
-        Ok(format!("Its run started (pid {pid}) in a process of its own; when its turn ends you get a message with what it said."))
     }
 
     // Write a session's model, level, partners and name into its file before anything runs it, so
@@ -941,35 +1242,25 @@ impl Tool for SessionsTool {
                     }
                     text(format!("{}{}", note.unwrap_or_default(), self.run(&summary.path, &summary.cwd, need("message")?, &summary.title)?))
                 }
-                // Stop a lane's run: the headless piccosta (print mode) holding its session, which
-                // stops its own commands as it goes. A session open in someone's terminal or editor
-                // isn't stopped from here; it gets a message instead.
+                // Stop a lane's run: the print-mode runs recorded for its session (publish), and
+                // everything under them. A session open in someone's terminal or editor isn't stopped
+                // from here; it gets a message instead.
                 "stop" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
-                    let runs = headless_runs(&summary.path);
-                    if runs.is_empty() {
+                    let Some(stopped) = stop_recorded(&summary.path).await else {
                         return text(if crate::session::held_elsewhere(&summary.path) { format!("\"{}\" is open in a terminal or editor, not a background run; send it a message instead.", summary.title) } else { format!("\"{}\" isn't running.", summary.title) });
-                    }
-                    for pid in &runs {
-                        // SAFETY: kill() takes plain integers; a pid already gone fails with ESRCH.
-                        unsafe { libc::kill(*pid, libc::SIGTERM) };
-                    }
-                    text(format!("Stopped \"{}\" (pid {}).", summary.title, runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")))
+                    };
+                    text(format!("\"{}\": {stopped}.", summary.title))
                 }
                 // Close a session: it's done. Its background run stops, it's marked closed for
                 // everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
-                    let runs = headless_runs(&summary.path);
-                    for pid in &runs {
-                        // SAFETY: kill() takes plain integers; a pid already gone fails with ESRCH.
-                        unsafe { libc::kill(*pid, libc::SIGTERM) };
-                    }
+                    let stopped = stop_recorded(&summary.path).await.map(|stopped| format!(", and {stopped}")).unwrap_or_default();
                     crate::session::set_closed(&self.agent_dir, &summary.path, true);
                     let mut lanes = load_lanes(&self.home);
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
-                    let stopped = if runs.is_empty() { String::new() } else { format!(", and its run (pid {}) stopped", runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")) };
                     text(format!("Closed \"{}\"{stopped}. A message to it opens it again.", summary.title))
                 }
                 // Delete a session this manager started: to the trash, with the Claude bridge's record
@@ -1120,35 +1411,11 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
         .replace("{memory}", &memory)
 }
 
-// Wake a manager that isn't the one running here: a message into its session, through its inbox
-// when a piccosta runs it, else a run of its own (launch). Its answer stays in its session.
-fn wake(home: &Path, file: &Path, cwd: &Path, text: &str) {
-    if crate::session::held_elsewhere(file) {
-        let _ = deliver(file, text);
-        return;
-    }
-    let _ = launch(file, cwd, text, &home.join("runs").join("manager.log"));
-}
-
-// What's waiting for the project managers: their schedules that are due, and messages left in the
-// inbox of one nobody is running (it was closed when they came), each as (its home, session file,
-// directory, message).
-fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
-    let homes = fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten();
-    let mut work = Vec::new();
-    for home in homes.map(|entry| entry.path()) {
-        let Some(file) = pointer(&home) else { continue };
-        let mut messages: Vec<String> = due_schedules(&home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)).collect();
-        if !crate::session::held_elsewhere(&file) {
-            messages.extend(take_inbox(&file));
-        }
-        if messages.is_empty() {
-            continue;
-        }
-        let Some(cwd) = crate::session::Session::open(&file, &home).ok().map(|session| PathBuf::from(&session.header().cwd)) else { continue };
-        work.push((home, file, cwd, messages.join("\n\n")));
-    }
-    work
+// Wake a manager that isn't the one running here: a message into its inbox, for the piccosta
+// running it to take in, or the service or a terminal UI once one opens it. Nothing starts one
+// here (send), as its run spends its model.
+pub fn wake(file: &Path, text: &str) -> std::io::Result<()> {
+    writeln!(inbox(file, true)?, "{}", json!({ "text": text }))
 }
 
 // --- The service ---
@@ -1313,15 +1580,14 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
                 ticks += 1;
                 let remind = ticks.is_multiple_of(LANE_SCAN_SECONDS);
                 incoming.extend(lane_news(&home, wait_minutes, remind));
+                // Their schedules that are due go to them too, into the inbox they wait in.
                 for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-                    let news = lane_news(&project_home, wait_minutes, remind);
-                    if let (false, Some(manager)) = (news.is_empty(), pointer(&project_home)) {
-                        let cwd = crate::session::Session::open(&manager, &project_home).ok().map(|session| PathBuf::from(&session.header().cwd)).unwrap_or_default();
-                        wake(&project_home, &manager, &cwd, &news.join("\n\n"));
+                    let mut news = lane_news(&project_home, wait_minutes, remind);
+                    let Some(manager) = pointer(&project_home) else { continue };
+                    news.extend(due_schedules(&project_home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)));
+                    if !news.is_empty() {
+                        let _ = wake(&manager, &news.join("\n\n"));
                     }
-                }
-                for (project_home, file, cwd, message) in project_work(&agent_dir) {
-                    wake(&project_home, &file, &cwd, &message);
                 }
                 for message in incoming {
                     if busy.load(Ordering::SeqCst) {

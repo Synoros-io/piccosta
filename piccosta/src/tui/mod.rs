@@ -67,6 +67,8 @@ const QUIT_CONFIRM: Duration = Duration::from_secs(2);
 // How long quitting waits for aborted sessions to write their last messages.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const NEW_TITLE: &str = "new session";
+// A session whose file was deleted while piccosta was away, back only for its unsent draft.
+const DELETED_TITLE: &str = "deleted session";
 // How many of this directory's sessions /resume lists, and how many undo steps the editor keeps.
 const PICKER_SESSIONS: usize = 500;
 const UNDO_STEPS: usize = 100;
@@ -145,6 +147,11 @@ struct Slot {
     parent: Option<usize>,
     // Its own settings, when it was started with flags of its own (/new <dir> --tools …).
     host: Option<Arc<Host>>,
+    // Its file has been seen on disk, so one missing now was deleted (a new session's isn't made
+    // until its first message); and closed or deleted elsewhere while it holds a draft or runs
+    // here, so it stays, marked.
+    saved: bool,
+    closed: bool,
 }
 
 impl Slot {
@@ -154,6 +161,8 @@ impl Slot {
             // Known from the file's name before the file is read, so the agents of a session another
             // piccosta runs are found without opening it.
             id: path.as_deref().map_or_else(String::new, id_of),
+            saved: path.as_deref().is_some_and(Path::exists),
+            closed: false,
             path,
             cwd: PathBuf::new(),
             live: None,
@@ -285,6 +294,9 @@ struct App {
     // sessions made since (find_new_sessions).
     started: std::time::SystemTime,
     folder_times: HashMap<PathBuf, std::time::SystemTime>,
+    // The closed sessions as of the last scan (session.rs closed_sessions), so one closed since
+    // can leave the list while one opened from /resume to read stays.
+    closed: HashMap<PathBuf, i64>,
     // Since when the focused draft has been /d…, on the way to the easter egg (commands.rs).
     descent_since: Option<Instant>,
     // The session files `/resume all` listed, by their number there.
@@ -425,6 +437,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         edit: None,
         started: std::time::SystemTime::now(),
         folder_times: HashMap::new(),
+        closed: crate::session::closed_sessions(&host.agent_dir),
         descent_since: None,
         found: Vec::new(),
         selection: None,
@@ -693,25 +706,44 @@ impl App {
         let Some(state) = state::load(&self.host.agent_dir) else { return false };
         let on_screen = state.panes.len();
         for (index, kept) in state.panes.into_iter().chain(state.open).enumerate() {
-            let path = kept.session.filter(|path| path.exists());
+            // One deleted or closed since comes back only for its draft, and a deleted one as what
+            // it is, never a new session: not opened, marked by the first scan.
+            let deleted = kept.session.as_deref().is_some_and(|path| !path.exists());
+            if kept.draft.is_empty() && kept.session.as_deref().is_some_and(|path| deleted || crate::session::is_closed(&self.host.agent_dir, path)) {
+                continue;
+            }
+            let path = kept.session;
             // A new session that was never saved comes back only where it was on screen.
             if path.is_none() && (index >= on_screen || !kept.cwd.is_dir()) {
                 continue;
             }
-            let slot = self.slots.len();
-            self.slots.push(Slot { cwd: kept.cwd, ..Slot::new(path.clone(), NEW_TITLE.into()) });
-            self.slots[slot].elsewhere = path.as_deref().is_some_and(crate::session::held_elsewhere);
-            if index >= on_screen || self.slots[slot].elsewhere {
-                self.follow(slot);
-            } else if let Err(error) = self.load(slot, None, None, None) {
-                self.notice = Some(error);
-                self.slots[slot] = Slot::new(None, NEW_TITLE.into());
+            // Panes that showed one session come back on one slot, sharing its draft.
+            if let Some(slot) = path.as_ref().and_then(|path| self.slots.iter().position(|slot| slot.path.as_ref() == Some(path))) {
+                if index < on_screen {
+                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
+                }
                 continue;
+            }
+            let slot = self.slots.len();
+            self.slots.push(Slot { cwd: kept.cwd, saved: deleted, ..Slot::new(path.clone(), if deleted { DELETED_TITLE } else { NEW_TITLE }.into()) });
+            self.slots[slot].elsewhere = path.as_deref().is_some_and(crate::manager::busy);
+            if !deleted && (index >= on_screen || self.slots[slot].elsewhere) {
+                self.follow(slot);
+            } else if !deleted && let Err(error) = self.load(slot, None, None, None) {
+                // Shown from its file instead, with its draft, to open when typed into.
+                self.notice = Some(error);
+                self.follow(slot);
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
                 self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
             }
+        }
+        // With no pane left, one holding a draft takes the screen, so the draft isn't lost.
+        if self.panes.is_empty()
+            && let Some(slot) = self.slots.iter().position(|slot| !slot.draft.text.is_empty())
+        {
+            self.panes.push(Pane { slot, scroll: 0, anchor: None });
         }
         if self.panes.is_empty() {
             self.slots.clear();
@@ -728,11 +760,12 @@ impl App {
         if !self.persist {
             return;
         }
-        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| path.exists()), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone() };
+        // A session deleted while open here keeps its file's name, so it comes back as one (restore).
+        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| slot.saved || path.exists()), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone() };
         let panes = self.panes.iter().map(|pane| kept(&self.slots[pane.slot], pane.scroll)).collect();
         let elsewhere = |index: usize| !self.panes.iter().any(|pane| pane.slot == index);
         let open = (0..self.slots.len())
-            .filter(|&index| elsewhere(index) && (self.slots[index].live.is_some() || !self.slots[index].draft.text.is_empty()) && self.slots[index].path.as_deref().is_some_and(Path::exists))
+            .filter(|&index| elsewhere(index) && (self.slots[index].live.is_some() || !self.slots[index].draft.text.is_empty()) && self.slots[index].path.as_deref().is_some_and(|path| self.slots[index].saved || path.exists()))
             .map(|index| kept(&self.slots[index], 0))
             .collect();
         let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, open }).unwrap_or_default();
@@ -754,10 +787,7 @@ impl App {
             let slot = match self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)) {
                 Some(slot) if self.slots[slot].live.is_some() => Ok(slot),
                 // Shown from its file: a fresh view to open, so its messages don't show twice.
-                Some(slot) => {
-                    self.slots[slot] = Slot { cwd: self.slots[slot].cwd.clone(), ..Slot::new(Some(path.clone()), self.slots[slot].title.clone()) };
-                    self.load(slot, None, None, None).map(|()| slot)
-                }
+                Some(slot) => self.reopen(slot).map(|()| slot),
                 None => self.open(Some(path.clone()), None, None),
             };
             let shared = slot.map(|slot| self.slots[slot].shared.clone());
@@ -804,6 +834,15 @@ impl App {
         self.list_sessions(found);
     }
 
+    // Open a slot shown from its file: a fresh view, so its messages don't show twice, keeping its
+    // draft and whether its file was seen, whether it opens or not (a deleted session's doesn't).
+    fn reopen(&mut self, slot: usize) -> Result<(), String> {
+        let view = &mut self.slots[slot];
+        let draft = std::mem::take(&mut view.draft);
+        self.slots[slot] = Slot { cwd: view.cwd.clone(), saved: view.saved, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
+        self.load(slot, None, None, None)
+    }
+
     // Open a session in a new slot: a file, or a new session on `model`.
     fn open(&mut self, path: Option<PathBuf>, model: Option<String>, thinking: Option<String>) -> Result<usize, String> {
         let slot = self.slots.len();
@@ -848,6 +887,11 @@ impl App {
             let _ = sender.send((slot, Update::Event(Box::new(event.clone()))));
         });
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
+        // A lane's run of it that is starting (recorded, not holding it yet) has it as much as
+        // another piccosta holding it does: a message for it goes to its inbox (send).
+        if let Some(path) = session.file().filter(|path| crate::manager::busy(path)) {
+            return Err(format!("{} {}", path.display(), crate::session::LIVE_ELSEWHERE));
+        }
         let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
         let view = &mut self.slots[slot];
         view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
@@ -910,7 +954,7 @@ impl App {
     fn show(&mut self, slot: usize) {
         let leaving = self.panes[self.focus].slot;
         if self.slots[slot].live.is_none() {
-            self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::session::held_elsewhere);
+            self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::manager::busy);
             self.follow(slot);
         }
         self.slots[slot].unread = false;
@@ -962,10 +1006,7 @@ impl App {
             self.notice = Some("Another piccosta is running this session; this pane follows it, and nothing typed here goes to it.".into());
             return false;
         }
-        let index = self.panes[self.focus].slot;
-        let view = &self.slots[index];
-        self.slots[index] = Slot { cwd: view.cwd.clone(), ..Slot::new(view.path.clone(), view.title.clone()) };
-        match self.load(index, None, None, None) {
+        match self.reopen(self.panes[self.focus].slot) {
             Ok(()) => true,
             Err(error) => {
                 self.notice = Some(error);
@@ -1042,15 +1083,22 @@ impl App {
     fn send(&mut self, text: String) {
         let pane = self.focus;
         self.panes[pane].scroll = 0;
-        // A message for a session another piccosta runs (the manager, say) goes to its inbox, which
-        // that piccosta takes in; typing into one shown from its file opens it here.
-        if self.current().live.is_none() && self.current().elsewhere {
-            let Some(path) = self.current().path.clone() else { return };
-            self.notice = Some(match crate::manager::deliver(&path, &text) {
-                Ok(()) => "Sent: the piccosta running this session takes it in after its current step.".into(),
-                Err(error) => format!("Couldn't leave the message: {error}"),
-            });
-            return;
+        // A message for a session another piccosta runs (the manager, say), or that a lane's run is
+        // starting in, goes to its inbox, which that piccosta takes in (manager::send), looked at
+        // afresh, not from the last scan; when nothing runs it, the session opens here and answers
+        // it, as does one shown from its file.
+        if self.current().live.is_none()
+            && let Some(path) = self.current().path.clone().filter(|path| path.exists())
+        {
+            let sent = crate::manager::send(&path, &text, None);
+            if !matches!(sent, Ok(crate::manager::Sent::Free)) {
+                self.notice = Some(match sent {
+                    Err(error) => format!("Couldn't leave the message: {error}"),
+                    Ok(_) => "Sent: the piccosta running this session takes it in after its current step.".into(),
+                });
+                return;
+            }
+            self.focused().elsewhere = false;
         }
         if !self.ensure_open() {
             self.focused().draft.insert(&text);
@@ -1196,6 +1244,22 @@ impl App {
     fn scan_agents(&mut self) {
         self.scans += 1;
         let locks_due = self.scans.is_multiple_of(LOCK_SCAN_EVERY);
+        // Sessions closed or deleted elsewhere (a manager's `sessions close`, another piccosta's
+        // delete) leave the list as /close takes them, unless one holds a draft or runs here: that
+        // one stays where it is, marked, until it's sent or cleared.
+        let closed = crate::session::closed_sessions(&self.host.agent_dir);
+        for index in 0..self.slots.len() {
+            let slot = &mut self.slots[index];
+            let Some(path) = slot.path.clone() else { continue };
+            let exists = path.exists();
+            let closed_since = closed.get(&path).is_some_and(|time| slot.closed || self.closed.get(&path) != Some(time));
+            slot.closed = (slot.saved && !exists) || closed_since;
+            slot.saved |= exists;
+            if slot.closed && !slot.busy() && slot.draft.text.is_empty() && self.close(index) {
+                self.slots[index].path = None;
+            }
+        }
+        self.closed = closed;
         for index in 0..self.slots.len() {
             let slot = &mut self.slots[index];
             // Messages other piccostas left for a session open here: queued while it runs, else
@@ -1212,7 +1276,7 @@ impl App {
             }
             let shown = self.panes.iter().any(|pane| pane.slot == index);
             if slot.live.is_none() && (locks_due || shown) {
-                slot.elsewhere = slot.path.as_deref().is_some_and(crate::session::held_elsewhere);
+                slot.elsewhere = slot.path.as_deref().is_some_and(crate::manager::busy);
                 let modified = slot.path.as_deref().and_then(|path| path.metadata().ok()?.modified().ok());
                 if !slot.elsewhere {
                     slot.working_elsewhere = false;
@@ -1335,11 +1399,12 @@ impl App {
             self.notice = Some(format!("“{}” is running; esc stops it, then it can go.", render::fit(&self.slots[slot].title, 60)));
             return false;
         }
-        let next = self.listed().into_iter().find(|&index| index != slot && self.slots[index].live.is_some()).or_else(|| self.new_session());
+        // Another session to show, needed only when every pane shows this one.
+        let showing: Vec<usize> = (0..self.panes.len()).rev().filter(|&pane| self.panes[pane].slot == slot).collect();
+        let next = if showing.len() < self.panes.len() { None } else { self.listed().into_iter().find(|&index| index != slot && self.slots[index].live.is_some()).or_else(|| self.new_session()) };
         // A fresh view, so opening it again doesn't show its messages twice; never saved, it's gone.
         let path = self.slots[slot].path.clone().filter(|path| path.exists());
         self.slots[slot] = Slot::new(path, self.slots[slot].title.clone());
-        let showing: Vec<usize> = (0..self.panes.len()).rev().filter(|&pane| self.panes[pane].slot == slot).collect();
         for pane in showing {
             if self.panes.len() > 1 {
                 self.panes.remove(pane);
@@ -1780,6 +1845,7 @@ impl App {
                 State::Running => (render::SPINNER[self.frame % render::SPINNER.len()], theme::ACCENT),
                 State::Retrying(_) => ("↻", theme::USER),
                 State::Compacting => ("◐", theme::ACCENT),
+                State::Idle if slot.closed => ("×", theme::DIM),
                 State::Idle if slot.elsewhere && slot.working_elsewhere => (render::SPINNER[self.frame % render::SPINNER.len()], theme::ACCENT),
                 State::Idle if slot.elsewhere => ("◎", theme::ACCENT),
                 State::Idle if slot.unread => ("●", theme::OK),

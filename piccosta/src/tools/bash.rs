@@ -57,7 +57,7 @@ const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 // Print mode closes Claude before killing its shells. Claude's two CLOSE_GRACE waits can take
 // four seconds (provider/claude/mod.rs); leave another second for shell cleanup and scheduling.
-pub(super) const SUBAGENT_STOP_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const SUBAGENT_STOP_GRACE: Duration = Duration::from_secs(5);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 // The environment variables that describe the session to commands (bash.ts:186-212, under
 // piccosta's own names).

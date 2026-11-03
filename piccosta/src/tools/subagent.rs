@@ -199,7 +199,7 @@ pub const SESSION_ENV: &str = "PICCOSTA_SESSION_ID";
 const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
 // Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the
 // fields after the name's ')', which start at field 3.
-const STAT_STARTTIME_AFTER_NAME: usize = 22 - 3;
+pub(crate) const STAT_STARTTIME_AFTER_NAME: usize = 22 - 3;
 
 // A piccosta run a session's tools started: a subagent job, or `piccosta -p` run by hand.
 pub struct RunningAgent {

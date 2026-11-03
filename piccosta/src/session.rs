@@ -643,6 +643,18 @@ impl Session {
         }
     }
 
+    // Let the file go for another piccosta to run the session (its clones' claim goes too), or take
+    // it back. Output of reclaim: false when another took it meanwhile.
+    pub fn release(&self) {
+        if let Some(file) = &self.lock {
+            let _ = file.unlock();
+        }
+    }
+
+    pub fn reclaim(&self) -> bool {
+        self.lock.as_ref().is_none_or(|file| file.try_lock().is_ok())
+    }
+
     // The header and every entry as file text. Unknown entries are written back as they were read.
     fn whole_file_text(&self) -> String {
         let mut text = String::new();

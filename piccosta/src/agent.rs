@@ -155,9 +155,10 @@ pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>) -> std::p
 
 // A session's controls for whoever drives it while it runs: abort the current run, and queue
 // messages for it. Steering goes in after the current turn's tool calls, a follow-up when the
-// model would otherwise stop (pi's steer and followUp, each one at a time by default).
+// model would otherwise stop (pi's steer and followUp, each one at a time by default). The Notify
+// wakes print mode's wait for background jobs when a message is queued.
 #[derive(Clone, Default)]
-pub struct Handle(Arc<std::sync::Mutex<Inbox>>);
+pub struct Handle(Arc<(std::sync::Mutex<Inbox>, tokio::sync::Notify)>);
 
 #[derive(Default)]
 struct Inbox {
@@ -185,10 +186,12 @@ impl Handle {
 
     pub fn steer(&self, text: String) {
         self.lock().steer.push(text);
+        self.0.1.notify_one();
     }
 
     pub fn follow_up(&self, text: String) {
         self.lock().follow_up.push(text);
+        self.0.1.notify_one();
     }
 
     pub fn set_steering_mode(&self, mode: &str) {
@@ -212,7 +215,7 @@ impl Handle {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -665,25 +668,15 @@ impl Agent {
             }
             // What the user queued that no turn took (follow-ups, and steering that came after
             // the last turn) starts the next run.
-            let queued = {
-                let mut inbox = self.handle.lock();
-                if inbox.steer.is_empty() {
-                    let all = inbox.follow_up_all;
-                    dequeue(&mut inbox.follow_up, all)
-                } else {
-                    let all = inbox.steering_all;
-                    dequeue(&mut inbox.steer, all)
-                }
-            };
+            let queued = self.take_queued();
             if !queued.is_empty() {
-                self.announce_queue();
-                starting.extend(queued.iter().map(|text| user_message(text)));
+                starting.extend(queued);
                 continue;
             }
             if self.config.hold_for_jobs && self.config.tool_shared.jobs.running_count() > 0 {
                 match self.wait_for_job().await {
-                    Some(notice) => {
-                        starting.push(AgentMessage::Custom(notice));
+                    Some(messages) => {
+                        starting.extend(messages);
                         continue;
                     }
                     None => {
@@ -698,16 +691,43 @@ impl Agent {
         Ok(())
     }
 
+    // The next of what's queued (steering first, then follow-ups), as user messages, and said.
+    fn take_queued(&mut self) -> Vec<AgentMessage> {
+        let queued = {
+            let mut inbox = self.handle.lock();
+            if inbox.steer.is_empty() {
+                let all = inbox.follow_up_all;
+                dequeue(&mut inbox.follow_up, all)
+            } else {
+                let all = inbox.steering_all;
+                dequeue(&mut inbox.steer, all)
+            }
+        };
+        if !queued.is_empty() {
+            self.announce_queue();
+        }
+        queued.iter().map(|text| user_message(text)).collect()
+    }
+
     // Print and json mode with a job still running after the model's last turn: wait for its
-    // finish message (longcmd.ts:533-554). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs
-    // are killed and their messages say why.
-    async fn wait_for_job(&mut self) -> Option<CustomMessage> {
-        let jobs = &self.config.tool_shared.jobs;
+    // finish message (longcmd.ts:533-554), or a message queued meanwhile (another piccosta's, from
+    // the session's inbox). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs are killed and
+    // their messages say why. Output: what starts the next turn, None when the wait was stopped.
+    async fn wait_for_job(&mut self) -> Option<Vec<AgentMessage>> {
+        let shared = self.config.tool_shared.clone();
+        let jobs = &shared.jobs;
         let cap = jobs.hold.map(|hold| tokio::time::Instant::now() + hold);
         let mut killed = false;
+        let handle = self.handle.clone();
         loop {
             tokio::select! {
-                notice = self.config.notices.recv() => return notice,
+                notice = self.config.notices.recv() => return notice.map(|notice| vec![AgentMessage::Custom(notice)]),
+                () = handle.0.1.notified() => {
+                    let queued = self.take_queued();
+                    if !queued.is_empty() {
+                        return Some(queued);
+                    }
+                }
                 () = self.cancel.cancelled() => return None,
                 () = tokio::time::sleep_until(cap.unwrap_or_else(tokio::time::Instant::now)), if cap.is_some() && !killed => {
                     killed = true;
