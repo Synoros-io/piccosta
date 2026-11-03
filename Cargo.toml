@@ -67,6 +67,9 @@ ratex-layout = "0.1.15"
 ratex-types = "0.1.15"
 ratex-render = { version = "0.1.15", features = ["embed-fonts"] }
 term-maths = "1"
+# The computer tool's accessibility tree: AT-SPI is D-Bus, and zbus speaks it in pure Rust on
+# tokio, without libdbus.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # The everyday build (`cargo build --release`), made to rebuild quickly: piccosta is one large crate,
 # and thin LTO with one codegen unit spent about two minutes on every change. What it runs is

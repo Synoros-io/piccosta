@@ -10,6 +10,7 @@
 // and longcmd and path hints into bash.
 
 pub mod bash;
+pub mod computer;
 pub mod edit;
 pub mod editfix;
 pub mod image;
@@ -69,6 +70,11 @@ pub trait Tool: Send + Sync {
     fn prepare_arguments(&self, arguments: Map<String, Value>) -> Map<String, Value> {
         arguments
     }
+    // A question the user has to answer yes to before this call runs, whatever the frontend's
+    // approval mode; with nobody to ask (print mode, a subagent), the call is refused (agent.rs).
+    fn approval(&self, _arguments: &Map<String, Value>) -> Option<&'static str> {
+        None
+    }
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a>;
 }
 
@@ -87,9 +93,14 @@ pub struct ToolShared {
     pub bin_dir: PathBuf,
     // The web tools' client, settings and stored results.
     pub web: web::WebShared,
+    // The computer tool's hidden desktop.
+    pub computer: computer::Settings,
     // Whether bash runs in the read-only sandbox: a session for a read-only kind, a read-only job's
     // subagent among them (host.rs).
     pub read_only: bool,
+    // Whether the session is of the visual kind, whose bash commands then run on the hidden
+    // desktop (host.rs, bash.rs).
+    pub visual: bool,
 }
 
 impl ToolShared {
@@ -113,7 +124,9 @@ impl ToolShared {
             shell_command_prefix: settings.shell_command_prefix(),
             bin_dir: agent_dir.join("bin"),
             web: web::WebShared::new(settings.web(), agent_dir, registry, credentials),
+            computer: computer::Settings::new(settings),
             read_only: false,
+            visual: false,
         }
     }
 }
@@ -135,9 +148,10 @@ pub struct ToolContext {
     pub shared: Arc<ToolShared>,
 }
 
-// The built-in tools, in the order pi lists them, then the web tools.
+// The built-in tools, in the order pi lists them, then the web tools and the computer.
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(read::ReadTool), Arc::new(bash::BashTool), Arc::new(edit::EditTool), Arc::new(write::WriteTool)];
     tools.extend(web::tools());
+    tools.push(Arc::new(computer::ComputerTool));
     tools
 }

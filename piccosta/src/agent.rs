@@ -148,10 +148,12 @@ pub enum Event {
 
 pub type EventSink = Box<dyn FnMut(&Event) + Send>;
 
-// Asked before each tool call runs, with the tool's name and arguments: Ok to run it, or the
-// reason it was refused, which becomes the call's error result. A frontend that asks the user
-// sets one (rpc mode for T3 Code's approvals); without one every call runs.
-pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>>;
+// Asked before each tool call runs, with the tool's name and arguments and the question the tool
+// needs the user's yes to, if any (Tool::approval), which the gate asks whatever its mode: Ok to
+// run it, or the reason it was refused, which becomes the call's error result. A frontend that
+// asks the user sets one (rpc mode for T3 Code's approvals); without one every call runs but
+// those with a question.
+pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>, Option<&'static str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>>;
 
 // A session's controls for whoever drives it while it runs: abort the current run, and queue
 // messages for it. Steering goes in after the current turn's tool calls, a follow-up when the
@@ -1269,11 +1271,15 @@ impl Agent {
                     .and_then(|validated| if self.cancel.is_cancelled() { Err("Operation aborted".to_string()) } else { Ok((tool, validated)) }),
             };
             // The gate's answer for a call that passed the checks; an abort while it waits is an
-            // abort.
+            // abort. A call that needs the user's yes, with no gate to ask, is refused.
             let checked = match (checked, self.config.gate.clone()) {
                 (Ok((tool, validated)), Some(gate)) => tokio::select! {
-                    allowed = gate(id.clone(), name.clone(), validated.clone()) => allowed.map(|()| (tool, validated)),
+                    allowed = gate(id.clone(), name.clone(), validated.clone(), tool.approval(&validated)) => allowed.map(|()| (tool, validated)),
                     () = self.cancel.cancelled() => Err("Operation aborted".to_string()),
+                },
+                (Ok((tool, validated)), None) => match tool.approval(&validated) {
+                    Some(question) => Err(format!("This call needs the user's yes (\"{question}\"), and nobody can answer here (print mode or a subagent). Ask the user to run it in the terminal UI or an editor.")),
+                    None => Ok((tool, validated)),
                 },
                 (checked, _) => checked,
             };

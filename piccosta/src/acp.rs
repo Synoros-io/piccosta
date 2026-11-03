@@ -101,8 +101,8 @@ enum Input {
     // From a session's task, keyed by its session id and which start of it this was.
     Event(String, u64, Box<Event>),
     Done(String, u64, Box<Done>),
-    // A tool call waiting for the user's yes.
-    Ask { session: String, serial: u64, call_id: String, reply: oneshot::Sender<Answer> },
+    // A tool call waiting for the user's yes, with the tool's own question if it has one.
+    Ask { session: String, serial: u64, call_id: String, question: Option<&'static str>, reply: oneshot::Sender<Answer> },
     // A cancelled prompt's time to stop is up; the number is which prompt of the session it was.
     CancelDeadline(String, u64, u64),
 }
@@ -247,7 +247,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             Some(Input::Line(line)) => acp.line(&line).await,
             Some(Input::Event(session, serial, event)) if acp.current(&session, serial) => acp.event(&session, *event),
             Some(Input::Done(session, serial, done)) if acp.current(&session, serial) => acp.done(&session, *done),
-            Some(Input::Ask { session, serial, call_id, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, reply),
+            Some(Input::Ask { session, serial, call_id, question, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, question, reply),
             Some(Input::CancelDeadline(session, serial, prompt)) if acp.current(&session, serial) => acp.cancel_deadline(&session, prompt),
             Some(Input::Closed) | None => break 0,
             _ => {}
@@ -478,20 +478,25 @@ impl Acp {
         let _ = reply.send(answer);
     }
 
-    // Ask the client about a tool call it already shows.
-    fn ask(&mut self, session: String, call_id: String, reply: oneshot::Sender<Answer>) {
+    // Ask the client about a tool call it already shows. A tool's own question heads the card, and
+    // its "always" says it covers that question for the rest of the session.
+    fn ask(&mut self, session: String, call_id: String, question: Option<&'static str>, reply: oneshot::Sender<Answer>) {
         let Some(call) = self.sessions.get(&session).and_then(|live| live.open.get(&call_id)) else {
             let _ = reply.send(Answer::No);
             return;
         };
         let id = self.next_request;
         self.next_request += 1;
+        let (always, title) = match question {
+            Some(question) => (format!("Allow every {} call that asks this, until the session closes", call.name), format!("{question} ({})", title(&call.name, &call.arguments))),
+            None => (format!("Always allow {}", call.name), title(&call.name, &call.arguments)),
+        };
         let options = json!([
             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
-            {"optionId": "allow-always", "name": format!("Always allow {}", call.name), "kind": "allow_always"},
+            {"optionId": "allow-always", "name": always, "kind": "allow_always"},
             {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
         ]);
-        let tool_call = json!({"toolCallId": call_id, "title": title(&call.name, &call.arguments), "kind": kind(&call.name)});
+        let tool_call = json!({"toolCallId": call_id, "title": title, "kind": kind(&call.name)});
         write_line(&json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {"sessionId": session, "toolCall": tool_call, "options": options}}));
         self.asks.insert(id, (session, call_id, reply));
     }
@@ -803,19 +808,21 @@ impl Acp {
 }
 
 // The gate a session's tool calls pass: through at once when the mode doesn't ask about the tool
-// or the user said "always" for it, else after the client's yes.
+// or the user said "always" for it, else after the client's yes. A call with a question for the
+// user (Tool::approval) is asked in every mode, and its "always" holds for that question only.
 fn gate(inputs: UnboundedSender<Input>, session: String, serial: u64, mode: Rc<Cell<Mode>>, always: Rc<RefCell<HashSet<String>>>) -> Gate {
-    Rc::new(move |call_id: String, name: String, _arguments: Map<String, Value>| {
+    Rc::new(move |call_id: String, name: String, _arguments: Map<String, Value>, question: Option<&'static str>| {
         let (inputs, session, mode, always) = (inputs.clone(), session.clone(), mode.clone(), always.clone());
         Box::pin(async move {
-            if !needs_approval(mode.get(), &name) || always.borrow().contains(&name) {
+            let key = question.map_or_else(|| name.clone(), str::to_string);
+            if (question.is_none() && !needs_approval(mode.get(), &name)) || always.borrow().contains(&key) {
                 return Ok(());
             }
             let (reply, answer) = oneshot::channel();
-            let _ = inputs.send(Input::Ask { session, serial, call_id, reply });
+            let _ = inputs.send(Input::Ask { session, serial, call_id, question, reply });
             match answer.await {
                 Ok(Answer::Always) => {
-                    always.borrow_mut().insert(name);
+                    always.borrow_mut().insert(key);
                     Ok(())
                 }
                 Ok(Answer::Once) => Ok(()),
@@ -934,6 +941,7 @@ fn title(tool: &str, arguments: &Map<String, Value>) -> String {
         "write" => format!("Write {}", get("path")),
         "web_search" => format!("Search: {}", first(get("query"))),
         "fetch_content" => format!("Fetch {}", get("url")),
+        "computer" => format!("Computer: {} on the {} desktop", get("action"), arguments.get("desktop").and_then(Value::as_str).unwrap_or("hidden")),
         // A subagent runs with its job's own tools and asks nothing, so the card says which.
         "subagent" => format!("{} ({}): {}", get("agent"), crate::tools::subagent::tools_of(get("agent")), first(get("task"))),
         _ => tool.to_string(),

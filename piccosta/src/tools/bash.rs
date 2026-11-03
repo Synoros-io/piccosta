@@ -286,7 +286,7 @@ pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Resu
 }
 
 // Start the shell. Output: its pid and the read end of the one pipe its stdout and stderr share.
-fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), String> {
+fn spawn(command: &str, context: &ToolContext, desktop: Option<&super::computer::Desktop>) -> Result<(u32, Arc<Receiver>), String> {
     use std::os::unix::process::CommandExt;
     let shell = shell_path(context.shared.shell_path.as_deref())?;
     let (reader, writer) = std::io::pipe().map_err(|error| format!("pipe: {error}"))?;
@@ -310,6 +310,9 @@ fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), S
         process.env("PI_SESSION_FILE", file);
     }
     process.env("PI_PROVIDER", &context.provider).env("PI_MODEL", &context.model_id).env("PI_REASONING_LEVEL", &context.thinking_level);
+    if let Some(desktop) = desktop {
+        desktop.hide(&mut process);
+    }
 
     // Its own session, as Node's detached spawn does: a process group we can kill as one, and no
     // controlling terminal, so nothing it runs can grab the TUI's keyboard. A read-only job's
@@ -513,7 +516,14 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     if !context.cwd.exists() {
         return Err(format!("Working directory does not exist: {}\nCannot execute bash commands.", context.cwd.display()));
     }
-    let (pid, pipe) = spawn(&command, context)?;
+    // A visual session runs the model's commands on the hidden desktop, claimed first so it's one
+    // piccosta started and no other session's close stops it under them (computer.rs,
+    // Desktop::hide). Commands piccosta builds (a subagent's child) keep this one's environment.
+    let desktop = match shared.visual && !arguments.own {
+        true => Some(shared.computer.claim().await?),
+        false => None,
+    };
+    let (pid, pipe) = spawn(&command, context, desktop.as_ref())?;
     running().push(Running { pid, own: arguments.own, kill_at: None, pipe: pipe.clone(), handed: false });
     super::reaper::track(pid, true);
     let started = Instant::now();

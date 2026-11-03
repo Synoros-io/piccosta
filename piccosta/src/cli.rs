@@ -37,7 +37,8 @@ pub struct Args {
     pub append_prompt: Vec<String>,
     // --yolo (Claude Code's --dangerously-skip-permissions, Codex's
     // --dangerously-bypass-approvals-and-sandbox): run every tool without asking, even where a
-    // frontend asks for approvals. The terminal never asks, as in pi.
+    // frontend asks for approvals. The terminal never asks, as in pi, but a tool's own question
+    // (the computer tool's main desktop), which every frontend asks in every mode.
     pub yolo: bool,
     // --restore: the terminal UI as it was when it last closed, whatever else the line asks for
     // (what /restart starts it again with).
@@ -223,7 +224,8 @@ Options:
   -nc, --no-context-files     Leave AGENTS.md and CLAUDE.md out
   --yolo                 Run every tool without asking, even in Zed's Ask mode or T3 Code's
                          Supervised (also --dangerously-skip-permissions,
-                         --dangerously-bypass-approvals-and-sandbox); the terminal never asks
+                         --dangerously-bypass-approvals-and-sandbox); the terminal asks only
+                         what a tool must (the computer tool's main desktop)
   -h, --help             This help
   -v, --version          The version
 ";

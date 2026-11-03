@@ -38,3 +38,4 @@ ratex-layout.workspace = true
 ratex-types.workspace = true
 ratex-render.workspace = true
 term-maths.workspace = true
+zbus.workspace = true

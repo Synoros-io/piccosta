@@ -153,11 +153,7 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     // On disk at once: the loop answers get_entries from the file, and T3 Code passes the path to
     // other processes before the first prompt.
     agent.session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
-    if !host.yolo
-        && let Some(gate) = approval_gate(inputs)
-    {
-        agent.set_gate(gate);
-    }
+    agent.set_gate(approval_gate(inputs, host.yolo));
     let (commands, receiver) = unbounded_channel();
     let reports = inputs.clone();
     let mut live = Live {
@@ -185,30 +181,31 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     Ok(live)
 }
 
-// The approval gate T3 Code's runtime mode asks for, or None in full access (or outside T3 Code).
-fn approval_gate(inputs: &UnboundedSender<Input>) -> Option<Gate> {
-    let mode = std::env::var(RUNTIME_MODE_ENV).ok()?;
-    if mode == "full-access" {
-        return None;
-    }
-    let edits_free = mode == "auto-accept-edits";
+// The approval gate T3 Code's runtime mode asks for. It lets everything through in full access,
+// outside T3 Code and with --yolo, except a call whose tool has a question for the user, which it
+// always asks.
+fn approval_gate(inputs: &UnboundedSender<Input>, yolo: bool) -> Gate {
+    let mode = std::env::var(RUNTIME_MODE_ENV).ok().filter(|mode| mode != "full-access" && !yolo);
+    let edits_free = mode.as_deref() == Some("auto-accept-edits");
     let inputs = inputs.clone();
-    Some(std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>| {
-        let inputs = inputs.clone();
+    std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>, question: Option<&'static str>| {
+        let (inputs, asks) = (inputs.clone(), mode.is_some());
         Box::pin(async move {
-            if APPROVAL_FREE.contains(&name.as_str()) || (edits_free && matches!(name.as_str(), "edit" | "write")) {
+            let free = !asks || APPROVAL_FREE.contains(&name.as_str()) || (edits_free && matches!(name.as_str(), "edit" | "write"));
+            if free && question.is_none() {
                 return Ok(());
             }
             let arguments = Value::Object(arguments).to_string();
             let message: String = arguments.chars().take(APPROVAL_ARGUMENT_CHARS).collect();
             let (reply, answer) = tokio::sync::oneshot::channel();
-            let _ = inputs.send(Input::Ask { title: format!("Allow {name}?"), message, reply });
+            let title = question.map_or_else(|| format!("Allow {name}?"), str::to_string);
+            let _ = inputs.send(Input::Ask { title, message, reply });
             match answer.await {
                 Ok(true) => Ok(()),
                 _ => Err(format!("{name} was declined in T3 Code.")),
             }
         })
-    }))
+    })
 }
 
 pub(crate) fn write_line(value: &Value) {

@@ -92,11 +92,14 @@
       "instructions": "You are a testing subagent. Another agent gave you something to check. Run the real thing first, and write a test only where the task asks for one. Report every result as it came out, failures word for word, and say what you didn't run."
     },
     "visual": {
-      "for": "visual work: images, screenshots, layouts and anything judged by eye",
+      "for": "visual work: images, screenshots, layouts, anything judged by eye, and using a computer",
       "models": [
         "openai-codex/gpt-6.1-terra:xhigh"
       ],
-      "instructions": "You are a visual subagent. Another agent gave you images, screenshots or a layout to judge or to make. Look at the real thing, not a description of it, and say what you see in plain terms: what's where and what's wrong, with exact positions, sizes or colors when they matter."
+      "owns": [
+        "computer"
+      ],
+      "instructions": "You are a visual subagent. Another agent gave you images, screenshots or a layout to judge or to make, or something to do on a computer. Look at the real thing, not a description of it, and say what you see in plain terms: what's where and what's wrong, with exact positions, sizes or colors when they matter. The computer tool works on a hidden desktop of your own: open apps there with its open action, look after every step, and say what you did and what the screen showed at the end."
     },
     "prose": {
       "for": "writing prose: READMEs, docs, explanations and messages people read",

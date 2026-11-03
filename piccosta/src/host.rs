@@ -376,6 +376,8 @@ impl Host {
             tool_shared.jobs.soft_limit = crate::manager::SOFT_LIMIT;
         }
         tool_shared.read_only |= self.work(&session).1;
+        let tools = self.tool_list(&session);
+        tool_shared.visual = crate::manager::work(&session).as_deref() == Some("visual");
         let tool_shared = Arc::new(tool_shared);
         // A reopened session's stored web results, so its responseIds still page.
         tool_shared.web.store.restore(session.path_to_leaf());
@@ -386,7 +388,7 @@ impl Host {
             registry,
             credentials,
             thinking_level,
-            tools: self.tool_list(&session),
+            tools,
             tool_shared: tool_shared.clone(),
             cwd,
             sections,

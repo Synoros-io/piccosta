@@ -83,7 +83,15 @@ const AGENT_SCAN: Duration = Duration::from_secs(2);
 enum Update {
     Event(Box<Event>),
     Done(Box<Done>),
+    // A tool's question for the user (Tool::approval), with the call's tool and action, answered
+    // with one of ANSWERS.
+    Ask(&'static str, String, tokio::sync::oneshot::Sender<&'static str>),
 }
+
+// The answers to a tool's question: yes this once, yes for the rest of the session, no.
+const ANSWERS: [&str; 3] = ["allow once", "allow for this session", "refuse"];
+// How much of the asking session's title a question's picker shows.
+const ASKER_CHARS: usize = 30;
 
 #[derive(PartialEq)]
 enum State {
@@ -288,6 +296,8 @@ struct App {
     last_click: Option<(Instant, Position, u8)>,
     quit: bool,
     picker: Option<Picker>,
+    // Questions waiting for the picker in use to close.
+    asks: std::collections::VecDeque<Picker>,
     // The prompts /rewind offered: each one's parent entry and its text.
     rewind: Vec<(Option<String>, String)>,
     history: Vec<String>,
@@ -315,7 +325,7 @@ fn id_of(path: &Path) -> String {
 
 // A list to choose from, filtered by what's typed.
 struct Picker {
-    title: &'static str,
+    title: String,
     items: Vec<String>,
     filter: String,
     selected: usize,
@@ -326,6 +336,9 @@ struct Picker {
     // In a picker of directories, the directory typed paths start from: what's typed can then be
     // the choice itself (a path, or anything when no item matches).
     free: Option<PathBuf>,
+    // A tool's question: where its answer goes. Closed without one, the sender drops and the
+    // call is refused.
+    answer: Option<tokio::sync::oneshot::Sender<&'static str>>,
 }
 
 impl Picker {
@@ -418,6 +431,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         last_click: None,
         quit: false,
         picker: None,
+        asks: Default::default(),
         rewind: Vec::new(),
         history: Vec::new(),
         sidebar_rows: Vec::new(),
@@ -815,7 +829,27 @@ impl App {
             let _ = sender.send((slot, Update::Event(Box::new(event.clone()))));
         });
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
-        let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
+        let (mut agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
+        // The terminal asks nothing but a tool's own question; "for this session" holds for that
+        // question until the session closes.
+        let (asks, allowed) = (self.sender.clone(), std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())));
+        agent.set_gate(std::rc::Rc::new(move |_: String, name: String, arguments: serde_json::Map<String, Value>, question: Option<&'static str>| {
+            let (asks, allowed) = (asks.clone(), allowed.clone());
+            Box::pin(async move {
+                let Some(question) = question.filter(|question| !allowed.borrow().contains(question)) else { return Ok(()) };
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let action = arguments.get("action").and_then(Value::as_str).map_or(name.clone(), |action| format!("{name} {action}"));
+                let _ = asks.send((slot, Update::Ask(question, action, reply)));
+                match answer.await {
+                    Ok(answer) if answer == ANSWERS[0] => Ok(()),
+                    Ok(answer) if answer == ANSWERS[1] => {
+                        allowed.borrow_mut().insert(question);
+                        Ok(())
+                    }
+                    _ => Err("The user refused.".to_string()),
+                }
+            })
+        }));
         let view = &mut self.slots[slot];
         view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
         view.manager = crate::manager::role(&agent.session).is_some();
@@ -1055,7 +1089,7 @@ impl App {
 
     // Choose from a list; an argument that matches one item picks it at once.
     fn pick(&mut self, title: &'static str, items: Vec<String>, filter: &str, apply: fn(&mut App, String)) {
-        let picker = Picker { title, items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None };
+        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None };
         let shown = picker.shown();
         if !filter.is_empty() && (shown.len() == 1 || shown.iter().any(|item| item.as_str() == filter)) {
             let choice = shown.iter().find(|item| item.as_str() == filter).unwrap_or(&shown[0]).to_string();
@@ -1312,6 +1346,17 @@ impl App {
         let visible = self.panes.iter().any(|pane| pane.slot == slot);
         let view = &mut self.slots[slot];
         match update {
+            // Shown at once unless a list is open, which it waits for. Its title says which session
+            // asks and for what, since it may not be the one on screen.
+            Update::Ask(question, action, reply) => {
+                let items = ANSWERS.map(str::to_string).to_vec();
+                let title = format!("{} · {action} · {question}", render::fit(&view.title, ASKER_CHARS));
+                let picker = Picker { title, items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(reply) };
+                match self.picker {
+                    None => self.picker = Some(picker),
+                    Some(_) => self.asks.push_back(picker),
+                }
+            }
             Update::Done(done) => {
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
@@ -1451,6 +1496,7 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if self.picker.is_some() {
             self.picker_key(key);
+            self.picker = self.picker.take().or_else(|| self.asks.pop_front());
             return;
         }
         if !(control && matches!(key.code, KeyCode::Char('c' | 'd'))) {
@@ -1639,10 +1685,14 @@ impl App {
                 picker.selected = 0;
             }
             KeyCode::Enter => {
-                let (choice, apply) = (picker.chosen(), picker.apply);
+                let (choice, apply, answer) = (picker.chosen(), picker.apply, picker.answer.take());
                 self.picker = None;
-                if let Some(choice) = choice {
-                    apply(self, choice);
+                match (choice, answer) {
+                    (Some(choice), Some(answer)) => {
+                        let _ = answer.send(ANSWERS.into_iter().find(|offered| *offered == choice).unwrap_or(ANSWERS[2]));
+                    }
+                    (Some(choice), None) => apply(self, choice),
+                    _ => {}
                 }
             }
             _ => {}
@@ -1922,11 +1972,11 @@ impl App {
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
         let Some(picker) = &self.picker else { return };
         let shown = picker.shown();
-        let width = area.width.min(PICKER_MAX_WIDTH);
+        let width = area.width.min(PICKER_MAX_WIDTH.max(picker.title.chars().count() as u16 + 4));
         let height = (shown.len() as u16 + 3).min(area.height.saturating_sub(4)).max(4);
         let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + area.height / 5, width, height };
         frame.render_widget(Clear, rect);
-        let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else { picker.title };
+        let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else { &picker.title };
         let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::ACCENT)).title(format!(" {title} "));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
