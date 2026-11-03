@@ -261,6 +261,10 @@ impl Matrix {
         self.cols
     }
 
+    pub fn data(&self) -> Data {
+        self.data
+    }
+
     // One row widened to f32: an embedding lookup.
     pub fn row(&self, index: usize) -> Vec<f32> {
         let mut out = vec![0f32; self.cols];

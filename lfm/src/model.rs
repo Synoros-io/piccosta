@@ -11,6 +11,9 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::{path::Path, time::Instant};
 
+#[cfg(feature = "gpu")]
+mod gpu;
+
 // torch's nn.LayerNorm default, which the audio projector is built with.
 const LAYER_NORM_EPS: f32 = 1e-5;
 // The downsampler's three stride-2 convolutions: a row of the encoder per eight spectrogram frames and mels
@@ -498,7 +501,7 @@ impl Sampler {
             logits.iter_mut().filter(|score| **score < threshold).for_each(|score| *score = f32::NEG_INFINITY);
         }
         softmax(&mut logits);
-        let mut target = ((self.next() >> 11) as f64 / (1u64 << 53) as f64) as f32;
+        let mut target = self.draw();
         for (code, &probability) in logits.iter().enumerate() {
             if target < probability {
                 return code as u32;
@@ -506,6 +509,11 @@ impl Sampler {
             target -= probability;
         }
         argmax(&logits)
+    }
+
+    // A uniform draw from [0, 1): the top 53 bits of the next number, as an f32.
+    fn draw(&mut self) -> f32 {
+        ((self.next() >> 11) as f64 / (1u64 << 53) as f64) as f32
     }
 }
 
@@ -532,6 +540,21 @@ pub enum Part {
     Audio(usize),
 }
 
+// What the language model reads next: the prompt's rows, a speech frame's codes, or a text token.
+enum Input {
+    Rows(Vec<f32>),
+    Frame(Vec<u32>),
+    Token(u32),
+}
+
+// Where a generation runs: on the CPU with its cache and the seconds spent in the depth decoder so far, or as a
+// session on the GPU.
+enum Decoder {
+    Cpu(Cache, f64),
+    #[cfg(feature = "gpu")]
+    Gpu(Box<gpu::Session>),
+}
+
 pub struct Model {
     pub tokenizer: Tokenizer,
     pub mel: MelSpectrogram,
@@ -548,6 +571,8 @@ pub struct Model {
     // the most rows a prompt may give the language model, text tokens and speech rows together; the caller's
     // resource budget, unlimited until it sets one
     pub max_prompt: usize,
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu::Gpu>,
 }
 
 impl Model {
@@ -707,7 +732,27 @@ impl Model {
             tokenizer,
             generation,
             max_prompt: usize::MAX,
+            #[cfg(feature = "gpu")]
+            gpu: None,
         })
+    }
+
+    // Runs the language model and the depth decoder on `device`: the CPU, or a GPU when lfm is built with its gpu
+    // feature. The GPU gets every weight it reads now, by building a session once, so the first step doesn't wait.
+    pub fn set_device(&mut self, device: &str) -> Result<()> {
+        match device {
+            "cpu" => Ok(()),
+            #[cfg(feature = "gpu")]
+            "gpu" => {
+                let (start, gpu) = (Instant::now(), gpu::Gpu::new()?);
+                gpu.session(self, 1, 1, 1, &self.sampler(0))?;
+                note("weights on the GPU", start);
+                self.gpu = Some(gpu);
+                Ok(())
+            }
+            _ if cfg!(feature = "gpu") => Err(format!("{device} is not a device: cpu or gpu")),
+            _ => Err(format!("{device} is not a device: this lfm is built for the cpu only, without its gpu feature")),
+        }
     }
 
     // The checkpoint's speech sampling settings (generation_config.json), seeded.
@@ -740,7 +785,7 @@ impl Model {
         );
         let prompt = self.prompt(system, Part::Audio(audio.len() / self.lm.hidden), false);
         let suppress = [self.tokens.audio_start, self.tokens.mixed_start];
-        let reply = self.generate(self.embed(&prompt, &audio)?, false, &suppress, max_tokens, &mut self.sampler(0));
+        let reply = self.generate(self.embed(&prompt, &audio)?, false, &suppress, max_tokens, &mut self.sampler(0))?;
         Ok(self.tokenizer.decode(&reply.0))
     }
 
@@ -748,7 +793,7 @@ impl Model {
     // English using a female voice."), at most `max_frames` of them.
     pub fn speak(&self, text: &str, system: &str, max_frames: usize, sampler: &mut Sampler) -> Result<Vec<Vec<u32>>> {
         let prompt = self.prompt(system, Part::Text(text.to_string()), true);
-        Ok(self.generate(self.embed(&prompt, &[])?, true, &[self.tokens.mixed_start], max_frames, sampler).1)
+        Ok(self.generate(self.embed(&prompt, &[])?, true, &[self.tokens.mixed_start], max_frames, sampler)?.1)
     }
 
     // The ChatML turns of the checkpoint's chat template: <|startoftext|>, then <|im_start|>role\ncontent<|im_end|>\n
@@ -810,20 +855,27 @@ impl Model {
         suppress: &[u32],
         max_slots: usize,
         sampler: &mut Sampler,
-    ) -> (Vec<u32>, Vec<Vec<u32>>) {
-        let start = Instant::now();
+    ) -> Result<(Vec<u32>, Vec<Vec<u32>>)> {
+        let mut start = Instant::now();
         let (mut text, mut frames) = (Vec::new(), Vec::new());
-        let mut cache = self.lm.cache();
-        let mut x = prompt;
-        self.lm.forward(&mut x, &mut cache);
-        note(&format!("prompt of {} rows", x.len() / self.lm.hidden), start);
-        let (start, mut depth_time) = (Instant::now(), 0.0);
+        let banned: Vec<u32> = suppress.iter().chain([&self.tokens.audio, &self.tokens.audio_out]).copied().collect();
+        let rows = prompt.len() / self.lm.hidden;
+        let mut decoder = Decoder::Cpu(self.lm.cache(), 0.0);
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            let capacity = rows.checked_add(max_slots).ok_or("a prompt and a --max too long to count")?;
+            decoder = Decoder::Gpu(Box::new(gpu.session(self, rows, capacity, max_slots, sampler)?));
+        }
+        let (mut input, mut slots) = (Input::Rows(prompt), 0);
         for slot in 0..max_slots {
-            let hidden = &x[x.len() - self.lm.hidden..];
-            let next = if speaking {
-                let sampling = Instant::now();
-                let mut codes = self.depth.sample(hidden, &frames, sampler);
-                depth_time += sampling.elapsed().as_secs_f64();
+            slots = slot;
+            let picked = self.step(&mut decoder, input, speaking, &frames, sampler, &banned)?;
+            if slot == 0 {
+                note(&format!("prompt of {rows} rows and the first slot"), start);
+                start = Instant::now();
+            }
+            input = if speaking {
+                let mut codes = picked;
                 if codes.contains(&self.eos_code) {
                     // any end-of-audio code ends the speech, and the frame goes back in as all end-of-audio codes
                     speaking = false;
@@ -831,38 +883,71 @@ impl Model {
                 } else {
                     frames.push(codes.clone());
                 }
-                // a frame enters the language model as the sum of its codes' embeddings, each codebook with its
-                // own rows of one shared table
+                Input::Frame(codes)
+            } else {
+                let token = picked[0];
+                if self.stop.contains(&token) {
+                    break;
+                }
+                text.push(token);
+                speaking = token == self.tokens.audio_start;
+                Input::Token(token)
+            };
+        }
+        let depth = match decoder {
+            Decoder::Cpu(_, time) if !frames.is_empty() => format!(" ({time:.3} s of it in the depth decoder)"),
+            _ => String::new(),
+        };
+        let made = format!("{} text tokens and {} speech frames", text.len(), frames.len());
+        note(&format!("{made}, {slots} slots after the first{depth}"), start);
+        Ok((text, frames))
+    }
+
+    // One slot: reads `input` through the language model, then picks from its last row a speech frame's codes
+    // while `speaking`, else the likeliest text token that isn't `banned`.
+    fn step(
+        &self,
+        decoder: &mut Decoder,
+        input: Input,
+        speaking: bool,
+        frames: &[Vec<u32>],
+        sampler: &mut Sampler,
+        banned: &[u32],
+    ) -> Result<Vec<u32>> {
+        let (cache, depth_time) = match decoder {
+            Decoder::Cpu(cache, depth_time) => (cache, depth_time),
+            #[cfg(feature = "gpu")]
+            Decoder::Gpu(session) => {
+                let gpu = self.gpu.as_ref().ok_or("a GPU session without the GPU")?;
+                return gpu.step(session, &input, speaking, frames, sampler, banned);
+            }
+        };
+        let mut x = match input {
+            Input::Rows(rows) => rows,
+            // a frame enters the language model as the sum of its codes' embeddings, each codebook with its own
+            // rows of one shared table
+            Input::Frame(codes) => {
                 let mut sum = vec![0f32; self.lm.hidden];
                 for (codebook, &code) in codes.iter().enumerate() {
                     let row = self.codebook_embedding.row(codebook * self.codebook_size + code as usize);
                     sum.iter_mut().zip(row).for_each(|(s, e)| *s += e);
                 }
                 sum
-            } else {
-                // the output head is tied to the input embeddings
-                let mut logits = matmul(hidden, self.embeddings);
-                dump("logits.0", &logits);
-                for &token in suppress.iter().chain([&self.tokens.audio, &self.tokens.audio_out]) {
-                    logits[token as usize] = f32::NEG_INFINITY;
-                }
-                let token = argmax(&logits);
-                if self.stop.contains(&token) {
-                    break;
-                }
-                text.push(token);
-                speaking = token == self.tokens.audio_start;
-                self.embeddings.row(token as usize)
-            };
-            if slot + 1 == max_slots {
-                break;
             }
-            x = next;
-            self.lm.forward(&mut x, &mut cache);
+            Input::Token(token) => self.embeddings.row(token as usize),
+        };
+        self.lm.forward(&mut x, cache);
+        let hidden = &x[x.len() - self.lm.hidden..];
+        if speaking {
+            let sampling = Instant::now();
+            let codes = self.depth.sample(hidden, frames, sampler);
+            *depth_time += sampling.elapsed().as_secs_f64();
+            return Ok(codes);
         }
-        let depth =
-            if frames.is_empty() { String::new() } else { format!(" ({depth_time:.3} s of it in the depth decoder)") };
-        note(&format!("{} text tokens and {} speech frames{depth}", text.len(), frames.len()), start);
-        (text, frames)
+        // the output head is tied to the input embeddings
+        let mut logits = matmul(hidden, self.embeddings);
+        dump("logits.0", &logits);
+        banned.iter().for_each(|&token| logits[token as usize] = f32::NEG_INFINITY);
+        Ok(vec![argmax(&logits)])
     }
 }

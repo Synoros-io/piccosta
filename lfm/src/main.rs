@@ -21,6 +21,8 @@ options:
   --quant FORMAT  the language model's and depth decoder's weights: bf16 as in the checkpoint, q8, or q4 (the
                   language model's layers in 4 bits, the rest in 8), quantized once into model.q8.safetensors
                   or model.q4.safetensors beside the checkpoint (default: $LFM_QUANT, else bf16)
+  --device NAME   where the language model and depth decoder run: cpu, or gpu when lfm is built with its
+                  gpu feature (default: $LFM_DEVICE, else cpu)
   --system TEXT   the system prompt: the task, its language and the voice
   --max N         at most N text tokens (listen) or speech frames (speak, decode)
   --max-input N   refuse input over N bytes (default: $LFM_MAX_INPUT, else 64 MiB)
@@ -63,7 +65,7 @@ fn run() -> Result<()> {
     let command = args.next().unwrap_or_default();
     let mut model = std::env::var_os("LFM_MODEL_DIR").map(PathBuf::from);
     let setting = |name: &str| std::env::var(name).ok().map(|text| (name.to_string(), text));
-    let (mut threads, mut quant) = (setting("LFM_THREADS"), setting("LFM_QUANT"));
+    let (mut threads, mut quant, mut device) = (setting("LFM_THREADS"), setting("LFM_QUANT"), setting("LFM_DEVICE"));
     let mut limits = [setting("LFM_MAX_INPUT"), setting("LFM_MAX_AUDIO"), setting("LFM_MAX_PROMPT")];
     let (mut system, mut max, mut seed, mut output, mut greedy, mut rest) = (None, None, None, None, false, Vec::new());
     while let Some(arg) = args.next() {
@@ -73,6 +75,7 @@ fn run() -> Result<()> {
             "--model" => model = Some(PathBuf::from(value()?)),
             "--threads" => threads = Some((arg.clone(), value()?)),
             "--quant" => quant = Some((arg.clone(), value()?)),
+            "--device" => device = Some((arg.clone(), value()?)),
             "--max-input" => limits[0] = Some((arg.clone(), value()?)),
             "--max-audio" => limits[1] = Some((arg.clone(), value()?)),
             "--max-prompt" => limits[2] = Some((arg.clone(), value()?)),
@@ -107,6 +110,8 @@ fn run() -> Result<()> {
     let halved = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
     let threads = positive(threads, halved as u64)? as usize;
     let quant = quant.map_or(Ok(None), |(name, text)| Format::parse(&text).map_err(|e| format!("{name}: {e}")))?;
+    let (device_setting, device) = device.unwrap_or(("--device".into(), "cpu".into()));
+    let on_device = |model: &mut Model| model.set_device(&device).map_err(|e| format!("{device_setting}: {e}"));
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().map_err(|e| e.to_string())?;
     let directory = model.ok_or("no model: pass --model DIR or set LFM_MODEL_DIR")?;
     let start = Instant::now();
@@ -123,6 +128,7 @@ fn run() -> Result<()> {
             // SAFETY: see above
             let mut model = unsafe { Model::load(&directory, quant)? };
             model.max_prompt = max_prompt;
+            on_device(&mut model)?;
             note(&format!("loaded, {threads} threads"), start);
             if rate != model.mel.rate {
                 return Err(format!("the audio is {rate} Hz; resample it to {} Hz (ffmpeg -ar {0})", model.mel.rate));
@@ -136,6 +142,7 @@ fn run() -> Result<()> {
             // SAFETY: see above
             let (mut model, codec) = unsafe { (Model::load(&directory, quant)?, Codec::load(&directory)?) };
             model.max_prompt = max_prompt;
+            on_device(&mut model)?;
             note(&format!("loaded, {threads} threads"), start);
             let clock = || {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)

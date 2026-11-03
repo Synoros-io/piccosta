@@ -12,3 +12,9 @@ regex.workspace = true
 libc.workspace = true
 rayon.workspace = true
 matrixmultiply.workspace = true
+wgpu = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+# the language model and the depth decoder on a GPU (gpu.rs), chosen at run time with --device gpu
+gpu = ["dep:wgpu", "dep:bytemuck"]

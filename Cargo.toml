@@ -74,6 +74,10 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # and matrixmultiply's sgemm kernel, which picks AVX2 or AVX-512 at run time.
 rayon = "1"
 matrixmultiply = "0.3"
+# lfm's GPU backend (its `gpu` feature): WGSL compute kernels through Vulkan, Metal or DX12, with no
+# window, surface or GL backend. bytemuck is already in the tree through image.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
+bytemuck = "1"
 
 # lfm is arithmetic: built at opt-level 0 the model runs dozens of times slower than real time, so lfm and its
 # matrix kernel build optimized in the debug profile too. Nothing piccosta depends on changes or rebuilds.
@@ -83,6 +87,23 @@ debug-assertions = false
 overflow-checks = false
 
 [profile.dev.package.matrixmultiply]
+opt-level = 3
+
+# lfm's GPU backend records a few hundred dispatches every generation step, and built unoptimized, wgpu's
+# bookkeeping took about 5 ms of each. These crates are in lfm's tree alone, so nothing piccosta builds changes.
+[profile.dev.package.wgpu]
+opt-level = 3
+[profile.dev.package.wgpu-core]
+opt-level = 3
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+[profile.dev.package.wgpu-types]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.ash]
+opt-level = 3
+[profile.dev.package.gpu-allocator]
 opt-level = 3
 
 # The everyday build (`cargo build --release`), made to rebuild quickly: piccosta is one large crate,
