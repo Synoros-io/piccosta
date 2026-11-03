@@ -507,24 +507,17 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         partial_arguments: Default::default(),
         has_finish_reason: false,
     };
-    let result = tokio::select! {
-        result = run(request, &mut output, &mut building, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let result = super::abortable(request, run(request, &mut output, &mut building, &mut send)).await;
     if result.is_ok() {
         finish_blocks(&mut output, &mut building, &mut send);
     }
-    let failure = match result {
-        Err(message) => Some(message),
-        Ok(()) if output.stop_reason == StopReason::Aborted => Some("Request was aborted".to_string()),
-        Ok(()) if output.stop_reason == StopReason::Error => Some(output.error_message.clone().unwrap_or_else(|| "Provider returned an error stop reason".into())),
-        Ok(()) if !building.has_finish_reason || output.stop_reason == StopReason::Pending => Some("Stream ended without finish_reason".to_string()),
-        Ok(()) => None,
-    };
-    if let Some(message) = failure {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    }
+    let ended = result.and_then(|()| match output.stop_reason {
+        StopReason::Aborted => Err("Request was aborted".to_string()),
+        StopReason::Error => Err(output.error_message.clone().unwrap_or_else(|| "Provider returned an error stop reason".into())),
+        _ if !building.has_finish_reason || output.stop_reason == StopReason::Pending => Err("Stream ended without finish_reason".to_string()),
+        _ => Ok(()),
+    });
+    super::settle(request, &mut output, ended);
     output
 }
 

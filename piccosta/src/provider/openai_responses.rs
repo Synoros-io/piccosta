@@ -85,18 +85,10 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         let _ = events.send(event);
     };
     let mut state = StreamState::new(request.model, new_output(request.model, API));
-    let result = tokio::select! {
-        result = run(request, &mut state, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let result = super::abortable(request, run(request, &mut state, &mut send)).await;
     let mut output = state.output;
-    if let Err(message) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    } else if output.stop_reason == StopReason::Pending {
-        output.stop_reason = StopReason::Error;
-        output.error_message = Some("OpenAI Responses stream ended without a stop reason".to_string());
-    }
+    let ended = result.and_then(|()| if output.stop_reason == StopReason::Pending { Err("OpenAI Responses stream ended without a stop reason".to_string()) } else { Ok(()) });
+    super::settle(request, &mut output, ended);
     output
 }
 

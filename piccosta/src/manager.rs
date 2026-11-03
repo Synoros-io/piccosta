@@ -38,6 +38,7 @@
 
 use crate::host::{Command, Host};
 use crate::message::{AgentMessage, Content};
+use crate::proc::{Process, Stat};
 use crate::tools::{Tool, ToolContext, ToolFuture, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -136,8 +137,6 @@ const STARTED_FILE: &str = "started";
 // How long a lane's file has to stay still after a finished turn before the manager hears of it:
 // a pair's next turn, or a run's last writes, start within that.
 const TURN_SETTLE_SECONDS: u64 = 5;
-// How much of a session file's end is read for its last message: room for a long answer.
-const TAIL_BYTES: u64 = 1024 * 1024;
 // How much `ledger search` returns.
 const SEARCH_CHARS: usize = 12_000;
 const DAY_MS: i64 = 86_400_000;
@@ -542,13 +541,6 @@ fn session_id(file: &Path) -> String {
     file.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit('_').next()).unwrap_or_default().to_string()
 }
 
-// Whether a lane's run is still going: its process is there and is that session's run (a pid can
-// pass to another process once the run is gone, and a zombie has no command line).
-fn running(pid: u32, file: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|line| line.split(|byte| *byte == 0).any(|argument| argument == file.as_os_str().as_bytes()))
-}
-
 // Run a message in a session in a piccosta of its own (print mode), apart from whoever starts it:
 // in a session and process group of its own, so it carries on when the manager, its terminal or
 // its service stops (the service's unit has KillMode=process for this). What it prints goes to
@@ -556,25 +548,15 @@ fn running(pid: u32, file: &Path) -> bool {
 // (start_run). It's recorded as the session's run from the start, as it records itself only then.
 // Input: the inbox's lock, held by the caller. Output: its process id.
 fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<u32> {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
-    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
     fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
     let output = fs::File::create(log)?;
-    let mut command = std::process::Command::new(exe);
+    let mut command = std::process::Command::new(crate::proc::exe()?);
     command.arg("-p").arg("--session").arg(file).current_dir(cwd);
     // A lane's run is the manager's, not a command's, even when an agent's `sessions message`
     // starts it (which wakes a project manager's lane, or the manager itself).
     command.env_remove(crate::tools::subagent::SESSION_ENV);
     command.stdin(std::process::Stdio::null()).stdout(output.try_clone()?).stderr(output);
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
+    let mut child = crate::proc::own_session(&mut command).spawn()?;
     let pid = child.id();
     // Read before it can be reaped, so its pid is still its own.
     let _ = publish(file, pid);
@@ -587,14 +569,7 @@ fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<u32> {
 // The model's last finished turn in a session file (one that didn't end on tool calls): its time
 // stamp and its text. Read from the file's end, so a long session costs no more than a short one.
 fn last_turn(file: &Path) -> Option<(String, String)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut handle = fs::File::open(file).ok()?;
-    let length = handle.metadata().ok()?.len();
-    handle.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES))).ok()?;
-    let mut tail = Vec::new();
-    handle.read_to_end(&mut tail).ok()?;
-    let tail = String::from_utf8_lossy(&tail);
-    let last = tail.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|entry| entry["type"] == "message")?;
+    let last = crate::session::last_entry(file, |entry| entry["type"] == "message")?;
     let message = &last["message"];
     let finished = message["role"] == "assistant" && message["stopReason"] != "toolUse";
     let text: String = message["content"].as_array()?.iter().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
@@ -633,7 +608,7 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
             reminders.push(format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text()));
             return false;
         }
-        let run_ended = lane.run.is_some_and(|pid| !running(pid, &lane.file));
+        let run_ended = lane.run.is_some_and(|pid| !recorded_runs(&lane.file).0.iter().any(|(run, _)| run.pid == pid as i32));
         if (last != lane.looked && now.saturating_sub(last) >= TURN_SETTLE_SECONDS) || run_ended {
             lane.looked = last;
             save = true;
@@ -676,19 +651,11 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
 // --- Runs ---
 
 // Where a print-mode run of a session is recorded while it runs: a file beside the session named
-// for its pid, holding the boot it runs in and its start time. A stop signals only what's
-// recorded (stop_run), never a terminal or editor that has the file open. One file a run, so runs
+// for its pid, holding what proc.rs knows it by (its boot and start time). A stop signals only
+// what's recorded, never a terminal or editor that has the file open. One file a run, so runs
 // coming and going never write over each other's record.
 fn run_record(session_file: &Path, pid: u32) -> PathBuf {
     PathBuf::from(format!("{}.run.{pid}", session_file.display()))
-}
-
-// The kernel's id for this boot (random(4)): a pid and a start time name a process only within
-// one boot, and a record left by a crash names nothing after the next.
-const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
-
-fn boot_id() -> String {
-    fs::read_to_string(BOOT_ID_FILE).unwrap_or_default().trim().to_string()
 }
 
 // Record process `pid` as a run of the session in `session_file`, under the inbox's lock (inbox),
@@ -696,29 +663,28 @@ fn boot_id() -> String {
 // whoever started it). Written whole to a file of its own and renamed into place, so a reader
 // finds all of it or none. Output: the record's path, which the run removes when it ends.
 fn publish(session_file: &Path, pid: u32) -> std::io::Result<PathBuf> {
-    let start = stat(pid as i32).ok_or_else(|| std::io::Error::other(format!("process {pid} is gone")))?.start;
+    let record = Process::record(pid as i32).ok_or_else(|| std::io::Error::other(format!("process {pid} is gone")))?;
     let path = run_record(session_file, pid);
     let partial = PathBuf::from(format!("{}.partial", path.display()));
-    fs::write(&partial, format!("{} {start}", boot_id()))?;
+    fs::write(&partial, record)?;
     fs::rename(partial, &path)?;
     Ok(path)
 }
 
-// The recorded runs of a session, under the inbox's lock, which the caller holds: those still
-// going, each known for sure from here on (Known) with its stat then, and the pids of those gone
-// this boot. The records of those gone are removed, and so is one from another boot, which is
-// never looked up: its pid could be anything's now.
-fn recorded_runs(session_file: &Path) -> (Vec<(Known, Stat)>, Vec<i32>) {
-    let (mut runs, mut gone, boot) = (Vec::new(), Vec::new(), boot_id());
+// The recorded runs of a session: those still going, each known for sure from here on with its
+// stat then, and the pids of those gone this boot. The records of those gone are removed, and so is
+// one from another boot, which is never looked up: its pid could be anything's now. Records are
+// made under the inbox's lock (publish), so a caller holding it sees every run there is.
+fn recorded_runs(session_file: &Path) -> (Vec<(Process, Stat)>, Vec<i32>) {
+    let (mut runs, mut gone) = (Vec::new(), Vec::new());
     let prefix = format!("{}.run.", session_file.file_name().unwrap_or_default().to_string_lossy());
     for entry in fs::read_dir(session_file.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|name| name.strip_prefix(&prefix)?.parse::<i32>().ok()) else { continue };
-        let text = fs::read_to_string(entry.path()).unwrap_or_default();
-        let Some(start) = text.trim().split_once(' ').filter(|(its_boot, _)| !boot.is_empty() && *its_boot == boot).and_then(|(_, start)| start.parse().ok()) else {
+        let Some(start) = crate::proc::recorded_start(&fs::read_to_string(entry.path()).unwrap_or_default()) else {
             let _ = fs::remove_file(entry.path());
             continue;
         };
-        match Known::open(pid, start) {
+        match Process::started(pid, start) {
             Some(run) => runs.push(run),
             None => {
                 gone.push(pid);
@@ -729,59 +695,10 @@ fn recorded_runs(session_file: &Path) -> (Vec<(Known, Stat)>, Vec<i32>) {
     (runs, gone)
 }
 
-// A process as /proc/<pid>/stat has it (proc_pid_stat(5): fields 4, 6 and 22).
-#[derive(Clone, Copy)]
-struct Stat {
-    parent: i32,
-    session: i32,
-    start: u64,
-}
-
-// None once it's gone, or a zombie, which is as good as gone.
-fn stat(pid: i32) -> Option<Stat> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
-    let number = |index: usize| fields.get(index)?.parse().ok();
-    (*fields.first()? != "Z").then_some(())?;
-    Some(Stat { parent: number(1)?, session: number(3)?, start: fields.get(crate::tools::subagent::STAT_STARTTIME_AFTER_NAME)?.parse().ok()? })
-}
-
-// One process, known for sure: a pidfd, which keeps naming it after its pid passes to another, and
-// its pid for reading /proc.
-struct Known {
-    fd: std::os::fd::OwnedFd,
-    pid: i32,
-}
-
-impl Known {
-    // Input: a pid and the start time it was seen with. Output: it, with its stat now; None when
-    // it's gone, or isn't that one.
-    fn open(pid: i32, start: u64) -> Option<(Known, Stat)> {
-        use std::os::fd::FromRawFd;
-        // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor (close-on-exec) or -1.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-        // SAFETY: that descriptor, just made and owned from here on.
-        let known = (fd >= 0).then(|| Known { fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, pid })?;
-        known.look().filter(|now| now.start == start).map(|now| (known, now))
-    }
-
-    // Its stat now. Read before the pidfd shows it still alive: a pid passes on only once its
-    // process is reaped, so a stat read while it lives is its own. None once it's gone.
-    fn look(&self) -> Option<Stat> {
-        stat(self.pid).filter(|_| self.signal(0))
-    }
-
-    fn signal(&self, signal: i32) -> bool {
-        use std::os::fd::AsRawFd;
-        // SAFETY: pidfd_send_signal on a descriptor this owns, with no siginfo.
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) == 0 }
-    }
-}
-
 // A process of a run being stopped: known for sure, the session it was in when it was found, and
 // whether that session was the run's then.
 struct Member {
-    process: Known,
+    process: Process,
     session: i32,
     ours: bool,
 }
@@ -814,7 +731,7 @@ struct Stopped {
 // STOP_POLL, for what forked meanwhile: SIGTERM to each one found while STOP_GRACE lasts, SIGKILL
 // to what's left after, until a walk finds nothing, or STOP_DEADLINE passes, which also cuts a
 // walk short. Each process is signalled through its pidfd.
-async fn stop_run(runs: Vec<(Known, Stat)>, gone: Vec<i32>) -> Stopped {
+async fn stop_run(runs: Vec<(Process, Stat)>, gone: Vec<i32>) -> Stopped {
     use std::collections::{HashMap, HashSet};
     let started = std::time::Instant::now();
     let (kill_from, deadline) = (started + STOP_GRACE, started + STOP_DEADLINE);
@@ -830,9 +747,9 @@ async fn stop_run(runs: Vec<(Known, Stat)>, gone: Vec<i32>) -> Stopped {
                 break;
             }
             let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()).filter(|pid| !members.contains_key(pid)) else { continue };
-            found.extend(stat(pid).filter(|stat| members.contains_key(&stat.parent) || seen.contains(&stat.session)).map(|stat| (pid, stat)));
+            found.extend(crate::proc::stat(pid).filter(|stat| members.contains_key(&stat.parent) || seen.contains(&stat.session)).map(|stat| (pid, stat)));
         }
-        let live: HashMap<i32, Stat> = members.values().filter_map(|member| Some((member.process.pid, member.process.look()?))).collect();
+        let live: HashMap<i32, Stat> = members.values().filter_map(|member| Some((member.process.pid, member.process.stat()?))).collect();
         lost.get_or_insert_with(|| members.keys().filter(|pid| !live.contains_key(pid)).copied().collect::<Vec<i32>>());
         let vouched: HashSet<i32> = members
             .values()
@@ -850,11 +767,11 @@ async fn stop_run(runs: Vec<(Known, Stat)>, gone: Vec<i32>) -> Stopped {
             }
             unsure.remove(&pid);
             let ours = stat.session == pid || vouched.contains(&stat.session);
-            admitted.extend(Known::open(pid, stat.start).map(|(process, _)| Member { process, session: stat.session, ours }));
+            admitted.extend(Process::started(pid, stat.start).map(|(process, _)| Member { process, session: stat.session, ours }));
         }
-        let left: Vec<&Known> = members.values().map(|member| &member.process).filter(|process| live.contains_key(&process.pid)).chain(admitted.iter().map(|member| &member.process)).collect();
+        let left: Vec<&Process> = members.values().map(|member| &member.process).filter(|process| live.contains_key(&process.pid)).chain(admitted.iter().map(|member| &member.process)).collect();
         if (left.is_empty() && finished) || std::time::Instant::now() >= deadline {
-            let unsure = unsure.into_iter().filter(|(pid, start)| stat(*pid).is_some_and(|stat| stat.start == *start)).map(|(pid, _)| pid).collect();
+            let unsure = unsure.into_iter().filter(|(pid, start)| crate::proc::stat(*pid).is_some_and(|stat| stat.start == *start)).map(|(pid, _)| pid).collect();
             return Stopped { count: members.len() + admitted.len(), left: left.iter().map(|process| process.pid).collect(), unsure, lost: lost.unwrap_or_default(), finished };
         }
         let killing = std::time::Instant::now() >= kill_from;
@@ -982,20 +899,20 @@ fn string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     arguments.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty())
 }
 
-// Every session on this computer, newest first.
-fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<crate::host::SessionSummary> {
-    let folders = fs::read_dir(agent_dir.join("sessions")).into_iter().flatten().flatten();
-    let mut found: Vec<crate::host::SessionSummary> = folders.flat_map(|folder| crate::host::sessions_in(&folder.path(), None, limit)).collect();
-    found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
-    found.truncate(limit);
-    found
-}
 
+// The one session an id, the start of one, or a name picks. An exact id wins; otherwise more than
+// one match is refused with the candidates named, since stopping or closing the wrong session (two
+// made in the same minute share their first characters) can't be undone.
 fn find(agent_dir: &Path, wanted: &str) -> Result<crate::host::SessionSummary, String> {
-    all_sessions(agent_dir, usize::MAX)
-        .into_iter()
-        .find(|summary| summary.id.starts_with(wanted) || summary.title == wanted)
-        .ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
+    let mut found: Vec<_> = crate::host::all_sessions(agent_dir, usize::MAX).into_iter().filter(|summary| summary.id.starts_with(wanted) || summary.title == wanted).collect();
+    if let Some(exact) = found.iter().position(|summary| summary.id == wanted) {
+        return Ok(found.swap_remove(exact));
+    }
+    match found.len() {
+        0 => Err(format!("No session matches \"{wanted}\" (an id, the start of one, or a name)")),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!("\"{wanted}\" matches {} sessions; give more of the id: {}", found.len(), found.iter().map(|summary| format!("{} \"{}\"", summary.id, summary.title)).collect::<Vec<_>>().join(", "))),
+    }
 }
 
 fn ago(modified: std::time::SystemTime) -> String {
@@ -1037,7 +954,7 @@ pub struct SessionsTool {
 
 impl SessionsTool {
     fn list(&self) -> String {
-        let lines: Vec<String> = all_sessions(&self.agent_dir, LIST_LIMIT)
+        let lines: Vec<String> = crate::host::all_sessions(&self.agent_dir, LIST_LIMIT)
             .iter()
             .map(|summary| {
                 let running = if crate::session::held_elsewhere(&summary.path) { " · running" } else if summary.closed { " · closed" } else { "" };
@@ -1141,7 +1058,7 @@ impl SessionsTool {
         // The day's and the week's, by provider; each session's tallied alone first, so a turn
         // settles only its own session's pending ones.
         let mut totals = Tallies::new();
-        for summary in all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
+        for summary in crate::host::all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
             let Ok(session) = crate::session::Session::open(&summary.path, &summary.cwd) else { continue };
             let mut tallies = Tallies::new();
             for message in session.context().messages {
@@ -1477,8 +1394,7 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     if settings.get("manager.autostart").and_then(Value::as_bool) != Some(true) || own_agent_dir() || started_by_agent() {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
-    let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
+    let exe = crate::proc::exe().ok()?.to_string_lossy().into_owned();
     let systemctl = |words: &[&str]| std::process::Command::new("systemctl").arg("--user").args(words).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success());
     let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     if systemctl(&["show-environment"]) {
@@ -1491,20 +1407,12 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
         }
         return Some(if systemctl(&["enable", "--now", UNIT]) { format!("Started the assistant ({UNIT})") } else { format!("Couldn't start {UNIT}; `systemctl --user status {UNIT}` says why") });
     }
-    use std::os::unix::process::CommandExt;
     let _ = fs::create_dir_all(home(&agent_dir));
     let log = fs::File::create(home(&agent_dir).join("assistant.log")).ok();
     let mut command = std::process::Command::new(exe);
     command.arg("assistant").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
     command.stderr(log.map_or(std::process::Stdio::null(), std::process::Stdio::from));
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    Some(match command.spawn() {
+    Some(match crate::proc::own_session(&mut command).spawn() {
         Ok(_) => "Started the assistant".into(),
         Err(error) => format!("Couldn't start the assistant: {error}"),
     })

@@ -68,18 +68,9 @@ pub fn inherited(fd: i32) -> OwnedFd {
 
 // Start the watcher: this binary again, with the pipe as its stdin and nothing else open.
 fn start() -> Option<(File, u32)> {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().ok()?;
-    let mut command = Command::new(exe);
+    let mut command = Command::new(std::env::current_exe().ok()?);
     command.env(REAPER_ENV, "1").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().ok()?;
+    let mut child = crate::proc::own_session(&mut command).spawn().ok()?;
     Some((File::from(OwnedFd::from(child.stdin.take()?)), child.id()))
 }
 

@@ -131,9 +131,15 @@ pub fn user_agent() -> String {
     format!("piccosta/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH)
 }
 
-// What piccosta calls itself to Codex and opencode (config.rs client_name), read once.
+// What piccosta calls itself to a service that asks which client sent a request: Codex's
+// `originator` and opencode's `x-opencode-client`. The agent dir's `clientName` replaces it, for a
+// service that stops taking this one; it's the install's name, not a project's, so it's read once.
+const CLIENT_NAME: &str = "piccosta";
+
 pub fn client_name() -> &'static str {
-    static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| crate::config::client_name(&crate::config::agent_dir()));
+    static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        crate::config::Settings::load(&crate::config::agent_dir(), None).get("clientName").and_then(serde_json::Value::as_str).unwrap_or(CLIENT_NAME).to_string()
+    });
     &NAME
 }
 
@@ -230,6 +236,23 @@ pub async fn post_openai(model: &Model, url: String, credential: &Credential, se
     }
     let detail = serde_json::from_str::<Value>(&text).ok().and_then(|json| json.pointer("/error/message").and_then(Value::as_str).map(str::to_string)).unwrap_or(text);
     Err(format!("{} {detail}", status.as_u16()).trim().to_string())
+}
+
+// A provider's stream, run until it ends or the user stops it, which fails it.
+pub async fn abortable(request: &Request<'_>, run: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
+    tokio::select! {
+        result = run => result,
+        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
+    }
+}
+
+// How a stream ended, on the message it built: a failure stops it with its reason, Aborted when
+// the user stopped it, else Error.
+pub fn settle(request: &Request<'_>, output: &mut AssistantMessage, result: Result<(), String>) {
+    if let Err(message) = result {
+        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
+        output.error_message = Some(message);
+    }
 }
 
 // An empty assistant message for a response that's about to start.

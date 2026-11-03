@@ -197,9 +197,6 @@ pub const PROCESS_NAME: &str = "piccosta";
 pub const SESSION_ENV: &str = "PICCOSTA_SESSION_ID";
 // How a piccosta is pointed at another agent dir (config.rs agent_dir).
 const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
-// Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the
-// fields after the name's ')', which start at field 3.
-pub(crate) const STAT_STARTTIME_AFTER_NAME: usize = 22 - 3;
 
 // A piccosta run a session's tools started: a subagent job, or `piccosta -p` run by hand.
 pub struct RunningAgent {
@@ -225,7 +222,7 @@ pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, 
     let Ok(entries) = std::fs::read_dir("/proc") else { return found };
     let agents = entries.flatten().filter_map(|entry| {
             let dir = entry.path();
-            entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
             if std::fs::read_to_string(dir.join("comm")).ok()?.trim_end() != PROCESS_NAME {
                 return None;
             }
@@ -249,8 +246,7 @@ pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, 
             // Its model, or the kind of work it was started for (a manager's lane, --use exploration).
             let value_of = |flag: &str| arguments.iter().position(|argument| argument == flag).and_then(|index| arguments.get(index + 1)).cloned();
             let model = value_of("--model").or_else(|| value_of("--use"));
-            let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
-            let started_ticks: f64 = stat.rsplit_once(')')?.1.split_whitespace().nth(STAT_STARTTIME_AFTER_NAME)?.parse().ok()?;
+            let started_ticks = crate::proc::stat(pid)?.start as f64;
             let running_for = std::time::Duration::from_secs_f64((uptime - started_ticks / ticks_per_second).max(0.0));
             let open_files = std::fs::read_dir(dir.join("fd")).into_iter().flatten().flatten();
             let session = open_files.filter_map(|fd| std::fs::read_link(fd.path()).ok()).find(|path| path.extension().is_some_and(|extension| extension == "jsonl"));

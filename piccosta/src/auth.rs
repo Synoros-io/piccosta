@@ -18,9 +18,10 @@
 // request (about 0.2 s each); here it's a file read, and a refresh only when one is due.
 
 use crate::clock;
+use crate::config::read_json_object;
 use crate::model::ProviderConfig;
 use base64::Engine;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -147,27 +148,17 @@ impl CredentialPaths {
     }
 }
 
-// A JSON file's object, an empty one when the file doesn't exist, or why it couldn't be read: a
-// login file that's there but doesn't read is a failure, not a missing login.
-fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
-    match fs::read_to_string(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
-        text => serde_json::from_str(&text.map_err(|error| format!("{}: {error}", path.display()))?).map_err(|error| format!("{}: {error}", path.display())),
-    }
+// A JWT's claims, or None. The payload is base64url; pi decodes it with atob, which rejects
+// base64url's `-` and `_`, so both alphabets are accepted here.
+fn jwt_claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?.trim_end_matches('=');
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload));
+    serde_json::from_slice(&decoded.ok()?).ok()
 }
 
-// The account id inside a Codex access token. Input: the JWT. Output: its chatgpt_account_id
-// claim, or None. The payload is base64url; pi decodes it with atob, which rejects base64url's
-// `-` and `_`, so both alphabets are accepted here.
+// The account id inside a Codex access token: its chatgpt_account_id claim, or None.
 fn codex_account_id(access_token: &str) -> Option<String> {
-    let payload = access_token.split('.').nth(1)?;
-    let trimmed = payload.trim_end_matches('=');
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(trimmed)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
-        .ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    claims.get(CODEX_JWT_CLAIM)?.get("chatgpt_account_id")?.as_str().filter(|id| !id.is_empty()).map(str::to_string)
+    jwt_claims(access_token)?.get(CODEX_JWT_CLAIM)?.get("chatgpt_account_id")?.as_str().filter(|id| !id.is_empty()).map(str::to_string)
 }
 
 // Run a models.json `!command` and take its output as the key. Input: the command after the `!`.
@@ -247,8 +238,7 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
         if let Some(access) = tokens.and_then(|tokens| tokens.get("access_token")).and_then(Value::as_str) {
             // The token's `exp` claim (epoch seconds): piccosta can't refresh this login, so an
             // expired one fails here, saying how to fix it, rather than as a bare 401 from Codex.
-            let expires = access.split('.').nth(1).and_then(|payload| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok());
-            let expires = expires.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).and_then(|claims| claims.get("exp")?.as_f64());
+            let expires = jwt_claims(access).and_then(|claims| claims.get("exp")?.as_f64());
             if expires.is_some_and(|exp| exp * 1000.0 <= crate::clock::now_ms() as f64) {
                 return Err(format!("the Codex CLI's login expired; run `codex` once ({})", codex_file.display()));
             }

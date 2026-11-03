@@ -76,7 +76,7 @@ pub fn listing(agent_dir: &Path) -> Option<futures_util::future::BoxFuture<'stat
     use futures_util::FutureExt;
     use std::sync::atomic::Ordering;
     let refresh = STARTUP_REFRESH.get().filter(|refresh| refresh.peek().is_none() && !LISTING_WAITED_OUT.load(Ordering::Relaxed))?.clone();
-    let timeout = list_seconds(&crate::config::Settings::global(agent_dir), "models.timeoutSeconds", LIST_TIMEOUT_S);
+    let timeout = list_seconds(&crate::config::Settings::load(agent_dir, None), "models.timeoutSeconds", LIST_TIMEOUT_S);
     Some(async move {
         if tokio::time::timeout(timeout, refresh).await.is_err() {
             LISTING_WAITED_OUT.store(true, Ordering::Relaxed);
@@ -313,7 +313,7 @@ pub fn start_refresh(agent_dir: PathBuf) -> Refresh {
 pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<String, String>> {
     let file = models_file(&agent_dir);
     let paths = crate::auth::CredentialPaths::from_environment(&agent_dir);
-    let settings = crate::config::Settings::global(&agent_dir);
+    let settings = crate::config::Settings::load(&agent_dir, None);
     let lists_fresh = list_seconds(&settings, "models.freshSeconds", LISTS_FRESH_S);
     let client = match crate::provider::http_client().timeout(list_seconds(&settings, "models.timeoutSeconds", LIST_TIMEOUT_S)).build() {
         Ok(client) => client,

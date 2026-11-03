@@ -539,8 +539,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     // the kernel then names "… (deleted)"), on the same command line, bringing everything back.
     if app.restart {
         use std::os::unix::process::CommandExt;
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
+        let exe = crate::proc::exe().map_err(|error| error.to_string())?;
         state::save_handover(&host.agent_dir, &handover).map_err(|error| format!("could not hand the background jobs over: {error}"))?;
         let error = std::process::Command::new(&exe).args(std::env::args_os().skip(1).filter(|argument| argument != "--restore")).arg("--restore").exec();
         state::take_handover(&host.agent_dir);
@@ -556,32 +555,18 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
 // this image started any are listed, so none of its own are taken from tokio.
 fn reap_inherited_children(handover: &state::Handover) {
     let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid)).collect();
-    let tasks = std::fs::read_dir("/proc/self/task").into_iter().flatten().flatten();
-    let children = tasks.filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok());
-    for pid in children.flat_map(|text| text.split_whitespace().filter_map(|pid| pid.parse::<u32>().ok()).collect::<Vec<_>>()) {
-        if !kept.contains(&pid) {
+    for pid in crate::proc::children() {
+        if !kept.contains(&(pid as u32)) {
             // SAFETY: waitpid on a known child pid with a status pointer it may ignore.
             std::thread::spawn(move || unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) });
         }
     }
 }
 
-// How much of a session file's end is read for its last message: room for a long answer.
-const TAIL_BYTES: u64 = 1024 * 1024;
-
 // Whether a session another piccosta runs is in the middle of a turn: its last message is the
-// user's, a tool's result, a background job's notice, or the model's call for tools. Read from the
-// file's end, so a long session costs no more than a short one.
+// user's, a tool's result, a background job's notice, or the model's call for tools.
 fn mid_turn(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let length = file.metadata().map_or(0, |metadata| metadata.len());
-    let mut tail = Vec::new();
-    if file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES))).is_err() || file.read_to_end(&mut tail).is_err() {
-        return false;
-    }
-    let tail = String::from_utf8_lossy(&tail);
-    let last = tail.lines().rev().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).find(|entry| entry["type"] == "message" || entry["type"] == "custom_message");
+    let last = crate::session::last_entry(path, |entry| entry["type"] == "message" || entry["type"] == "custom_message");
     last.is_some_and(|entry| entry["type"] == "custom_message" || entry["message"]["role"] != "assistant" || entry["message"]["stopReason"] == "toolUse")
 }
 

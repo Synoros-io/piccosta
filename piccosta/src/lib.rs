@@ -18,6 +18,7 @@ pub mod json_number;
 pub mod message;
 pub mod model;
 pub mod pintask;
+pub mod proc;
 pub mod prompt;
 pub mod provider;
 pub mod retry;

@@ -17,21 +17,24 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
+// "~" and "~/..." under home; any other path as written.
+pub fn expand_home(raw: &str) -> PathBuf {
+    match raw.strip_prefix('~') {
+        Some("") => home_dir(),
+        Some(rest) if rest.starts_with('/') => home_dir().join(&rest[1..]),
+        _ => PathBuf::from(raw),
+    }
+}
+
 // Input: a path as the model wrote it. Output: the path with odd spaces made plain, a leading
 // "@" dropped (models copy @file mentions), "~" expanded and a file:// URL turned into its path.
 pub fn normalize(raw: &str) -> PathBuf {
     let spaced: String = raw.chars().map(|c| if is_unicode_space(c) { ' ' } else { c }).collect();
     let path = spaced.strip_prefix('@').unwrap_or(&spaced);
-    if path == "~" {
-        return home_dir();
+    match path.strip_prefix("file://") {
+        Some(rest) => PathBuf::from(percent_decode(rest.strip_prefix("localhost").unwrap_or(rest))),
+        None => expand_home(path),
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home_dir().join(rest);
-    }
-    if let Some(rest) = path.strip_prefix("file://") {
-        return PathBuf::from(percent_decode(rest.strip_prefix("localhost").unwrap_or(rest)));
-    }
-    PathBuf::from(path)
 }
 
 // %XX escapes in a file URL's path, as fileURLToPath undoes them. Bytes that don't form valid

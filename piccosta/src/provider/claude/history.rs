@@ -57,18 +57,6 @@ pub const SHAPE_PARTS: [&str; 6] = ["systemPrompt", "tools", "cliModel", "effort
 
 pub type Shape = Map<String, Value>;
 
-// What a live query holds: its shape, one print per message of pi's it holds, and the tool calls
-// it is parked on (None while a turn streams or after the last one).
-pub struct Held {
-    pub shape: Shape,
-    pub prints: Vec<String>,
-    pub pending: Option<Vec<String>>,
-    // Its turn is over, stopped mid-answer (pi's abort) or answered, and it waits, as Claude Code
-    // does at its prompt, for the next message, which goes into this same query (mod.rs, interrupt
-    // and hold).
-    pub waiting: bool,
-}
-
 // --- Fingerprints ---
 
 // Input: any JSON. Output: the sha256 of JSON.stringify of it, hex, so a held context is a list of
@@ -135,7 +123,7 @@ pub fn shape(system_prompt: &str, tools: &[ToolDefinition], cli_model: &str, eff
 // plus results for exactly the calls the query is parked on, or plus user messages for a query
 // that waits, which are then delivered; otherwise Err with the first reason found, and the call
 // rewrites.
-pub fn decide(live: Option<&Held>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
+pub fn decide(live: Option<&super::State>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
     let live = live.ok_or("no live query for this session")?;
     let changed: Vec<&str> = SHAPE_PARTS.into_iter().filter(|part| shape.get(*part) != live.shape.get(*part)).collect();
     if !changed.is_empty() {

@@ -402,6 +402,20 @@ pub fn held_elsewhere(path: &Path) -> bool {
     fs::File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)))
 }
 
+// How much of a session file's end is read for its last entries: room for a long answer.
+const TAIL_BYTES: u64 = 1024 * 1024;
+
+// The last entry of a session file that `wanted` picks, read from the file's end, so a long session
+// costs no more than a short one.
+pub fn last_entry(path: &Path, wanted: impl Fn(&Value) -> bool) -> Option<Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(file.metadata().ok()?.len().saturating_sub(TAIL_BYTES))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail).lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|entry| wanted(entry))
+}
+
 impl Session {
     // A new, empty session. Input: the working directory, and the folder to keep the file in
     // (None for memory only). Output: the session, not yet on disk.

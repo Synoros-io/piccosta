@@ -359,16 +359,10 @@ async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
 // Wait for a shell to exit, through a pidfd, then reap it. One handed to the next image (/restart)
 // is left unreaped and this never returns: the next image reaps it and reports its end.
 async fn exit_of(pid: u32) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::fd::FromRawFd;
     use std::os::unix::process::ExitStatusExt;
-    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor (close-on-exec) or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor just made and owned by nothing else, which the OwnedFd keeps open as
-    // long as the AsyncFd holds it.
-    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd::from_raw_fd(fd)) }.map_err(std::io::Error::from)?;
+    let shell = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
+    // SAFETY: the pidfd is owned by the AsyncFd, which keeps it open as long as it's registered.
+    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(shell.fd) }.map_err(std::io::Error::from)?;
     let _ready = pidfd.readable().await?;
     // The check and the reap happen under the list's lock, so hand_over can't come between them.
     let reaped = {

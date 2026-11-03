@@ -171,7 +171,7 @@ impl Host {
     // The host for a directory other than the process's own (an ACP client names one per session).
     pub fn at(cwd: PathBuf) -> Host {
         let agent_dir = config::agent_dir();
-        let settings = config::Settings::load(&agent_dir, &cwd);
+        let settings = config::Settings::load(&agent_dir, Some(&cwd));
         let session_dir = session::default_session_dir(&agent_dir, &cwd);
         Host { cwd, agent_dir, settings, session_dir, context_files: true, tools: true, tool_names: None, exclude_tools: Vec::new(), append_prompt: None, yolo: false }
     }
@@ -264,11 +264,7 @@ impl Host {
             return Ok(self.cwd.join(wanted));
         }
         let matches = |summary: &SessionSummary| summary.id.starts_with(wanted) || summary.title == wanted;
-        let everywhere = || {
-            let folders = std::fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten();
-            folders.flat_map(|folder| sessions_in(&folder.path(), None, usize::MAX))
-        };
-        let found = self.sessions(usize::MAX).into_iter().find(matches).or_else(|| everywhere().find(matches));
+        let found = self.sessions(usize::MAX).into_iter().find(matches).or_else(|| all_sessions(&self.agent_dir, usize::MAX).into_iter().find(matches));
         found.map(|summary| summary.path).ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
     }
 
@@ -553,6 +549,16 @@ impl Host {
 
 // Session files in one directory, optionally restricted to their recorded cwd. A closed
 // session may have been renamed, so its header supplies both the id and the directory it ran in.
+// Every session on this computer, newest first: each project folder's newest `limit`, then the
+// newest `limit` of those.
+pub fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<SessionSummary> {
+    let folders = std::fs::read_dir(agent_dir.join("sessions")).into_iter().flatten().flatten();
+    let mut found: Vec<SessionSummary> = folders.flat_map(|folder| sessions_in(&folder.path(), None, limit)).collect();
+    found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+    found.truncate(limit);
+    found
+}
+
 pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries

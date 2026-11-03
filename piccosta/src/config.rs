@@ -16,11 +16,6 @@ use std::path::{Path, PathBuf};
 // settings are pi's, and a repo that also uses pi would hand them to piccosta.
 pub const PROJECT_CONFIG_DIR: &str = ".piccosta";
 
-// What piccosta calls itself to a service that asks which client sent a request: Codex's
-// `originator` and opencode's `x-opencode-client`. settings.json's `clientName` replaces it, for a
-// service that stops taking this one.
-const CLIENT_NAME: &str = "piccosta";
-
 // Defaults from settings-defaults.ts, used when neither settings file sets the key.
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
@@ -69,9 +64,10 @@ fn deep_merge(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
     }
 }
 
-// One settings file. Output: its object (empty when the file is missing), or an error message
-// when it exists but isn't a JSON object.
-fn read_settings_file(path: &Path) -> Result<Map<String, Value>, String> {
+// One JSON file (settings, a login). Output: its object (empty when the file is missing), or an
+// error message when it exists but isn't a JSON object: a login file that's there but doesn't
+// read is a failure, not a missing login.
+pub(crate) fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
@@ -87,8 +83,7 @@ fn read_settings_file(path: &Path) -> Result<Map<String, Value>, String> {
 // The thinking level `model` (provider/id) was last set to, from the agent dir's settings.json. Read
 // fresh each time: another session, or another piccosta (Zed's, T3 Code's), may have set it since.
 pub fn remembered_thinking_level(agent_dir: &Path, model: &str) -> Option<String> {
-    let settings = read_settings_file(&agent_dir.join("settings.json")).ok()?;
-    settings.get(MODEL_THINKING_LEVELS)?.get(model)?.as_str().map(str::to_string)
+    Settings::load(agent_dir, None).get(MODEL_THINKING_LEVELS)?.get(model)?.as_str().map(str::to_string)
 }
 
 // Change the agent dir's settings.json: `edit` gets its object, and the file is written back only
@@ -98,7 +93,7 @@ pub fn remembered_thinking_level(agent_dir: &Path, model: &str) -> Option<String
 fn edit_settings(agent_dir: &Path, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
     let path = agent_dir.join("settings.json");
     let failed = |error: &dyn std::fmt::Display| format!("could not save {}: {error}", path.display());
-    let mut settings = read_settings_file(&path)?;
+    let mut settings = read_json_object(&path)?;
     let before = settings.clone();
     edit(&mut settings);
     if settings == before {
@@ -132,32 +127,21 @@ pub fn remember_model(agent_dir: &Path, provider: &str, model_id: &str) -> Resul
     })
 }
 
-// The client name (CLIENT_NAME, or `clientName`), from the agent dir's settings.json only. It's what
-// this install calls itself, not a project's choice, and one process serves many projects (ACP
-// opens a host per project directory), so like the Claude bridge settings it's read once for the
-// whole process.
-pub fn client_name(agent_dir: &Path) -> String {
-    let global = read_settings_file(&agent_dir.join("settings.json")).unwrap_or_default();
-    global.get("clientName").and_then(Value::as_str).unwrap_or(CLIENT_NAME).to_string()
-}
-
 impl Settings {
-    // Load both scopes. Input: the agent dir and the working directory.
-    pub fn load(agent_dir: &Path, cwd: &Path) -> Settings {
+    // The agent dir's settings.json, and the project's in `cwd` merged over it. Without a cwd it's
+    // the install's alone, for what belongs to the user rather than a project, and is the same for
+    // every project one process serves: the model lists, the Claude bridge, the client name, the
+    // models' thinking levels.
+    pub fn load(agent_dir: &Path, cwd: Option<&Path>) -> Settings {
         let mut settings = Settings::default();
-        for path in [agent_dir.join("settings.json"), cwd.join(PROJECT_CONFIG_DIR).join("settings.json")] {
-            match read_settings_file(&path) {
+        let project = cwd.map(|cwd| cwd.join(PROJECT_CONFIG_DIR).join("settings.json"));
+        for path in std::iter::once(agent_dir.join("settings.json")).chain(project) {
+            match read_json_object(&path) {
                 Ok(object) => deep_merge(&mut settings.merged, &object),
                 Err(error) => settings.load_errors.push(error),
             }
         }
         settings
-    }
-
-    // The agent dir's settings.json alone, for what belongs to the install rather than a project
-    // (the model lists, kept in the agent dir for every project).
-    pub fn global(agent_dir: &Path) -> Settings {
-        Settings { merged: read_settings_file(&agent_dir.join("settings.json")).unwrap_or_default(), load_errors: Vec::new() }
     }
 
     // A value by dotted path, e.g. "retry.maxRetries".

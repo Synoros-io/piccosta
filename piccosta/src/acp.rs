@@ -380,8 +380,7 @@ impl Acp {
                 } else if let Some(dir) = &self.args.session_dir {
                     crate::host::sessions_in(Path::new(dir), None, usize::MAX)
                 } else {
-                    std::fs::read_dir(crate::config::agent_dir().join("sessions")).into_iter().flatten().flatten()
-                        .flat_map(|entry| crate::host::sessions_in(&entry.path(), None, usize::MAX)).collect()
+                    crate::host::all_sessions(&crate::config::agent_dir(), usize::MAX)
                 };
                 listed.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
                 let sessions: Vec<Value> = listed

@@ -31,13 +31,7 @@ const SEARCH_MAX_ENTRIES: usize = 20_000;
 const SEARCH_SKIP_DIRS: [&str; 7] = [".git", "node_modules", "target", ".venv", "__pycache__", "dist", "build"];
 
 fn resolve_from(base_dir: &Path, raw: &str) -> PathBuf {
-    let path = match raw {
-        "~" => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
-        _ => match raw.strip_prefix("~/") {
-            Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
-            None => PathBuf::from(raw),
-        },
-    };
+    let path = super::paths::expand_home(raw);
     let joined = if path.is_absolute() { path } else { base_dir.join(path) };
     super::paths::resolve(&joined.to_string_lossy(), Path::new("/"))
 }

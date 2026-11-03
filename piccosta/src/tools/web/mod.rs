@@ -184,13 +184,13 @@ fn format_search_summary(results: &[search::SearchResult], answer: &str) -> Stri
 
 // Keep the search text and its guidance under the output cap, cutting the text and saying so
 // (web-tool-core.ts boundSearchPresentation). Output: (text, truncated, original, returned, omitted).
-fn bound_search_presentation(text: &str, guidance: &str, truncation_guidance: &str, max_chars: usize) -> (String, bool, usize, usize, usize) {
+fn bound_search_presentation(text: &str, guidance: &str, max_chars: usize) -> (String, bool, usize, usize, usize) {
     let text_length = crate::js::utf16_len(text);
     let full = format!("{text}{guidance}");
     if crate::js::utf16_len(&full) <= max_chars {
         return (full, false, text_length, text_length, 0);
     }
-    let marker = format!("\n\n---\n[Output truncated.]{truncation_guidance}");
+    let marker = format!("\n\n---\n[Output truncated.]{guidance}");
     let prefix_length = max_chars.saturating_sub(crate::js::utf16_len(&marker));
     let units = utf16(text);
     let bounded = format!("{}{marker}", from_utf16(&units[..prefix_length.min(units.len())]));
@@ -301,24 +301,6 @@ impl Tool for WebSearchTool {
     }
 }
 
-// build_search_return from stored-search JSON (pi-web-access's QueryResultData shape), for
-// checking the output against pi-web-access's on the same results.
-pub fn build_search_return_json(web: &WebShared, query_list: &[String], results: &Value, inline_content: Option<Vec<Extracted>>, include_content: bool) -> ToolOutput {
-    let results: Vec<QueryData> = results
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|r| QueryData {
-            query: r["query"].as_str().unwrap_or("").to_string(),
-            answer: r["answer"].as_str().unwrap_or("").to_string(),
-            results: r["results"].as_array().into_iter().flatten().map(|x| search::SearchResult { title: x["title"].as_str().unwrap_or("").into(), url: x["url"].as_str().unwrap_or("").into(), snippet: x["snippet"].as_str().unwrap_or("").into() }).collect(),
-            error: r["error"].as_str().map(str::to_string),
-            provider: match r["provider"].as_str() { Some("searxng") => Some("searxng"), Some("openai") => Some("openai"), _ => None },
-        })
-        .collect();
-    build_search_return(web, query_list, &results, inline_content, include_content)
-}
-
 // The search's text, its stored ids and its details (web-tool-core.ts buildSearchReturn).
 fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryData], inline_content: Option<Vec<Extracted>>, include_content: bool) -> ToolOutput {
     let max_chars = web.settings.max_inline_content_chars;
@@ -349,7 +331,7 @@ fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryD
     let search_id = store::generate_id();
     web.store.store_search(&search_id, Value::Array(results.iter().map(QueryData::to_json).collect()));
 
-    let guidance = |_for_truncation: bool| {
+    let guidance = {
         let mut value = String::new();
         if let (Some(id), Some(content)) = (&fetch_id, &inline_content) {
             value += &format!("\n---\nFull content for {} sources is ready as responseId \"{id}\". ", content.len());
@@ -361,7 +343,7 @@ fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryD
         value
     };
     let trimmed = crate::js::trim(&output).to_string();
-    let (text, truncated, original, returned, omitted) = bound_search_presentation(&trimmed, &guidance(false), &guidance(true), max_chars);
+    let (text, truncated, original, returned, omitted) = bound_search_presentation(&trimmed, &guidance, max_chars);
     let details = json!({
         "queries": query_list,
         "queryCount": query_list.len(),

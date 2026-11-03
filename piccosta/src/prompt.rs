@@ -40,9 +40,6 @@ pub const INPUT_SECTIONS: [&str; 2] = ["project_context", "cwd"];
 // past any such save and well short of the time to the next message.
 const SAVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-// The last good bytes of every context file and import read in this piccosta process, by path.
-static SNAPSHOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
-
 // The constitution is off unless asked for: benchmarks gave mixed results with it, and it is about
 // 2,200 tokens on every request (2026-11-02). PICCOSTA_CONSTITUTION holds the text itself (how the
 // bench passes it into a sandbox), PICCOSTA_CONSTITUTION_FILE a path to it, or "built-in" for
@@ -57,8 +54,8 @@ pub struct ContextFile {
     pub content: String,
 }
 
-// What reading the context files ran into: the files that couldn't be read and had no last good
-// bytes to stand in, and whether one was still being saved with none (piccosta just started).
+// What reading the context files ran into: the files that couldn't be read, and whether one was
+// written so recently that it may be mid-save.
 #[derive(Default)]
 struct Reads {
     failures: Vec<String>,
@@ -66,31 +63,19 @@ struct Reads {
 }
 
 impl Reads {
-    // A file's bytes, or None when it's not there (only a not-found says so). A file that can't be
-    // read, or was written under SAVE_SETTLE ago, gives its last good bytes instead, so each file
-    // keeps its own and the rest still update; one with none that can't be read is a failure.
+    // A file's bytes, or None when it's not there (only a not-found says so) or can't be read (a
+    // failure). One written under SAVE_SETTLE ago is read, and marks the reads unsettled.
     fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
-        let read = std::fs::metadata(path).and_then(|metadata| Ok((metadata.modified()?, std::fs::read(path)?)));
-        let mut snapshots = SNAPSHOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match read {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                snapshots.remove(path);
-                None
-            }
-            Ok((written, bytes)) if !written.elapsed().is_ok_and(|age| age < SAVE_SETTLE) => {
-                snapshots.insert(path.to_path_buf(), bytes.clone());
+        match std::fs::metadata(path).and_then(|metadata| Ok((metadata.modified()?, std::fs::read(path)?))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok((written, bytes)) => {
+                self.unsettled |= written.elapsed().is_ok_and(|age| age < SAVE_SETTLE);
                 Some(bytes)
             }
-            // Still being saved: its last good bytes, or with none these, marked unsettled, so a
-            // session that holds instructions keeps them and a new one starts with what's there.
-            Ok((_, bytes)) => snapshots.get(path).cloned().or_else(|| {
-                self.unsettled = true;
-                Some(bytes)
-            }),
-            Err(error) => snapshots.get(path).cloned().or_else(|| {
+            Err(error) => {
                 self.failures.push(format!("Could not read {}: {error}", path.display()));
                 None
-            }),
+            }
         }
     }
 }
@@ -188,16 +173,8 @@ fn context_files(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<Context
 }
 
 fn import_target(raw: &str, importing_file: &Path) -> PathBuf {
-    let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let path = if raw == "~" {
-        home()
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        home().join(rest)
-    } else if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
-    } else {
-        importing_file.parent().unwrap_or(Path::new("/")).join(raw)
-    };
+    let path = crate::tools::paths::expand_home(raw);
+    let path = if path.is_absolute() { path } else { importing_file.parent().unwrap_or(Path::new("/")).join(path) };
     crate::tools::paths::canonical(&crate::tools::paths::resolve(&path.to_string_lossy(), Path::new("/")))
 }
 
@@ -302,8 +279,8 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
     }
     let mut reads = Reads::default();
     let project = inputs.context_files.then(|| project_context(inputs.cwd, inputs.agent_dir, &mut reads)).flatten();
-    // A file that can't be read with no last good bytes in this process (piccosta just started): a
-    // session that holds instructions keeps them, rather than lose that file's.
+    // A file that can't be read, or may be mid-save: a session that holds instructions keeps them
+    // as they were, rather than lose that file's or take half of it.
     let held = inputs.held_context.as_deref().and_then(|held| held.strip_prefix("<project_context>\n")?.strip_suffix("\n</project_context>"));
     let project = if reads.failures.is_empty() && !reads.unsettled { project } else { held.map(String::from).or(project) };
     if let Some(project) = project {
@@ -344,10 +321,9 @@ fn project_context(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Option<St
 
 // Read a running session's context files again into its sections, so an AGENTS.md edited, added or
 // removed since it opened reaches the next request. The section keeps its place, and a new one goes
-// where sections() puts it, just before cwd. A file that can't be read, or is still being saved,
-// goes in as it last read whole (Reads::read); one that never did leaves the section as it was,
-// since dropping instructions that are still there would rewrite the cache now and again once
-// they read. The next run reads them again.
+// where sections() puts it, just before cwd. A file that can't be read, or may be mid-save, leaves
+// the section as it was, since dropping instructions that are still there, or taking half a file,
+// would rewrite the cache now and again once they read whole. The next run reads them again.
 pub fn reload_context_files(sections: &mut IndexMap<String, String>, cwd: &Path, agent_dir: &Path) {
     let mut reads = Reads::default();
     let project = project_context(cwd, agent_dir, &mut reads);

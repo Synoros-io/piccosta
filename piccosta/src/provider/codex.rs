@@ -13,7 +13,7 @@ use super::codex_ws::{self, Failure, Target};
 use super::responses::{self, ConvertOptions, StreamState};
 use super::transcript;
 use super::{clamp_thinking_level, new_output, user_agent, Request, StreamEvent, BODY_IDLE_TIMEOUT, HEADER_TIMEOUT};
-use crate::message::{AssistantMessage, Message, StopReason};
+use crate::message::{AssistantMessage, Message};
 use crate::model::Model;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ const VERBOSITY_SESSIONS: usize = 1024;
 
 fn verbosity(request: &Request<'_>) -> String {
     let read = || {
-        let settings = crate::config::Settings::load(&crate::config::agent_dir(), request.cwd);
+        let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(request.cwd));
         settings.get("codex.verbosity").and_then(Value::as_str).unwrap_or(DEFAULT_VERBOSITY).to_string()
     };
     match (request.session_id.filter(|_| request.cache), VERBOSITY.lock()) {
@@ -182,17 +182,10 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let mut send = |event: StreamEvent| {
         let _ = events.send(event);
     };
-    let output = new_output(model, API);
-    let mut state = StreamState::new(model, output);
-    let result = tokio::select! {
-        result = run(request, &mut state, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let mut state = StreamState::new(model, new_output(model, API));
+    let result = super::abortable(request, run(request, &mut state, &mut send)).await;
     let mut output = state.output;
-    if let Err(message) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    }
+    super::settle(request, &mut output, result);
     output
 }
 

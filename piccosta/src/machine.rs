@@ -36,7 +36,7 @@ const SWAP_SAMPLE_EVERY: Duration = Duration::from_secs(30);
 
 // Each overused resource, in words ("load 18.4 on 12 cores"); empty when all is well.
 fn strain(cwd: &Path) -> Vec<String> {
-    let settings = crate::config::Settings::load(&crate::config::agent_dir(), cwd);
+    let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(cwd));
     let setting = |name: &str, default: f64| settings.get(&format!("machine.{name}")).and_then(serde_json::Value::as_f64).unwrap_or(default);
     let mut found = Vec::new();
     let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
