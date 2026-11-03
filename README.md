@@ -25,9 +25,9 @@ It stores no credentials, it uses existing pathways to never store any keys or a
 - **New models show up on their own.** The model lists for Claude, Codex and opencode-go ship with piccosta, and are fetched again from pi.dev's catalog (the one pi reads) at most every four hours. `modelCatalog.url` in settings points elsewhere; `modelCatalog.refresh: false` keeps to the built-in lists.
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
-### model scale
+### Model scale
 
-Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. Each has a first choice and the models that take over when a plan runs low.
+Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
 - piccosta records how much of your Claude and Codex plans is used, as the plans report it with each response, and moves to the next model once one passes 80% of a window.
 - The defaults ship with piccosta. Your changes go in one file, `scale.json` in piccosta's folder: `/scale edit` writes all of it there and opens it in your editor, and `/scale <kind> <model[:level]> …` sets one kind's models. A kind you change keeps the rest of its defaults; `"off": true` turns one off.
 - `/scale` shows it all with the plans' usage. `--use <kind>` starts a session on its pick, on the command line, in `/new` and in Ctrl+N's box.
