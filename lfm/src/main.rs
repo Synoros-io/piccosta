@@ -1,7 +1,7 @@
 // lfm: LFM3-Audio-2B as the two commands of piccosta's voice mode, speech in and text out (`listen`), text in
 // and speech out (`speak`), through stdin and stdout.
 
-use lfm::{VERBOSE, audio, codec::Codec, model::Model, note, tensor::Result};
+use lfm::{VERBOSE, audio, codec::Codec, model::Model, note, quant::Format, tensor::Result};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -18,6 +18,9 @@ options:
   --model DIR     the LFM3-Audio-2B checkpoint directory (default: $LFM_MODEL_DIR); its files are read in
                   place, so they must not be changed while lfm runs
   --threads N     worker threads, at least one (default: $LFM_THREADS, else half the logical CPUs)
+  --quant FORMAT  the language model's and depth decoder's weights: bf16 as in the checkpoint, q8, or q4 (the
+                  language model's layers in 4 bits, the rest in 8), quantized once into model.q8.safetensors
+                  or model.q4.safetensors beside the checkpoint (default: $LFM_QUANT, else bf16)
   --system TEXT   the system prompt: the task, its language and the voice
   --max N         at most N text tokens (listen) or speech frames (speak, decode)
   --max-input N   refuse input over N bytes (default: $LFM_MAX_INPUT, else 64 MiB)
@@ -60,7 +63,7 @@ fn run() -> Result<()> {
     let command = args.next().unwrap_or_default();
     let mut model = std::env::var_os("LFM_MODEL_DIR").map(PathBuf::from);
     let setting = |name: &str| std::env::var(name).ok().map(|text| (name.to_string(), text));
-    let mut threads = setting("LFM_THREADS");
+    let (mut threads, mut quant) = (setting("LFM_THREADS"), setting("LFM_QUANT"));
     let mut limits = [setting("LFM_MAX_INPUT"), setting("LFM_MAX_AUDIO"), setting("LFM_MAX_PROMPT")];
     let (mut system, mut max, mut seed, mut output, mut greedy, mut rest) = (None, None, None, None, false, Vec::new());
     while let Some(arg) = args.next() {
@@ -69,6 +72,7 @@ fn run() -> Result<()> {
         match arg.as_str() {
             "--model" => model = Some(PathBuf::from(value()?)),
             "--threads" => threads = Some((arg.clone(), value()?)),
+            "--quant" => quant = Some((arg.clone(), value()?)),
             "--max-input" => limits[0] = Some((arg.clone(), value()?)),
             "--max-audio" => limits[1] = Some((arg.clone(), value()?)),
             "--max-prompt" => limits[2] = Some((arg.clone(), value()?)),
@@ -102,12 +106,14 @@ fn run() -> Result<()> {
     // well as one per logical CPU; half the logical CPUs is that on the usual two-way machine
     let halved = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
     let threads = positive(threads, halved as u64)? as usize;
+    let quant = quant.map_or(Ok(None), |(name, text)| Format::parse(&text).map_err(|e| format!("{name}: {e}")))?;
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().map_err(|e| e.to_string())?;
     let directory = model.ok_or("no model: pass --model DIR or set LFM_MODEL_DIR")?;
     let start = Instant::now();
     // Every load below maps the checkpoint, which must not change while lfm runs (Weights::open). lfm can't make
     // that so for other processes: it is the operator's precondition, which the usage text states. lfm itself
-    // writes only the -o file, and write_output refuses one that is, or links to, a mapped file.
+    // writes the -o file, which write_output refuses when it is, or links to, a mapped file, and a quantized
+    // file only under a new name, renamed into place (quant::open).
     match command.as_str() {
         "listen" => {
             let (samples, rate) = audio::read_wav(&read_input(rest.first(), max_input)?)?;
@@ -115,7 +121,7 @@ fn run() -> Result<()> {
                 return Err(format!("the speech is over {max_audio} s, the budget --max-audio sets"));
             }
             // SAFETY: see above
-            let mut model = unsafe { Model::load(&directory)? };
+            let mut model = unsafe { Model::load(&directory, quant)? };
             model.max_prompt = max_prompt;
             note(&format!("loaded, {threads} threads"), start);
             if rate != model.mel.rate {
@@ -128,7 +134,7 @@ fn run() -> Result<()> {
         "speak" => {
             let text = if rest.is_empty() { text_input(None, max_input)? } else { rest.join(" ") };
             // SAFETY: see above
-            let (mut model, codec) = unsafe { (Model::load(&directory)?, Codec::load(&directory)?) };
+            let (mut model, codec) = unsafe { (Model::load(&directory, quant)?, Codec::load(&directory)?) };
             model.max_prompt = max_prompt;
             note(&format!("loaded, {threads} threads"), start);
             let clock = || {

@@ -4,6 +4,7 @@
 
 use crate::audio::MelSpectrogram;
 use crate::note;
+use crate::quant::{self, Format};
 use crate::tensor::*;
 use crate::tokenizer::Tokenizer;
 use rayon::prelude::*;
@@ -551,10 +552,12 @@ pub struct Model {
 
 impl Model {
     // Loads config.json, generation_config.json, tokenizer.json and model.safetensors from the checkpoint
-    // directory. Weights stay mapped; only norms, biases and the like are copied.
+    // directory. Weights stay mapped; only norms, biases and the like are copied. Under a `quant` format the
+    // language model's and depth decoder's matrices come from the quantized file beside the checkpoint, which
+    // is written first when it is missing or was written from a different checkpoint (quant::open).
     /// # Safety
-    /// model.safetensors must not change while the process runs, as `Weights::open` says.
-    pub unsafe fn load(directory: &Path) -> Result<Model> {
+    /// model.safetensors and the quantized file must not change while the process runs, as `Weights::open` says.
+    pub unsafe fn load(directory: &Path, quant: Option<Format>) -> Result<Model> {
         let read = |name: &str| {
             let path = directory.join(name);
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
@@ -562,8 +565,13 @@ impl Model {
         let json =
             |name: &str| -> Result<Value> { serde_json::from_str(&read(name)?).map_err(|e| format!("{name}: {e}")) };
         let (config, generation) = (json("config.json")?, json("generation_config.json")?);
+        let path = directory.join("model.safetensors");
         // SAFETY: passed on to this function's caller.
-        let weights = unsafe { Weights::open(&directory.join("model.safetensors"))? };
+        let mut weights = unsafe { Weights::open(&path)? };
+        if let Some(format) = quant {
+            // SAFETY: passed on to this function's caller.
+            weights.overlay(unsafe { quant::open(&weights, &path, format)? });
+        }
         let number = |value: &Value, what: &str| value.as_f64().ok_or(format!("config.json has no {what}"));
         // a layer type's rotary settings: LFM3 keys them by layer type, LFM2 has one flat set
         let rope = |config: &Value, layer_type: &str, window: Option<usize>| -> Result<AttentionKind> {
@@ -809,11 +817,13 @@ impl Model {
         let mut x = prompt;
         self.lm.forward(&mut x, &mut cache);
         note(&format!("prompt of {} rows", x.len() / self.lm.hidden), start);
-        let start = Instant::now();
+        let (start, mut depth_time) = (Instant::now(), 0.0);
         for slot in 0..max_slots {
             let hidden = &x[x.len() - self.lm.hidden..];
             let next = if speaking {
+                let sampling = Instant::now();
                 let mut codes = self.depth.sample(hidden, &frames, sampler);
+                depth_time += sampling.elapsed().as_secs_f64();
                 if codes.contains(&self.eos_code) {
                     // any end-of-audio code ends the speech, and the frame goes back in as all end-of-audio codes
                     speaking = false;
@@ -850,7 +860,9 @@ impl Model {
             x = next;
             self.lm.forward(&mut x, &mut cache);
         }
-        note(&format!("{} text tokens and {} speech frames", text.len(), frames.len()), start);
+        let depth =
+            if frames.is_empty() { String::new() } else { format!(" ({depth_time:.3} s of it in the depth decoder)") };
+        note(&format!("{} text tokens and {} speech frames{depth}", text.len(), frames.len()), start);
         (text, frames)
     }
 }

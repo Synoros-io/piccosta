@@ -1,7 +1,8 @@
 // Weights and the arithmetic every part of the model shares: a safetensors file read in place, linear layers
-// over bf16 weights, attention, norms and activations. Everything computes in f32; the weights stay bf16 in the
-// mapped file and are widened as they are used.
+// over bf16 or quantized weights (quant.rs), attention, norms and activations. Everything computes in f32; the
+// weights stay as they are in the mapped file and are widened as they are used.
 
+use crate::quant::{self, GROUP};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::{
@@ -19,23 +20,29 @@ pub type Result<T> = std::result::Result<T, String>;
 // and the language model's narrowest layer (2048 rows) still splits into 32 tasks.
 const BLOCK_ROWS: usize = 64;
 
-// With fewer input rows than this, each weight row is streamed once per input row through the fused bf16
-// dot product: the work is memory-bound and the row stays in cache. With more, a block of weights is widened
-// once and handed to the sgemm kernel, which reuses it across all the rows. Timing both paths on this model's
-// layers put them even at about eight rows.
-const GEMM_MIN_ROWS: usize = 8;
+// One input row reads each weight where it lies (a decode step, bound by memory). With fewer input rows than
+// this, each weight row is widened once into a buffer that stays in L1 and read by the input rows four at a
+// time; with more, a block of weights is widened and handed to the sgemm kernel, which packs the input rows once
+// per block instead of reading them again for every weight row. Timed on this model's layers with 6 threads on
+// a shared machine: at 12 rows (the depth decoder) 70–93 GFLOP/s against sgemm's 25–30, at 84 rows 122–139
+// against 91–104, at 388 even (114–145 against 131–144), and at 23,520 rows of 256 inputs 22 against 92.
+const GEMM_MIN_ROWS: usize = 256;
 
 // Query rows attention scores at a time. A block of queries sees at most its own rows plus the window before
 // them, or every key in full attention, so a task's scores are 64 × keys rather than queries × keys: 2 MB at
 // 8192 keys, where scoring the whole prompt at once would take 256 MB per head.
 const QUERY_BLOCK: usize = 64;
 
-// The rows of a weight matrix as they lie in memory: bf16 straight from the checkpoint, or f32 for the few
-// matrices built at load time (the Fourier bases).
+// The rows of a weight matrix as they lie in memory: bf16 straight from the checkpoint, f32 for the few
+// matrices built at load time (the Fourier bases), or the codes and scales of a quantized file (quant.rs).
 #[derive(Clone, Copy)]
 pub enum Data {
     Bf16(&'static [u16]),
     F32(&'static [f32]),
+    // a code per value and a scale per row
+    Q8(&'static [i8], &'static [f32]),
+    // a code per value, two to a byte, and a bf16 scale and minimum per group of GROUP values
+    Q4(&'static [u8], &'static [u16]),
 }
 
 // A rows × cols matrix in row-major order. A linear layer's weight is [outputs, inputs], as torch stores it.
@@ -62,6 +69,8 @@ struct Entry {
 // loading copies nothing and the kernel can drop and re-read the pages under memory pressure.
 pub struct Weights {
     tensors: HashMap<String, Entry>,
+    // the header's __metadata__ object, Null when it has none
+    pub metadata: Value,
 }
 
 // The device and inode of every file mapped so far, so that output can refuse to overwrite one (`is_mapped`).
@@ -107,9 +116,10 @@ impl Weights {
             .map(|length| bytes[8..].split_at(length))
             .ok_or_else(|| fail("header past the end".into()))?;
         let header: Value = serde_json::from_slice(header).map_err(|e| fail(e.to_string()))?;
-        let mut tensors = HashMap::new();
+        let (mut tensors, mut metadata) = (HashMap::new(), Value::Null);
         for (name, info) in header.as_object().ok_or_else(|| fail("header is not an object".into()))? {
             if name == "__metadata__" {
+                metadata = info.clone();
                 continue;
             }
             let offset = |index: usize| info["data_offsets"][index].as_u64().unwrap_or(0) as usize;
@@ -126,7 +136,16 @@ impl Weights {
             };
             tensors.insert(name.clone(), entry);
         }
-        Ok(Weights { tensors })
+        Ok(Weights { tensors, metadata })
+    }
+
+    // Takes `other`'s tensors in place of this file's of the same names: a quantized file over its checkpoint.
+    pub fn overlay(&mut self, other: Weights) {
+        self.tensors.extend(other.tensors);
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.tensors.keys()
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -142,29 +161,28 @@ impl Weights {
     }
 
     // The tensor as a matrix of shape[0] rows; trailing dimensions fold into the columns, so a 1×1
-    // convolution's [out, in, 1] weight reads as [out, in]. bf16 stays in place; f32 is borrowed in place too.
+    // convolution's [out, in, 1] weight reads as [out, in]. bf16 and f32 are borrowed in place, and so are a
+    // quantized matrix's codes (I8, or U8 holding two 4-bit codes a byte) and the scales beside them.
     pub fn matrix(&self, name: &str) -> Result<Matrix> {
         let entry = self.entry(name)?;
         let rows = entry.shape.first().copied().unwrap_or(1);
         // A hostile header can name a shape whose product wraps around to match a short byte range, so the
-        // product and its size in bytes are checked. Equal to the length of a real slice, they fit in isize.
-        let count = entry.shape.iter().try_fold(1usize, |count, &d| count.checked_mul(d));
-        // the header promises aligned offsets and the mapping starts on a page, but check before reinterpreting
-        let aligned = |size: usize| {
-            (entry.bytes.as_ptr() as usize).is_multiple_of(size)
-                && count.and_then(|count| count.checked_mul(size)) == Some(entry.bytes.len())
+        // product is checked, and Matrix::new checks it against the length of the slices it is given.
+        let count = entry.shape.iter().try_fold(1usize, |count, &d| count.checked_mul(d)).unwrap_or(0);
+        let scales = |dtype: &str| match self.entry(&format!("{name}.scale"))? {
+            scales if scales.dtype == dtype => Ok(scales),
+            _ => Err(format!("its scales are not {dtype}")),
         };
-        let count = count.unwrap_or(0);
-        // SAFETY: the bytes are in the 'static mapping, aligned and exactly `count` elements long (checked above).
-        // A shape with a zero in it is refused by `Matrix::new`, so rows can't claim more than the bytes hold.
         let data = match entry.dtype.as_str() {
-            "BF16" if aligned(2) => {
-                Data::Bf16(unsafe { std::slice::from_raw_parts(entry.bytes.as_ptr().cast(), count) })
-            }
-            "F32" if aligned(4) => Data::F32(unsafe { std::slice::from_raw_parts(entry.bytes.as_ptr().cast(), count) }),
-            dtype => return Err(format!("{name}: unsupported or misaligned {dtype} tensor")),
+            "BF16" => slice(entry).map(Data::Bf16),
+            "F32" => slice(entry).map(Data::F32),
+            "I8" => slice(entry).and_then(|codes| Ok(Data::Q8(codes, slice(scales("F32")?)?))),
+            "U8" => slice(entry).and_then(|codes| Ok(Data::Q4(codes, slice(scales("BF16")?)?))),
+            dtype => Err(format!("unsupported {dtype} tensor")),
         };
-        Matrix::new(data, rows, count / rows.max(1)).map_err(|e| format!("{name}: {e}"))
+        // a byte of U8 holds two 4-bit codes
+        let cols = count / rows.max(1) * if entry.dtype == "U8" { 2 } else { 1 };
+        data.and_then(|data| Matrix::new(data, rows, cols)).map_err(|e| format!("{name}: {e}"))
     }
 
     // The whole tensor widened to an owned f32 vector: norms, biases and other small parameters.
@@ -183,15 +201,48 @@ impl Weights {
     }
 }
 
+// An entry's bytes as numbers of type T, refused when they are misaligned for T or not a whole number of them.
+// The header promises aligned offsets and the mapping starts on a page, but this checks before reinterpreting.
+fn slice<T: Copy>(entry: &Entry) -> Result<&'static [T]> {
+    let size = std::mem::size_of::<T>();
+    if !(entry.bytes.as_ptr() as usize).is_multiple_of(size) || !entry.bytes.len().is_multiple_of(size) {
+        return Err(format!("a misaligned {} tensor", entry.dtype));
+    }
+    // SAFETY: the bytes are in the 'static mapping, aligned for T and a whole number of T long; the callers'
+    // T are integers and floats, for which every bit pattern is a value.
+    Ok(unsafe { std::slice::from_raw_parts(entry.bytes.as_ptr().cast(), entry.bytes.len() / size) })
+}
+
 impl Matrix {
-    // `rows` × `cols` over `data`, refused unless both are positive and their product is exactly its length.
+    // `rows` × `cols` over `data`, refused unless both are positive and the slices hold exactly that many
+    // values: a value each, a code each and a scale per row (q8), or a code per value two to a byte and a pair
+    // per group of whole groups (q4).
     pub fn new(data: Data, rows: usize, cols: usize) -> Result<Matrix> {
-        let length = match data {
-            Data::Bf16(values) => values.len(),
-            Data::F32(values) => values.len(),
+        let count = rows.checked_mul(cols).filter(|_| rows > 0 && cols > 0);
+        let whole = count.is_some_and(|count| match data {
+            Data::Bf16(values) => values.len() == count,
+            Data::F32(values) => values.len() == count,
+            Data::Q8(codes, scales) => codes.len() == count && scales.len() == rows,
+            Data::Q4(codes, scales) => {
+                cols.is_multiple_of(GROUP) && codes.len() * 2 == count && scales.len() == count / GROUP * 2
+            }
+        });
+        if !whole {
+            return Err(format!("{rows} × {cols} is not a matrix of the values given"));
+        }
+        // Scales and minimums come from an overlay file: each must be a number, and so must the largest value it
+        // can rebuild (code 127 or -128 in q8, 0 to 15 in q4). A NaN or an infinity would load and quietly
+        // corrupt every result it touched.
+        let finite = match data {
+            Data::Q8(_, scales) => scales.iter().all(|&scale| (scale * 128.0).is_finite()),
+            Data::Q4(_, pairs) => pairs.chunks_exact(2).all(|pair| {
+                let (scale, minimum) = (bf16(pair[0]), bf16(pair[1]));
+                minimum.is_finite() && (minimum + 15.0 * scale).is_finite()
+            }),
+            _ => true,
         };
-        if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(length) {
-            return Err(format!("{rows} × {cols} is not a matrix of {length} values"));
+        if !finite {
+            return Err(format!("a {rows} × {cols} matrix whose scales aren't finite numbers"));
         }
         Ok(Matrix { data, rows, cols })
     }
@@ -212,31 +263,43 @@ impl Matrix {
 
     // One row widened to f32: an embedding lookup.
     pub fn row(&self, index: usize) -> Vec<f32> {
+        let mut out = vec![0f32; self.cols];
+        self.widen(index, &mut out);
+        out
+    }
+
+    // Row `index` widened to f32 into `out`, which is a row long.
+    fn widen(&self, index: usize, out: &mut [f32]) {
         let range = index * self.cols..(index + 1) * self.cols;
+        let (codes, groups) = (range.start / 2..range.end / 2, range.start / GROUP * 2..range.end / GROUP * 2);
         match self.data {
-            Data::Bf16(data) => data[range].iter().map(|&bits| bf16(bits)).collect(),
-            Data::F32(data) => data[range].to_vec(),
+            Data::Bf16(data) => out.iter_mut().zip(&data[range]).for_each(|(o, &bits)| *o = bf16(bits)),
+            Data::F32(data) => out.copy_from_slice(&data[range]),
+            Data::Q8(codes, scales) => {
+                out.iter_mut().zip(&codes[range]).for_each(|(o, &code)| *o = code as f32 * scales[index])
+            }
+            Data::Q4(data, scales) => quant::widen_q4(&data[codes], &scales[groups], out),
         }
     }
 
-    // Rows `rows` as one f32 block, widened into `buffer` when they are bf16.
+    // Rows `rows` as one f32 block, widened into `buffer` unless they are f32 already.
     fn block<'a>(&self, rows: std::ops::Range<usize>, buffer: &'a mut Vec<f32>) -> &'a [f32] {
-        let range = rows.start * self.cols..rows.end * self.cols;
-        match self.data {
-            Data::F32(data) => &data[range],
-            Data::Bf16(data) => {
-                buffer.clear();
-                buffer.extend(data[range].iter().map(|&bits| bf16(bits)));
-                buffer
-            }
+        if let Data::F32(data) = self.data {
+            return &data[rows.start * self.cols..rows.end * self.cols];
         }
+        buffer.resize(rows.len() * self.cols, 0.0);
+        rows.zip(buffer.chunks_mut(self.cols)).for_each(|(row, out)| self.widen(row, out));
+        buffer
     }
 
     fn dot(&self, row: usize, x: &[f32]) -> f32 {
         let range = row * self.cols..(row + 1) * self.cols;
+        let (codes, groups) = (range.start / 2..range.end / 2, range.start / GROUP * 2..range.end / GROUP * 2);
         match self.data {
             Data::Bf16(data) => dot_bf16(x, &data[range]),
             Data::F32(data) => x.iter().zip(&data[range]).map(|(a, b)| a * b).sum(),
+            Data::Q8(data, scales) => quant::dot_q8(x, &data[range]) * scales[row],
+            Data::Q4(data, scales) => quant::dot_q4(x, &data[codes], &scales[groups]),
         }
     }
 }
@@ -281,13 +344,24 @@ pub fn matmul(x: &[f32], w: Matrix) -> Vec<f32> {
     let out = Shared(y.as_mut_ptr());
     (0..n.div_ceil(BLOCK_ROWS)).into_par_iter().for_each(|block| {
         let rows = block * BLOCK_ROWS..n.min((block + 1) * BLOCK_ROWS);
+        if m == 1 {
+            // SAFETY: element (0, row) belongs to this block alone.
+            rows.for_each(|row| unsafe { *out.at(row) = w.dot(row, &x[..k]) });
+            return;
+        }
         if m < GEMM_MIN_ROWS {
-            for row in rows {
-                for i in 0..m {
-                    // SAFETY: element (i, row) belongs to this block alone.
-                    unsafe { *out.at(i * n + row) = w.dot(row, &x[i * k..(i + 1) * k]) };
+            WIDENED.with_borrow_mut(|buffer| {
+                for row in rows {
+                    let weights = w.block(row..row + 1, buffer);
+                    for first in (0..m).step_by(4) {
+                        // the last four repeat the last row when m isn't a multiple of four
+                        let inputs = std::array::from_fn(|i| &x[(first + i).min(m - 1) * k..][..k]);
+                        let sums = dots4(weights, inputs);
+                        // SAFETY: elements (i, row) belong to this block alone.
+                        (first..m.min(first + 4)).for_each(|i| unsafe { *out.at(i * n + row) = sums[i - first] });
+                    }
                 }
-            }
+            });
             return;
         }
         WIDENED.with_borrow_mut(|buffer| {
@@ -348,12 +422,55 @@ unsafe fn dot_bf16_avx2(x: &[f32], w: &[u16]) -> f32 {
             *sum = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(x.as_ptr().add(at)) }, weights, *sum);
         }
     }
+    let tail: f32 = (steps * 32..x.len()).map(|i| x[i] * bf16(w[i])).sum();
+    total(sums) + tail
+}
+
+// Σ w[j]·x[i][j] for each of four rows of x, through AVX2 and FMA when the CPU has them.
+fn dots4(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: the features this needs were just detected.
+        return unsafe { dots4_avx2(w, x) };
+    }
+    x.map(|x| x.iter().zip(w).map(|(a, b)| a * b).sum())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dots4_avx2(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let length = x.iter().fold(w.len(), |length, x| length.min(x.len()));
+    // two sums of eight lanes a row, 16 values a step: each weight load serves four multiply-adds
+    let mut sums = [[_mm256_setzero_ps(); 2]; 4];
+    let steps = length / 16;
+    for step in 0..steps {
+        for half in 0..2 {
+            let at = step * 16 + half * 8;
+            // SAFETY: at + 8 <= steps * 16 <= the length of w and of every row of x.
+            let weights = unsafe { _mm256_loadu_ps(w.as_ptr().add(at)) };
+            for (sum, x) in sums.iter_mut().zip(x) {
+                sum[half] = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(x.as_ptr().add(at)) }, weights, sum[half]);
+            }
+        }
+    }
+    let zero = _mm256_setzero_ps();
+    std::array::from_fn(|i| {
+        let tail: f32 = (steps * 16..length).map(|j| x[i][j] * w[j]).sum();
+        total([sums[i][0], sums[i][1], zero, zero]) + tail
+    })
+}
+
+// The sum of every lane of four AVX sums: the end of each SIMD dot product.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn total(sums: [std::arch::x86_64::__m256; 4]) -> f32 {
+    use std::arch::x86_64::*;
     let total = _mm256_add_ps(_mm256_add_ps(sums[0], sums[1]), _mm256_add_ps(sums[2], sums[3]));
     let mut lanes = [0f32; 8];
     // SAFETY: lanes holds exactly eight floats.
     unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), total) };
-    let tail: f32 = (steps * 32..x.len()).map(|i| x[i] * bf16(w[i])).sum();
-    lanes.iter().sum::<f32>() + tail
+    lanes.iter().sum()
 }
 
 // Scaled dot-product attention of `rows` new queries over the cached keys and values, the new ones last.
