@@ -115,17 +115,14 @@ impl OutputAccumulator {
         self.current_line_bytes
     }
 
-    // Everything so far, raw, for when a command moves to the background and its log starts:
-    // the bytes in memory, or the spill file's path holding them. Borrow them so a failed job
-    // handoff can keep collecting output in the foreground.
-    pub fn raw(&mut self) -> Result<RawOutput<'_>, String> {
+    // The command moves to the background, and its spill file becomes the job's log: spill now if
+    // the output never needed to, so the bytes in memory go in it. Output: the file's path and the
+    // open file, which keeps whatever was written even after a failed write; None when no file
+    // could be made. The accumulator is done after this.
+    pub fn take_spill(&mut self) -> Option<(PathBuf, std::fs::File)> {
+        self.ensure_spill();
         self.flush_spill();
-        self.check_error()?;
-        if self.spilled {
-            Ok(RawOutput::File(&self.spill_path))
-        } else {
-            Ok(RawOutput::Memory(&self.raw))
-        }
+        self.spill.take().map(|file| (self.spill_path.clone(), file))
     }
 
     pub fn check_error(&self) -> Result<(), String> {
@@ -214,13 +211,16 @@ impl OutputAccumulator {
             if let Some(parent) = self.spill_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.spill_path)?;
-            file.write_all(&self.raw)?;
-            Ok(file)
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.spill_path)
         })();
         match file {
-            Ok(file) => {
-                self.raw.clear();
+            // Once made, the file is kept even if writing to it fails partway: a job moved to the
+            // background takes it as its log, with whatever got written, instead of none.
+            Ok(mut file) => {
+                match file.write_all(&self.raw) {
+                    Ok(()) => self.raw.clear(),
+                    Err(error) => self.error = Some(error),
+                }
                 self.spilled = true;
                 self.spill = Some(file);
             }
@@ -231,9 +231,4 @@ impl OutputAccumulator {
     pub fn spill_path(&self) -> Option<&Path> {
         (self.spilled && self.error.is_none()).then_some(self.spill_path.as_path())
     }
-}
-
-pub enum RawOutput<'a> {
-    Memory(&'a [u8]),
-    File(&'a Path),
 }

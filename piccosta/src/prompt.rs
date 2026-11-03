@@ -46,12 +46,14 @@ const SAVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 // The last good bytes of every context file and import read in this piccosta process, by path.
 static SNAPSHOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
 
-// The constitution: PICCOSTA_CONSTITUTION holds the text itself (how the bench passes it into a
-// sandbox), PICCOSTA_CONSTITUTION_FILE a path to it. With neither, prompts/constitution.md, the
-// text this binary was built with. PICCOSTA_CONSTITUTION_FILE set to an empty string turns it off.
+// The constitution is off unless asked for: benchmarks gave mixed results with it, and it is about
+// 2,200 tokens on every request (2026-11-02). PICCOSTA_CONSTITUTION holds the text itself (how the
+// bench passes it into a sandbox), PICCOSTA_CONSTITUTION_FILE a path to it, or "built-in" for
+// prompts/constitution.md, the text this binary was built with.
 const CONSTITUTION_TEXT_ENV: &str = "PICCOSTA_CONSTITUTION";
 const CONSTITUTION_FILE_ENV: &str = "PICCOSTA_CONSTITUTION_FILE";
 const BUILT_IN_CONSTITUTION: &str = include_str!("../prompts/constitution.md");
+const CONSTITUTION_BUILT_IN: &str = "built-in";
 
 pub struct ContextFile {
     pub path: PathBuf,
@@ -242,9 +244,9 @@ fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], reads: &mut Reads) 
 pub fn constitution(model_name: &str) -> Result<Option<String>, String> {
     let text = match (std::env::var(CONSTITUTION_TEXT_ENV), std::env::var(CONSTITUTION_FILE_ENV)) {
         (Ok(text), _) if !text.trim().is_empty() => text,
-        (_, Ok(path)) if path.is_empty() => return Ok(None),
-        (_, Ok(path)) => std::fs::read_to_string(&path).map_err(|error| format!("{CONSTITUTION_FILE_ENV}={path}: {error}"))?,
-        _ => BUILT_IN_CONSTITUTION.to_string(),
+        (_, Ok(path)) if path == CONSTITUTION_BUILT_IN => BUILT_IN_CONSTITUTION.to_string(),
+        (_, Ok(path)) if !path.is_empty() => std::fs::read_to_string(&path).map_err(|error| format!("{CONSTITUTION_FILE_ENV}={path}: {error}"))?,
+        _ => return Ok(None),
     };
     if text.trim().is_empty() {
         return Ok(None);

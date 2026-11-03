@@ -527,9 +527,7 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     // Any command still running at the soft limit moves to the background, and so does every one
     // when the user sends a message now. A timeout only kills a command (watch enforces it there
     // too); it never holds one in the foreground, where a long one would block the session.
-    // longcmd kept commands
-    // with a timeout in the foreground. Once a move fails the command stays.
-    let mut can_move = true;
+    // longcmd kept commands with a timeout in the foreground.
     let mut tail = Tail::default();
     let soft_limit = tokio::time::sleep(if arguments.background { Duration::ZERO } else { shared.jobs.soft_limit });
     tokio::pin!(soft_limit);
@@ -548,9 +546,7 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
             event = events.recv() => match event {
                 Some(Event::Data(data)) => {
                     output.append(&data);
-                    if can_move {
-                        tail.push(&data);
-                    }
+                    tail.push(&data);
                     if context.updates.is_some() {
                         dirty = true;
                         if update_at.is_none() {
@@ -582,15 +578,8 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
                     () = &mut soft_limit => {}
                     () = &mut detach => {}
                 }
-            }, if can_move && !kill.is_cancelled() => {
-                match to_background(arguments, context, &mut output, pid, kill.clone(), started, std::mem::take(&mut tail), events) {
-                    Ok(result) => return Ok(Run::Background(result)),
-                    // No log could be opened: stay in the foreground, as pi's own bash would.
-                    Err(returned) => {
-                        events = returned;
-                        can_move = false;
-                    }
-                }
+            }, if !kill.is_cancelled() => {
+                return Ok(Run::Background(to_background(arguments, context, &mut output, pid, kill.clone(), started, std::mem::take(&mut tail), events)));
             }
             () = context.cancel.cancelled(), if !kill.is_cancelled() => kill.cancel(),
         }
@@ -620,7 +609,7 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
 
 // The soft limit passed, or the user sent a message now: hand the command to a background job and
 // tell the model (longcmd.ts:493-529).
-// Output: the call's result, or the event channel back when no log could be opened.
+// Output: the call's result.
 #[allow(clippy::too_many_arguments)]
 fn to_background(
     arguments: &Arguments,
@@ -631,22 +620,10 @@ fn to_background(
     started: Instant,
     tail: Tail,
     events: mpsc::UnboundedReceiver<Event>,
-) -> Result<ToolOutput, mpsc::UnboundedReceiver<Event>> {
+) -> ToolOutput {
     let shared = context.shared.clone();
     let session_tag: String = if context.session_id.is_empty() { std::process::id().to_string() } else { context.session_id.chars().take(8).collect() };
-    let spill = output.spill_path().map(Path::to_path_buf);
-    let raw = match output.raw() {
-        Ok(raw) => raw,
-        Err(_) => return Err(events),
-    };
-    let job = match shared.jobs.start(&session_tag, &context.cwd, &arguments.command, pid, kill, started, raw) {
-        Ok(job) => job,
-        Err(_) => return Err(events),
-    };
-    // The log now holds everything the spill file did.
-    if let Some(spill) = spill {
-        let _ = std::fs::remove_file(spill);
-    }
+    let job = shared.jobs.start(&session_tag, &arguments.command, pid, kill, started, output.take_spill());
     let (text, cut) = tail.text();
     let status = format!(
         "[Still running after {}; moved to background job {}, pid {}. {}Full output, including what it prints from now on: {}]",
@@ -662,7 +639,7 @@ fn to_background(
     let reply = format!("{}{status}\n{instruction}", if text.is_empty() { String::new() } else { format!("{text}\n\n") });
 
     tokio::spawn(log_until_done(shared, job, arguments.command.clone(), tail, events));
-    Ok(ToolOutput { content: vec![Content::text(reply)], details: None, is_error: false })
+    ToolOutput { content: vec![Content::text(reply)], details: None, is_error: false }
 }
 
 // A background job's output goes to its log and its tail until the command ends; then the job

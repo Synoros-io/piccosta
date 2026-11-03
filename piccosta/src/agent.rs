@@ -175,6 +175,14 @@ impl Handle {
         self.lock().cancel.cancel();
     }
 
+    // Stop the run without killing its commands, the way every interrupt does (Esc, an rpc abort,
+    // ACP's cancel). Input: the session's jobs. The move goes out before the abort, and bash's
+    // biased select takes it first, so each running command goes on as a background job.
+    pub fn interrupt(&self, jobs: &crate::tools::jobs::Jobs) {
+        jobs.detach_all();
+        self.abort();
+    }
+
     pub fn steer(&self, text: String) {
         self.lock().steer.push(text);
     }

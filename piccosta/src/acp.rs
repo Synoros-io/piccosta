@@ -452,7 +452,7 @@ impl Acp {
                 let mut runs = live.runs.lock().unwrap();
                 runs.cancelled_through = runs.sent;
             }
-            live.handle.abort();
+            live.handle.interrupt(&live.shared.jobs);
             let (inputs, session, serial, prompt) = (self.inputs.clone(), session.to_string(), live.serial, live.prompts);
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(CANCEL_WAIT).await;

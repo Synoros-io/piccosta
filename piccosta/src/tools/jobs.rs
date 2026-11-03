@@ -17,6 +17,9 @@
 //   process group, and their logs say so. /restart is not an end: its jobs are handed to the
 //   image it execs (hand_over, adopt), which sends their messages when they exit. An abort during the model's turn doesn't kill a job
 //   that is already in the background: the turn that started it is over.
+// - An interrupt never kills a command: Esc, an rpc abort, ACP's cancel and a steer message move
+//   the turn's running commands to the background (agent::Handle::interrupt). Closing or
+//   replacing a session is an end, and kills them.
 //
 // No new tools: the model stops a job with `kill -- -<pid>` through bash and reads the log with
 // its read or bash tools.
@@ -32,6 +35,9 @@
 // Fixed from longcmd: the session id prefix only changes every 65.5 s (session ids are UUIDv7)
 // and job ids restart per process, so two sessions in one cwd overwrote each other's `-1.log`.
 // Logs are now created only where no file exists, moving on to the next job number if one does.
+//
+// A job's log is the command's spill file, renamed: a command that moves keeps every byte it
+// printed, with nothing to copy and no second file to make. One that never spilled spills now.
 
 use crate::message::{CustomMessage, TextOrBlocks};
 use std::collections::HashMap;
@@ -50,6 +56,8 @@ const DEFAULT_SOFT_LIMIT_SECONDS: f64 = 2.0;
 const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
 const DEFAULT_JOB_DIR: &str = ".pi-jobs";
 const JOB_DIR_ENV: &str = "PICCOSTA_LONGCMD_DIR";
+// Unix's null device: the log of a job whose output had nowhere to go (Jobs::start).
+const NO_LOG: &str = "/dev/null";
 // Optional cap, in seconds, on how long print and json mode wait for running jobs after the model
 // ends its turn. Unset means wait as long as a job runs, which is what a blocking bash would have
 // done. When the cap is hit the jobs are killed and the model is told.
@@ -296,48 +304,49 @@ impl Jobs {
             .collect()
     }
 
-    // Input: the session tag, the cwd, the command, its pid and kill token, and its output so far.
-    // Output: the new job and its open log, with the output so far already written.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        &self,
-        session_tag: &str,
-        cwd: &Path,
-        command: &str,
-        pid: u32,
-        kill: CancellationToken,
-        started: Instant,
-        earlier_output: super::output::RawOutput<'_>,
-    ) -> std::io::Result<Job> {
-        let dir = self.job_dir(cwd);
-        // Next free job number for this tag: create_new fails on an existing file.
-        let (id, path, mut log) = loop {
+    // Input: the session tag, the command, its pid and kill token, and its spill file (path and
+    // open file) holding everything it printed so far. Output: the new job, its log that file under
+    // the job's name. A hard link to the new name, then removing the old, is a rename that never
+    // replaces another session's log: a taken name moves on to the next job number. If the link
+    // can't be made, the log keeps the spill's name, and the session's end no longer removes it.
+    // With no spill file at all (none could be made in the job directory) the log is the null
+    // device: the job still runs, is listed, survives /restart and sends its message with the
+    // output tail, and the log path it gives says that nothing more was kept.
+    pub fn start(&self, session_tag: &str, command: &str, pid: u32, kill: CancellationToken, started: Instant, spill: Option<(PathBuf, std::fs::File)>) -> Job {
+        let Some((spill_path, log)) = spill else {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            let path = dir.join(format!("{session_tag}-{id}.log"));
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => break (id, path, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
+            return self.list(id, pid, command, started, PathBuf::from(NO_LOG), std::fs::File::options().append(true).open(NO_LOG).ok(), kill);
         };
-        match earlier_output {
-            super::output::RawOutput::Memory(bytes) => log.write_all(bytes)?,
-            super::output::RawOutput::File(spill) => {
-                let mut source = std::fs::File::open(spill)?;
-                std::io::copy(&mut source, &mut log)?;
+        // The spill name leaves the session's cleanup list only once it's gone or is the log itself;
+        // a name the unlink couldn't remove is still cleaned up when the session ends.
+        let untrack = |spill_path: &PathBuf| self.spill_files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|path| path != spill_path);
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let path = spill_path.with_file_name(format!("{session_tag}-{id}.log"));
+            match std::fs::hard_link(&spill_path, &path) {
+                Ok(()) => {
+                    if std::fs::remove_file(&spill_path).is_ok() {
+                        untrack(&spill_path);
+                    }
+                    return self.list(id, pid, command, started, path, Some(log), kill);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    untrack(&spill_path);
+                    return self.list(id, pid, command, started, spill_path, Some(log), kill);
+                }
             }
         }
-        Ok(self.list(id, pid, command, started, path, log, kill))
     }
 
     // List a job as running. Output: its handle, holding its open log.
     #[allow(clippy::too_many_arguments)]
-    fn list(&self, id: u64, pid: u32, command: &str, started: Instant, log_path: PathBuf, log: std::fs::File, kill: CancellationToken) -> Job {
+    fn list(&self, id: u64, pid: u32, command: &str, started: Instant, log_path: PathBuf, log: Option<std::fs::File>, kill: CancellationToken) -> Job {
         let kill_reason = Arc::new(Mutex::new(None));
         let silent = Arc::new(AtomicBool::new(false));
         let running = RunningJob { pid, command: command.to_string(), started, log_path: log_path.clone(), kill, kill_reason: kill_reason.clone(), silent: silent.clone() };
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id, running);
-        Job { id, pid, log_path, log: Some(log), kill_reason, silent, started }
+        Job { id, pid, log_path, log, kill_reason, silent, started }
     }
 
     // /restart: take the running jobs out of this session, so its end doesn't kill them, and hand
@@ -358,7 +367,7 @@ impl Jobs {
         let log = std::fs::OpenOptions::new().append(true).open(&handed.log_path)?;
         self.next_id.fetch_max(handed.id + 1, Ordering::SeqCst);
         let started = Instant::now().checked_sub(Duration::from_millis(handed.elapsed_ms)).unwrap_or_else(Instant::now);
-        Ok(self.list(handed.id, handed.pid, &handed.command, started, handed.log_path.clone(), log, kill))
+        Ok(self.list(handed.id, handed.pid, &handed.command, started, handed.log_path.clone(), Some(log), kill))
     }
 
     // Input: a job whose command ended, the command, its output tail and how it ended. Closes the

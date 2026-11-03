@@ -1095,11 +1095,9 @@ impl App {
     // Esc: the commands the turn is running move to the background, where they carry on and report
     // when they end, and the model stops.
     fn interrupt(&mut self) {
-        if let Some(shared) = &self.focused().shared {
-            shared.jobs.detach_all();
-        }
-        let Some((handle, commands)) = &self.focused().live else { return };
-        handle.abort();
+        let slot = self.focused();
+        let (Some((handle, commands)), Some(shared)) = (&slot.live, &slot.shared) else { return };
+        handle.interrupt(&shared.jobs);
         let (steer, follow_up) = handle.clear();
         let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
         if !queued.is_empty() {

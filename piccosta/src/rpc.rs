@@ -306,7 +306,7 @@ impl Rpc {
                 Some(json!({"disposition": "queued"}))
             }
             "abort" | "abort_retry" => {
-                live.handle.abort();
+                live.handle.interrupt(&live.shared.jobs);
                 if live.streaming && kind == "abort" {
                     live.aborts.push(id);
                     return Ok(Reply::Later);
