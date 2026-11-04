@@ -18,8 +18,8 @@ const MAX_FEATURE_VALUES: usize = 64 << 20;
 
 // Reads a RIFF WAV file of 16-bit or 32-bit integer PCM or 32-bit float samples and averages its channels to
 // mono, as the model's preprocessor does ("channel_reduction": "mean"). Returns the samples in [-1, 1] and the
-// sample rate. A data chunk whose length runs past the end (a WAV streamed through a pipe) is read to the end.
-pub fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+// sample rate. Only streamed stdin treats zero or unknown data length as samples until EOF.
+pub fn read_wav(bytes: &[u8], streamed: bool) -> Result<(Vec<f32>, u32)> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("not a WAV file".into());
     }
@@ -29,7 +29,12 @@ pub fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     let mut at = 12;
     while at + 8 <= bytes.len() {
         let size = u32_at(at + 4) as usize;
-        let body = &bytes[at + 8..bytes.len().min(at + 8 + size)];
+        let until_eof = streamed && &bytes[at..at + 4] == b"data" && (size == 0 || size == u32::MAX as usize);
+        let end = if until_eof { bytes.len() } else { at + 8 + size };
+        if end > bytes.len() {
+            return Err("truncated WAV chunk".into());
+        }
+        let body = &bytes[at + 8..end];
         match &bytes[at..at + 4] {
             b"fmt " if body.len() >= 16 => {
                 // 0xFFFE is WAVE_FORMAT_EXTENSIBLE: the real format is the first two bytes of its sub-format GUID
@@ -61,10 +66,17 @@ pub fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
 
 // 16-bit PCM mono WAV of `samples`, clipped to [-1, 1].
 pub fn write_wav(samples: &[f32], rate: u32) -> Vec<u8> {
-    let data = (samples.len() * 2) as u32;
-    let mut out = Vec::with_capacity(44 + data as usize);
+    let mut out = wav_header(rate, (samples.len() * 2) as u32);
+    out.extend(pcm(samples));
+    out
+}
+
+// The header of a 16-bit PCM mono WAV with `data` bytes of samples. A stream whose length isn't known yet says
+// u32::MAX, the most it can, as ffmpeg does writing to a pipe, and a player plays what follows until it ends.
+pub fn wav_header(rate: u32, data: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(44);
     out.extend(b"RIFF");
-    out.extend((36 + data).to_le_bytes());
+    out.extend(data.saturating_add(36).to_le_bytes());
     out.extend(b"WAVEfmt ");
     // a 16-byte format chunk: PCM, one channel, the rate, bytes per second, bytes per frame, bits per sample
     for field in [16u32, 1 | (1 << 16), rate, rate * 2, 2 | (16 << 16)] {
@@ -72,8 +84,12 @@ pub fn write_wav(samples: &[f32], rate: u32) -> Vec<u8> {
     }
     out.extend(b"data");
     out.extend(data.to_le_bytes());
-    out.extend(samples.iter().flat_map(|v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()));
     out
+}
+
+// `samples` as 16-bit PCM, clipped to [-1, 1].
+pub fn pcm(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect()
 }
 
 // The encoder's input: a power spectrogram of Hann-windowed frames (no centring), Slaney mel filters, log10

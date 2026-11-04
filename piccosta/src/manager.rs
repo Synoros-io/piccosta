@@ -928,6 +928,7 @@ impl Tool for SessionsTool {
                 // marked closed for everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
+                    crate::voice::hang_up(&self.agent_dir, &summary.path);
                     let stopped = match end(&self.home, &summary.path, "close").await {
                         None => String::new(),
                         Some(Err(why)) => format!("; {why}"),

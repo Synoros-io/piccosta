@@ -6,7 +6,7 @@
 //   or `piccosta call [assistant | <session id or name>]` (the assistant when none is named). It's
 //   a record in the agent dir naming the session's file and an id of its own; starting another ends
 //   it, and so do `/hangup`, `piccosta hangup` and closing that session (a socket close, the UI's
-//   /close).
+//   /close). `voice.call`, when it's set, runs for the length of the call (below).
 // - Push-to-talk talks into the call. With none, `piccosta voice start` and `voice stop` do nothing
 //   and exit 0, so the button can be the one the user already talks to people with.
 // - What push-to-talk hears, and what's said, belongs to the call it started in, by its id: once
@@ -32,6 +32,10 @@
 //   has written it, and closes its stdin when the turn ends. It says each line as it comes (Piper
 //   reads its stdin this way) and exits after the last. Turns are said one after another, never
 //   over each other.
+// - `voice.call`, an optional shell command, starts with each call and is killed, with everything it
+//   started, when the call ends. It's for what listening and speaking share and shouldn't start
+//   over each push or turn, like a speech model held loaded (`lfm serve`) that the listen and speak
+//   commands use. A detached supervisor owns its process group until the call ends.
 // - `voice.quick`, optional: a fast model (provider/id) that answers each of the user's messages
 //   first, from the end of the conversation, while the session's model does the work. Its lines go
 //   to the speak command first, then the session's answer's, which wait their turn. It's spoken
@@ -58,6 +62,8 @@ use tokio_util::sync::CancellationToken;
 const HOLD_FILE: &str = "voice.pid";
 const LOCK_FILE: &str = "voice.lock";
 const CALL_FILE: &str = "call.json";
+// Supervisors hold this through cleanup, so a replacement can't bind a socket the old call still owns.
+const CALL_LOCK_FILE: &str = "voice.call.lock";
 // Where a hold's errors and the listen command's stderr go, in the agent dir.
 const LOG_FILE: &str = "voice.log";
 // How long a hold listens when no `voice stop` comes (a missed key release), unless
@@ -85,6 +91,8 @@ const STOP_SECONDS: u64 = 5;
 // spoken line is a sentence, a couple of seconds, so half a second ends speech within the line
 // being said, and reading a small file twice a second costs nothing.
 const CALL_POLL: Duration = Duration::from_millis(500);
+// Give a call's command a second to unlink sockets and close devices before killing its leftovers.
+const CALL_EXIT_GRACE: Duration = Duration::from_secs(1);
 // How many turns can wait to be said, and how many pieces of one turn's answer: a few turns is
 // more than anyone asks while one is said, and four thousand streamed pieces is several thousand
 // tokens, minutes of speech. Past either, what doesn't fit is dropped, never waited for.
@@ -185,19 +193,67 @@ async fn ended(agent_dir: &Path, id: &str) {
     }
 }
 
-// Call the session in `file`, under a new id, which ends any other call; None hangs up.
+// A process's record, its pid and its boot and start time, for live_record to find it by.
+fn running(pid: u32) -> Value {
+    json!({ "pid": pid, "started": crate::proc::start(pid as i32).map(|start| format!("{} {start}", crate::proc::boot_id())) })
+}
+
+// Publish the call before starting anything. All transitions share the voice lock; old supervisors
+// see their id disappear, and only ever signal the children they own.
 pub fn set_call(agent_dir: &Path, file: Option<&Path>) -> std::io::Result<()> {
-    match file {
-        Some(file) => write_record(&agent_dir.join(CALL_FILE), json!({ "session": file, "id": uuid::Uuid::now_v7().to_string() })),
-        None => std::fs::remove_file(agent_dir.join(CALL_FILE)).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }),
+    let _lock = lock(agent_dir).map_err(std::io::Error::other)?;
+    let record = agent_dir.join(CALL_FILE);
+    let Some(file) = file else { return remove_call(&record) };
+    let id = uuid::Uuid::now_v7().to_string();
+    write_record(&record, json!({ "session": file, "id": id }))?;
+    let mut supervisor = std::process::Command::new(std::env::current_exe()?);
+    supervisor.arg("voice").arg("run-call").arg(id).env("PICCOSTA_AGENT_DIR", agent_dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log()?);
+    match std::os::unix::process::CommandExt::process_group(&mut supervisor, 0).spawn() {
+        Ok(mut child) => { std::thread::spawn(move || child.wait()); Ok(()) }
+        Err(error) => { let _ = remove_call(&record); Err(error) }
     }
 }
 
-// Hang up if the call is with the session in `file`, which is closing.
+fn remove_call(record: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(record).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) })
+}
+
+// Compare and remove under the same lock, so closing one session never hangs up a newer call.
 pub fn hang_up(agent_dir: &Path, file: &Path) {
+    let Ok(_lock) = lock(agent_dir) else { return };
     if call(agent_dir).as_deref() == Some(file) {
-        let _ = set_call(agent_dir, None);
+        let _ = remove_call(&agent_dir.join(CALL_FILE));
     }
+}
+
+// Keep the group's leader unreaped until both signals have gone to its group. Even a shell that
+// exits after `command &` keeps its pid reserved, so teardown can't signal a reused group number.
+async fn run_call(agent_dir: &Path, id: &str) -> Result<(), String> {
+    let command_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(agent_dir.join(CALL_LOCK_FILE)).map_err(|e| e.to_string())?;
+    command_lock.lock().map_err(|e| e.to_string())?;
+    if !reading(agent_dir).map_err(|e| e.to_string())?.is_some_and(|(_, now)| now == id) { return Ok(()) }
+    let settings = crate::config::Settings::load(agent_dir, std::env::current_dir().ok().as_deref());
+    let Some(command) = text_setting(&settings, "voice.call") else { return Ok(()) };
+    // The call ending, or this process being told to end (a logout, a kill), takes the same way out,
+    // so its command never outlives it. The signals are caught before the command starts, so none
+    // can end this process between the two.
+    use tokio::signal::unix::{signal, SignalKind};
+    let caught = |kind| signal(kind).map_err(|error| format!("couldn't catch a signal: {error}"));
+    let (mut term, mut hangup, mut interrupt) = (caught(SignalKind::terminate())?, caught(SignalKind::hangup())?, caught(SignalKind::interrupt())?);
+    let mut child = shell(&command).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log().map_err(|e| e.to_string())?).spawn().map_err(|e| e.to_string())?;
+    tokio::select! {
+        () = ended(agent_dir, id) => {}
+        _ = term.recv() => {}
+        _ = hangup.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+    if let Some(pid) = child.id() {
+        // SAFETY: this unreaped child still owns the process-group number.
+        unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
+        tokio::time::sleep(CALL_EXIT_GRACE).await;
+    }
+    kill_group(&mut child).await;
+    Ok(())
 }
 
 // The session `wanted` names for `piccosta call`: the assistant's for none or "assistant", the file
@@ -210,8 +266,7 @@ fn session_named(agent_dir: &Path, wanted: Option<&str>) -> Result<PathBuf, Stri
     }
 }
 
-// The lock `voice start`, `voice stop` and a hold that's ending take before touching the hold's
-// record, so no two of them act on it at once. It's let go when the file is dropped.
+// The lock for call transitions and the hold's record. It's let go when the file is dropped.
 fn lock(agent_dir: &Path) -> Result<std::fs::File, String> {
     let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(agent_dir.join(LOCK_FILE)).map_err(|error| error.to_string())?;
     file.lock().map_err(|error| error.to_string())?;
@@ -229,6 +284,7 @@ pub async fn run(arguments: &[String]) -> Result<(), String> {
     match arguments.first().map(String::as_str) {
         Some("call") => set_call(&agent_dir, Some(&session_named(&agent_dir, arguments.get(1).map(String::as_str))?)).map_err(|error| error.to_string()),
         Some("hangup") => set_call(&agent_dir, None).map_err(|error| error.to_string()),
+        Some("run-call") => run_call(&agent_dir, arguments.get(1).ok_or("voice run-call needs a call id")?).await,
         Some("start") => {
             // Off a call, push-to-talk is someone else's button.
             let Some((target, id)) = current(&agent_dir) else { return Ok(()) };
@@ -245,7 +301,7 @@ pub async fn run(arguments: &[String]) -> Result<(), String> {
             let mut hold = std::process::Command::new(exe);
             hold.arg("voice").arg("hold").arg(&id).arg(&target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
             let hold = std::os::unix::process::CommandExt::process_group(&mut hold, 0).spawn().map_err(|error| format!("couldn't start listening: {error}"))?;
-            write_record(&hold_file, json!({ "pid": hold.id(), "started": crate::proc::start(hold.id() as i32).map(|start| format!("{} {start}", crate::proc::boot_id())) })).map_err(|error| error.to_string())
+            write_record(&hold_file, running(hold.id())).map_err(|error| error.to_string())
         }
         Some("stop") => {
             let _lock = lock(&agent_dir)?;

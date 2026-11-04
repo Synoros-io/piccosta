@@ -2302,6 +2302,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde_json",
+ "socket2",
  "wgpu",
 ]
 

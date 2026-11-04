@@ -635,7 +635,7 @@ impl Gpu {
         let mapped = mapped.try_recv().map_err(|_| "the GPU's output was never mapped")?;
         mapped.map_err(|e| format!("the GPU's output: {e}"))?;
         let view = staging.get_mapped_range(..).map_err(|e| format!("the GPU's output: {e}"))?;
-        Ok(view.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect())
+        Ok(view.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)).collect())
     }
 
     // `run`, except that with LFM_DUMP set each op is its own submission and the layers' outputs are dumped as

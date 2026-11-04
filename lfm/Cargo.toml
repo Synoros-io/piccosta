@@ -10,6 +10,7 @@ description = "LFM3-Audio-2B speech to text and text to speech on the CPU, in pl
 serde_json.workspace = true
 regex.workspace = true
 libc.workspace = true
+socket2.workspace = true
 rayon.workspace = true
 matrixmultiply.workspace = true
 wgpu = { workspace = true, optional = true }

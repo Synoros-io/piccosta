@@ -577,6 +577,17 @@ impl Agent {
             return Ok(());
         }
         self.fresh_cancel();
+        // However the run ends, an error included, it ends settled, so nothing waits on it after it's
+        // over (a frontend's working state, a call's speech).
+        let ran = self.turns(queued, first).await;
+        let spent = self.record_spent();
+        (self.emit)(&Event::AgentSettled { aborted: ran.as_ref().is_ok_and(|aborted| *aborted) });
+        ran.and(spent)
+    }
+
+    // The turns of one run (run_from): the queued messages and `first`, then whatever follows them
+    // (retries, compaction, job messages, queued follow-ups). Output: whether it was aborted.
+    async fn turns(&mut self, queued: Vec<AgentMessage>, first: Option<AgentMessage>) -> Result<bool, String> {
         // Compact first when the last response left the context past the threshold; the new
         // prompt replaces any retry that schedules (agent-session.ts _prepareRun, _startRun).
         if let Some((assistant, entry_id)) = self.last_projected_assistant() {
@@ -642,9 +653,7 @@ impl Agent {
             }
             break;
         }
-        self.record_spent()?;
-        (self.emit)(&Event::AgentSettled { aborted });
-        Ok(())
+        Ok(aborted)
     }
 
     // What was spent for this session outside the conversation meanwhile (voice's quick answers),
