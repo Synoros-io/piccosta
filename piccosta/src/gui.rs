@@ -11,7 +11,6 @@
 //   the environment says otherwise. T3 runs in the foreground, as its own command does.
 
 use serde_json::{json, Value};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -33,7 +32,9 @@ pub fn open(name: &str, arguments: &[String]) -> Result<(), String> {
         if let Some(note) = configure_zed(&exe)? {
             eprintln!("{note}");
         }
-        let started = Command::new(&program).arg(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn();
+        let mut command = Command::new(&program);
+        command.arg(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let started = crate::proc::own_group(&mut command).spawn();
         return started.map(drop).map_err(|error| format!("{}: {error}", program.display()));
     }
     let shim = crate::config::agent_dir().join("gui-bin");
@@ -47,7 +48,7 @@ pub fn open(name: &str, arguments: &[String]) -> Result<(), String> {
         }
     }
     eprintln!("Starting T3 Code on {}. The first time, turn on its Pi provider (Settings, Providers, Pi): its binary path, pi, runs this piccosta.", dir.display());
-    Err(format!("{}: {}", program.display(), command.exec()))
+    Err(format!("{}: {}", program.display(), crate::proc::resume(&mut command)))
 }
 
 // This piccosta as it was started: found on PATH when started by name, so a link (~/bin/piccosta)
@@ -69,26 +70,26 @@ fn find(settings: &crate::config::Settings, name: &str, names: &[&str]) -> Resul
     let path = std::env::var_os("PATH").unwrap_or_default();
     names
         .iter()
-        .flat_map(|program| std::env::split_paths(&path).map(move |dir| dir.join(program)))
+        .flat_map(|program| std::env::split_paths(&path).map(move |dir| crate::platform::executable(&dir, program)))
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| format!("Can't find {name} on PATH ({}); set \"gui\": {{\"{name}\": \"/path/to/it\"}} in piccosta's settings.json", names.join(", ")))
 }
 
 // `pi` in the shim folder, pointing at this piccosta.
 fn link_pi(shim: &Path, exe: &Path) -> Result<(), String> {
-    let link = shim.join("pi");
+    let link = crate::platform::executable(shim, "pi");
     if std::fs::read_link(&link).ok().as_deref() == Some(exe) {
         return Ok(());
     }
     std::fs::create_dir_all(shim).map_err(|error| format!("{}: {error}", shim.display()))?;
     let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(exe, &link).map_err(|error| format!("{}: {error}", link.display()))
+    crate::proc::link(exe, &link).map_err(|error| format!("{}: {error}", link.display()))
 }
 
 // Make Zed's settings run this piccosta as an agent. Output: a note to print when it changed
 // something, or an error saying what to add by hand.
 fn configure_zed(exe: &Path) -> Result<Option<String>, String> {
-    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))).ok_or("No home folder")?;
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| Some(crate::config::home().join(".config"))).ok_or("No home folder")?;
     let path = config.join("zed").join("settings.json");
     let entry = json!({"type": "custom", "command": exe, "args": ["--mode", "acp"]});
     let by_hand = || format!("Add this to {} under \"agent_servers\": \"piccosta\": {entry}", path.display());

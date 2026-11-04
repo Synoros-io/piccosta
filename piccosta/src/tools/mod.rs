@@ -19,8 +19,29 @@ pub mod output;
 pub mod pathhint;
 pub mod paths;
 pub mod read;
+#[cfg(target_os = "linux")]
 pub mod readonly;
+#[cfg(not(target_os = "linux"))]
+pub mod readonly {
+    pub const LABEL: &str = "";
+    pub fn check() -> Result<(), String> {
+        static WARNING: std::sync::Once = std::sync::Once::new();
+        WARNING.call_once(|| eprintln!("piccosta: readOnly commands run without the Landlock accident guard on this platform"));
+        Ok(())
+    }
+    pub fn enter() -> std::io::Result<()> { Ok(()) }
+}
+#[cfg(unix)]
 pub mod reaper;
+#[cfg(windows)]
+pub mod reaper {
+    // Job Objects close in the kernel even if the harness is killed; no watcher is needed.
+    pub const REAPER_ENV: &str = "PICCOSTA_REAPER";
+    pub fn track(_pid: u32, _running: bool) {}
+    pub fn run() {}
+    pub fn hand_over() -> Option<(i32, u32)> { None }
+    pub fn adopt(_fd: i32, _pid: u32) {}
+}
 pub mod subagent;
 pub mod truncate;
 pub mod validate;

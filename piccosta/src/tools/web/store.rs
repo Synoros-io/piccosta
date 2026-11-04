@@ -14,7 +14,6 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -179,7 +178,7 @@ impl Store {
 
     fn ensure_cache_dir(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.cache_dir)?;
-        fs::set_permissions(&self.cache_dir, fs::Permissions::from_mode(0o700))
+        crate::platform::permissions(&self.cache_dir, 0o700)
     }
 
     // Write <id>.json beside its siblings by a temp file and rename, after making room for it.
@@ -197,7 +196,7 @@ impl Store {
         let temp_name = format!("{key}.{}.{}.{}.tmp", std::process::id(), crate::clock::now_ms(), uuid::Uuid::new_v4().simple());
         let temp_path = self.cache_dir.join(&temp_name);
         let written = (|| -> std::io::Result<()> {
-            let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp_path)?;
+            let mut file = crate::platform::private_file(fs::OpenOptions::new().write(true).create_new(true)).open(&temp_path)?;
             file.write_all(serialized.as_bytes())?;
             file.sync_all()?;
             fs::rename(&temp_path, self.cache_dir.join(&key))

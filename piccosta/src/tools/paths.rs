@@ -14,14 +14,14 @@ fn is_unicode_space(c: char) -> bool {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    crate::config::home()
 }
 
 // "~" and "~/..." under home; any other path as written.
 pub fn expand_home(raw: &str) -> PathBuf {
     match raw.strip_prefix('~') {
         Some("") => home_dir(),
-        Some(rest) if rest.starts_with('/') => home_dir().join(&rest[1..]),
+        Some(rest) if rest.starts_with('/') || cfg!(windows) && rest.starts_with('\\') => home_dir().join(rest.trim_start_matches(['/', std::path::MAIN_SEPARATOR])),
         _ => PathBuf::from(raw),
     }
 }
@@ -31,6 +31,10 @@ pub fn expand_home(raw: &str) -> PathBuf {
 pub fn normalize(raw: &str) -> PathBuf {
     let spaced: String = raw.chars().map(|c| if is_unicode_space(c) { ' ' } else { c }).collect();
     let path = spaced.strip_prefix('@').unwrap_or(&spaced);
+    #[cfg(windows)]
+    if path.starts_with("file://") {
+        return url::Url::parse(path).ok().and_then(|url| url.to_file_path().ok()).unwrap_or_else(|| PathBuf::from(path));
+    }
     match path.strip_prefix("file://") {
         Some(rest) => PathBuf::from(percent_decode(rest.strip_prefix("localhost").unwrap_or(rest))),
         None => expand_home(path),
@@ -69,14 +73,15 @@ pub fn resolve(raw: &str, cwd: &Path) -> PathBuf {
 }
 
 fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out = PathBuf::from("/");
+    let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             Component::Normal(part) => out.push(part),
             Component::ParentDir => {
                 out.pop();
             }
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            Component::RootDir | Component::Prefix(_) => out.push(component.as_os_str()),
+            Component::CurDir => {}
         }
     }
     out
@@ -85,6 +90,10 @@ fn lexical_clean(path: &Path) -> PathBuf {
 // Node's code and message for an errno, as libuv's uv_strerror writes them. A model reads these
 // (pi passes fs errors through), and "ENOENT: no such file or directory, open '/x'" names both
 // the problem and the path. Errnos not listed fall back to Rust's own description.
+#[cfg(windows)]
+fn errno_text(_code: i32) -> Option<(&'static str, &'static str)> { None }
+
+#[cfg(unix)]
 fn errno_text(code: i32) -> Option<(&'static str, &'static str)> {
     Some(match code {
         1 => ("EPERM", "operation not permitted"),
@@ -134,8 +143,16 @@ pub fn fs_error(error: &io::Error, syscall: &str, path: Option<&Path>) -> String
     }
 }
 
-// access(2) on a path, as Node's fs.access checks it. Input: the path and libc's R_OK/W_OK bits.
-pub fn access(path: &Path, mode: libc::c_int) -> io::Result<()> {
+// Can this user read the file, and (for edit) write it too? Unix keeps Node's access(2) check;
+// Windows opens it to check its ACL, rather than treating Unix permission bits as an ACL.
+#[cfg(windows)]
+pub fn access(path: &Path, writable: bool) -> io::Result<()> {
+    std::fs::OpenOptions::new().read(true).write(writable).open(path).map(drop)
+}
+
+#[cfg(unix)]
+pub fn access(path: &Path, writable: bool) -> io::Result<()> {
+    let mode = libc::R_OK | if writable { libc::W_OK } else { 0 };
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
     // SAFETY: access() only reads the NUL-terminated path we just built.

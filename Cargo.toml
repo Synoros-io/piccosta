@@ -81,6 +81,11 @@ term-maths = "1"
 # it was built on (Arch's 2.43 rules out Ubuntu 24.04 and Debian 12), and the static one needs no
 # libraries at all. Debug info is stripped; the symbols stay, so a panic's backtrace still names
 # its functions.
+# Debug builds keep line numbers for backtraces and nothing more: full debug info made each
+# build several gigabytes.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 incremental = true
 codegen-units = 16

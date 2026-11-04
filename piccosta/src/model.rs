@@ -454,6 +454,11 @@ pub struct Model {
     pub input_limits: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<IndexMap<String, String>>,
+    // The service tier to ask for, set per model in models.json's modelOverrides: OpenAI's
+    // "priority" is Codex's fast mode (about twice as fast, counted higher against the plan). It
+    // stays the same for a session's whole life, so the prompt cache is unaffected. None: default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 impl Model {

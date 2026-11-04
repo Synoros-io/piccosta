@@ -29,8 +29,8 @@ const DEFAULT_TRANSPORT: &str = "auto";
 // (settings-manager.ts setModelThinkingLevel), so pi and piccosta share one store.
 const MODEL_THINKING_LEVELS: &str = "modelThinkingLevels";
 
-// The agent dir: $PICCOSTA_AGENT_DIR, else $XDG_DATA_HOME/piccosta/agent, else
-// ~/.local/share/piccosta/agent.
+// The agent dir: PICCOSTA_AGENT_DIR, else piccosta/agent under data_home (XDG on Unix,
+// roaming AppData on Windows). The environment overrides keep existing installations movable.
 pub fn agent_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PICCOSTA_AGENT_DIR") {
         return PathBuf::from(dir);
@@ -38,9 +38,18 @@ pub fn agent_dir() -> PathBuf {
     data_home().join("piccosta").join("agent")
 }
 
-// Where the freedesktop spec keeps a user's data: $XDG_DATA_HOME, else ~/.local/share.
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
+}
+
+// XDG remains an override everywhere. macOS uses XDG too; Windows defaults to roaming AppData.
 pub fn data_home() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local/share"))
+    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        #[cfg(windows)]
+        { std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| home().join("AppData/Roaming")) }
+        #[cfg(unix)]
+        { home().join(".local/share") }
+    })
 }
 
 // Settings from the agent dir's settings.json, with a project's .piccosta/settings.json merged over it.

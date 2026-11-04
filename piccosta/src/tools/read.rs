@@ -76,7 +76,7 @@ impl Tool for ReadTool {
 // slow disk or a large image resize doesn't stall the other tool calls.
 fn read_file(arguments: &Arguments, absolute: &std::path::Path, context: &ToolContext) -> Result<ToolOutput, String> {
     // pi checks readability with access(R_OK) first, so that's the syscall a missing file names.
-    paths::access(absolute, libc::R_OK).map_err(|error| paths::fs_error(&error, "access", Some(absolute)))?;
+    paths::access(absolute, false).map_err(|error| paths::fs_error(&error, "access", Some(absolute)))?;
     let mut file = std::fs::File::open(absolute).map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;

@@ -206,12 +206,11 @@ impl OutputAccumulator {
         }
         // Only the user may read it (output can carry private data), and create_new never follows
         // a link someone else put at the path (output-files.ts:12-33).
-        use std::os::unix::fs::OpenOptionsExt;
         let file = (|| {
             if let Some(parent) = self.spill_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.spill_path)
+            crate::platform::private_file(std::fs::OpenOptions::new().write(true).create_new(true)).open(&self.spill_path)
         })();
         match file {
             // Once made, the file is kept even if writing to it fails partway: a job moved to the

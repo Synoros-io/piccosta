@@ -142,11 +142,12 @@ pub struct CredentialPaths {
 impl CredentialPaths {
     // The paths for an agent dir, read from the environment.
     pub fn from_environment(agent_dir: &Path) -> CredentialPaths {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = crate::config::home();
         CredentialPaths {
             login_dir: std::env::var_os("PICCOSTA_LOGIN_DIR").map(PathBuf::from).unwrap_or_else(|| agent_dir.join("login")),
             codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex")),
-            opencode_dir: crate::config::data_home().join("opencode"),
+            // OpenCode keeps its XDG layout on Windows too; our AppData default is only ours.
+            opencode_dir: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("opencode"),
         }
     }
 }
@@ -397,15 +398,14 @@ fn percent_encode(value: &str) -> String {
 // may read it, and its folder only the owner may open. Written to a temp file and renamed, so a
 // crash never leaves half a file holding the only copy of a rotated refresh token.
 pub fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::io::Write;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        crate::platform::permissions(dir, 0o700)?;
     }
     let text = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
     let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temp)?;
+    let mut file = crate::platform::private_file(fs::OpenOptions::new().write(true).create(true).truncate(true)).open(&temp)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     fs::rename(&temp, path)

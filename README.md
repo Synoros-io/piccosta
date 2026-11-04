@@ -22,7 +22,7 @@ It stores no credentials of its own: it uses each account's existing login, and 
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
 - **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats.
-- **New models show up on their own.** piccosta offers what each connected account serves: Codex's own list for your ChatGPT login, the models Claude Code offers your Claude login, opencode-go's `/models`, and `<baseUrl>/models` for a `models.json` provider that names no models. The lists are fetched as piccosta starts and with `/models refresh`; one that can't be fetched keeps the last one, and an account you aren't logged in to offers nothing. What you set for a model goes over what its provider reports, in `models.json`'s `providers.<provider>.modelOverrides.<id>` (pi's format), e.g. `{"contextWindow": 200000, "maxTokens": 8000, "input": ["text"], "thinkingLevelMap": {"medium": "medium"}}`; an object such as `thinkingLevelMap` or `compat` changes only the keys you name.
+- **New models show up on their own.** piccosta offers what each connected account serves: Codex's own list for your ChatGPT login, the models Claude Code offers your Claude login, opencode-go's `/models`, and `<baseUrl>/models` for a `models.json` provider that names no models. The lists are fetched as piccosta starts and with `/models refresh`; one that can't be fetched keeps the last one, and an account you aren't logged in to offers nothing. What you set for a model goes over what its provider reports, in `models.json`'s `providers.<provider>.modelOverrides.<id>` (pi's format), e.g. `{"contextWindow": 200000, "maxTokens": 8000, "input": ["text"], "thinkingLevelMap": {"medium": "medium"}}`; an object such as `thinkingLevelMap` or `compat` changes only the keys you name. `"serviceTier": "priority"` asks a Codex model for its fast mode (about twice as fast, counted higher against your plan).
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
 ### Model scale
@@ -137,7 +137,20 @@ search and exploration) run their commands in a Landlock sandbox, which needs Li
 (Landlock ABI 6); on an older kernel their commands don't run, unless the kind has
 `"readOnly": false` in `scale.json`.
 
-The release binary is for x86-64. To install it:
+macOS and native Windows can be built from source with stable Rust (`cargo build`, then put
+`target/debug/piccosta` or `target/debug/piccosta.exe` on PATH). On Windows, install the MSVC
+Build Tools with the C++ workload; on macOS, install Xcode Command Line Tools. The TLS library
+also needs CMake and a C compiler; MSVC builds need NASM, or
+`AWS_LC_SYS_PREBUILT_NASM=1` to use AWS-LC's packaged assembly. These platforms have not yet
+been run on a real machine.
+Windows commands need Git for Windows, including Git Bash: piccosta searches Git's usual
+install directories and PATH, or uses `shellPath` from settings.json. No PowerShell translation.
+On macOS and Windows, read-only kinds run **without** the Landlock accident guard and print
+one warning per process. TeX uses the existing text fallback when graphics are unavailable.
+Windows uses Job Objects to stop command trees and local, owner-only named pipes for runtimes.
+Windows `/restart` closes running commands rather than carrying them into the replacement.
+
+The Linux release binary is for x86-64. To install it:
 
 ```sh
 mkdir -p ~/.local/bin
@@ -216,18 +229,26 @@ Add `--yolo` to skip permissions.
 
 ## Settings
 
-piccosta keeps its files in `$PICCOSTA_AGENT_DIR` when it's set, else `$XDG_DATA_HOME/piccosta/agent`, else `~/.local/share/piccosta/agent`: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`).
+piccosta keeps its files in `$PICCOSTA_AGENT_DIR` when it's set, else `$XDG_DATA_HOME/piccosta/agent`, else `~/.local/share/piccosta/agent` on Linux and macOS (XDG layout), or `%APPDATA%/piccosta/agent` on Windows: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`). `HOME` remains an override; Windows otherwise uses `USERPROFILE`. Existing `CODEX_HOME` and Claude config overrides still apply.
+
+macOS runtime sockets use `$PICCOSTA_RUNTIME_DIR`, default `$XDG_DATA_HOME/piccosta/run` (or `~/.local/share/piccosta/run`), with hashed session names to fit Unix socket limits. Set it to a shorter, private directory if your home path is too long. Linux sockets remain beside session files; Windows named pipes need no socket files.
 
 `settings.json` uses pi's keys:
 - `defaultProvider` and `defaultModel`;
 - `defaultThinkingLevel` and `modelThinkingLevels`;
-- `compaction`, `retry`, `shellCommandPrefix` and `transport`;
+- `compaction`, `retry`, `shellCommandPrefix`, `shellPath` (override the command shell) and `transport`;
 - piccosta's own `manager` and `gui`.
 
 A project's `.piccosta/settings.json` is merged over them, except the model lists' settings, which only the agent dir's file sets:
 - `models.freshSeconds`: a list fetched more recently than this isn't fetched again at start (900);
 - `models.timeoutSeconds`: how long one list may take (10);
 - `models.codexClientVersion`: the Codex version piccosta asks Codex's list as, since the list leaves out models newer than that. Without it, piccosta asks as the Codex CLI last did, else as `codex --version` says.
+
+`claudeBridge.holdSeconds` in the agent dir's settings (overridden by `CLAUDE_BRIDGE_HOLD_SECONDS`)
+keeps a session's Claude Code process waiting after a turn: 300 seconds by default, 0 to end it
+after every turn. Restarted requests are byte-identical; holding saves only startup, measured at
+449 ms to the first token. Assistant and manager sessions hold until closed or piccosta exits,
+regardless of this setting. Closing a session, quitting and `/restart` end held processes.
 
 `web.fetch.maxSizeMB` is the largest page the web tools fetch, a PDF aside (5).
 

@@ -120,6 +120,9 @@ pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, 
     if let Some(key) = cache_key {
         body.insert("prompt_cache_key".into(), key.into());
     }
+    if let Some(tier) = &model.service_tier {
+        body.insert("service_tier".into(), tier.clone().into());
+    }
     body.insert("tool_choice".into(), "auto".into());
     body.insert("parallel_tool_calls".into(), true.into());
     if !request_tools.is_empty() {

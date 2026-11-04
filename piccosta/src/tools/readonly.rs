@@ -15,6 +15,8 @@
 
 use std::io;
 
+pub const LABEL: &str = " in the read-only sandbox (Landlock)";
+
 // The rights to files that change something: write a file, then remove a directory or file and
 // make each kind of node (bits 4 to 12), all in ABI 1; then refer (moving a file between
 // directories, ABI 2) and truncate (ABI 3).

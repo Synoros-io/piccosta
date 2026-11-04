@@ -14,6 +14,7 @@ use ratex_types::color::Color as TexColor;
 use ratex_types::math_style::MathStyle;
 use std::collections::HashMap;
 use std::io::Write;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const MODE_ENV: &str = "PICCOSTA_TEX";
@@ -22,7 +23,9 @@ const MODE_ENV: &str = "PICCOSTA_TEX";
 const EM_PER_CELL_HEIGHT: f32 = 0.8;
 // How long the terminal gets to answer the startup query, and how long past tmux's own answer
 // (tmux answers DA1 itself) the outer terminal's graphics reply may still take.
+#[cfg(unix)]
 const QUERY_WAIT: Duration = Duration::from_millis(500);
+#[cfg(unix)]
 const TMUX_GRACE: Duration = Duration::from_millis(150);
 // A cell's size in pixels when the terminal doesn't say.
 const FALLBACK_CELL: (u32, u32) = (10, 20);
@@ -235,6 +238,10 @@ fn command(out: &mut Vec<u8>, control: &str, payload: &[u8], tmux: bool) {
 
 // Ask for a graphics reply, the cell size, the background color, then DA1, whose answer every
 // terminal gives; read what comes back.
+#[cfg(windows)]
+fn query(_tmux: bool) -> String { String::new() }
+
+#[cfg(unix)]
 fn query(tmux: bool) -> String {
     let mut ask = Vec::new();
     command(&mut ask, "i=31,s=1,v=1,a=q,t=d,f=24", b"AAAA", tmux);

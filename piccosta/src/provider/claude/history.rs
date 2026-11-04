@@ -120,9 +120,8 @@ pub fn shape(system_prompt: &str, tools: &[ToolDefinition], cli_model: &str, eff
 
 // Input: what the live query holds (None when there is none), and this call's messages with their
 // prints and shape. Output: Ok(n) when the call's context is the held one (its first n messages)
-// plus results for exactly the calls the query is parked on, or plus user messages for a query
-// that waits, which are then delivered; otherwise Err with the first reason found, and the call
-// rewrites.
+// plus results for exactly the calls it is parked on, or a new user turn after an answer;
+// otherwise Err with the first reason found, and the call rewrites.
 pub fn decide(live: Option<&super::State>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
     let live = live.ok_or("no live query for this session")?;
     let changed: Vec<&str> = SHAPE_PARTS.into_iter().filter(|part| shape.get(*part) != live.shape.get(*part)).collect();
@@ -138,17 +137,10 @@ pub fn decide(live: Option<&super::State>, messages: &[Message], prints: &[Strin
     if messages.len() <= held {
         return Err(format!("context has {} messages, Claude Code holds {held}", messages.len()));
     }
-    // A waiting query takes what comes next: its context (with its answer, when it gave one; a
-    // stopped answer pi drops), then user messages only, which include pi's custom messages (a job's
-    // notice, lane news).
-    if live.waiting {
-        let after: Vec<&Message> = messages[held..].iter().filter(visible).collect();
-        if after.is_empty() || !after.iter().all(|message| matches!(message, Message::User(_))) {
-            return Err("what came after the waiting query's turn isn't only user messages".into());
-        }
-        return Ok(held);
-    }
-    let pending = live.pending.as_ref().ok_or("the live query is not parked at a tool call")?;
+    let Some(pending) = live.pending.as_ref() else {
+        return if messages[held..].iter().all(|message| matches!(message, Message::User(_))) { Ok(held) }
+            else { Err("the held query needs a new user turn".into()) };
+    };
     // What pi added has to be tool results and nothing else: a user message here (a steer, an
     // extension's text) reaches Claude Code as part of a rewritten context, not mid-query.
     let mut ids = Vec::new();
@@ -189,8 +181,14 @@ pub fn anthropic_blocks(blocks: &[Content]) -> Vec<Value> {
 // Input: the visible messages. Output: where the history ends, the prompt the new query opens
 // with (the trailing user run as one prompt, since the API merges consecutive user messages
 // anyway), and whether that prompt is the continue note.
-pub fn split(messages: &[Message]) -> (usize, Vec<Value>, bool) {
-    let start = turn_start(messages);
+pub fn split(key: &str, messages: &[Message]) -> (usize, Vec<Value>, bool) {
+    // pi hides an aborted answer, leaving two user turns adjacent. The first already reached
+    // Claude Code: keep it in the history with its interrupt note, not in the new prompt.
+    let kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let end = kept.get(key).and_then(|entry| entry.1.as_ref()).filter(|kept| {
+        kept.prints.len() <= messages.len() && messages.iter().zip(&kept.prints).all(|(message, print)| fingerprint(message) == *print)
+    }).map_or(0, |kept| kept.prints.len());
+    let start = turn_start(messages).max(end);
     if start == messages.len() {
         return (start, vec![json!({"type": "text", "text": CONTINUE_NOTE})], true);
     }
@@ -338,10 +336,9 @@ pub fn convert(messages: &[Message], served: &[ToolDefinition]) -> Vec<Value> {
 // cc-session-io's repairToolPairing, which its import applies: every tool_use answered in the user
 // message right after it (a missing one stubbed first), and every tool_result there for a call
 // that was made (others dropped). Input and output: Anthropic messages.
-fn repair(messages: Vec<Value>) -> Vec<Value> {
+fn repair(messages: Vec<Value>, mut pending: Option<IndexSet<String>>) -> Vec<Value> {
     let stub = |id: &String| json!({"type": "tool_result", "tool_use_id": id, "content": NO_RESULT_RECORDED, "is_error": true});
     let mut out: Vec<Value> = Vec::new();
-    let mut pending: Option<IndexSet<String>> = None;
     let flush = |out: &mut Vec<Value>, pending: &mut Option<IndexSet<String>>| {
         if let Some(ids) = pending.take().filter(|ids| !ids.is_empty()) {
             out.push(json!({"role": "user", "content": ids.iter().map(stub).collect::<Vec<_>>()}));
@@ -393,7 +390,7 @@ fn repair(messages: Vec<Value>) -> Vec<Value> {
 // CLAUDE_CONFIG_DIR, else ~/.claude.
 fn claude_dir() -> PathBuf {
     SETTINGS.config_dir.clone().or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude"))
+        .unwrap_or_else(|| crate::config::home().join(".claude"))
 }
 
 // A path with symlinks resolved, or the path itself when it can't be.
@@ -501,7 +498,15 @@ impl Records {
     // per user message, a user message's tool results split from (and ahead of) its other blocks.
     pub fn import(&mut self, messages: Vec<Value>) {
         let synthetic_id = |prefix: &str| format!("{prefix}{}", &Uuid::new_v4().simple().to_string()[..24]);
-        for message in repair(messages) {
+        // A copied prefix may stop at a tool call. Seed the repair with all blocks of that
+        // response, so appending pi's real results doesn't discard them as orphans.
+        let last = self.records.iter().rev().find(|record| is_message(record));
+        let pending = last.filter(|record| record["type"] == "assistant").map(|last| {
+            self.records.iter().filter(|record| record["type"] == "assistant" && record["message"]["id"] == last["message"]["id"])
+                .flat_map(|record| record["message"]["content"].as_array().into_iter().flatten())
+                .filter(|block| block["type"] == "tool_use").filter_map(|block| block["id"].as_str().map(String::from)).collect()
+        });
+        for message in repair(messages, pending) {
             let content = message["content"].clone();
             if message["role"] == "assistant" {
                 let content = match content {
@@ -565,7 +570,7 @@ fn strings(value: &Value) -> Vec<String> {
 }
 
 // The first call for a pi session: remember its sidecar and load what an earlier process kept.
-pub fn attach(key: &str, session_file: Option<&Path>) {
+pub fn attach(key: &str, session_file: Option<&Path>, messages: &[Message]) {
     let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !SETTINGS.keep || kept.contains_key(key) {
         return;
@@ -577,16 +582,61 @@ pub fn attach(key: &str, session_file: Option<&Path>) {
         if meta["format"] != SIDECAR_FORMAT || meta["version"] != SIDECAR_VERSION {
             return None;
         }
-        Some(Kept { shape: meta["shape"].as_object().cloned()?, prints: strings(&meta["prints"]), roles: strings(&meta["roles"]),
-            records: lines.collect::<Result<_, _>>().ok()? })
+        // A killed piccosta never got to keep the answer. Claude Code's journal still has the
+        // prompt attachments and completed blocks, including the tail pi never displayed.
+        let records = meta["active"].as_str().zip(meta["projectPath"].as_str())
+            .and_then(|(id, project)| fs::read_to_string(session_path(id, project)).ok())
+            .map(|text| native_records(&text)).or_else(|| lines.collect::<Result<_, _>>().ok())?;
+        let mut loaded = Kept { shape: meta["shape"].as_object().cloned()?, prints: strings(&meta["prints"]), roles: strings(&meta["roles"]), records };
+        let messages: Vec<Message> = messages.iter().filter(visible).cloned().collect();
+        // A crash during a tool can leave its assistant saved in pi but not in the checkpoint.
+        // Count the native records already represented by those saved messages before importing
+        // anything else, or the same assistant gets appended twice.
+        if meta["active"].is_string() && loaded.prints.len() <= messages.len()
+            && messages.iter().zip(&loaded.prints).all(|(message, print)| fingerprint(message) == *print)
+        {
+            loaded.roles = messages.iter().map(|message| role(message).to_string()).collect();
+            let count = align(&loaded, &messages, messages.len()).iter().rposition(Option::is_some).map_or(0, |last| last + 1);
+            if count > loaded.prints.len() {
+                debug(&format!("recovered: reconciled {count} persisted messages"));
+                loaded.prints = messages[..count].iter().map(fingerprint).collect();
+            }
+            loaded.roles.truncate(loaded.prints.len());
+        }
+        Some(loaded)
     });
     kept.insert(key.to_string(), (sidecar, loaded));
 }
 
-// At a clean query end: keep its session file's chain records for the next rewrite. Input: the pi
-// session, Claude Code's session id and project path, and what it holds (shape, prints, roles, its
-// final answer included). Written to the sidecar whole and renamed into place.
-pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape: &Shape, prints: Vec<String>, roles: Vec<String>) {
+pub fn detach(key: &str) {
+    KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(key);
+}
+
+fn native_records(text: &str) -> Vec<Value> {
+    text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["uuid"].is_string()).collect()
+}
+
+// Save before sending the prompt: even the first answer needs a recoverable native journal.
+// The saved records are a fallback if Claude Code has not opened that journal yet.
+pub fn checkpoint(key: &str, cc_session_id: &str, project_path: &str, shape: &Shape, prints: &[String], roles: &[String]) -> std::io::Result<()> {
+    let map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some((Some(sidecar), _)) = map.get(key) else { return Ok(()) };
+    let records = fs::read_to_string(session_path(cc_session_id, project_path)).map(|text| native_records(&text)).unwrap_or_default();
+    let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "active": cc_session_id,
+        "projectPath": project_path, "shape": shape, "prints": prints, "roles": roles});
+    save(sidecar, &meta, &records)
+}
+
+fn save(sidecar: &Path, meta: &Value, records: &[Value]) -> std::io::Result<()> {
+    let text: String = std::iter::once(meta).chain(records).map(|record| js::stringify(record) + "\n").collect();
+    let partial = PathBuf::from(format!("{}.partial", sidecar.display()));
+    fs::write(&partial, text).and_then(|()| fs::rename(&partial, sidecar))
+}
+
+// Keep the query's chain records for the next resume: its final answer, a stopped stream's tail,
+// or a parked response whose calls pi will answer later. Written whole and renamed into place.
+#[allow(clippy::too_many_arguments)]
+pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape: &Shape, prints: Vec<String>, roles: Vec<String>, pending: &[String]) {
     if !SETTINGS.keep {
         return;
     }
@@ -594,16 +644,21 @@ pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape
     let Ok(text) = fs::read_to_string(&file) else {
         return debug(&format!("kept: could not read {}, nothing kept", file.display()));
     };
-    let records: Vec<Value> = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["uuid"].is_string()).collect();
+    let mut records = native_records(&text);
+    // Closing a parked query writes Claude Code's cancellation results. pi already has the real
+    // results (including commands moved to the background), so only keep through the tool call.
+    if !pending.is_empty() {
+        records.truncate(records.iter().rposition(|record| record["type"] == "assistant" && record["message"]["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| block["type"] == "tool_use" && block["id"].as_str().is_some_and(|id| pending.iter().any(|call| call == id)))
+        })).map_or(0, |index| index + 1));
+    }
     let mut map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = map.entry(key.to_string()).or_insert((None, None));
+    let Some(entry) = map.get_mut(key) else { return }; // A released session belongs to its next owner.
     debug(&format!("kept: {} records of {cc_session_id} for {} pi messages", records.len(), prints.len()));
     if let Some(sidecar) = &entry.0 {
         let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd,
             "shape": shape, "prints": prints, "roles": roles});
-        let text: String = std::iter::once(&meta).chain(&records).map(|record| js::stringify(record) + "\n").collect();
-        let partial = PathBuf::from(format!("{}.partial", sidecar.display()));
-        if fs::write(&partial, text).and_then(|()| fs::rename(&partial, sidecar)).is_err() {
+        if save(sidecar, &meta, &records).is_err() {
             debug(&format!("kept: could not save {}", sidecar.display()));
         }
     }
@@ -624,10 +679,8 @@ enum Kind {
 // leave them out and the prompt pi gives is the one the model sees.
 const PROMPT_ATTACHMENTS: [&str; 3] = ["prompt_snapshot", "prompt_render_point", "deferred_tools_record"];
 
-// Claude Code's notice for a turn that got no reply: it writes one after a resumed session that ends
-// at a user record. The bridge has it answer such a turn instead (mod.rs, RESUME_ENV), but kept
-// records from before can hold the notice, and read back as the model's own words, a run of them
-// teaches it to answer that way.
+// Claude Code's notice for a turn that got no reply. Old kept sessions can contain it as a real
+// reply; new resumes use it only in a filtered terminal boundary (write_session), never on the wire.
 pub const NO_RESPONSE: &str = "No response requested.";
 
 // Whether an assistant message is that notice.
@@ -848,15 +901,18 @@ fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, proje
     }
     let shared = prints.iter().zip(&kept.prints).take_while(|(print, kept)| print == kept).count();
     let ends = align(kept, history, shared);
-    // A cut has to leave every tool call with its results on the same side: a converted result whose
-    // call was copied would be dropped as an orphan, a copied call whose results were converted
-    // would reach the API unanswered.
+    // A run of results or user messages cannot be split. A copied call can end the prefix:
+    // import seeds its repair from those calls and pairs the appended results with them.
     let mut cut = ends.len().min(shared);
-    let has_calls = |message: &Message| matches!(message, Message::Assistant(assistant) if assistant.content.iter().any(|block| matches!(block, Content::ToolCall { .. })));
-    while cut > 0 && (ends[cut - 1].is_none() || matches!(history.get(cut), Some(Message::ToolResult(_))) || has_calls(&history[cut - 1])) {
+    while cut > 0 && ends[cut - 1].is_none() {
         cut -= 1;
     }
     let mut last = ends.get(cut.checked_sub(1)?).copied().flatten()?;
+    // A stopped answer and its interrupt note have no visible pi messages. When all the kept
+    // messages matched, their trailing records still belong to this prefix.
+    if cut == kept.prints.len() {
+        last = kept.records.len().checked_sub(1)?;
+    }
     // The chain links after the last copied message, up to the next one (the attachments Claude Code
     // writes after a prompt) go too.
     while last + 1 < kept.records.len() && !is_message(&kept.records[last + 1]) {
@@ -887,11 +943,22 @@ fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, proje
 // still be flushing into the file it had.
 #[allow(clippy::too_many_arguments)]
 pub fn write_session(key: &str, history: &[Message], prints: &[String], cwd: &str, project_path: &str, served: &[ToolDefinition], cli_model: &str, shape: &Shape) -> std::io::Result<String> {
-    let records = from_kept(key, history, prints, cwd, project_path, served, cli_model, shape).unwrap_or_else(|| {
+    let mut records = from_kept(key, history, prints, cwd, project_path, served, cli_model, shape).unwrap_or_else(|| {
         let mut records = Records::new(project_path, &real_or(cwd).nfc().collect::<String>(), cli_model);
         records.import(convert(history, served));
         records
     });
+    // Claude Code 2.1.318 inserts a visible no-response reply when --resume ends on a user
+    // record, or starts that turn before initialize can supply our tools. Its own terminal API
+    // error records prevent both and are filtered from requests. This boundary has no API bytes;
+    // the real next prompt goes through stdin after initialize, even after an interrupt.
+    if records.records.iter().rev().find(|record| is_message(record)).is_some_and(|record| record["type"] == "user") {
+        let mut boundary = records.base("assistant");
+        boundary.insert("isApiErrorMessage".into(), json!(true));
+        boundary.insert("message".into(), json!({"id": Uuid::new_v4().to_string(), "type": "message", "role": "assistant", "model": "<synthetic>",
+            "content": [{"type": "text", "text": NO_RESPONSE}], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}));
+        records.records.push(Value::Object(boundary));
+    }
     records.save()?;
     Ok(records.session_id)
 }

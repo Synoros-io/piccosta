@@ -25,11 +25,21 @@ pub fn now_ms() -> i64 {
 // "YYYY-MM-DDTHH:MM:SS.mmm" with no zone, and the zone's offset from UTC in seconds.
 pub fn local_now() -> (String, i64) {
     // SAFETY: localtime_r only fills the struct it's given.
+    #[cfg(unix)]
     let offset_seconds = unsafe {
         let now = libc::time(std::ptr::null_mut());
         let mut local: libc::tm = std::mem::zeroed();
         libc::localtime_r(&now, &mut local);
         local.tm_gmtoff
+    };
+    #[cfg(windows)]
+    let offset_seconds = unsafe {
+        use windows_sys::Win32::System::{Time::*, SystemServices::{TIME_ZONE_ID_DAYLIGHT, TIME_ZONE_ID_STANDARD}};
+        let mut zone: DYNAMIC_TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let state = GetDynamicTimeZoneInformation(&mut zone);
+        // Windows' bias is UTC minus local, in minutes; Unix's offset is local minus UTC.
+        let seasonal = match state { TIME_ZONE_ID_DAYLIGHT => zone.DaylightBias, TIME_ZONE_ID_STANDARD => zone.StandardBias, _ => 0 };
+        -i64::from(zone.Bias + seasonal) * 60
     };
     let local = iso_from_ms(now_ms() + offset_seconds * MILLISECONDS_PER_SECOND);
     (local.trim_end_matches('Z').to_string(), offset_seconds)

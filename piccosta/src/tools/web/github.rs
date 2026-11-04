@@ -390,7 +390,8 @@ impl Drop for ChildGroup {
         if let Some(children) = children.as_mut()
             && let Some(at) = children.iter().position(|pid| *pid == self.pid)
         {
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+            crate::proc::kill_group(self.pid as u32, crate::proc::KILL);
+            crate::proc::release(self.pid as u32);
             children.swap_remove(at);
         }
     }
@@ -414,8 +415,10 @@ impl Clones {
     fn spawn(&self, command: &mut tokio::process::Command) -> Option<(tokio::process::Child, ChildGroup)> {
         let mut children = self.children.lock().unwrap();
         let children = children.as_mut()?;
-        let child = command.process_group(0).kill_on_drop(true).spawn().ok()?;
+        crate::proc::group(command);
+        let child = command.kill_on_drop(true).spawn().ok()?;
         let pid = child.id()? as i32;
+        crate::proc::attach(pid as u32).ok()?;
         children.push(pid);
         Some((child, ChildGroup { pid, children: self.children.clone() }))
     }
@@ -434,11 +437,10 @@ impl Clones {
         self.sweep_stale(&parent);
         let path = parent.join(format!("runtime-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&path).ok()?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
+        crate::platform::permissions(&path, 0o700).ok()?;
         let pid = std::process::id();
         let start = crate::proc::start(pid as i32).map(|start| start.to_string());
-        let owner = json!({"version": OWNER_VERSION, "pid": pid, "platform": "linux", "bootId": crate::proc::boot_id(), "startTime": start});
+        let owner = json!({"version": OWNER_VERSION, "pid": pid, "platform": std::env::consts::OS, "bootId": crate::proc::boot_id(), "startTime": start});
         std::fs::write(path.join(OWNER_FILE), owner.to_string()).ok()?;
         *runtime = Some(path.clone());
         Some(path)
@@ -462,7 +464,8 @@ impl Clones {
     pub fn shutdown(&self) {
         // Closing the registry under the spawn lock also rules out a new child after shutdown.
         for pid in self.children.lock().unwrap().take().into_iter().flatten() {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            crate::proc::kill_group(pid as u32, crate::proc::KILL);
+            crate::proc::release(pid as u32);
         }
         if let Some(path) = self.runtime.lock().unwrap().take() {
             let _ = std::fs::remove_dir_all(path);
@@ -528,9 +531,9 @@ impl Clones {
         };
         if !succeeded {
             if let Some(pid) = pid {
-                unsafe { libc::kill(-pid, libc::SIGTERM) };
+                crate::proc::kill_group(pid as u32, crate::proc::TERM);
                 if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    crate::proc::kill_group(pid as u32, crate::proc::KILL);
                     let _ = child.wait().await;
                 }
             }

@@ -43,6 +43,7 @@
 
 use crate::message::{CustomMessage, TextOrBlocks};
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -60,7 +61,7 @@ pub const SOFT_LIMIT_ENV: &str = "PICCOSTA_LONGCMD_SOFT_S";
 const DEFAULT_JOB_DIR: &str = ".piccosta-jobs";
 const JOB_DIR_ENV: &str = "PICCOSTA_LONGCMD_DIR";
 // Unix's null device: the log of a job whose output had nowhere to go (Jobs::start).
-const NO_LOG: &str = "/dev/null";
+const NO_LOG: &str = crate::platform::NULL;
 // Optional cap, in seconds, on how long print and json mode wait for running jobs after the model
 // ends its turn. Unset means wait as long as a job runs, which is what a blocking bash would have
 // done. When the cap is hit the jobs are killed and the model is told.
@@ -79,15 +80,7 @@ pub const NOTICE_TYPE: &str = "longcmd";
 
 // Signal a command's process group, or the process alone if the group is already gone
 // (shell.ts:205-216). The shell leads its own group, so the group id is its pid.
-pub fn signal_group(pid: u32, signal: i32) {
-    let Ok(pid) = i32::try_from(pid) else { return };
-    // SAFETY: kill() takes plain integers; a stale pid at worst fails with ESRCH.
-    unsafe {
-        if libc::kill(-pid, signal) != 0 {
-            libc::kill(pid, signal);
-        }
-    }
-}
+pub use crate::proc::signal_group;
 
 // Input: an env var holding seconds. Output: that duration, zero included, or None when it's unset
 // or not a number of seconds.
@@ -186,7 +179,7 @@ pub struct Shell {
     pub pid: u32,
     pub own: bool,
     pub kill_at: Option<Instant>,
-    pub pipe: Arc<tokio::net::unix::pipe::Receiver>,
+    pub pipe: Arc<crate::proc::Receiver>,
     pub handed: bool,
 }
 
@@ -308,9 +301,9 @@ impl Jobs {
             Some(shell) if shell.kill_at.is_some() => {}
             Some(shell) => {
                 shell.kill_at = Some(Instant::now() + super::bash::SUBAGENT_STOP_GRACE);
-                signal_group(pid, libc::SIGTERM);
+                signal_group(pid, crate::proc::TERM);
             }
-            None => signal_group(pid, libc::SIGKILL),
+            None => signal_group(pid, crate::proc::KILL),
         }
     }
 
@@ -405,6 +398,10 @@ impl Jobs {
     // /restart: take the running jobs out of this session, so its end doesn't kill them, and hand
     // them to the next image: from now on this image neither reaps nor kills their shells, whose
     // pipes go across the exec. Output: one record each (a job whose shell already ended isn't one).
+    #[cfg(windows)]
+    pub fn hand_over(&self) -> Vec<HandedJob> { Vec::new() }
+
+    #[cfg(unix)]
     pub fn hand_over(&self) -> Vec<HandedJob> {
         let mut handed = Vec::new();
         let mut shells = self.shells();

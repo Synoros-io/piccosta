@@ -154,13 +154,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     let signalled = std::rc::Rc::new(std::cell::Cell::new(None));
     let (signal_code, closer) = (signalled.clone(), commands.clone());
     tokio::task::spawn_local(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut term), Ok(mut hangup), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup()), signal(SignalKind::interrupt())) else { return };
-        let code: u8 = tokio::select! {
-            _ = term.recv() => 143,
-            _ = interrupt.recv() => 143,
-            _ = hangup.recv() => 129,
-        };
+        let code = piccosta::proc::termination(true).await;
         signal_code.set(Some(code));
         let _ = closer.send(piccosta::runtime::Command::Close(None));
         tokio::time::sleep(piccosta::runtime::STOP_WAIT).await;

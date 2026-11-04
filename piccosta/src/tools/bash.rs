@@ -28,12 +28,12 @@ use super::{pathhint, Tool, ToolContext, ToolFuture, ToolOutput, ToolUpdate};
 use crate::message::{Content, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::os::fd::OwnedFd;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::unix::pipe::Receiver;
+use crate::proc::Receiver;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -184,11 +184,36 @@ fn shell_path(custom: Option<&str>) -> Result<PathBuf, String> {
     if let Some(custom) = custom {
         return if Path::new(custom).exists() { Ok(PathBuf::from(custom)) } else { Err(format!("Custom shell path not found: {custom}")) };
     }
+    #[cfg(windows)]
+    { windows_shell() }
+    #[cfg(unix)]
     if Path::new("/bin/bash").exists() {
         return Ok(PathBuf::from("/bin/bash"));
     }
-    let on_path = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("bash")).find(|candidate| candidate.is_file()));
-    Ok(on_path.unwrap_or_else(|| PathBuf::from("sh")))
+    #[cfg(unix)]
+    {
+        let on_path = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("bash")).find(|candidate| candidate.is_file()));
+        Ok(on_path.unwrap_or_else(|| PathBuf::from("sh")))
+    }
+}
+
+// Git for Windows ships the same bash dialect the models use on Unix. WSL's bash.exe is not
+// a native shell, so prefer Git's install directories before the PATH fallback.
+#[cfg(windows)]
+fn windows_shell() -> Result<PathBuf, String> {
+    let roots = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"];
+    for root in roots.into_iter().filter_map(std::env::var_os) {
+        for relative in ["Git/bin/bash.exe", "Git/usr/bin/bash.exe", "Programs/Git/bin/bash.exe"] {
+            let candidate = PathBuf::from(&root).join(relative);
+            if candidate.is_file() { return Ok(candidate); }
+        }
+    }
+    let windows = std::env::var_os("SystemRoot").map(PathBuf::from);
+    if let Some(shell) = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("bash.exe")).find(|candidate| {
+        let wsl = windows.as_ref().is_some_and(|root| ["System32", "Sysnative"].iter().any(|dir| candidate.to_string_lossy().eq_ignore_ascii_case(&root.join(dir).join("bash.exe").to_string_lossy())));
+        candidate.is_file() && !wsl
+    })) { return Ok(shell); }
+    Err("No bash found. Install Git for Windows (including Git Bash), or set shellPath in piccosta's settings.json to bash.exe. PowerShell is not a bash substitute.".into())
 }
 
 // Stop a shell's group (jobs.rs kill_group), and SIGKILL one of piccosta's own at its deadline.
@@ -197,13 +222,19 @@ async fn stop_group(jobs: &jobs::Jobs, pid: u32) {
     let deadline = jobs.shells().iter().find(|shell| shell.pid == pid).and_then(|shell| shell.kill_at);
     if let Some(deadline) = deadline {
         tokio::time::sleep_until(deadline.into()).await;
-        signal_group(pid, libc::SIGKILL);
+        signal_group(pid, crate::proc::KILL);
     }
 }
 
 // Take back a background job the image before this one handed over (jobs.rs hand_over): its shell
 // is still this process's child and its pipe came across the exec. It's watched and finished the
 // way to_background does it, so its end reaches the session as if nothing happened.
+#[cfg(windows)]
+pub fn adopt(_shared: Arc<super::ToolShared>, _handed: HandedJob) -> std::io::Result<()> {
+    Err(std::io::Error::other("Windows cannot inherit a running command across /restart"))
+}
+
+#[cfg(unix)]
 pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Result<()> {
     // The watcher already lists its group, and came across too.
     let pipe = Arc::new(Receiver::from_owned_fd(super::reaper::inherited(handed.pipe))?);
@@ -219,7 +250,6 @@ pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Resu
 
 // Start the shell. Output: its pid and the read end of the one pipe its stdout and stderr share.
 fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), String> {
-    use std::os::unix::process::CommandExt;
     let shell = shell_path(context.shared.shell_path.as_deref())?;
     let (reader, writer) = std::io::pipe().map_err(|error| format!("pipe: {error}"))?;
     let error_writer = writer.try_clone().map_err(|error| format!("pipe: {error}"))?;
@@ -250,31 +280,22 @@ fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), S
     if read_only {
         super::readonly::check()?;
     }
-    // SAFETY: setsid() and the sandbox's system calls are async-signal-safe and run in the child
-    // between fork and exec.
-    unsafe {
-        process.pre_exec(move || {
-            libc::setsid();
-            if read_only {
-                super::readonly::enter()?;
-            }
-            Ok(())
-        });
-    }
-    let sandbox = if read_only { " in the read-only sandbox (Landlock)" } else { "" };
+    crate::proc::shell_setup(&mut process, read_only);
+    let sandbox = if read_only { super::readonly::LABEL } else { "" };
     let child = process.spawn().map_err(|error| format!("spawn {}{sandbox} {}", shell.display(), super::paths::error_code(&error)))?;
+    crate::proc::attach(child.id()).map_err(|error| format!("command job: {error}"))?;
     // The Command holds the pipe's write ends; they close here, so the pipe ends with the shell's
     // own copies. Dropping a std Child reaps nothing: exit_of does that.
     drop(process);
-    let pipe = Receiver::from_owned_fd(OwnedFd::from(reader)).map_err(|error| format!("pipe: {error}"))?;
+    let pipe = crate::proc::pipe(reader).map_err(|error| format!("pipe: {error}"))?;
     Ok((child.id(), Arc::new(pipe)))
 }
 
 // Read the pipe into the channel until it closes.
 async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
-    while pipe.readable().await.is_ok() {
-        match pipe.try_read(&mut buffer) {
+    loop {
+        match crate::proc::read_pipe(&pipe, &mut buffer).await {
             Ok(0) => break,
             Ok(count) => {
                 if chunks.send(buffer[..count].to_vec()).is_err() {
@@ -289,12 +310,29 @@ async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
 
 // Wait for a shell to exit, through a pidfd, then reap it. One handed to the next image (/restart)
 // is left unreaped and this never returns: the next image reaps it and reports its end.
+#[cfg(windows)]
+async fn exit_of(_jobs: &jobs::Jobs, pid: u32) -> std::io::Result<std::process::ExitStatus> { crate::proc::wait(pid).await }
+
+#[cfg(unix)]
 async fn exit_of(jobs: &jobs::Jobs, pid: u32) -> std::io::Result<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
-    let shell = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
-    // SAFETY: the pidfd is owned by the AsyncFd, which keeps it open as long as it's registered.
-    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(shell.fd) }.map_err(std::io::Error::from)?;
-    let _ready = pidfd.readable().await?;
+    #[cfg(target_os = "linux")]
+    {
+        let shell = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
+        // SAFETY: AsyncFd owns the pidfd until it has reported this child's exit.
+        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(shell.fd) }.map_err(std::io::Error::from)?;
+        let _ready = pidfd.readable().await?;
+    }
+    #[cfg(target_os = "macos")]
+    tokio::task::spawn_blocking(move || {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // WNOWAIT observes the exit without reaping, so /restart can still hand it over.
+        loop {
+            if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 { return Ok(()); }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
+        }
+    }).await.map_err(std::io::Error::other)??;
     // The check and the reap happen under the list's lock, so hand_over can't come between them.
     let reaped = {
         let shells = jobs.shells();
@@ -353,9 +391,7 @@ async fn watch(shared: Arc<super::ToolShared>, pipe: Arc<Receiver>, pid: u32, ki
     let outcome = match (killed, status) {
         (Some(outcome), _) => outcome,
         (None, Some(Ok(status))) => {
-            use std::os::unix::process::ExitStatusExt;
-            // A shell killed by a signal has no exit code: 128 + the signal, the shell convention.
-            Outcome::Exited(status.code().unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal)))
+            Outcome::Exited(crate::proc::exit_code(status))
         }
         (None, Some(Err(error))) => Outcome::Failed(error.to_string()),
         (None, None) => Outcome::Failed("Command terminated without an exit code".into()),
@@ -374,11 +410,12 @@ async fn watch(shared: Arc<super::ToolShared>, pipe: Arc<Receiver>, pid: u32, ki
         tokio::time::sleep_until(deadline.into()).await;
         let mut shells = jobs.shells();
         if shells.iter().any(|shell| shell.pid == pid) {
-            signal_group(pid, libc::SIGKILL);
+            signal_group(pid, crate::proc::KILL);
             shells.retain(|shell| shell.pid != pid);
         }
     }
     super::reaper::track(pid, false);
+    crate::proc::release(pid);
     let _ = events.send(Event::Done(outcome));
 }
 

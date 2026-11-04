@@ -249,13 +249,12 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         let _ = lines.send(Input::Closed);
     });
     let mut acp = Acp { args, inputs, sessions: HashMap::new(), hosts: HashMap::new(), initialized: false, notices: false, terminals: false, models: None, next_request: 0, next_session: 0, asks: HashMap::new(), after: Vec::new() };
-    use tokio::signal::unix::{signal, SignalKind};
-    let (mut term, mut hangup) = (signal(SignalKind::terminate()).map_err(|error| error.to_string())?, signal(SignalKind::hangup()).map_err(|error| error.to_string())?);
+    let termination = crate::proc::termination(false);
+    tokio::pin!(termination);
     let code = loop {
         let input = tokio::select! {
             input = received.recv() => input,
-            _ = term.recv() => break 143,
-            _ = hangup.recv() => break 129,
+            code = &mut termination => break code,
         };
         match input {
             Some(Input::Line(line)) => acp.line(&line).await,

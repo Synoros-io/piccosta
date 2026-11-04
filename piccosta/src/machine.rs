@@ -1,11 +1,34 @@
 // How busy the machine is, so a model can be told when it's overused. An agent that knows the
 // load is high, memory is nearly gone or swap is filling, or $TMPDIR or its disk is nearly full
 // can hold off on starting more and look at what's running, instead of adding to it. Nothing is stopped or
-// slowed: the note is all this does, and the run carries on whatever the load. Linux only (it
-// reads /proc); elsewhere it finds nothing. Each threshold below is the default for a `machine.*`
+// slowed: the note is all this does, and the run carries on whatever the load. Readings come from
+// the OS; a failed reading is simply absent. Each threshold below is the default for a `machine.*`
 // setting of the same name (machine.loadPerCore, ...), for a machine whose normal looks different.
 
 use std::path::Path;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+struct Resources {
+    load: Option<f64>,
+    // Memory and swap use kB, matching Linux's /proc/meminfo.
+    memory: Option<(f64, f64)>,
+    swap: Option<(f64, f64)>,
+}
+
+#[cfg(target_os = "linux")]
+fn resources() -> Resources {
+    let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|text| text.split_whitespace().next()?.parse().ok());
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kb = |key: &str| meminfo.lines().find_map(|line| line.strip_prefix(key)?.split_whitespace().next()?.parse::<f64>().ok());
+    Resources { load, memory: kb("MemTotal:").zip(kb("MemAvailable:")), swap: kb("SwapTotal:").zip(kb("SwapFree:")) }
+}
+#[cfg(target_os = "macos")]
+use macos::resources;
+#[cfg(windows)]
+use windows::{resources, disk};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -40,22 +63,19 @@ fn strain(cwd: &Path) -> Vec<String> {
     let setting = |name: &str, default: f64| settings.get(&format!("machine.{name}")).and_then(serde_json::Value::as_f64).unwrap_or(default);
     let mut found = Vec::new();
     let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
-    let load: Option<f64> = std::fs::read_to_string("/proc/loadavg").ok().and_then(|text| text.split_whitespace().next()?.parse().ok());
-    if let Some(load) = load.filter(|load| *load > setting("loadPerCore", LOAD_PER_CORE) * cores as f64) {
+    let resources = resources();
+    if let Some(load) = resources.load.filter(|load| *load > setting("loadPerCore", LOAD_PER_CORE) * cores as f64) {
         found.push(format!("load {load:.1} on {cores} cores"));
     }
-    // /proc/meminfo's values are in kB.
-    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let kilobytes = |key: &str| meminfo.lines().find_map(|line| line.strip_prefix(key)?.split_whitespace().next()?.parse::<f64>().ok());
     let gigabytes = |kb: f64| kb * 1024.0 / BYTES_PER_GB;
     let mut memory_low = false;
-    if let (Some(total), Some(available)) = (kilobytes("MemTotal:"), kilobytes("MemAvailable:"))
+    if let Some((total, available)) = resources.memory
         && available < setting("memoryAvailableFraction", MEMORY_AVAILABLE_FRACTION) * total
     {
         memory_low = true;
         found.push(format!("memory {:.1} GB free of {:.0}", gigabytes(available), gigabytes(total)));
     }
-    if let (Some(total), Some(free)) = (kilobytes("SwapTotal:"), kilobytes("SwapFree:"))
+    if let Some((total, free)) = resources.swap
         && total > 0.0
     {
         // Growth is measured from the lowest use read in the last REPEAT, older readings dropped
@@ -87,6 +107,7 @@ fn strain(cwd: &Path) -> Vec<String> {
 }
 
 // A filesystem's id, bytes used and bytes in all, from statvfs.
+#[cfg(unix)]
 fn disk(path: &Path) -> Option<(u64, f64, f64)> {
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };

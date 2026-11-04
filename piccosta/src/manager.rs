@@ -1154,7 +1154,7 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     }
     let exe = crate::proc::exe().ok()?.to_string_lossy().into_owned();
     let systemctl = |words: &[&str]| std::process::Command::new("systemctl").arg("--user").args(words).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success());
-    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| Some(crate::config::home().join(".config")))?;
     if systemctl(&["show-environment"]) {
         let unit = unit_text(&exe, &agent_dir);
         let path = config.join("systemd/user").join(UNIT);
@@ -1220,13 +1220,13 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
             eprintln!("piccosta manager: {error}");
         }
     });
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
+    let termination = crate::proc::termination(true);
+    tokio::pin!(termination);
     let mut poll = tokio::time::interval(POLL);
     let scheduled = |schedule: Schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text);
     loop {
         tokio::select! {
-            _ = term.recv() => break,
+            _ = &mut termination => break,
             // The schedules that are due: the assistant's, and the project managers', which go to
             // them wherever they run, or wait in their sessions.
             _ = poll.tick() => {

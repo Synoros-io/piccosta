@@ -19,6 +19,8 @@ pub mod message;
 pub mod model;
 pub mod pintask;
 pub mod proc;
+pub mod platform;
+mod ipc;
 pub mod prompt;
 pub mod provider;
 pub mod retry;

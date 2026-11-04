@@ -14,7 +14,7 @@
 // adopt), so the watcher never sees it close, keeps its list, and goes on covering the jobs the
 // new image takes back.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -32,7 +32,9 @@ static PIPE: Mutex<Option<Option<(File, u32)>>> = Mutex::new(None);
 pub fn track(pid: u32, running: bool) {
     let mut pipe = PIPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((stdin, _)) = pipe.get_or_insert_with(start) {
-        let _ = writeln!(stdin, "{}{pid}", if running { '+' } else { '-' });
+        // A group joins with its leader's start time (proc::group_held), taken while it runs.
+        let start = if running { crate::proc::start(pid as i32).map_or(String::new(), |start| format!(" {start}")) } else { String::new() };
+        let _ = writeln!(stdin, "{}{pid}{start}", if running { '+' } else { '-' });
     }
 }
 
@@ -77,18 +79,19 @@ fn start() -> Option<(File, u32)> {
 // The watcher's whole life: keep the list until the pipe closes, then stop what's on it, SIGTERM
 // first, then SIGKILL after bash's stop grace (subagents write their last messages then).
 pub fn run() {
-    let mut groups: HashSet<i32> = HashSet::new();
+    let mut groups: HashMap<u32, Option<u64>> = HashMap::new();
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-        let (sign, pid) = line.split_at(line.len().min(1));
-        if let Ok(pid) = pid.parse::<i32>() {
-            if sign == "+" { groups.insert(pid) } else { groups.remove(&pid) };
+        let (sign, rest) = line.split_at(line.len().min(1));
+        let mut fields = rest.split_whitespace();
+        if let Some(Ok(pid)) = fields.next().map(str::parse::<u32>) {
+            if sign == "+" { groups.insert(pid, fields.next().and_then(|start| start.parse().ok())) } else { groups.remove(&pid) };
         }
     }
     if groups.is_empty() {
         return;
     }
-    // SAFETY: killpg() takes plain integers; a group already gone fails with ESRCH.
-    let signal_all = |signal| groups.iter().for_each(|&group| unsafe { libc::killpg(group, signal); });
+    // Each group only while it's still the one registered (proc::group_held).
+    let signal_all = |signal| groups.iter().filter(|&(&group, &start)| crate::proc::group_held(group, start)).for_each(|(&group, _)| crate::proc::kill_group(group, signal));
     signal_all(libc::SIGTERM);
     std::thread::sleep(super::bash::SUBAGENT_STOP_GRACE);
     signal_all(libc::SIGKILL);

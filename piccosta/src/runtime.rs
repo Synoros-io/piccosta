@@ -1,8 +1,8 @@
 // The session runtime: what runs a session, the same in every piccosta that runs one (the terminal
 // UI, print mode, rpc, ACP, the assistant). It holds the session's agent and does what it's asked
 // one thing at a time, except a message, a stop and a close, which it takes at once, mid-turn too.
-// It listens on a Unix socket beside the session file (<session file>.sock, its owner's alone), so
-// another piccosta reaches it the way a frontend in its own process does, with a JSON line:
+// It listens on an owner-only local stream named for the session (ipc.rs), so another piccosta
+// reaches it the way a frontend in its own process does, with a JSON line:
 // - {"do": "message", "text": ...}: steers the turn when one runs (its commands move to the
 //   background, so the model reads it at the next step), else starts one;
 // - {"do": "stop"}: Esc: running commands move to the background and the turn stops; a run of its
@@ -35,8 +35,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use crate::ipc::{connect, Timed};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -118,23 +117,13 @@ pub fn socket_path(file: &Path) -> PathBuf {
     PathBuf::from(format!("{}{SOCKET_SUFFIX}", file.display()))
 }
 
-// The socket's address for bind and connect. A Unix socket's address holds 107 bytes and a session
-// file's path is longer, so it's named through the directory, open while it's used: the kernel
-// reads /proc/self/fd/<dir>/<name> as the file in that directory.
-fn address(file: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
-    let dir = std::fs::File::open(file.parent().unwrap_or(Path::new("/")))?;
-    let name = socket_path(file).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-    let address = PathBuf::from(format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()));
-    Ok((dir, address))
-}
-
 // The session file's lock, for a moment. None when the file isn't there yet: a session not on disk
 // has a new name nobody else has.
 fn hold(file: &Path) -> Result<Option<std::fs::File>, String> {
     let Ok(handle) = std::fs::File::open(file) else { return Ok(None) };
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
-        match handle.try_lock() {
+        match crate::platform::try_session_lock(&handle) {
             Ok(()) => return Ok(Some(handle)),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(LOCK_POLL),
             Err(std::fs::TryLockError::WouldBlock) => return Err(format!("{} {LIVE_ELSEWHERE} (an older one, which needs a restart to let go of it)", file.display())),
@@ -176,7 +165,7 @@ impl Drop for Claim {
         if let Some(listening) = self.listening.take() {
             listening.abort();
         }
-        let _ = std::fs::remove_file(socket_path(&self.file));
+        crate::ipc::remove(&self.file);
     }
 }
 
@@ -190,20 +179,7 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
     let _held = hold(&file)?;
     let failed = |error: std::io::Error| format!("{}: {error}", socket_path(&file).display());
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/"))).map_err(failed)?;
-    let (_dir, address) = address(&file).map_err(failed)?;
-    let listener = match UnixListener::bind(&address) {
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            if running(&file) {
-                return Err(format!("{} {LIVE_ELSEWHERE}", file.display()));
-            }
-            let _ = std::fs::remove_file(&address);
-            UnixListener::bind(&address)
-        }
-        bound => bound,
-    }
-    .map_err(failed)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket_path(&file), std::fs::Permissions::from_mode(0o600)).map_err(failed)?;
+    let listener = crate::ipc::bind(&file).map_err(|error| if error.kind() == std::io::ErrorKind::AddrInUse { format!("{} {LIVE_ELSEWHERE}", file.display()) } else { failed(error) })?;
     if file.exists() {
         let cwd = PathBuf::from(&session.header().cwd);
         *session = Session::open(&file, &cwd).map_err(|error| error.to_string())?;
@@ -228,8 +204,6 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
         }
         let _ = std::fs::remove_file(&inbox);
     }
-    listener.set_nonblocking(true).map_err(failed)?;
-    let listener = tokio::net::UnixListener::from_std(listener).map_err(failed)?;
     let (taken_by, taken) = mpsc::unbounded_channel();
     let (gate, watch): (Gate, Arc<Mutex<Watch>>) = (Arc::new(Mutex::new(Some(taken_by))), Arc::default());
     let listening = Some(listen(listener, gate.clone(), watch.clone()));
@@ -242,11 +216,11 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
 // short is never a message. A request is a whole line: one its sender didn't finish writing is
 // never acted on, so a sender whose write failed knows it wasn't (ask). A stop or close is answered
 // by a task of its own once it has taken effect, a subscriber's lines by another.
-fn listen(listener: tokio::net::UnixListener, gate: Gate, watch: Arc<Mutex<Watch>>) -> tokio::task::JoinHandle<()> {
+fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { return };
-            let (read, mut write) = stream.into_split();
+            let Ok(stream) = crate::ipc::accept(&listener).await else { return };
+            let (read, mut write) = tokio::io::split(stream);
             let mut line = String::new();
             if !matches!(tokio::time::timeout(READ_WAIT, tokio::io::BufReader::new(read).read_line(&mut line)).await, Ok(Ok(1..))) || !line.ends_with('\n') {
                 continue;
@@ -309,56 +283,6 @@ impl Run {
     }
 }
 
-// The runtime on a connected socket, by its peer credentials.
-fn runner(stream: &UnixStream) -> Option<Run> {
-    let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt writes at most `length` bytes into the ucred this owns.
-    let got = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut credentials).cast(), &mut length) } == 0;
-    got.then(|| Run::of(credentials.pid)).flatten()
-}
-
-// Connect to the session's socket, never waiting. A listening socket takes a connection at once,
-// before its runtime gets to it, so one is refused only for a full backlog, which only a runtime
-// that stopped taking them (stopped, stuck) has: that's WouldBlock. A Unix socket's connect is
-// never left in progress (af_unix.c), so there's nothing to poll for.
-fn connect(file: &Path) -> std::io::Result<UnixStream> {
-    let (_dir, address) = address(file)?;
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.set_nonblocking(true)?;
-    socket.connect(&socket2::SockAddr::unix(address)?)?;
-    socket.set_nonblocking(false)?;
-    Ok(socket.into())
-}
-
-// A connection under one deadline: each read and write waits for what's left of it, none once it
-// has passed.
-struct Timed<'a>(&'a UnixStream, Instant);
-
-impl Timed<'_> {
-    fn left(&self) -> std::io::Result<Option<Duration>> {
-        Some(self.1.saturating_duration_since(Instant::now())).filter(|left| !left.is_zero()).map(Some).ok_or(std::io::ErrorKind::TimedOut.into())
-    }
-}
-
-impl Read for Timed<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.0.set_read_timeout(self.left()?)?;
-        self.0.read(buffer)
-    }
-}
-
-impl Write for Timed<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.set_write_timeout(self.left()?)?;
-        self.0.write(bytes)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 // What came of asking a runtime (ask).
 pub enum Asked {
     // Nothing listens on the session's socket: nobody runs it.
@@ -383,7 +307,7 @@ pub fn ask(file: &Path, request: Value, wait: Duration) -> Asked {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Asked::Unread,
         Err(_) => return Asked::Nobody,
     };
-    let runner = runner(&stream);
+    let runner = crate::ipc::peer(&stream).and_then(Run::of);
     if Timed(&stream, deadline).write_all(format!("{request}\n").as_bytes()).is_err() {
         return Asked::Unread;
     }
@@ -424,7 +348,7 @@ pub fn end(file: &Path, what: &str, ours: Option<&Run>) -> Option<Result<(), Str
         Asked::Silent(Some(runner)) if ours != Some(&runner) => {
             Err(format!("it didn't answer in {waited} s; the piccosta running it (pid {}) isn't the run you started (not the same pid, start time and boot), so it was left alone", runner.pid))
         }
-        Asked::Silent(Some(runner)) if crate::proc::Process::started(runner.pid, runner.start).is_some_and(|process| process.signal(libc::SIGKILL)) => {
+        Asked::Silent(Some(runner)) if crate::proc::Process::started(runner.pid, runner.start).is_some_and(|process| process.signal(crate::proc::KILL)) => {
             Err(format!("it didn't answer in {waited} s, so its run (pid {}) was killed, with everything it ran", runner.pid))
         }
         Asked::Silent(_) => Err(format!("it didn't answer in {waited} s, and the piccosta running it couldn't be found to kill")),
@@ -516,8 +440,7 @@ pub fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<Run> {
 // Subscribe to the turn ends of the runtime running the session in `file`: each line it sends goes
 // to `heard`, until it ends. Output: whether it ended saying so, rather than going silent.
 pub async fn subscribe(file: &Path, mut heard: impl FnMut(Value)) -> bool {
-    let Ok((_dir, address)) = address(file) else { return false };
-    let Ok(mut stream) = tokio::net::UnixStream::connect(&address).await else { return false };
+    let Ok(mut stream) = crate::ipc::connect_async(file).await else { return false };
     if stream.write_all(format!("{}\n", json!({"do": "subscribe"})).as_bytes()).await.is_err() {
         return false;
     }

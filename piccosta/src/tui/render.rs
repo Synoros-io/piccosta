@@ -564,7 +564,7 @@ fn summary(arguments: &Map<String, Value>) -> String {
 // A path with the home directory written as ~. Path::strip_prefix matches whole components, so
 // /home/me2 isn't under /home/me; a HOME of / is left alone, since every path is under it.
 pub fn home_relative(path: &std::path::Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|home| home.parent().is_some());
+    let home = Some(crate::config::home()).filter(|home| home.parent().is_some());
     match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~/{}", rest.display()),

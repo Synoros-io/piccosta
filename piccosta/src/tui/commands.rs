@@ -168,7 +168,7 @@ impl App {
                 let mut recent: Vec<crate::host::SessionSummary> = folders.flat_map(|folder| crate::host::sessions_in(&folder.path(), None, 1)).filter(|summary| summary.cwd.is_dir()).collect();
                 recent.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
                 // Then the projects worked in lately, then every git repository near home.
-                let repos = git_repositories(&std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()));
+                let repos = git_repositories(&crate::config::home());
                 // piccosta's own folders (the assistant's home) aren't projects.
                 for dir in recent.into_iter().map(|summary| summary.cwd).filter(|dir| !dir.starts_with(&self.host.agent_dir)).chain(repos) {
                     let dir = super::render::home_relative(&dir);
@@ -436,7 +436,7 @@ impl App {
     // session's directory, then from home (so "projects/x" finds ~/projects/x).
     fn directory(&self, typed: &str) -> Result<std::path::PathBuf, String> {
         let base = self.base_dir();
-        resolve_directory(typed, &base).ok_or_else(|| format!("No directory {typed} (looked in {} and {})", base.display(), std::env::var("HOME").unwrap_or_default()))
+        resolve_directory(typed, &base).ok_or_else(|| format!("No directory {typed} (looked in {} and {})", base.display(), crate::config::home().display()))
     }
 
     // Where a typed path starts from: the focused session's directory, else piccosta's.
@@ -591,7 +591,7 @@ impl App {
         // the files differ, which they always do here).
         let mut lines: Vec<String> = changes.lines().map(str::to_string).collect();
         for path in untracked.lines() {
-            let added = git(&["--no-pager", "diff", "--no-color", "--no-index", "--", "/dev/null", path]).map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
+            let added = git(&["--no-pager", "diff", "--no-color", "--no-index", "--", crate::platform::NULL, path]).map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
             lines.extend(added.lines().map(str::to_string));
         }
         if lines.is_empty() {
@@ -708,14 +708,11 @@ const NOT_PROJECTS: [&str; 6] = ["node_modules", "target", "build", "venv", "__p
 // A directory typed for a new session: ~ is home; else it's looked for from `base` (the focused
 // session's directory), then from home. Output: the directory, links followed, when it's there.
 pub(super) fn resolve_directory(typed: &str, base: &Path) -> Option<std::path::PathBuf> {
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    // A trailing slash goes, but / stays the root.
-    let trimmed = typed.trim_end_matches('/');
-    let typed = if trimmed.is_empty() { typed } else { trimmed };
-    let expanded = match typed.strip_prefix('~') {
-        Some(rest) => home.join(rest.trim_start_matches('/')),
-        None => std::path::PathBuf::from(typed),
-    };
+    let home = crate::config::home();
+    // A trailing separator goes, but a root stays one: / here, D:/ or D:\ on Windows.
+    let trimmed = typed.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
+    let typed = if trimmed.is_empty() || trimmed.ends_with(':') { typed } else { trimmed };
+    let expanded = crate::tools::paths::expand_home(typed);
     [base.join(&expanded), home.join(&expanded)].into_iter().find_map(|dir| dir.canonicalize().ok().filter(|dir| dir.is_dir()))
 }
 
@@ -830,7 +827,7 @@ fn markdown(messages: &[AgentMessage]) -> String {
 // back; nothing is ever deleted outright. Output: Ok when they all went, else what happened, naming
 // any file that couldn't come back and where it is.
 pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
-    let _ = std::fs::remove_file(crate::runtime::socket_path(path));
+    crate::ipc::remove(path);
     let beside = [crate::provider::claude::SIDECAR_SUFFIX].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
     let mut moved: Vec<(&Path, (std::path::PathBuf, std::path::PathBuf))> = Vec::new();
     for file in beside.iter().map(|file| file.as_path()).filter(|file| file.exists()).chain(std::iter::once(path)) {
@@ -858,12 +855,11 @@ pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
 // was. It is when the rename would cross file systems (the spec's per-volume trash folders aren't
 // done) or the trash can't be written.
 fn trash(file: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    use std::os::unix::fs::DirBuilderExt;
     let trash = crate::config::data_home().join("Trash");
     let (Ok(path), Some(name)) = (std::path::absolute(file), file.file_name()) else { return None };
     let url = url::Url::from_file_path(&path).ok()?;
     // The spec has the trash readable by its owner only.
-    if ["files", "info"].iter().any(|folder| std::fs::DirBuilder::new().recursive(true).mode(0o700).create(trash.join(folder)).is_err()) {
+    if ["files", "info"].iter().any(|folder| crate::platform::private_dir(&trash.join(folder)).is_err()) {
         return None;
     }
     // Path is percent-encoded as in a URL; the date is local time, to the second.

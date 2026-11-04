@@ -151,7 +151,7 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
     if let Some(message) = aborted() {
         return Err(message);
     }
-    if let Err(error) = paths::access(absolute, libc::R_OK | libc::W_OK) {
+    if let Err(error) = paths::access(absolute, true) {
         if let Some(message) = aborted() {
             return Err(message);
         }

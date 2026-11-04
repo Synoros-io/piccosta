@@ -421,9 +421,8 @@ pub async fn run(args: crate::cli::Args) -> Result<std::process::ExitCode, Strin
 }
 
 async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode, String> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
-    let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
+    let termination = crate::proc::termination(false);
+    tokio::pin!(termination);
     let host = Arc::new(Host::for_args(&args));
     crate::scale::watch();
     // After /restart: the watcher and the background jobs the image before handed over.
@@ -526,8 +525,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
             return Err(format!("could not draw: {error}"));
         }
         tokio::select! {
-            _ = term.recv() => { exit_code = 143; app.quit = true; },
-            _ = hangup.recv() => { exit_code = 129; app.quit = true; },
+            code = &mut termination => { exit_code = code; app.quit = true; },
             event = input.next() => match event {
                 Some(Ok(event)) => app.input(event),
                 _ => app.quit = true,
@@ -574,10 +572,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     // /restart: this process becomes the binary now at its path (a build replaces the file, which
     // the kernel then names "… (deleted)"), on the same command line, bringing everything back.
     if app.restart {
-        use std::os::unix::process::CommandExt;
         let exe = crate::proc::exe().map_err(|error| error.to_string())?;
         state::save_handover(&host.agent_dir, &handover).map_err(|error| format!("could not hand the background jobs over: {error}"))?;
-        let error = std::process::Command::new(&exe).args(std::env::args_os().skip(1).filter(|argument| argument != "--restore")).arg("--restore").exec();
+        let error = crate::proc::resume(std::process::Command::new(&exe).args(std::env::args_os().skip(1).filter(|argument| argument != "--restore")).arg("--restore"));
         state::take_handover(&host.agent_dir);
         return Err(format!("could not start {} again: {error}", exe.display()));
     }
@@ -589,6 +586,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
 // (tools/reaper.rs) runs on; any other child (a Claude process still closing, say) would stay a
 // zombie when it ends, since nothing in this image waits on it, so a thread waits on each. Only children that existed before this image started any are
 // listed, so none of its own are taken from tokio.
+#[cfg(windows)]
+fn reap_inherited_children(_handover: &state::Handover) {}
+
+#[cfg(unix)]
 fn reap_inherited_children(handover: &state::Handover) {
     let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid)).collect();
     for pid in crate::proc::children() {
@@ -600,16 +601,23 @@ fn reap_inherited_children(handover: &state::Handover) {
 }
 
 fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture,
-        EnableFocusChange,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
+    let entered = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture, EnableFocusChange);
+    // Keys like shift+enter get codes of their own through kitty's keyboard protocol. Windows'
+    // console has nothing like it (crossterm refuses the request there), so it's asked for on Unix.
+    #[cfg(unix)]
+    let entered = entered.and_then(|()| {
+        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+        crossterm::execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+        KEYBOARD_PUSHED.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    });
+    // A terminal that refused part of it goes back as it was, not left raw.
+    if let Err(error) = entered {
+        restore();
+        return Err(error);
+    }
     // tmux passes on keys like shift+enter and ctrl+enter only to a pane that asks in xterm's way
     // (modifyOtherKeys), and only with `extended-keys on` in tmux.conf; the kitty request above
     // doesn't reach it.
@@ -634,8 +642,12 @@ fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
         restore();
         previous(info);
     }));
-    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).inspect_err(|_| restore())
 }
+
+// Whether setup asked for kitty's keyboard protocol, so restore takes back only what was asked for.
+#[cfg(unix)]
+static KEYBOARD_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Where a background task's panic is written, in the agent dir.
 const PANIC_LOG: &str = "panic.log";
@@ -648,10 +660,14 @@ fn restore() {
     if std::env::var_os("TMUX").is_some() {
         print!("{MODIFY_OTHER_KEYS_OFF}");
     }
-    use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, PopKeyboardEnhancementFlags};
+    use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
+    // Its own command, so a terminal that refuses it can't stop the rest from running.
+    #[cfg(unix)]
+    if KEYBOARD_PUSHED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
-        PopKeyboardEnhancementFlags,
         DisableFocusChange,
         DisableMouseCapture,
         DisableBracketedPaste,
@@ -902,7 +918,7 @@ impl App {
             && crate::manager::project_manager(agent_dir, &dir).is_none()
             && crate::host::sessions_in(&crate::session::default_session_dir(agent_dir, &dir), Some(&dir), 1).is_empty();
         // Home isn't a project: a session started there (outside every project) is a plain one.
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = Some(crate::config::home());
         let eligible = self.persist && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
         let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
         if eligible && (first || self.slots[slot].make_manager) && crate::manager::role(&session).is_none() {
@@ -1875,7 +1891,7 @@ impl App {
                 if project.is_some() {
                     lines.push(Line::default());
                 }
-                let name = if std::env::var_os("HOME").is_some_and(|home| slot.cwd == std::path::Path::new(&home)) { "~".to_string() } else { slot.cwd.file_name().map_or_else(|| slot.cwd.display().to_string(), |name| name.to_string_lossy().into_owned()) };
+                let name = if slot.cwd == crate::config::home() { "~".to_string() } else { slot.cwd.file_name().map_or_else(|| slot.cwd.display().to_string(), |name| name.to_string_lossy().into_owned()) };
                 lines.push(Line::from(Span::styled(format!(" {}", render::fit(&name, room + 2)), Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD))));
                 project = Some(slot.cwd.clone());
             }
