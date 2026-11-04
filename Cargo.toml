@@ -19,7 +19,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 # Session ids are UUIDv7 (time-ordered) and entry ids come from random v4 UUIDs, as in pi.
 uuid = { version = "1", features = ["v4", "v7"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal", "net"] }
 # rustls with the system's certificate store; no OpenSSL to link against.
 reqwest = { version = "0.13", features = ["json", "stream"] }
 base64 = "0.22"
@@ -28,6 +28,8 @@ futures-util = "0.3"
 tokio-util = "0.7"
 # setsid, kill and access for the shell tools; already in the tree through tokio.
 libc = "0.2"
+# A session socket's connect that never waits (runtime.rs); already in the tree through tokio.
+socket2 = "0.6"
 # NFKC for edit's fuzzy matching, as JavaScript's String.normalize does it.
 unicode-normalization = "0.1"
 # Decoding, resizing and re-encoding images for read; pi uses this same crate through WebAssembly.

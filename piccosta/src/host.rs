@@ -12,7 +12,6 @@ use indexmap::IndexMap;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 // The pi release piccosta is based on and speaks the protocols of (session files, json and rpc
 // mode).
@@ -37,19 +36,6 @@ pub struct Host {
     pub append_prompt: Option<String>,
     // --yolo: no approvals, whatever the frontend asks for.
     pub yolo: bool,
-}
-
-// What a live session's task is asked to do, one at a time.
-pub enum Command {
-    Prompt(String, Vec<crate::message::Content>),
-    Model(String),
-    Thinking(String),
-    Name(String),
-    Compact(Option<String>),
-    AutoCompaction(bool),
-    AutoRetry(bool),
-    // Work with other models from the next prompt on (none: alone again).
-    Team(Team),
 }
 
 // The models a session works with besides its own (provider/id, in the order they speak after
@@ -140,15 +126,6 @@ fn exchange_over(session: &Session, done_counts: bool) -> bool {
     let text: String = reply.content.iter().filter_map(|block| if let crate::message::Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
     let last_line = text.lines().rev().map(|line| line.trim_matches(|character: char| character.is_whitespace() || "*_`.".contains(character))).find(|line| !line.is_empty());
     done_counts && last_line.is_some_and(|line| line.eq_ignore_ascii_case(DONE_LINE))
-}
-
-// What the task reports after each command (and after a turn a background job started, marked
-// `notice`): how it went, and the model and thinking level the session has now.
-pub struct Done {
-    pub result: Result<(), String>,
-    pub notice: bool,
-    pub model: Model,
-    pub thinking: String,
 }
 
 // A session file as a list shows it.
@@ -350,10 +327,12 @@ impl Host {
     // A session ready to run. Input: the model and thinking level asked for, if any (else what
     // the session last used, else the level that model was last set to, else the settings'
     // defaults), where events go, and whether a run
-    // waits for background jobs before it ends (print and json mode). Output: the agent and the
-    // tools' shared state (background jobs, web results), which the caller shuts down at the end.
+    // waits for background jobs before it ends (print and json mode). The session is claimed first
+    // and read again (runtime.rs claim), and everything after is made from it as it is then.
+    // Output: the agent and the tools' shared state (background jobs, web results), which the
+    // caller shuts down at the end.
     pub fn open(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, emit: EventSink, hold_for_jobs: bool) -> Result<(Agent, Arc<ToolShared>), String> {
-        session.claim()?;
+        let claim = crate::runtime::claim(&mut session)?;
         let registry = self.registry()?;
         let resumed = session.context();
         let wanted = self.wanted(Some(&session), model, &registry);
@@ -414,6 +393,7 @@ impl Host {
             gate: None,
             hold_for_jobs,
             manager_home,
+            claim,
         };
         let agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
         Ok((agent, tool_shared))
@@ -439,66 +419,9 @@ impl Host {
         config::remembered_thinking_level(&self.agent_dir, &format!("{}/{}", model.provider, model.id))
     }
 
-    // A live session's task: its commands one at a time, and (with `wake`) a background job's
-    // finish message as a turn of its own when it comes while the session is idle; without, it
-    // waits for the next prompt (rpc mode: T3 Code stops a pi that starts a run unasked). Steering and aborts don't wait
-    // in this line; they go through the agent's handle while a prompt runs. The task ends when
-    // the commands' sender is dropped, after stopping the session's jobs and web state. Runs on a
-    // LocalSet: the agent's future isn't Send (rustc can't prove it through the providers'
-    // higher-ranked lifetimes).
-    pub fn spawn(self: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: bool, mut commands: UnboundedReceiver<Command>, mut done: impl FnMut(Done) + 'static) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn_local(async move {
-            let mut team = team(&agent.session);
-            loop {
-                let (result, notice) = tokio::select! {
-                    command = commands.recv() => match command {
-                        Some(command) if !commands.is_closed() => (self.obey(&mut agent, command, &mut team).await, false),
-                        _ => break,
-                    },
-                    Some(notice) = agent.notice(), if wake => {
-                        if tools::jobs::stopped_by_user(&notice) {
-                            agent.hold_notice(notice);
-                            continue;
-                        }
-                        (agent.take_notice(notice).await, true)
-                    }
-                };
-                done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
-            }
-            // The session is closed: a Claude query waiting for its next message goes too.
-            crate::provider::claude::close(agent.session.id());
-            shared.jobs.shutdown("quit");
-            shared.web.shutdown();
-        })
-    }
-
-    // Carry out one command. `team` is the models the session works with.
-    async fn obey(&self, agent: &mut Agent, command: Command, team: &mut Team) -> Result<(), String> {
-        let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
-        match command {
-            Command::Prompt(text, images) => self.answer(agent, team, &text, images).await,
-            Command::Team(asked) => {
-                *team = record_team(&self.registry()?, &mut agent.session, &asked)?;
-                Ok(())
-            }
-            Command::Compact(instructions) => agent.compact(instructions.as_deref()).await,
-            Command::Thinking(level) => written(agent.set_thinking_level(&level)),
-            Command::Name(name) => written(agent.set_name(&name)),
-            Command::AutoCompaction(enabled) => {
-                agent.set_auto_compaction(enabled);
-                Ok(())
-            }
-            Command::AutoRetry(enabled) => {
-                agent.set_auto_retry(enabled);
-                Ok(())
-            }
-            Command::Model(name) => self.switch_model(agent, &name),
-        }
-    }
-
     // Put the session on another model (provider/id). It brings the level it was last set to;
     // one never set keeps the session's.
-    fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
+    pub fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         let model = self.registry()?.resolve(name)?.clone();
         let sections = self.sections(&model, &agent.session)?;
@@ -514,6 +437,9 @@ impl Host {
     // speaker's model on the session for one run, opened by its note; the session model takes it
     // back for the user's next message. A failed or stopped turn ends the exchange.
     pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>) -> Result<(), String> {
+        if text.is_empty() && images.is_empty() && agent.session.queued().is_empty() {
+            return Ok(());
+        }
         let lead = format!("{}/{}", agent.model().provider, agent.model().id);
         let speakers: Vec<String> = std::iter::once(lead.clone()).chain(team.models.iter().filter(|model| **model != lead).cloned()).collect();
         let rounds = self.settings.get("pairRounds").and_then(Value::as_u64).unwrap_or(PAIR_ROUNDS).max(1);

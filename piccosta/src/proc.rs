@@ -1,42 +1,32 @@
 // Processes: knowing one for sure, and starting one apart from this one.
 //
 // A pid names a process only while it lives: once it's reaped the number passes on. So a process
-// found by its number (a record on disk, a list in /proc) is opened as a pidfd, which names that
-// one process for as long as it's held, and checked against the start time it was recorded with. A
-// start time counts from boot, so a record carries the boot it was made in too. Every piccosta
-// process that has to find or stop another goes through here: the lanes' run records
-// (manager.rs), the Claude bridge's children, bash's shells, the web tools' clone dirs.
+// found by its number (a record on disk, a socket's peer) is checked against the start time it was
+// found with, through a pidfd, which names that one process for as long as it's held. A start time
+// counts from boot, so a record carries the boot it was made in too: the web tools' clone dirs keep
+// their owner's. bash waits for its shells through a pidfd too, and a manager kills a session's
+// runner that doesn't answer through one (runtime.rs end).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 // The kernel's id for this boot (random(4)).
 const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
-// Where /proc/<pid>/stat keeps the parent (field 4), the session (field 6) and the start time
-// (field 22, clock ticks since boot), counted among the fields after the name's ')', which start
-// at field 3, the state (proc_pid_stat(5)).
-const STAT_PARENT: usize = 4 - 3;
-const STAT_SESSION: usize = 6 - 3;
+// Where /proc/<pid>/stat keeps the start time (field 22, clock ticks since boot), counted among the
+// fields after the name's ')', which start at field 3, the state (proc_pid_stat(5)).
 const STAT_START: usize = 22 - 3;
 
 pub fn boot_id() -> String {
     std::fs::read_to_string(BOOT_ID_FILE).unwrap_or_default().trim().to_string()
 }
 
-// A live process as its stat has it. None once it's gone, or a zombie, which is as good as gone.
-#[derive(Clone, Copy)]
-pub struct Stat {
-    pub parent: i32,
-    pub session: i32,
-    pub start: u64,
-}
-
-pub fn stat(pid: i32) -> Option<Stat> {
+// When a live process started, in clock ticks since boot. None once it's gone, or a zombie, which
+// is as good as gone.
+pub fn start(pid: i32) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
     (*fields.first()? != "Z").then_some(())?;
-    let number = |index: usize| fields.get(index)?.parse().ok();
-    Some(Stat { parent: number(STAT_PARENT)?, session: number(STAT_SESSION)?, start: fields.get(STAT_START)?.parse().ok()? })
+    fields.get(STAT_START)?.parse().ok()
 }
 
 // One process, known for sure: a pidfd, and its pid for reading /proc.
@@ -54,32 +44,23 @@ impl Process {
         (fd >= 0).then(|| Process { fd: unsafe { OwnedFd::from_raw_fd(fd) }, pid })
     }
 
-    // Its stat now, None once it's gone. Read before the pidfd shows it alive: a pid passes on only
-    // once its process is reaped, so a stat read while it lives is its own.
-    pub fn stat(&self) -> Option<Stat> {
-        stat(self.pid).filter(|_| self.signal(0))
+    // The process `pid` names now, if it's the one that started at `start`. Its start time is read
+    // before the pidfd shows it alive: a pid passes on only once its process is reaped, so a time
+    // read while it lives is its own.
+    pub fn started(pid: i32, start: u64) -> Option<Process> {
+        let process = Process::open(pid)?;
+        (self::start(pid) == Some(start) && process.signal(0)).then_some(process)
     }
 
+    // Send it a signal (0 only checks it's alive). Output: whether it went.
     pub fn signal(&self, signal: i32) -> bool {
         // SAFETY: pidfd_send_signal on a descriptor this owns, with no siginfo.
         unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) == 0 }
     }
-
-    // The process `pid` names now, if it's the one that started at `start`, with its stat now.
-    pub fn started(pid: i32, start: u64) -> Option<(Process, Stat)> {
-        let process = Process::open(pid)?;
-        let now = process.stat().filter(|now| now.start == start)?;
-        Some((process, now))
-    }
-
-    // What a later process finds a live one by, with its pid: "<boot id> <start time>".
-    pub fn record(pid: i32) -> Option<String> {
-        Some(format!("{} {}", boot_id(), stat(pid)?.start))
-    }
 }
 
-// The start time a record (Process::record) names, None when it was made in another boot, where
-// its pid could be anything's now.
+// The start time a record ("<boot id> <start time>") names, None when it was made in another
+// boot, where its pid could be anything's now.
 pub fn recorded_start(record: &str) -> Option<u64> {
     let (boot, start) = record.trim().split_once(' ')?;
     (!boot.is_empty() && boot == boot_id()).then(|| start.parse().ok())?

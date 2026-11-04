@@ -65,7 +65,6 @@ use history::{fingerprint, Shape};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -408,8 +407,7 @@ async fn ask_alone(subtype: &str) -> Result<Value, String> {
     if let Some(dir) = &SETTINGS.config_dir {
         command.env("CLAUDE_CONFIG_DIR", dir);
     }
-    // Tracked like a query's child, so piccosta's shutdown stops it too, and killed and waited for
-    // here however the answer went.
+    // Killed and waited for here however the answer went.
     let mut child = start(command)?;
     let id = request_id();
     child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": subtype}})).await;
@@ -509,8 +507,6 @@ struct Child {
     process: tokio::process::Child,
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
-    // Its entry in CHILDREN, by its pidfd's number.
-    tracked: Option<RawFd>,
     // The last STDERR_TAIL bytes of its stderr, and the task keeping them, stopped by stderr_tail or
     // when the child is dropped, so a descendant holding stderr open can't keep it alive.
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -532,15 +528,22 @@ fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String
     start(command)
 }
 
-// Start a claude, kept in CHILDREN until it's dropped.
+// Start a claude. It ends when its Child is dropped (kill_on_drop), and with this piccosta
+// however that ends: the kernel sends it SIGKILL as the thread that started it ends (bash.rs spawn
+// says when that is), which is after every query has had its chance to close it (shutdown).
 fn start(mut command: tokio::process::Command) -> Result<Child, String> {
+    let parent = std::process::id();
+    // SAFETY: prctl() and getppid() are async-signal-safe and run in the child between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other("piccosta ended"));
+            }
+            Ok(())
+        });
+    }
     let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
-    // Opened before it can be reaped, so the pidfd is that process's whatever later takes its pid.
-    let tracked = process.id().and_then(|pid| crate::proc::Process::open(pid as i32)).map(|child| {
-        let fd = child.fd.as_raw_fd();
-        lock(&CHILDREN).insert(fd, child);
-        fd
-    });
     let stdout = process.stdout.take().ok_or("Claude Code started without a stdout")?;
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let stderr_reader = process.stderr.take().map(|mut pipe| {
@@ -555,16 +558,13 @@ fn start(mut command: tokio::process::Command) -> Result<Child, String> {
             }
         })
     });
-    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), tracked, stderr, stderr_reader })
+    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), stderr, stderr_reader })
 }
 
-// However a child ends, it leaves the shutdown list when it's dropped (kill_on_drop stops one still
+// However a child ends, its stderr reader goes when it's dropped (kill_on_drop stops one still
 // running then).
 impl Drop for Child {
     fn drop(&mut self) {
-        if let Some(fd) = self.tracked {
-            lock(&CHILDREN).remove(&fd);
-        }
         if let Some(reader) = &self.stderr_reader {
             reader.abort();
         }
@@ -624,10 +624,6 @@ fn with_stderr(failure: String, tail: &str) -> String {
     if tail.is_empty() { failure } else { format!("{failure}\nClaude Code's stderr: {tail}") }
 }
 
-// Every claude child not dropped yet, by its pidfd's number, for the exit on a signal. A pidfd
-// names its own process only, so a signal through it can't reach a later one given the pid.
-static CHILDREN: LazyLock<Mutex<HashMap<RawFd, crate::proc::Process>>> = LazyLock::new(Default::default);
-
 // How many query tasks haven't finished, live or let go of and still closing their child, for
 // shutdown to wait on, and how often it looks.
 static QUERIES: AtomicUsize = AtomicUsize::new(0);
@@ -636,7 +632,8 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 // piccosta is exiting (a quit, /restart's exec, a signal), where nothing would be dropped: stop
 // every live query and wait for every query task, these and the ones let go of earlier, to close
 // its child (end of input, SIGTERM, SIGKILL) and delete its session files. A child still there
-// after that (Claude Code's model listing, or one that didn't close in time) is killed.
+// after that (Claude Code's model listing, or one that didn't close in time) dies with this
+// piccosta (start), or at /restart's exec, where its input closes.
 pub async fn shutdown() {
     for (_, live) in lock(&LIVE).drain() {
         let_go(live, "piccosta is exiting");
@@ -644,9 +641,6 @@ pub async fn shutdown() {
     let deadline = Instant::now() + SHUTDOWN_WAIT;
     while QUERIES.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         tokio::time::sleep(SHUTDOWN_POLL).await;
-    }
-    for (_, child) in lock(&CHILDREN).drain() {
-        child.signal(libc::SIGKILL);
     }
 }
 
@@ -860,8 +854,7 @@ fn kept_base(messages: &[Message]) -> (Vec<String>, Vec<String>) {
 }
 
 // Let go of a query taken out of LIVE: its task is told why and closes its child on its own time.
-// Nothing waits for it here, so a session closing or switching lets go of its file at once (a
-// switch back used to find it still held, and a prompt typed then went to an inbox nothing read).
+// Nothing waits for it here, so a session closing or switching lets go of it at once.
 fn let_go(live: Live, reason: &str) {
     let _ = live.commands.send(Command::Discard(reason.to_string()));
 }

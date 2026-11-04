@@ -10,7 +10,8 @@ mod state;
 mod tex;
 
 use crate::agent::{Event, Handle};
-use crate::host::{Command, Done, Host};
+use crate::host::Host;
+use crate::runtime::{Command, Done};
 use crate::message::AgentMessage;
 use crossterm::event::{Event as Input, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures_util::StreamExt;
@@ -21,7 +22,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use render::{Block as Part, Flags, Rows, ToolView};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,8 +77,8 @@ const UNDO_STEPS: usize = 100;
 const TAB_SPACES: &str = "    ";
 // Clicks this close together make a double or triple click (GTK's default gtk-double-click-time).
 const MULTI_CLICK: Duration = Duration::from_millis(400);
-// How many agent scans go between looks at other piccostas' locks on the sessions listed (10 s).
-const LOCK_SCAN_EVERY: u64 = 5;
+// How many agent scans go between asks of the runtimes of the sessions listed (10 s).
+const RUNTIME_SCAN_EVERY: u64 = 5;
 // How often the sidebar looks again for the agents each session has running.
 const AGENT_SCAN: Duration = Duration::from_secs(2);
 
@@ -87,6 +88,29 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    // What a scan's runtimes said (asker): each one's status, None when nothing runs it; and
+    // whether it was a look for agents.
+    Scanned(BTreeMap<PathBuf, Option<Value>>, bool),
+    // How a message from the slot's editor to a session not run here went, and its text as typed.
+    Sent(Result<crate::runtime::Sent, String>, String),
+}
+
+// Asking runtimes, which waits on their sockets (a stopped one's, up to its wait), so it's done off
+// the UI's thread (asker): what it comes to, as an update for a slot.
+type Ask = Box<dyn FnOnce() -> (usize, Update) + Send>;
+
+// The thread that asks, one ask after another, so messages go in the order they were sent. Each
+// answer goes back as an update, applied before the UI next draws. It ends with the UI.
+fn asker(updates: UnboundedSender<(usize, Update)>) -> std::sync::mpsc::Sender<Ask> {
+    let (asks, asked) = std::sync::mpsc::channel::<Ask>();
+    std::thread::spawn(move || {
+        for ask in asked {
+            if updates.send(ask()).is_err() {
+                return;
+            }
+        }
+    });
+    asks
 }
 
 #[derive(PartialEq)]
@@ -123,22 +147,21 @@ struct Slot {
     draft: Editor,
     // Each message's rows, by the width and flags they were drawn for.
     cache: HashMap<usize, (u16, Flags, Rows)>,
-    // Its id, and the agents its tools have running (subagents, `piccosta -p` run by hand).
+    // Its id, and the piccostas its commands started that run now (subagents, `piccosta -p` run by
+    // hand): each one's session file and job.
     id: String,
-    agents: Vec<crate::tools::subagent::RunningAgent>,
+    agents: Vec<(PathBuf, Option<String>)>,
     // When its current run started, for the working line under the conversation.
     working_since: Option<Instant>,
     // Whether it compacts on its own (/autocompact), and the models it works with (/pair, /trio).
     auto_compaction: bool,
     team: crate::host::Team,
-    // Run by another piccosta (it holds the file's lock), and, when shown here, the file's time
-    // as last read: such a session is followed from its file, never run twice.
+    // Run by another piccosta (its runtime answers), and, when shown here, the file's time as last
+    // read: such a session is followed from its file, never run twice. And whether that runtime
+    // is working.
     elsewhere: bool,
     followed: Option<std::time::SystemTime>,
-    // Another piccosta has it open and is in the middle of a turn (mid_turn), and the file's time
-    // when that was last read.
     working_elsewhere: bool,
-    elsewhere_read: Option<std::time::SystemTime>,
     // A manager's session (the assistant, or its project's manager), which leads its group; and,
     // for a new one, that it's to be made its project's manager when it opens (/manager).
     manager: bool,
@@ -187,7 +210,6 @@ impl Slot {
             elsewhere: false,
             followed: None,
             working_elsewhere: false,
-            elsewhere_read: None,
             manager: false,
             make_manager: false,
             parent: None,
@@ -197,6 +219,11 @@ impl Slot {
 
     fn busy(&self) -> bool {
         self.state != State::Idle
+    }
+
+    // Open here or run elsewhere, so its agents are looked for.
+    fn watched(&self) -> bool {
+        (self.live.is_some() || self.elsewhere) && !self.id.is_empty()
     }
 
     // Open, idle, and nothing in it yet: no message, no draft, no file (a new session's file is
@@ -274,7 +301,7 @@ struct App {
     frame: usize,
     sender: UnboundedSender<(usize, Update)>,
     updates: UnboundedReceiver<(usize, Update)>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::task::JoinHandle<crate::agent::Agent>>,
     model: Option<String>,
     persist: bool,
     notice: Option<String>,
@@ -283,8 +310,11 @@ struct App {
     delete_armed: Option<(Instant, usize)>,
     // ctrl+x was pressed: the next key finishes a two-key chord.
     chord: bool,
-    // How many times scan_agents has run.
+    // How many times scan_agents has run, where the UI's asks of runtimes go (asker), and whether a
+    // scan is out, so a slow one (a stopped runtime's wait) isn't asked again before it's back.
     scans: u64,
+    asks: std::sync::mpsc::Sender<Ask>,
+    scanning: bool,
     // The state last saved (state.rs), as written, so it's written again only when it changes.
     saved: String,
     // /restart: start again on the binary as it is now, once everything here has stopped; and
@@ -396,7 +426,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
     let host = Arc::new(Host::for_args(&args));
     crate::scale::watch();
-    // After /restart: the reaper and the background jobs the image before handed over.
+    // After /restart: the watcher and the background jobs the image before handed over.
     let handover = if args.restore { state::take_handover(&host.agent_dir) } else { state::Handover::default() };
     if let Some((fd, pid)) = handover.reaper {
         crate::tools::reaper::adopt(fd, pid);
@@ -425,6 +455,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         sidebar: true,
         flags: Flags::default(),
         frame: 0,
+        asks: asker(sender.clone()),
+        scanning: false,
         sender,
         updates,
         tasks: Vec::new(),
@@ -553,10 +585,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
 }
 
 // After /restart, the processes the old image started are still this process's children. The
-// jobs it handed over are taken back and reaped by their watchers, and the reaper runs on; any
-// other child (a Claude process still closing, say) would stay a zombie when it ends, since
-// nothing in this image waits on it, so a thread waits on each. Only children that existed before
-// this image started any are listed, so none of its own are taken from tokio.
+// jobs it handed over are taken back and reaped by bash's watch tasks, and the watcher
+// (tools/reaper.rs) runs on; any other child (a Claude process still closing, say) would stay a
+// zombie when it ends, since nothing in this image waits on it, so a thread waits on each. Only children that existed before this image started any are
+// listed, so none of its own are taken from tokio.
 fn reap_inherited_children(handover: &state::Handover) {
     let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid)).collect();
     for pid in crate::proc::children() {
@@ -565,13 +597,6 @@ fn reap_inherited_children(handover: &state::Handover) {
             std::thread::spawn(move || unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) });
         }
     }
-}
-
-// Whether a session another piccosta runs is in the middle of a turn: its last message is the
-// user's, a tool's result, a background job's notice, or the model's call for tools.
-fn mid_turn(path: &Path) -> bool {
-    let last = crate::session::last_entry(path, |entry| entry["type"] == "message" || entry["type"] == "custom_message");
-    last.is_some_and(|entry| entry["type"] == "custom_message" || entry["message"]["role"] != "assistant" || entry["message"]["stopReason"] == "toolUse")
 }
 
 fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
@@ -715,7 +740,7 @@ impl App {
             }
             let slot = self.slots.len();
             self.slots.push(Slot { cwd: kept.cwd, saved: deleted, ..Slot::new(path.clone(), if deleted { DELETED_TITLE } else { NEW_TITLE }.into()) });
-            self.slots[slot].elsewhere = path.as_deref().is_some_and(crate::manager::busy);
+            self.slots[slot].elsewhere = path.as_deref().is_some_and(crate::runtime::running);
             if !deleted && (index >= on_screen || self.slots[slot].elsewhere) {
                 self.follow(slot);
             } else if !deleted && let Err(error) = self.load(slot, None, None, None) {
@@ -763,7 +788,7 @@ impl App {
         }
     }
 
-    // /restart: each saved session's running background jobs, and the reaper, for the next image.
+    // /restart: each saved session's running background jobs, and the watcher, for the next image.
     fn hand_over(&self) -> state::Handover {
         let sessions = self.slots.iter().filter_map(|slot| Some((slot.path.clone()?, slot.shared.as_ref()?.jobs.hand_over()))).filter(|(_, jobs)| !jobs.is_empty()).collect();
         state::Handover { reaper: crate::tools::reaper::hand_over(), sessions }
@@ -876,11 +901,6 @@ impl App {
             let _ = sender.send((slot, Update::Event(Box::new(event.clone()))));
         });
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
-        // A lane's run of it that is starting (recorded, not holding it yet) has it as much as
-        // another piccosta holding it does: a message for it goes to its inbox (send).
-        if let Some(path) = session.file().filter(|path| crate::manager::busy(path)) {
-            return Err(format!("{} {}", path.display(), crate::session::LIVE_ELSEWHERE));
-        }
         let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
         let view = &mut self.slots[slot];
         view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
@@ -902,17 +922,18 @@ impl App {
         view.context_tokens = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
         view.auto_compaction = agent.auto_compaction();
         view.team = crate::host::team(&agent.session);
-        let (commands, receiver) = unbounded_channel();
         view.id = agent.session.id().to_string();
         // Everything queued goes in together at the next step, as Claude Code sends it.
-        agent.handle().set_steering_mode("all");
-        view.live = Some((agent.handle(), commands));
+        let handle = agent.handle();
+        handle.set_steering_mode("all");
         view.shared = Some(shared.clone());
         let sender = self.sender.clone();
         let done = move |done: Done| {
             let _ = sender.send((slot, Update::Done(Box::new(done))));
         };
-        self.tasks.push(host.spawn(agent, shared, true, receiver, done));
+        let (commands, task) = crate::runtime::spawn(host, agent, shared, true, false, done);
+        self.slots[slot].live = Some((handle, commands));
+        self.tasks.push(task);
         prompts.retain(|prompt| !self.history.contains(prompt));
         self.history.splice(0..0, prompts);
         Ok(())
@@ -943,7 +964,7 @@ impl App {
     fn show(&mut self, slot: usize) {
         let leaving = self.panes[self.focus].slot;
         if self.slots[slot].live.is_none() {
-            self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::manager::busy);
+            self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::runtime::running);
             self.follow(slot);
         }
         self.slots[slot].unread = false;
@@ -1072,44 +1093,54 @@ impl App {
     fn send(&mut self, text: String) {
         let pane = self.focus;
         self.panes[pane].scroll = 0;
-        // A message for a session another piccosta runs (the manager, say), or that a lane's run is
-        // starting in, goes to its inbox, which that piccosta takes in (manager::send), looked at
-        // afresh, not from the last scan; when nothing runs it, the session opens here and answers
-        // it, as does one shown from its file.
+        // A message for a session not open here goes to whatever runs it (the assistant's service,
+        // another terminal), as the user's when it's a manager's, sent off this thread (asker, then
+        // sent).
         if self.current().live.is_none()
             && let Some(path) = self.current().path.clone().filter(|path| path.exists())
         {
-            let sent = crate::manager::send(&path, &text, None);
-            if !matches!(sent, Ok(crate::manager::Sent::Free)) {
-                self.notice = Some(match sent {
-                    Err(error) => format!("Couldn't leave the message: {error}"),
-                    Ok(_) => "Sent: the piccosta running this session takes it in after its current step.".into(),
-                });
-                return;
-            }
-            self.focused().elsewhere = false;
+            let (slot, sent) = (self.panes[pane].slot, if self.current().manager { crate::manager::from_user(&text) } else { text.clone() });
+            let _ = self.asks.send(Box::new(move || (slot, Update::Sent(crate::runtime::send(&path, &sent, None), text))));
+            return;
         }
         if !self.ensure_open() {
             self.focused().draft.insert(&text);
             return;
         }
         let slot = self.focused();
-        let Some((handle, commands)) = &slot.live else { return };
-        // While the model works, a message waits for the step it's on; commands that step is
-        // running move to the background (they carry on and report when they end), so the message
-        // isn't left waiting on them.
+        let Some((_, commands)) = &slot.live else { return };
+        // While the model works, a message waits for the step it's on, and the commands that step
+        // is running move to the background (they carry on and report when they end), so it isn't
+        // left waiting on them; else it starts a turn (runtime.rs).
+        let _ = commands.send(Command::Message(text.clone()));
         if slot.busy() {
-            handle.steer(text);
-            if let Some(shared) = &slot.shared {
-                shared.jobs.detach_all();
-            }
             return;
         }
-        let _ = commands.send(Command::Prompt(text.clone(), Vec::new()));
         slot.state = State::Running;
         if slot.title == NEW_TITLE {
             slot.title = render::fit(text.lines().next().unwrap_or(""), 80);
         }
+    }
+
+    // How a message from a slot's editor to a session not open here went (send). When nothing ran
+    // the session, the message waits in its file and the session opens here, which answers it
+    // first. One not sent goes back into the editor.
+    fn sent(&mut self, slot: usize, sent: Result<crate::runtime::Sent, String>, text: String) {
+        self.notice = Some(match sent {
+            Ok(crate::runtime::Sent::Queued) => {
+                self.slots[slot].elsewhere = false;
+                if self.slots[slot].live.is_some() || (self.slots[slot].path.is_some() && self.reopen(slot).is_ok()) {
+                    return;
+                }
+                "It's queued in the session, for whatever opens it next.".into()
+            }
+            Ok(crate::runtime::Sent::Unconfirmed) => "Sent, not confirmed: the piccosta running this session didn't answer in time. It isn't sent again.".into(),
+            Ok(_) => "Sent: the piccosta running this session reads it at its next step.".into(),
+            Err(error) => {
+                self.slots[slot].draft.insert(&text);
+                format!("Couldn't send it: {error}")
+            }
+        });
     }
 
     // Work with other models in the focused session (none: alone again), and say how.
@@ -1175,10 +1206,9 @@ impl App {
     // Esc: the commands the turn is running move to the background, where they carry on and report
     // when they end, and the model stops.
     fn interrupt(&mut self) {
-        let slot = self.focused();
-        let (Some((handle, commands)), Some(shared)) = (&slot.live, &slot.shared) else { return };
-        handle.interrupt(&shared.jobs);
+        let Some((handle, commands)) = &self.focused().live else { return };
         let (steer, follow_up) = handle.clear();
+        let _ = commands.send(Command::Stop(None));
         let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
         if !queued.is_empty() {
             let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new()));
@@ -1222,17 +1252,17 @@ impl App {
         true
     }
 
-    // Look again at what runs here and elsewhere: messages left in open sessions' inboxes, which
-    // listed sessions another piccosta has open, what a followed one's file holds now, and the
-    // agents of every open or followed session (the assistant, a manager in another terminal, their
-    // lanes), an agent's own agents under its row. Kept cheap for an idle UI: /proc is walked once a
-    // scan, every scan while a session is busy or has background jobs or agents, else every
-    // LOCK_SCAN_EVERY scans, which still finds what a command left running with `&` and what other
-    // piccostas start. Other piccostas' locks are looked at as often, a shown session's every scan.
-    // Then the state is saved.
+    // Look again at what runs elsewhere: which listed sessions another piccosta runs and whether
+    // they're working, what a followed one's file holds now, and the agents of every open or
+    // followed session (the assistant, a manager in another terminal, their lanes), an agent's own
+    // agents under its row, all asked of their runtimes off this thread (asker; the answers come to
+    // scanned). Kept cheap for an idle UI: agents are looked for every scan while a session is busy
+    // or has background jobs or agents, else every RUNTIME_SCAN_EVERY scans, which still finds what
+    // other piccostas start. Other piccostas' runtimes are asked as often, a shown session's and an
+    // agent's every scan. Then the state is saved.
     fn scan_agents(&mut self) {
         self.scans += 1;
-        let locks_due = self.scans.is_multiple_of(LOCK_SCAN_EVERY);
+        let runtimes_due = self.scans.is_multiple_of(RUNTIME_SCAN_EVERY);
         // Sessions closed or deleted elsewhere (a manager's `sessions close`, another piccosta's
         // delete) leave the list as /close takes them, unless one holds a draft or runs here: that
         // one stays where it is, marked, until it's sent or cleared.
@@ -1251,41 +1281,28 @@ impl App {
         self.closed = closed;
         for index in 0..self.slots.len() {
             let slot = &mut self.slots[index];
-            // Messages other piccostas left for a session open here: queued while it runs, else
-            // the next prompt.
-            if let (Some((handle, commands)), Some(path)) = (&slot.live, &slot.path) {
-                for text in crate::manager::take_inbox(path) {
-                    if slot.state == State::Idle {
-                        let _ = commands.send(Command::Prompt(text, Vec::new()));
-                        slot.state = State::Running;
-                    } else {
-                        handle.steer(text);
-                    }
-                }
-            }
-            let shown = self.panes.iter().any(|pane| pane.slot == index);
-            if slot.live.is_none() && (locks_due || shown) {
-                slot.elsewhere = slot.path.as_deref().is_some_and(crate::manager::busy);
-                let modified = slot.path.as_deref().and_then(|path| path.metadata().ok()?.modified().ok());
-                if !slot.elsewhere {
-                    slot.working_elsewhere = false;
-                } else if modified != slot.elsewhere_read {
-                    slot.working_elsewhere = slot.path.as_deref().is_some_and(mid_turn);
-                    slot.elsewhere_read = modified;
-                }
+            // A runtime here that ended on its own (a manager's `sessions close`) is let go of
+            // where it is: the slot keeps what it shows, its draft and whether it was closed.
+            if slot.live.as_ref().is_some_and(|(_, commands)| commands.is_closed()) {
+                (slot.live, slot.shared) = (None, None);
             }
             if slot.followed.is_some() {
                 self.follow(index);
             }
         }
-        let watched = |slot: &Slot| (slot.live.is_some() || slot.elsewhere) && !slot.id.is_empty();
-        let active = |slot: &Slot| slot.busy() || !slot.agents.is_empty() || slot.shared.as_ref().is_some_and(|shared| shared.jobs.running_count() > 0);
-        if locks_due || self.slots.iter().any(|slot| watched(slot) && active(slot)) {
-            let ids: Vec<&str> = self.slots.iter().filter(|slot| watched(slot)).map(|slot| slot.id.as_str()).collect();
-            let mut found = crate::tools::subagent::running_under(&ids);
-            for slot in self.slots.iter_mut() {
-                slot.agents = if watched(slot) { found.remove(&slot.id).unwrap_or_default() } else { Vec::new() };
-            }
+        // One scan out at a time: a stopped runtime holds one up by its wait. Each runtime is asked
+        // once, however many sessions share its folder.
+        if !self.scanning {
+            let asked = |index: usize| self.slots[index].live.is_none() && (runtimes_due || self.slots[index].parent.is_some() || self.panes.iter().any(|pane| pane.slot == index));
+            let sessions = (0..self.slots.len()).filter(|&index| asked(index)).filter_map(|index| self.slots[index].path.clone());
+            let active = |slot: &Slot| slot.busy() || !slot.agents.is_empty() || slot.shared.as_ref().is_some_and(|shared| shared.jobs.running_count() > 0);
+            let agents = runtimes_due || self.slots.iter().any(|slot| slot.watched() && active(slot));
+            let folders = self.slots.iter().filter(|slot| agents && slot.watched()).filter_map(|slot| slot.path.as_deref()?.parent()).flat_map(|folder| [folder.to_path_buf(), folder.join("subagents")]);
+            let sockets = folders.flat_map(|folder| std::fs::read_dir(folder).into_iter().flatten().flatten());
+            let found = sockets.filter_map(|entry| Some(PathBuf::from(entry.path().to_str()?.strip_suffix(crate::runtime::SOCKET_SUFFIX)?)));
+            let files: BTreeSet<PathBuf> = sessions.chain(found).collect();
+            let scan = move || (0, Update::Scanned(files.into_iter().map(|file| (file.clone(), crate::runtime::status(&file))).collect(), agents));
+            self.scanning = self.asks.send(Box::new(scan)).is_ok();
         }
         // The assistant's row, once its session exists (it starts a moment after piccosta does).
         if let Some(file) = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok())
@@ -1293,24 +1310,44 @@ impl App {
         {
             self.slots.push(Slot { cwd: crate::manager::home(&self.host.agent_dir), manager: true, ..Slot::new(Some(file), crate::manager::assistant_name(&self.host.agent_dir)) });
         }
-        if locks_due {
+        if runtimes_due {
             self.find_new_sessions();
         }
-        // Each running subagent with a session gets a row of its own under its parent, so it can
-        // be walked to and opened (followed live); a finished one's row goes unless it's on screen.
+        self.save_state();
+    }
+
+    // What a scan's runtimes said (scan_agents): a session not open here runs elsewhere when its
+    // runtime is there, and works when it says so. In a look for agents, each open or followed
+    // session's are the runtimes in its folder and the subagents folder beside it that name it as
+    // the session whose command started them (its subagents, `piccosta -p` run by hand), each
+    // given a row of its own under its parent, job (or "agent") then model, so it can be walked to
+    // and opened (followed live); a finished one's row goes unless it's on screen. Then the state
+    // is saved.
+    fn scanned(&mut self, statuses: BTreeMap<PathBuf, Option<Value>>, agents: bool) {
+        self.scanning = false;
+        for slot in self.slots.iter_mut().filter(|slot| slot.live.is_none()) {
+            if let Some(status) = slot.path.as_ref().and_then(|path| statuses.get(path)) {
+                (slot.elsewhere, slot.working_elsewhere) = (status.is_some(), status.as_ref().is_some_and(|status| status["working"] == true));
+            }
+        }
+        for slot in self.slots.iter_mut().filter(|_| agents) {
+            let folder = slot.path.as_deref().and_then(Path::parent).filter(|_| slot.watched());
+            let under = |file: &Path| folder.is_some_and(|folder| file.parent().is_some_and(|parent| parent == folder || parent == folder.join("subagents")));
+            let running = statuses.iter().filter_map(|(file, status)| Some((file, status.as_ref()?)));
+            slot.agents = running.filter(|(file, status)| under(file) && status["parent"] == slot.id).map(|(file, status)| (file.clone(), status["job"].as_str().map(str::to_string))).collect();
+        }
         let mut children = Vec::new();
         for (index, slot) in self.slots.iter().enumerate() {
-            for agent in &slot.agents {
-                let Some(file) = &agent.session else { continue };
+            for (file, job) in &slot.agents {
                 if !self.slots.iter().chain(&children).any(|other: &Slot| other.path.as_ref() == Some(file)) {
-                    let model = agent.model.as_deref().map_or("", |model| model.rsplit('/').next().unwrap_or(model));
-                    children.push(Slot { cwd: slot.cwd.clone(), parent: Some(index), elsewhere: true, ..Slot::new(Some(file.clone()), format!("{} · {model}", agent.job.as_deref().unwrap_or("agent"))) });
+                    let model = crate::session::Session::read(file).ok().and_then(|session| session.context().model).map_or(String::new(), |(_, id)| id);
+                    children.push(Slot { cwd: slot.cwd.clone(), parent: Some(index), elsewhere: true, ..Slot::new(Some(file.clone()), format!("{} · {model}", job.as_deref().unwrap_or("agent"))) });
                 }
             }
         }
         self.slots.extend(children);
         for index in 0..self.slots.len() {
-            let finished = self.slots[index].parent.is_some() && self.slots[index].path.as_deref().is_some_and(|path| !crate::session::held_elsewhere(path));
+            let finished = self.slots[index].parent.is_some() && self.slots[index].path.as_ref().is_some_and(|path| statuses.get(path) == Some(&None));
             if finished && !self.panes.iter().any(|pane| pane.slot == index) {
                 self.slots[index].path = None;
             }
@@ -1410,6 +1447,8 @@ impl App {
         let view = &mut self.slots[slot];
         match update {
             Update::Report(text) => self.report(text),
+            Update::Scanned(statuses, agents) => self.scanned(statuses, agents),
+            Update::Sent(sent, text) => self.sent(slot, sent, text),
             Update::Done(done) => {
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
@@ -1749,19 +1788,17 @@ impl App {
     // Abort every run, let the sessions write their last messages, then stop what's left.
     async fn shutdown(&mut self, reason: &str) {
         for slot in &mut self.slots {
-            if let Some((handle, _)) = slot.live.take() {
-                handle.abort();
-            }
+            // A runtime ends when its commands' channel goes: it stops its turn and keeps in the
+            // session what it hadn't read.
+            slot.live = None;
             if let Some(shared) = &slot.shared {
                 shared.jobs.shutdown(reason);
                 shared.web.shutdown();
             }
         }
-        crate::tools::bash::kill_all_running();
         let tasks = std::mem::take(&mut self.tasks);
         let _ = tokio::time::timeout(SHUTDOWN_WAIT, futures_util::future::join_all(tasks)).await;
         crate::provider::claude::shutdown().await;
-        crate::tools::bash::kill_all_running();
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1850,13 +1887,6 @@ impl App {
             let title_style = if slot.manager { title_style.add_modifier(Modifier::BOLD) } else { title_style };
             let (mark, room) = if slot.parent.is_some() { (format!("  ↳ {mark} "), room.saturating_sub(3)) } else { (format!(" {mark} "), room) };
             lines.push(Line::from(vec![Span::styled(mark, Style::new().fg(color)), Span::styled(render::fit(&slot.title, room), title_style)]));
-            // The agents it has running with no session to open, one row each: job (or "agent"),
-            // how long, then the model, which is what the sidebar's width cuts.
-            for agent in slot.agents.iter().filter(|agent| agent.session.is_none()) {
-                let model = agent.model.as_deref().map_or("", |model| model.rsplit('/').next().unwrap_or(model));
-                let text = format!("{} {} {model}", agent.job.as_deref().unwrap_or("agent"), render::duration(agent.running_for));
-                lines.push(Line::from(Span::styled(format!("   ↳ {}", render::fit(&text, room.saturating_sub(2))), Style::new().fg(theme::ACCENT))));
-            }
         }
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -2102,8 +2132,8 @@ fn pane_inner(index: usize, rect: Rect) -> Rect {
 fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut tex::Tex) -> Rows {
     match message {
         // A manager's news (a lane's turn, a schedule) comes in as its message, "[<time>, what]",
-        // but it's for the model: shown as a notice. The user's own words through the inbox,
-        // "[<time>, from the user]", stay the user's.
+        // but it's for the model: shown as a notice. The user's own words sent to it from
+        // elsewhere, "[<time>, from the user]", stay the user's.
         AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags.tools_open),
         AgentMessage::User(user) => render::user(&user.content.text(), width, tex),
         AgentMessage::Assistant(assistant) => {

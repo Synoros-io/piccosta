@@ -437,7 +437,7 @@ impl Clones {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
         let pid = std::process::id();
-        let start = crate::proc::stat(pid as i32).map(|stat| stat.start.to_string());
+        let start = crate::proc::start(pid as i32).map(|start| start.to_string());
         let owner = json!({"version": OWNER_VERSION, "pid": pid, "platform": "linux", "bootId": crate::proc::boot_id(), "startTime": start});
         std::fs::write(path.join(OWNER_FILE), owner.to_string()).ok()?;
         *runtime = Some(path.clone());

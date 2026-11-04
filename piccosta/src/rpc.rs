@@ -6,8 +6,9 @@
 // has no extensions: it sends extension_ui_request only to ask approval (confirm) and to tell the
 // user something (notify), and reads extension_ui_response only for its confirms.
 
-use crate::agent::{Event, EventSink, Gate, Handle};
-use crate::host::{Command, Done, Host};
+use crate::agent::{Agent, Event, EventSink, Gate, Handle};
+use crate::host::Host;
+use crate::runtime::{Command, Done};
 use crate::message::{AgentMessage, Content};
 use crate::model::Model;
 use crate::session::{Session, SessionEntry};
@@ -49,7 +50,7 @@ struct Live {
     // Its tools' shared state: a steering message moves the running commands to the background.
     shared: Arc<crate::tools::ToolShared>,
     commands: UnboundedSender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<Agent>>,
     id: String,
     file: Option<PathBuf>,
     // With no file (--no-session, which T3 Code uses for titles and other generated text): the
@@ -143,11 +144,11 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         }
     };
     let live = rpc.live;
-    live.handle.abort();
     drop(live.commands);
-    let _ = tokio::time::timeout(STOP_WAIT, live.task).await;
+    if let Some(task) = live.task {
+        let _ = tokio::time::timeout(STOP_WAIT, task).await;
+    }
     crate::provider::claude::shutdown().await;
-    crate::tools::bash::kill_all_running();
     Ok(ExitCode::from(code))
 }
 
@@ -168,31 +169,15 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     {
         agent.set_gate(gate);
     }
-    let (commands, receiver) = unbounded_channel();
     let reports = inputs.clone();
-    let mut live = Live {
-        generation,
-        handle: agent.handle(),
-        shared: shared.clone(),
-        commands,
-        task: tokio::task::spawn_local(async {}),
-        id: agent.session.id().to_string(),
-        file: agent.session.file().map(PathBuf::from),
-        memory: agent.session.file().is_none().then(|| agent.session.clone()),
-        name: crate::host::name(&agent.session),
-        model: agent.model().clone(),
-        thinking: agent.thinking_level().to_string(),
-        auto_compaction: agent.auto_compaction(),
-        streaming: false,
-        compacting: false,
-        owed: VecDeque::new(),
-        compaction: None,
-        aborts: Vec::new(),
-    };
-    live.task = host.clone().spawn(agent, shared, false, receiver, move |done| {
+    let (handle, id, file, name) = (agent.handle(), agent.session.id().to_string(), agent.session.file().map(PathBuf::from), crate::host::name(&agent.session));
+    let (memory, model, thinking, auto_compaction) = (agent.session.file().is_none().then(|| agent.session.clone()), agent.model().clone(), agent.thinking_level().to_string(), agent.auto_compaction());
+    let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
         let _ = reports.send(Input::Done(generation, Box::new(done)));
     });
-    Ok(live)
+    let task = Some(task);
+    let (streaming, compacting, owed, compaction, aborts) = (false, false, VecDeque::new(), None, Vec::new());
+    Ok(Live { generation, handle, shared, commands, task, id, file, memory, name, model, thinking, auto_compaction, streaming, compacting, owed, compaction, aborts })
 }
 
 // The approval gate T3 Code's runtime mode asks for, or None in full access (or outside T3 Code).
@@ -316,7 +301,7 @@ impl Rpc {
                 Some(json!({"disposition": "queued"}))
             }
             "abort" | "abort_retry" => {
-                live.handle.interrupt(&live.shared.jobs);
+                let _ = live.commands.send(Command::Stop(None));
                 if live.streaming && kind == "abort" {
                     live.aborts.push(id);
                     return Ok(Reply::Later);
@@ -582,11 +567,11 @@ impl Rpc {
     // thinking level over (new, fork, clone); a switched-to session runs with its own. If the new
     // one can't start, the old file is served again.
     async fn replace(&mut self, session: impl FnOnce(&Rpc) -> Result<Session, String>, keep_model: bool) -> Result<(), String> {
-        self.live.handle.abort();
         let (closed, _) = unbounded_channel();
         drop(std::mem::replace(&mut self.live.commands, closed));
-        let task = std::mem::replace(&mut self.live.task, tokio::task::spawn_local(async {}));
-        let _ = tokio::time::timeout(STOP_WAIT, task).await;
+        if let Some(task) = self.live.task.take() {
+            let _ = tokio::time::timeout(STOP_WAIT, task).await;
+        }
         for (id, name) in std::mem::take(&mut self.live.owed).into_iter().flatten() {
             respond(id, name, Err("the session was replaced".into()));
         }

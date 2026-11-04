@@ -496,8 +496,8 @@ impl App {
     fn delete(&mut self, slot: usize) -> Option<String> {
         let (path, title) = (self.slots[slot].path.clone().filter(|path| path.exists()), self.slots[slot].title.clone());
         // A session another piccosta is running would lose its file from under it. One open here
-        // is held by this piccosta's own lock, which reads as held from a second look.
-        if self.slots[slot].live.is_none() && path.as_deref().is_some_and(crate::session::held_elsewhere) {
+        // answers on its socket too, so it's asked only when it isn't.
+        if self.slots[slot].live.is_none() && path.as_deref().is_some_and(crate::runtime::running) {
             self.notice = Some(format!("“{title}” is open in another piccosta; quit it there first."));
             return None;
         }
@@ -813,13 +813,14 @@ fn markdown(messages: &[AgentMessage]) -> String {
     out
 }
 
-// A session's file to the trash, with the files beside it (the Claude bridge's record of it, its
-// inbox). The session's own file goes last, so a piccosta stopped partway leaves the session listed
-// where it was. When one can't go, the ones already moved come back; nothing is ever deleted
-// outright. Output: Ok when they all went, else what happened, naming any file that couldn't come
-// back and where it is.
+// A session's file to the trash, with the Claude bridge's record of it beside it; a socket a
+// piccosta that died left there goes. The session's own file goes last, so a piccosta stopped
+// partway leaves the session listed where it was. When one can't go, the ones already moved come
+// back; nothing is ever deleted outright. Output: Ok when they all went, else what happened, naming
+// any file that couldn't come back and where it is.
 pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
-    let beside = [crate::provider::claude::SIDECAR_SUFFIX, ".inbox"].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
+    let _ = std::fs::remove_file(crate::runtime::socket_path(path));
+    let beside = [crate::provider::claude::SIDECAR_SUFFIX].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
     let mut moved: Vec<(&Path, (std::path::PathBuf, std::path::PathBuf))> = Vec::new();
     for file in beside.iter().map(|file| file.as_path()).filter(|file| file.exists()).chain(std::iter::once(path)) {
         let Some(went) = trash(file) else {

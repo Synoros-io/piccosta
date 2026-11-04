@@ -29,11 +29,6 @@ const CONTEXT_FILE_NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENT
 // doesn't belong in every request either.
 const IMPORT_MAX_BYTES: usize = crate::tools::truncate::DEFAULT_MAX_BYTES;
 
-// The sections built from the session's own files rather than piccosta's text: its AGENTS.md /
-// CLAUDE.md files and its directory. A running session takes a change to these at once; a change to
-// any other section (a new build's wording, the constitution, SYSTEM.md, APPEND_SYSTEM.md, the
-// manager's part) waits for its next compaction or model change (agent.rs system_update).
-pub const INPUT_SECTIONS: [&str; 2] = ["project_context", "cwd"];
 // How recently a context file may have been written for its new text to be taken: a save that
 // truncates the file and then writes it is mid-way for milliseconds, and a read then would put half
 // a file in the prompt and the whole one in the next, two rewrites for one edit. Two seconds is far
@@ -278,7 +273,7 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
         raw.insert("addendum".into(), append.clone());
     }
     let mut reads = Reads::default();
-    let project = inputs.context_files.then(|| project_context(inputs.cwd, inputs.agent_dir, &mut reads)).flatten();
+    let project = inputs.context_files.then(|| project_context(&expanded(inputs.cwd, inputs.agent_dir, &mut reads))).flatten();
     // A file that can't be read, or may be mid-save: a session that holds instructions keeps them
     // as they were, rather than lose that file's or take half of it.
     let held = inputs.held_context.as_deref().and_then(|held| held.strip_prefix("<project_context>\n")?.strip_suffix("\n</project_context>"));
@@ -307,41 +302,47 @@ fn tagged(name: &str, content: &str) -> String {
     format!("<{name}>\n{content}\n</{name}>")
 }
 
-// The project_context section's text: every context file for the session, imports expanded, or
-// None when there are none.
-fn project_context(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Option<String> {
+// Every context file for the session (path, text), imports expanded.
+fn expanded(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<(PathBuf, String)> {
     let files = context_files(cwd, agent_dir, reads);
     let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
+    files.iter().map(|file| (file.path.clone(), expand_imports(file, &in_prompt, reads))).collect()
+}
+
+// The project_context section's text for those files, or None when there are none.
+fn project_context(files: &[(PathBuf, String)]) -> Option<String> {
     let mut parts = vec!["The user's instructions for this project, from its AGENTS.md and CLAUDE.md files, outermost first:".to_string()];
-    for file in &files {
-        parts.push(format!("<project_instructions path=\"{}\">\n{}\n</project_instructions>", file.path.display(), expand_imports(file, &in_prompt, reads)));
+    for (path, text) in files {
+        parts.push(format!("<project_instructions path=\"{}\">\n{text}\n</project_instructions>", path.display()));
     }
     (!files.is_empty()).then(|| parts.join("\n\n"))
 }
 
-// Read a running session's context files again into its sections, so an AGENTS.md edited, added or
-// removed since it opened reaches the next request. The section keeps its place, and a new one goes
-// where sections() puts it, just before cwd. A file that can't be read, or may be mid-save, leaves
-// the section as it was, since dropping instructions that are still there, or taking half a file,
-// would rewrite the cache now and again once they read whole. The next run reads them again.
-pub fn reload_context_files(sections: &mut IndexMap<String, String>, cwd: &Path, agent_dir: &Path) {
+// A running session's project_context section as its context files are now (agent.rs
+// prompt_update): Some(None) when there are none, and None when one can't be read whole now (a
+// failure, or written in the last SAVE_SETTLE, maybe mid-save).
+pub fn context_now(cwd: &Path, agent_dir: &Path) -> Option<Option<String>> {
     let mut reads = Reads::default();
-    let project = project_context(cwd, agent_dir, &mut reads);
-    if !reads.failures.is_empty() || reads.unsettled {
-        return;
-    }
-    match project {
-        Some(project) => {
-            let text = tagged("project_context", &project);
-            match sections.get_index_of("project_context") {
-                Some(index) => sections[index] = text,
-                None => {
-                    let before_cwd = sections.get_index_of("cwd").unwrap_or(sections.len());
-                    sections.shift_insert(before_cwd, "project_context".into(), text);
-                }
-            }
+    let files = expanded(cwd, agent_dir, &mut reads);
+    (reads.failures.is_empty() && !reads.unsettled).then(|| project_context(&files).map(|project| tagged("project_context", &project)))
+}
+
+// The instructions a project_context section holds: each file's path and text, below the header
+// line, which is piccosta's wording. "" for none.
+pub fn instructions(section: Option<&str>) -> &str {
+    section.and_then(|text| text.split_once("\n\n")).map_or("", |(_, files)| files)
+}
+
+// Put a project_context section in a prompt's sections, or take it out (None). It keeps its place,
+// and a new one goes where sections() puts it, just before cwd.
+pub fn set_project_context(sections: &mut IndexMap<String, String>, project: Option<String>) {
+    match (project, sections.get_index_of("project_context")) {
+        (Some(text), Some(index)) => sections[index] = text,
+        (Some(text), None) => {
+            let before_cwd = sections.get_index_of("cwd").unwrap_or(sections.len());
+            sections.shift_insert(before_cwd, "project_context".into(), text);
         }
-        None => {
+        (None, _) => {
             sections.shift_remove("project_context");
         }
     }

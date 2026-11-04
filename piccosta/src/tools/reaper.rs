@@ -1,12 +1,14 @@
-// The reaper: a small second piccosta that outlives this one only to stop its commands.
+// The watcher: a small second piccosta that outlives this one only to stop its commands.
 //
-// piccosta stops the shells it started when it quits or gets a signal it can catch. SIGKILL (how
-// Zed stops an agent) can't be caught, so those shells and everything under them would run on with
-// nobody watching. So the first command a piccosta runs also starts this watcher: the same binary,
-// started with REAPER_ENV set, in a session of its own so a closing terminal's signals don't reach
-// it. piccosta tells it each shell's process group as the shell starts ("+pid") and as it ends
-// ("-pid") through a pipe. When the pipe closes, piccosta is gone, however it went, and the
-// watcher stops every group still listed, the way bash.rs stops one, then exits.
+// A runtime stops its commands when it ends (jobs.rs shutdown), but a piccosta killed with SIGKILL
+// (how Zed stops an agent, and how a manager ends a runner that doesn't answer, runtime.rs end)
+// ends no runtime, and the commands would run on with nobody watching. So the first command a
+// piccosta runs also starts this watcher: the same binary, started with REAPER_ENV set, in a session
+// of its own so a closing terminal's signals don't reach it. The runtimes' job registry tells it
+// each shell's process group as the shell starts ("+pid") and as it's reaped ("-pid") through a
+// pipe (bash.rs). When the pipe closes, piccosta is gone, however it went, and the watcher stops
+// every group still listed, the way bash.rs stops one, then exits. One per piccosta process: a lane
+// runs in a piccosta of its own (runtime.rs launch), with a watcher of its own.
 //
 // /restart execs a new image in the same process. The pipe goes across the exec (hand_over,
 // adopt), so the watcher never sees it close, keeps its list, and goes on covering the jobs the
@@ -18,16 +20,12 @@ use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
 
 // Set in the watcher's environment; main() checks it before anything else.
 pub const REAPER_ENV: &str = "PICCOSTA_REAPER";
-// How long the groups get after SIGTERM before SIGKILL: bash.rs's stop grace for subagents, which
-// write their last messages then.
-const STOP_GRACE: Duration = super::bash::SUBAGENT_STOP_GRACE;
 
 // The pipe to the watcher and the watcher's pid, once it's started; None until the first command,
-// or when it couldn't start (then commands run as they did without it).
+// or when it couldn't start (then commands run as they would without it).
 static PIPE: Mutex<Option<Option<(File, u32)>>> = Mutex::new(None);
 
 // Tell the watcher a shell's group started (`running`) or ended. Starts the watcher the first time.
@@ -61,20 +59,23 @@ pub fn keep_across_exec(fd: i32) {
 // A descriptor the image before this one kept across the exec, owned here from now on and closed
 // on the next exec again, so the commands this image starts don't inherit it.
 pub fn inherited(fd: i32) -> OwnedFd {
-    // SAFETY: the previous image left it open for this one, and nothing else here owns it.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    unsafe { OwnedFd::from_raw_fd(fd) }
+    // SAFETY: the image before left it open for this one, and nothing else here owns it.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        OwnedFd::from_raw_fd(fd)
+    }
 }
 
 // Start the watcher: this binary again, with the pipe as its stdin and nothing else open.
 fn start() -> Option<(File, u32)> {
-    let mut command = Command::new(std::env::current_exe().ok()?);
+    let mut command = Command::new(crate::proc::exe().ok()?);
     command.env(REAPER_ENV, "1").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = crate::proc::own_session(&mut command).spawn().ok()?;
     Some((File::from(OwnedFd::from(child.stdin.take()?)), child.id()))
 }
 
-// The watcher's whole life: keep the list until the pipe closes, then stop what's on it.
+// The watcher's whole life: keep the list until the pipe closes, then stop what's on it, SIGTERM
+// first, then SIGKILL after bash's stop grace (subagents write their last messages then).
 pub fn run() {
     let mut groups: HashSet<i32> = HashSet::new();
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -89,6 +90,6 @@ pub fn run() {
     // SAFETY: killpg() takes plain integers; a group already gone fails with ESRCH.
     let signal_all = |signal| groups.iter().for_each(|&group| unsafe { libc::killpg(group, signal); });
     signal_all(libc::SIGTERM);
-    std::thread::sleep(STOP_GRACE);
+    std::thread::sleep(super::bash::SUBAGENT_STOP_GRACE);
     signal_all(libc::SIGKILL);
 }

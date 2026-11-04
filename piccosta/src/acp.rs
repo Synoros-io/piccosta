@@ -25,8 +25,9 @@
 // and every open one is finished before a prompt is answered; model, thinking and mode all go in
 // configOptions, load's answer included; nothing but protocol lines on stdout.
 
-use crate::agent::{Event, EventSink, Gate, Handle};
-use crate::host::{Command, Done, Host};
+use crate::agent::{Agent, Event, EventSink, Gate, Handle};
+use crate::host::Host;
+use crate::runtime::{Command, Done};
 use crate::message::{AgentMessage, Content, StopReason, TextOrBlocks};
 use crate::model::Model;
 use crate::rpc::write_line;
@@ -131,10 +132,9 @@ struct Live {
     serial: u64,
     host: Arc<Host>,
     shared: Arc<crate::tools::ToolShared>,
-    handle: Handle,
     runs: Arc<Mutex<Runs>>,
     commands: UnboundedSender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Agent>,
     model: Model,
     thinking: String,
     mode: Rc<Cell<Mode>>,
@@ -267,13 +267,10 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             _ => {}
         }
     };
-    let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| {
-        live.handle.abort();
-        live.task
-    }).collect();
+    // Each runtime ends as its commands' channel goes.
+    let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| live.task).collect();
     let _ = tokio::time::timeout(STOP_WAIT, futures_util::future::join_all(tasks)).await;
     crate::provider::claude::shutdown().await;
-    crate::tools::bash::kill_all_running();
     Ok(ExitCode::from(code))
 }
 
@@ -401,7 +398,6 @@ impl Acp {
             "session/close" => {
                 self.asks.retain(|_, (session, ..)| session != &session_id);
                 if let Some(mut live) = self.sessions.remove(&session_id) {
-                    live.handle.abort();
                     drop(live.commands);
                     if tokio::time::timeout(STOP_WAIT, &mut live.task).await.is_err() {
                         live.task.abort();
@@ -489,7 +485,7 @@ impl Acp {
                 let mut runs = live.runs.lock().unwrap();
                 runs.cancelled_through = runs.sent;
             }
-            live.handle.interrupt(&live.shared.jobs);
+            let _ = live.commands.send(Command::Stop(None));
             let (inputs, session, serial, prompt) = (self.inputs.clone(), session.to_string(), live.serial, live.prompts);
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(CANCEL_WAIT).await;
@@ -748,17 +744,16 @@ impl Acp {
             }
         }
         let used = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
-        let (handle, live_model, live_thinking) = (agent.handle(), agent.model().clone(), agent.thinking_level().to_string());
-        runs.lock().unwrap().handle = handle.clone();
-        let (commands, receiver) = unbounded_channel();
+        let (live_model, live_thinking) = (agent.model().clone(), agent.thinking_level().to_string());
+        runs.lock().unwrap().handle = agent.handle();
         let reports = (self.inputs.clone(), id.clone());
         let finishes = runs.clone();
-        let task = host.clone().spawn(agent, shared.clone(), false, receiver, move |done| {
+        let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
             finishes.lock().unwrap().finished += 1;
             let _ = reports.0.send(Input::Done(reports.1.clone(), serial, Box::new(done)));
         });
         let live = Live {
-            serial, host, shared, handle, runs, commands, task, model: live_model, thinking: live_thinking, mode, always, owed: VecDeque::new(), muted: 0, prompt: None, cancelled: false,
+            serial, host, shared, runs, commands, task, model: live_model, thinking: live_thinking, mode, always, owed: VecDeque::new(), muted: 0, prompt: None, cancelled: false,
             prompts: 0, stop: None, error: None, message: 0, open: HashMap::new(), titled, used, cost,
         };
         self.sessions.insert(id.clone(), live);

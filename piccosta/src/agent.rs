@@ -176,14 +176,6 @@ impl Handle {
         self.lock().cancel.cancel();
     }
 
-    // Stop the run without killing its commands, the way every interrupt does (Esc, an rpc abort,
-    // ACP's cancel). Input: the session's jobs. The move goes out before the abort, and bash's
-    // biased select takes it first, so each running command goes on as a background job.
-    pub fn interrupt(&self, jobs: &crate::tools::jobs::Jobs) {
-        jobs.detach_all();
-        self.abort();
-    }
-
     pub fn steer(&self, text: String) {
         self.lock().steer.push(text);
         self.0.1.notify_one();
@@ -274,7 +266,7 @@ pub struct AgentConfig {
     // The system prompt as sections (prompt.rs).
     pub sections: IndexMap<String, String>,
     // Whether the prompt carries the session's AGENTS.md files (--no-context-files turns them off);
-    // they're read again before each run.
+    // they're looked at before each run, for an edit (prompt_update).
     pub context_files: bool,
     pub retry: RetrySettings,
     // When to compact, resolved for this model.
@@ -290,6 +282,8 @@ pub struct AgentConfig {
     // The manager's home, for the manager service: its compactions keep only the newest of the
     // user's words verbatim and add its ledger's newest entries (manager.rs).
     pub manager_home: Option<PathBuf>,
+    // The session's socket, which its runtime listens on (runtime.rs).
+    pub claim: Option<crate::runtime::Claim>,
 }
 
 pub struct Agent {
@@ -365,6 +359,23 @@ impl Agent {
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
     pub fn handle(&self) -> Handle {
         self.handle.clone()
+    }
+
+    // Have `watch` see every event before whoever the events go to (the runtime's turn ends).
+    pub fn tap(&mut self, mut watch: impl FnMut(&Event) + Send + 'static) {
+        let mut emit = std::mem::replace(&mut self.emit, Box::new(|_| {}));
+        self.emit = Box::new(move |event| {
+            watch(event);
+            emit(event);
+        });
+    }
+
+    pub fn take_claim(&mut self) -> Option<crate::runtime::Claim> {
+        self.config.claim.take()
+    }
+
+    pub fn manager_home(&self) -> Option<PathBuf> {
+        self.config.manager_home.clone()
     }
 
     // A fresh cancel token for the run about to start, the one the handle aborts.
@@ -453,117 +464,53 @@ impl Agent {
         self.run_auto_compaction(Reason::Manual, false, instructions).await.map(drop)
     }
 
-    // The system message that brings the session's prompt and tools up to date, or None when they
-    // already are (system-prompt.ts diffSystemPromptSections, agent-loop.ts declareToolChanges).
-    // A session keeps the prompt it has: any change to it rewrites the provider's whole prompt
-    // cache (a new build's prompt text did that to every running session on its next turn,
-    // 11.9M tokens written in a day, 2026-11-01). So it's brought up to date only when it has none
-    // yet, at a compaction or a model change (which start a new cache anyway), or when what it's
-    // built from changed: its context files (prompt::INPUT_SECTIONS) or what a tool can be called
-    // with, its name and parameters less their descriptions (a subagent job added or removed
-    // changes the job enum in the subagent tool's parameters). A tool's wording, like the prompt's,
-    // waits: the tools that stayed keep the definitions and tool-list lines the session has.
-    fn system_update(&self) -> Option<SystemMessage> {
-        let messages = crate::message::to_model_messages(&self.session.context().messages);
-        let current = transcript::current_system_message(&messages);
-        let previous: IndexMap<String, String> = current
-            .as_ref()
-            .and_then(|system| system.sections.as_ref())
-            .map(|sections| sections.iter().filter_map(|(name, text)| text.clone().map(|text| (name.clone(), text))).collect())
-            .unwrap_or_default();
-        let current_tools: Vec<ToolDefinition> = current.and_then(|system| system.tools_added).unwrap_or_default();
-        let desired: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
-        let stayed = |tool: &ToolDefinition| {
-            current_tools.iter().any(|held| held.name == tool.name && callable_schema(&held.parameters) == callable_schema(&tool.parameters))
-        };
-        let tools_changed = desired.len() != current_tools.len() || !desired.iter().all(stayed);
-        // An input section is the same when its files are: piccosta's header line above them is
-        // wording, which waits like any other.
-        let same_input = |name: &str| match (previous.get(name), self.config.sections.get(name)) {
-            (Some(held), Some(new)) => below_header(held).map_or(held.as_str(), |(_, files)| files) == below_header(new).map_or(new.as_str(), |(_, files)| files),
-            (held, new) => held == new,
-        };
-        let inputs_changed = crate::prompt::INPUT_SECTIONS.iter().any(|name| !same_input(name)) || tools_changed;
-        // The newest of a system message, a reply, a compaction or a model change, walking back from
-        // the leaf. A reset is free only until the first request after it: once a reply follows it,
-        // the cache has been written again with the prompt as it was, and the chance has passed.
-        let since_reset = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
-            SessionEntry::Message { message: AgentMessage::System(_) | AgentMessage::Assistant(_), .. } => Some(false),
+    // The prompt the session runs with is built once and kept in it, as its system message, so
+    // every request repeats it byte for byte: any change to it rewrites the provider's whole prompt
+    // cache (a new build's wording did that to every running session on its next turn, 11.9M tokens
+    // written in a day, 2026-11-01). It's built again only when what it's made from changes: the
+    // session has none yet; it was compacted or put on another model since (each starts a new cache
+    // anyway); or its AGENTS.md files now differ from the instructions its prompt holds, compared
+    // file text to file text (prompt::instructions), so piccosta's wording around them doesn't
+    // count. Until then a new build's wording, a tool's description or a changed scale wait.
+    // Output: the system message to add, None when nothing differs.
+    fn prompt_update(&mut self) -> Option<SystemMessage> {
+        let event = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
+            SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
             SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
             _ => None,
         });
-        let reset = previous.is_empty() || since_reset == Some(true);
-        if !reset && !inputs_changed {
+        let messages = crate::message::to_model_messages(&self.session.context().messages);
+        let held = transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
+        let now = if self.config.context_files { crate::prompt::context_now(&self.config.cwd, &crate::config::agent_dir()) } else { Some(None) };
+        let edited = now.as_ref().is_some_and(|project| crate::prompt::instructions(project.as_deref()) != crate::prompt::instructions(held.as_deref()));
+        if !event.is_none_or(|event| event) && !edited {
             return None;
         }
-        // After a reset every section is brought up to date. Otherwise only what the prompt is built
-        // from goes in: the input sections whose files changed, under the header the session already
-        // has, and the tool list when the tools did. The rest of the wording stays as it was.
-        let refreshed = |name: &str| reset || (crate::prompt::INPUT_SECTIONS.contains(&name) && !same_input(name)) || (name == "tools" && tools_changed);
-        let mut patch: IndexMap<String, Option<String>> = IndexMap::new();
-        for (name, text) in &self.config.sections {
-            if !refreshed(name) {
-                continue;
-            }
-            let text = match (previous.get(name).and_then(|held| below_header(held)), below_header(text)) {
-                _ if reset => text.clone(),
-                (Some((header, _)), Some((_, files))) => format!("{header}\n\n{files}"),
-                // The tool list the session has, less the lines of tools that went or changed, with
-                // the lines of the new ones after its last tool, or after its opening line when none
-                // stayed, so its own frame is kept. With no list held, the new one.
-                _ if name == "tools" => {
-                    let tool_of = |line: &str| line.strip_prefix("- ").and_then(|rest| rest.split_once(": ")).map(|(tool, _)| tool.to_string());
-                    let kept = |line: &&str| tool_of(line).is_none_or(|tool| desired.iter().any(|wanted| wanted.name == tool && stayed(wanted)));
-                    let mut lines: Vec<&str> = previous.get(name).map_or("", String::as_str).lines().filter(kept).collect();
-                    let at = lines.iter().rposition(|line| tool_of(line).is_some()).map(|last| last + 1).or((!lines.is_empty()).then_some(1));
-                    match at {
-                        Some(at) => {
-                            lines.splice(at..at, text.lines().filter(|line| tool_of(line).is_some() && !kept(line)));
-                            lines.join("\n")
-                        }
-                        None => text.clone(),
-                    }
-                }
-                _ => text.clone(),
-            };
-            if previous.get(name) != Some(&text) {
-                patch.insert(name.clone(), Some(text));
-            }
+        if let Some(project) = now {
+            crate::prompt::set_project_context(&mut self.config.sections, project);
         }
-        // A section the new prompt doesn't have goes only at a reset, or when it's an input whose
-        // files went. The tool list, when the new prompt has none (a SYSTEM.md replaced it), stays
-        // as held until a reset, like any other wording.
-        for name in previous.keys() {
-            if !self.config.sections.contains_key(name) && refreshed(name) && (reset || name != "tools") {
-                patch.insert(name.clone(), None);
-            }
-        }
+        self.prompt_patch()
+    }
 
-        // After a reset any tool whose definition differs goes in; otherwise only the ones added or
-        // with new parameters.
-        let added: Vec<ToolDefinition> = desired.iter().filter(|tool| if reset { !current_tools.contains(tool) } else { !stayed(tool) }).cloned().collect();
-        let removed: Vec<ToolReference> = current_tools
-            .iter()
-            .filter(|tool| !desired.iter().any(|wanted| wanted.name == tool.name))
-            .map(|tool| ToolReference { name: tool.name.clone() })
-            .collect();
-        if patch.is_empty() && added.is_empty() && removed.is_empty() {
-            return None;
-        }
-        Some(SystemMessage {
+    // What makes the prompt the session holds the one this build makes now: the sections that
+    // differ (None for one that went), the tools added or changed, and the tools gone. None when
+    // it's the same.
+    fn prompt_patch(&self) -> Option<SystemMessage> {
+        let current = transcript::current_system_message(&crate::message::to_model_messages(&self.session.context().messages));
+        let held: IndexMap<String, Option<String>> = current.as_ref().and_then(|system| system.sections.clone()).unwrap_or_default();
+        let held_tools = current.and_then(|system| system.tools_added).unwrap_or_default();
+        let tools: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
+        let mut patch: IndexMap<String, Option<String>> = self.config.sections.iter().filter(|(name, text)| held.get(*name) != Some(&Some((*text).clone()))).map(|(name, text)| (name.clone(), Some(text.clone()))).collect();
+        patch.extend(held.keys().filter(|name| !self.config.sections.contains_key(*name)).map(|name| (name.clone(), None)));
+        let added: Vec<ToolDefinition> = tools.iter().filter(|tool| !held_tools.contains(tool)).cloned().collect();
+        let removed: Vec<ToolReference> = held_tools.iter().filter(|held| !tools.iter().any(|tool| tool.name == held.name)).map(|held| ToolReference { name: held.name.clone() }).collect();
+        (!patch.is_empty() || !added.is_empty() || !removed.is_empty()).then(|| SystemMessage {
             content: TextOrBlocks::Text(String::new()),
             sections: (!patch.is_empty()).then_some(patch),
             tools_added: (!added.is_empty()).then_some(added),
             tools_removed: (!removed.is_empty()).then_some(removed),
             timestamp: clock::now_ms(),
         })
-    }
-
-    // Read the session's AGENTS.md files again, unless they're off.
-    fn reload_context_files(&mut self) {
-        if self.config.context_files {
-            crate::prompt::reload_context_files(&mut self.config.sections, &self.config.cwd, &crate::config::agent_dir());
-        }
     }
 
     // Add a message to the session and announce it. Custom messages are their own entry type.
@@ -583,20 +530,17 @@ impl Agent {
         Ok(id)
     }
 
-    // Send the user's prompt and run until the model is done (and any retry or background job
-    // it waits on). Output: an error only when the session can't be written; model failures end
-    // up in the session as failed assistant messages, as in pi.
-    pub async fn prompt(&mut self, text: &str) -> Result<(), String> {
-        self.run_from(user_message(text)).await
-    }
-
-    // A prompt with images attached (rpc mode's `images`).
+    // Send the user's prompt, with any images (rpc mode's `images`), and run until the model is
+    // done (and any retry or background job it waits on). An empty one with none answers only
+    // what's queued in the session. Output: an error only when the session can't be written; model
+    // failures end up in the session as failed assistant messages, as in pi.
     pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>) -> Result<(), String> {
         // A prompt in a closed session opens it again.
         if let Some(file) = self.session.file() {
             crate::session::set_closed(&crate::config::agent_dir(), file, false);
         }
-        self.run_from(with_images(text, images)).await
+        let first = (!text.is_empty() || !images.is_empty()).then(|| with_images(text, images));
+        self.run_from(first).await
     }
 
     pub fn set_gate(&mut self, gate: Gate) {
@@ -612,7 +556,7 @@ impl Agent {
     // Run a turn on a background job's finish message, as longcmd does in pi when the session
     // is idle.
     pub async fn take_notice(&mut self, notice: CustomMessage) -> Result<(), String> {
-        self.run_from(AgentMessage::Custom(notice)).await
+        self.run_from(Some(AgentMessage::Custom(notice))).await
     }
 
     // Keep a job's message for the next prompt, which it goes in ahead of: a kill the user asked
@@ -621,7 +565,13 @@ impl Agent {
         self.held.push(notice);
     }
 
-    async fn run_from(&mut self, first: AgentMessage) -> Result<(), String> {
+    // A run, starting with the messages queued in the session (sent while nothing ran it, or left
+    // by a stop), then `first`.
+    async fn run_from(&mut self, first: Option<AgentMessage>) -> Result<(), String> {
+        let queued: Vec<AgentMessage> = self.session.queued().iter().map(|text| user_message(text)).collect();
+        if queued.is_empty() && first.is_none() {
+            return Ok(());
+        }
         self.fresh_cancel();
         // Compact first when the last response left the context past the threshold; the new
         // prompt replaces any retry that schedules (agent-session.ts _prepareRun, _startRun).
@@ -629,11 +579,11 @@ impl Agent {
             self.check_compaction(&assistant, Some(&entry_id), false).await?;
         }
         let mut starting: Vec<AgentMessage> = self.held.drain(..).map(AgentMessage::Custom).collect();
-        starting.push(first);
+        starting.extend(queued);
+        starting.extend(first);
         let mut aborted = false;
         loop {
-            self.reload_context_files();
-            if let Some(system) = self.system_update() {
+            if let Some(system) = self.prompt_update() {
                 starting.insert(0, AgentMessage::System(system));
             }
             let outcome = self.run(std::mem::take(&mut starting)).await?;
@@ -711,8 +661,8 @@ impl Agent {
     }
 
     // Print and json mode with a job still running after the model's last turn: wait for its
-    // finish message (longcmd.ts:533-554), or a message queued meanwhile (another piccosta's, from
-    // the session's inbox). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs are killed and
+    // finish message (longcmd.ts:533-554), or a message queued meanwhile (one sent to its
+    // runtime). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs are killed and
     // their messages say why. Output: what starts the next turn, None when the wait was stopped.
     async fn wait_for_job(&mut self) -> Option<Vec<AgentMessage>> {
         let shared = self.config.tool_shared.clone();
@@ -1240,8 +1190,7 @@ impl Agent {
         // The compacted context starts a new cache anyway, so the prompt is brought up to date now,
         // before the first response on it: a compaction inside a tool loop goes straight on to the
         // next response, and an update left for the next run would rewrite the cache a second time.
-        self.reload_context_files();
-        if let Some(system) = self.system_update() {
+        if let Some(system) = self.prompt_update() {
             let message = AgentMessage::System(system);
             (self.emit)(&Event::MessageStart { message: message.clone() });
             (self.emit)(&Event::MessageEnd { message: message.clone() });
@@ -1431,22 +1380,4 @@ fn tool_result_message(run: ToolRun) -> ToolResultMessage {
         timestamp: clock::now_ms(),
         duration_ms: run.duration_ms.map(|ms| ms as f64),
     }
-}
-
-// What a tool can be called with: its parameter schema with the "description" strings taken out at
-// every depth, since they're wording. Only string values go, so a parameter named description stays.
-fn callable_schema(schema: &Value) -> Value {
-    match schema {
-        Value::Object(map) => Value::Object(
-            map.iter().filter(|(key, value)| !(*key == "description" && value.is_string())).map(|(key, value)| (key.clone(), callable_schema(value))).collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(callable_schema).collect()),
-        other => other.clone(),
-    }
-}
-
-// A project_context section split at its header line: the header (piccosta's wording, with the
-// opening tag) and the files below it. None for other sections.
-fn below_header(text: &str) -> Option<(&str, &str)> {
-    text.starts_with("<project_context>\n").then(|| text.split_once("\n\n")).flatten()
 }

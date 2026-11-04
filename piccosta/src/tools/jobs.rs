@@ -13,13 +13,15 @@
 //   session: at the next turn boundary when the agent is busy, as a new turn when it's idle.
 // - In print and json mode the run is held open after the model's last turn until a job exits,
 //   so its message becomes a new turn before piccosta exits.
-// - At session end and when piccosta is killed by a signal, running jobs die with their whole
-//   process group, and their logs say so. /restart is not an end: its jobs are handed to the
-//   image it execs (hand_over, adopt), which sends their messages when they exit. An abort during the model's turn doesn't kill a job
-//   that is already in the background: the turn that started it is over.
+// - Every command the session starts is listed here (shells) until it's reaped, foreground or
+//   background: at session end its runtime stops them all with their whole process groups, and
+//   their logs say so; when piccosta dies without stopping them, its watcher does (reaper.rs).
+//   /restart is not an end: its jobs are handed to the image it execs (hand_over, adopt), which
+//   sends their messages when they exit. An abort during the model's turn doesn't kill a job that
+//   is already in the background: the turn that started it is over.
 // - An interrupt never kills a command: Esc, an rpc abort, ACP's cancel and a steer message move
-//   the turn's running commands to the background (agent::Handle::interrupt). Closing or
-//   replacing a session is an end, and kills them.
+//   the turn's running commands to the background (runtime.rs). Closing or replacing a session
+//   is an end, and kills them.
 //
 // No new tools: the model stops a job with `kill -- -<pid>` through bash and reads the log with
 // its read or bash tools.
@@ -41,6 +43,7 @@
 
 use crate::message::{CustomMessage, TextOrBlocks};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -73,6 +76,18 @@ pub const TAIL_KEEP_BYTES: usize = 2 * super::truncate::DEFAULT_MAX_BYTES;
 const COMMAND_PREVIEW_CHARS: usize = 200;
 // customType of the finish message in the session.
 pub const NOTICE_TYPE: &str = "longcmd";
+
+// Signal a command's process group, or the process alone if the group is already gone
+// (shell.ts:205-216). The shell leads its own group, so the group id is its pid.
+pub fn signal_group(pid: u32, signal: i32) {
+    let Ok(pid) = i32::try_from(pid) else { return };
+    // SAFETY: kill() takes plain integers; a stale pid at worst fails with ESRCH.
+    unsafe {
+        if libc::kill(-pid, signal) != 0 {
+            libc::kill(pid, signal);
+        }
+    }
+}
 
 // Input: an env var holding seconds. Output: that duration, zero included, or None when it's unset
 // or not a number of seconds.
@@ -163,8 +178,21 @@ struct RunningJob {
     silent: Arc<AtomicBool>,
 }
 
-// One session's background jobs, shared by every bash call.
+// A shell the session started, listed until it's reaped: its pid (its process group's), whether
+// it's piccosta's own (a subagent: SIGTERM, then SIGKILL at `kill_at`), its output pipe (held, so
+// the descriptor lives while it's listed and can go across /restart's exec), and whether it went
+// to the next image, which reaps it from then on.
+pub struct Shell {
+    pub pid: u32,
+    pub own: bool,
+    pub kill_at: Option<Instant>,
+    pub pipe: Arc<tokio::net::unix::pipe::Receiver>,
+    pub handed: bool,
+}
+
+// One session's commands and background jobs, shared by every bash call.
 pub struct Jobs {
+    pub shells: Mutex<Vec<Shell>>,
     pub soft_limit: Duration,
     pub hold: Option<Duration>,
     pub path_hints: bool,
@@ -192,7 +220,7 @@ impl Drop for Detachable<'_> {
 }
 
 // The reason /stop kills jobs with; their messages wait for the next prompt instead of waking the
-// model (Host::spawn).
+// model (runtime.rs).
 pub const STOPPED_BY_USER: &str = "stopped by /stop";
 
 pub fn stopped_by_user(notice: &CustomMessage) -> bool {
@@ -209,6 +237,7 @@ impl Jobs {
     // Input: where finish messages go. Settings come from the environment (see the constants).
     pub fn new(notices: mpsc::UnboundedSender<CustomMessage>) -> Jobs {
         Jobs {
+            shells: Mutex::new(Vec::new()),
             soft_limit: seconds_from_env(SOFT_LIMIT_ENV).unwrap_or(Duration::from_secs_f64(DEFAULT_SOFT_LIMIT_SECONDS)),
             // A hold of 0 would kill every job the moment the model is done, so it counts as unset.
             hold: seconds_from_env(HOLD_ENV).filter(|hold| !hold.is_zero()),
@@ -265,27 +294,50 @@ impl Jobs {
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
+    pub fn shells(&self) -> std::sync::MutexGuard<'_, Vec<Shell>> {
+        self.shells.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Stop a shell's process group, or the shell alone if the group is already gone: SIGTERM for
+    // one of piccosta's own, which its watcher turns to SIGKILL at `kill_at` (bash.rs watch),
+    // SIGKILL for any other. Repeated stops share the first deadline: a background job's stop and
+    // its watcher can race.
+    pub fn kill_group(&self, pid: u32) {
+        let mut shells = self.shells();
+        match shells.iter_mut().find(|shell| shell.pid == pid && shell.own) {
+            Some(shell) if shell.kill_at.is_some() => {}
+            Some(shell) => {
+                shell.kill_at = Some(Instant::now() + super::bash::SUBAGENT_STOP_GRACE);
+                signal_group(pid, libc::SIGTERM);
+            }
+            None => signal_group(pid, libc::SIGKILL),
+        }
+    }
+
     // Kill one job's process group, and say why in its log and message.
-    fn kill_job(job: &RunningJob, reason: &str, silent: bool) {
+    fn kill_job(&self, job: &RunningJob, reason: &str, silent: bool) {
         job.kill_reason.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(|| reason.to_string());
         if silent {
             job.silent.store(true, Ordering::SeqCst);
         }
         job.kill.cancel();
-        super::bash::kill_group(job.pid);
+        self.kill_group(job.pid);
     }
 
     // Kill every running job. Silent kills send no message: used when nothing is left to tell.
     pub fn kill_all(&self, reason: &str, silent: bool) {
         for job in self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values() {
-            Jobs::kill_job(job, reason, silent);
+            self.kill_job(job, reason, silent);
         }
     }
 
-    // Session end: kill running jobs without messages and remove this session's spill files.
+    // Session end: kill running jobs without messages, then every command still running in the
+    // foreground, and remove this session's spill files.
     pub fn shutdown(&self, reason: &str) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.kill_all(&format!("session shutdown ({reason})"), true);
+        let left: Vec<u32> = self.shells().iter().filter(|shell| !shell.handed).map(|shell| shell.pid).collect();
+        left.into_iter().for_each(|pid| self.kill_group(pid));
         for path in self.spill_files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..) {
             let _ = std::fs::remove_file(path);
         }
@@ -351,13 +403,17 @@ impl Jobs {
     }
 
     // /restart: take the running jobs out of this session, so its end doesn't kill them, and hand
-    // them to the next image. Output: one record each (a job whose shell already ended isn't one).
+    // them to the next image: from now on this image neither reaps nor kills their shells, whose
+    // pipes go across the exec. Output: one record each (a job whose shell already ended isn't one).
     pub fn hand_over(&self) -> Vec<HandedJob> {
         let mut handed = Vec::new();
+        let mut shells = self.shells();
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|&id, job| {
-            let Some((own, pipe)) = super::bash::hand_over(job.pid) else { return true };
+            let Some(shell) = shells.iter_mut().find(|shell| shell.pid == job.pid && !shell.handed) else { return true };
+            shell.handed = true;
+            super::reaper::keep_across_exec(shell.pipe.as_raw_fd());
             let elapsed_ms = job.started.elapsed().as_millis() as u64;
-            handed.push(HandedJob { id, pid: job.pid, own, command: job.command.clone(), elapsed_ms, log_path: job.log_path.clone(), pipe });
+            handed.push(HandedJob { id, pid: job.pid, own: shell.own, command: job.command.clone(), elapsed_ms, log_path: job.log_path.clone(), pipe: shell.pipe.as_raw_fd() });
             false
         });
         handed

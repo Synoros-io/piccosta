@@ -17,10 +17,6 @@ const DEFAULT_STDIN_WAIT_SECONDS: u64 = 30;
 // argument parsers use, and what pi exits with on a bad flag).
 const USAGE_EXIT_CODE: u8 = 2;
 
-// How often a print run looks at its session's inbox while it works, for a message that should
-// reach it at the next step rather than after the run.
-const INBOX_POLL: Duration = Duration::from_secs(2);
-
 // `piccosta auth status`: for each account piccosta knows (auth::ACCOUNTS), then each other
 // provider models.json configures, whether a credential resolves and where it comes from. Keys are
 // never printed. A provider with none is listed, not a failure: the user has the accounts they
@@ -90,11 +86,12 @@ fn write_line(line: &str) {
     }
 }
 
-// A print or json run: every message in turn, then (text mode) the last answer on stdout. Output:
-// the exit code, or the error that stopped the run before it began.
+// A print or json run: what's queued in the session, every message in turn, then whatever is sent
+// to its runtime while it runs, and (text mode) the last answer on stdout. Output: the exit code, or
+// the error that stopped the run before it began.
 async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     let json = args.mode.as_deref() == Some("json");
-    let host = piccosta::host::Host::for_args(&args);
+    let host = std::sync::Arc::new(piccosta::host::Host::for_args(&args));
     host.show_settings_errors();
     let mut session = host.opening(&args)?;
     // A subagent's new session records its job as its kind, whose tools and readOnly it then runs
@@ -121,76 +118,15 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     if json {
         write_line(&serde_json::to_string(agent.session.header()).unwrap_or_default());
     }
-    // While it runs, the run is recorded beside its session (manager::start_run), so a manager's
-    // stop can tell it from a terminal or editor that has the file open. The record goes when the
-    // run ends, by a signal too. What waits in its inbox (a launch's message) is taken with it, to
-    // answer after the messages it was given.
-    struct Recorded(Option<std::path::PathBuf>);
-    impl Drop for Recorded {
-        fn drop(&mut self) {
-            if let Some(path) = &self.0 {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-    let (record, waiting) = agent.session.file().and_then(|file| piccosta::manager::start_run(file).ok()).unzip();
-    let recorded = Recorded(record);
-    let record = recorded.0.clone();
-
-    // SIGTERM and SIGHUP end the run, after killing background jobs with their process groups.
-    // SIGINT goes the SIGTERM way (exit 143), as longcmd made it: Node's default left jobs
-    // running (longcmd.ts:350-363).
-    let shutdown = tool_shared.clone();
-    let abort = agent.handle();
-    // Another piccosta's messages for the session (its inbox) come in one queue, oldest first,
-    // starting with those waiting when the run took the session. While a prompt runs they steer it,
-    // as the terminal UI's do: running commands move to the background and the message goes in at
-    // the next step. Between prompts each is a prompt of its own. The queue and whether a prompt
-    // runs share a lock, so a message taken for the queue reaches the agent before any taken after.
-    let inbox = std::sync::Arc::new(std::sync::Mutex::new((false, waiting.clone().unwrap_or_default().into_iter().collect::<std::collections::VecDeque<String>>())));
-    fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-    let (held, session_file) = (inbox.clone(), agent.session.file().map(std::path::Path::to_path_buf));
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut term), Ok(mut hangup), Ok(mut interrupt)) =
-            (signal(SignalKind::terminate()), signal(SignalKind::hangup()), signal(SignalKind::interrupt()))
-        else {
-            return;
-        };
-        let code = tokio::select! {
-            _ = term.recv() => 143,
-            _ = interrupt.recv() => 143,
-            _ = hangup.recv() => 129,
-        };
-        // Messages taken from the inbox and not yet in the session (steering the agent hasn't used,
-        // the run's own queue) go back to the inbox, in order, so a stop never loses one.
-        let (steer, follow) = abort.clear();
-        let queued: Vec<String> = steer.into_iter().chain(follow).chain(lock(&held).1.drain(..)).collect();
-        if let Some(file) = &session_file {
-            let _ = piccosta::manager::requeue(file, &queued);
-        }
-        abort.abort();
-        piccosta::provider::claude::shutdown().await;
-        shutdown.jobs.shutdown(if code == 129 { "SIGHUP" } else { "SIGTERM" });
-        // A foreground command whose tool call hasn't seen the abort yet.
-        piccosta::tools::bash::kill_all_running();
-        shutdown.web.shutdown();
-        if let Some(path) = &record {
-            let _ = std::fs::remove_file(path);
-        }
-        std::process::exit(code);
-    });
-
     // The first prompt is piped stdin, then a blank line, then the first message (pi runs the two
     // together, so a file's last line fused with the question); each further message is a prompt
-    // of its own. With neither there's nothing to answer, which is an error, not a quiet success.
+    // of its own. With neither, and nothing queued in the session, there's nothing to answer, which
+    // is an error, not a quiet success.
     let stdin = read_piped_stdin().await;
     let mut messages = args.messages.clone().into_iter();
     let first = [stdin, messages.next().unwrap_or_default()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n\n");
     let prompts: Vec<String> = std::iter::once(first).filter(|text| !text.is_empty()).chain(messages).collect();
-    if prompts.is_empty() && waiting.as_ref().is_none_or(Vec::is_empty) {
+    if prompts.is_empty() && agent.session.queued().is_empty() {
         return Err("nothing to answer: give a message, or pipe one in".into());
     }
     // The team (--pair or --trio, recorded with the session, or the one it already has): each
@@ -199,76 +135,61 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         Some(team) => piccosta::host::record_team(&host.registry()?, &mut agent.session, team)?,
         None => piccosta::host::team(&agent.session),
     };
-    if let Some(file) = agent.session.file().map(std::path::Path::to_path_buf) {
-        let (inbox, handle, shared) = (inbox.clone(), agent.handle(), tool_shared.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(INBOX_POLL).await;
-                let mut inbox = lock(&inbox);
-                let (running, queue) = &mut *inbox;
-                if *running {
-                    queue.extend(piccosta::manager::take_inbox(&file));
-                    if !queue.is_empty() {
-                        queue.drain(..).for_each(|text| handle.steer(text));
-                        shared.jobs.detach_all();
-                    }
-                }
-            }
-        });
+    let before = agent.session.context().messages.len();
+    // The run is the session's runtime, which ends when nothing is left to answer; the first
+    // failure to write the session is the run's error.
+    let failed = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let failure = failed.clone();
+    let (commands, task) = piccosta::runtime::spawn(host.clone(), agent, tool_shared, true, true, move |done| {
+        if let Err(error) = done.result {
+            failure.borrow_mut().get_or_insert(error);
+        }
+    });
+    for prompt in prompts {
+        let _ = commands.send(piccosta::runtime::Command::Prompt(prompt, Vec::new()));
     }
-    let mut prompts: std::collections::VecDeque<String> = prompts.into();
-    loop {
-        let next = prompts.pop_front().or_else(|| {
-            let (_, queue) = &mut *lock(&inbox);
-            if queue.is_empty() {
-                queue.extend(agent.session.file().map(piccosta::manager::take_inbox).unwrap_or_default());
-            }
-            queue.pop_front()
-        });
-        // Nothing left: the run lets its session go, unless a message came as it ended.
-        let Some(text) = next else {
-            let more = piccosta::manager::release_and_take(&agent.session);
-            if more.is_empty() {
-                break;
-            }
-            lock(&inbox).1.extend(more);
-            continue;
+    // SIGTERM and SIGHUP close the runtime, which stops the run, keeps what it hadn't read in the
+    // session and kills its jobs with their process groups. SIGINT goes the SIGTERM way (exit 143),
+    // as longcmd made it: Node's default left jobs running (longcmd.ts:350-363).
+    let signalled = std::rc::Rc::new(std::cell::Cell::new(None));
+    let (signal_code, closer) = (signalled.clone(), commands.clone());
+    tokio::task::spawn_local(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut hangup), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup()), signal(SignalKind::interrupt())) else { return };
+        let code: u8 = tokio::select! {
+            _ = term.recv() => 143,
+            _ = interrupt.recv() => 143,
+            _ = hangup.recv() => 129,
         };
-        let before = agent.session.context().messages.len();
-        lock(&inbox).0 = true;
-        let answered = host.answer(&mut agent, &team, &text, Vec::new()).await;
-        // What was steered and no step took goes back ahead of what's queued.
-        {
-            let (running, queue) = &mut *lock(&inbox);
-            *running = false;
-            let (steering, follow_up) = agent.handle().clear();
-            steering.into_iter().chain(follow_up).rev().for_each(|text| queue.push_front(text));
-        }
-        // With a team, every reply of the exchange is printed under the model that wrote it, so
-        // the conversation reads as it happened; alone, only the last message is (below).
-        if !json && !team.models.is_empty() {
-            let mut speaker = String::new();
-            for message in agent.session.context().messages.into_iter().skip(before) {
-                let AgentMessage::Assistant(reply) = message else { continue };
-                let model = format!("{}/{}", reply.provider, reply.model);
-                if model != speaker {
-                    write_line(&format!("\n── {model} ──"));
-                    speaker = model;
-                }
-                reply.content.iter().for_each(|block| if let Content::Text { text, .. } = block { write_line(text) });
-            }
-        }
-        if let Err(error) = answered {
-            piccosta::provider::claude::shutdown().await;
-            tool_shared.jobs.shutdown("error");
-            tool_shared.web.shutdown();
-            return Err(error);
-        }
-    }
+        signal_code.set(Some(code));
+        let _ = closer.send(piccosta::runtime::Command::Close(None));
+        tokio::time::sleep(piccosta::runtime::STOP_WAIT).await;
+        std::process::exit(code.into());
+    });
+    drop(commands);
+    let agent = task.await.map_err(|error| error.to_string())?;
     // The last answer's Claude query waits for a next message that won't come here.
     piccosta::provider::claude::shutdown().await;
-    tool_shared.jobs.shutdown("quit");
-    tool_shared.web.shutdown();
+    if let Some(code) = signalled.get() {
+        return Ok(ExitCode::from(code));
+    }
+    if let Some(error) = failed.borrow_mut().take() {
+        return Err(error);
+    }
+    // With a team, every reply of the run is printed under the model that wrote it, so the
+    // conversation reads as it happened; alone, only the last message is (below).
+    if !json && !team.models.is_empty() {
+        let mut speaker = String::new();
+        for message in agent.session.context().messages.into_iter().skip(before) {
+            let AgentMessage::Assistant(reply) = message else { continue };
+            let model = format!("{}/{}", reply.provider, reply.model);
+            if model != speaker {
+                write_line(&format!("\n── {model} ──"));
+                speaker = model;
+            }
+            reply.content.iter().for_each(|block| if let Content::Text { text, .. } = block { write_line(text) });
+        }
+    }
     // A subagent's session is one task: done when its run is, so it closes and leaves its parent's
     // list.
     if std::env::var_os(piccosta::tools::subagent::CHILD_ENV).is_some()
@@ -305,7 +226,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Started as the reaper by another piccosta (tools/reaper.rs): watch for it to go, and nothing else.
+    // Started as the watcher by another piccosta (tools/reaper.rs): watch for it to go, and nothing else.
     if std::env::var_os(piccosta::tools::reaper::REAPER_ENV).is_some() {
         piccosta::tools::reaper::run();
         return ExitCode::SUCCESS;
@@ -341,12 +262,17 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("tell") => {
-            let text = arguments[1..].join(" ");
+            let text = piccosta::manager::from_user(&arguments[1..].join(" "));
             let Some(file) = piccosta::manager::session_file(&config::agent_dir()) else { return fail("no assistant yet: start it with `piccosta assistant`".into()) };
-            // Into its inbox, for the service to take in; with the service down it waits there.
-            return match piccosta::manager::wake(&file, &text) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(format!("{}: {error}", file.display())),
+            // To its runtime; with the service down it waits in its session.
+            return match piccosta::runtime::send(&file, &text, None) {
+                // Sent all the same, so it isn't a failure to send again.
+                Ok(piccosta::runtime::Sent::Unconfirmed) => {
+                    eprintln!("piccosta: sent, not confirmed: the assistant didn't answer in time");
+                    ExitCode::SUCCESS
+                }
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
             };
         }
         _ => {}
@@ -383,8 +309,8 @@ async fn main() -> ExitCode {
     match args.mode.as_deref() {
         Some("rpc") => piccosta::rpc::run(args).await.unwrap_or_else(fail),
         Some("acp") => piccosta::acp::run(args).await.unwrap_or_else(fail),
-        Some("json") => run_print(args).await.unwrap_or_else(fail),
-        _ if print => run_print(args).await.unwrap_or_else(fail),
+        Some("json") => tokio::task::LocalSet::new().run_until(run_print(args)).await.unwrap_or_else(fail),
+        _ if print => tokio::task::LocalSet::new().run_until(run_print(args)).await.unwrap_or_else(fail),
         _ => piccosta::tui::run(args).await.unwrap_or_else(fail),
     }
 }

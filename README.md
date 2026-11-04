@@ -65,7 +65,7 @@ The model hands a task to a kind of work on the scale (critical, general, review
   - Page Up/Down (or Alt+↑↓) walks the list, showing earlier sessions without starting them until you type.
   - Ctrl+S searches the list, and `/resume all` reaches every project's sessions.
   - `-r` resumes by id, the start of one, or a name; `-c` resumes this directory's latest.
-- **Sessions are never run twice.** A running piccosta locks its session file; another one shows that session live from its file, and what you type there goes into its inbox.
+- **Sessions are never run twice.** The piccosta running a session answers on a socket beside its file; another one shows that session live from its file, and what you type there goes to the one running it, which reads it at its next step. A message for a session nothing runs waits in its file for the next one to open it.
 - **Cleaning up.** Delete twice moves the shown session to the trash, where a file manager can restore it. If it can't go to the trash (it's on another disk, say), the session stays where it is and piccosta says so. A session you leave that's idle closes on its own, and an empty one goes away.
 - **The keys Claude Code taught you:**
   - Enter queues a message while a run goes, and Esc stops the run.

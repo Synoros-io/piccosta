@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod provider;
 pub mod retry;
 pub mod rpc;
+pub mod runtime;
 pub mod scale;
 pub mod session;
 pub mod tools;

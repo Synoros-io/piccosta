@@ -355,16 +355,12 @@ pub struct Session {
     // user or assistant message, so starting piccosta and quitting leaves no empty file
     // (session-manager.ts:1160-1170).
     flushed: bool,
-    // The file, held under an advisory lock while this process runs the session (claim), so no
-    // other piccosta runs it at the same time; shared by clones, released when the last goes.
-    lock: Option<std::sync::Arc<fs::File>>,
 }
 
-// What a claim refused by another process says, after the file's path.
-pub const LIVE_ELSEWHERE: &str = "is open in another piccosta";
+// A message sent while nothing ran the session, or left unread by a stop: never sent to a model as
+// it is; the session's next turn takes it, ahead of its own message (agent.rs run_from).
+pub const QUEUED_TYPE: &str = "piccosta-queued";
 
-// Whether another process runs the session in `path` (holds its lock). Two piccostas writing one
-// file would fork its tree, so a frontend shows such a session instead of running it.
 // Closed sessions: the ones someone said are done (a manager's `sessions close`, the terminal's
 // /close, a subagent's run when it ends). A closed session leaves the lists that show what's
 // going on (the sidebar, a manager's lanes) and is still there to find (/resume, `sessions list`);
@@ -398,24 +394,6 @@ pub fn set_closed(agent_dir: &Path, file: &Path, closed: bool) {
     }
 }
 
-pub fn held_elsewhere(path: &Path) -> bool {
-    fs::File::open(path).is_ok_and(|file| matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)))
-}
-
-// How much of a session file's end is read for its last entries: room for a long answer.
-const TAIL_BYTES: u64 = 1024 * 1024;
-
-// The last entry of a session file that `wanted` picks, read from the file's end, so a long session
-// costs no more than a short one.
-pub fn last_entry(path: &Path, wanted: impl Fn(&Value) -> bool) -> Option<Value> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(file.metadata().ok()?.len().saturating_sub(TAIL_BYTES))).ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    String::from_utf8_lossy(&tail).lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|entry| wanted(entry))
-}
-
 impl Session {
     // A new, empty session. Input: the working directory, and the folder to keep the file in
     // (None for memory only). Output: the session, not yet on disk.
@@ -439,7 +417,6 @@ impl Session {
             leaf_id: None,
             file,
             flushed: false,
-            lock: None,
         }
     }
 
@@ -490,7 +467,7 @@ impl Session {
         if version < CURRENT_SESSION_VERSION {
             return Err(OpenError::TooOld { path: path.to_path_buf(), version });
         }
-        let mut session = Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.to_path_buf()), flushed: true, lock: None };
+        let mut session = Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.to_path_buf()), flushed: true };
         for value in values {
             if let Some(entry) = entry_from_value(value) {
                 session.index_entry(entry);
@@ -625,10 +602,6 @@ impl Session {
                 return Err(error);
             }
             self.flushed = true;
-            // Made here, so this process is the one running it.
-            if file.try_lock().is_ok() {
-                self.lock = Some(std::sync::Arc::new(file));
-            }
             return Ok(());
         }
         let mut file = OpenOptions::new().append(true).open(path)?;
@@ -642,31 +615,23 @@ impl Session {
         Ok(())
     }
 
-    // Claim the file for this process, as the one running the session. A session not on disk yet is
-    // claimed when its file is made. Output: an error when another piccosta holds it.
-    pub fn claim(&mut self) -> Result<(), String> {
-        let Some(path) = self.file.as_ref().filter(|path| path.exists()) else { return Ok(()) };
-        let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => {
-                self.lock = Some(std::sync::Arc::new(file));
-                Ok(())
-            }
-            Err(fs::TryLockError::WouldBlock) => Err(format!("{} {LIVE_ELSEWHERE}", path.display())),
-            Err(fs::TryLockError::Error(error)) => Err(format!("{}: {error}", path.display())),
-        }
+    // Queue a message for the session's next turn (QUEUED_TYPE).
+    pub fn queue(&mut self, text: &str) -> io::Result<String> {
+        self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text })))
     }
 
-    // Let the file go for another piccosta to run the session (its clones' claim goes too), or take
-    // it back. Output of reclaim: false when another took it meanwhile.
-    pub fn release(&self) {
-        if let Some(file) = &self.lock {
-            let _ = file.unlock();
-        }
-    }
-
-    pub fn reclaim(&self) -> bool {
-        self.lock.as_ref().is_none_or(|file| file.try_lock().is_ok())
+    // The messages queued at the leaf and not taken yet, oldest first: those after its last message
+    // from the user, since a turn takes them all as user messages before anything else. An entry
+    // holds one (its text), or the several of an old inbox (its texts; runtime.rs claim).
+    pub fn queued(&self) -> Vec<String> {
+        let path = self.path_to_leaf();
+        let after = path.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::User(_), .. })).map_or(0, |at| at + 1);
+        let queued = path[after..].iter().filter_map(|entry| match entry {
+            SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => Some(data),
+            _ => None,
+        });
+        let texts = queued.flat_map(|data| data.get("text").into_iter().chain(data["texts"].as_array().into_iter().flatten()));
+        texts.filter_map(|text| text.as_str().map(str::to_string)).collect()
     }
 
     // The header and every entry as file text. Unknown entries are written back as they were read.
