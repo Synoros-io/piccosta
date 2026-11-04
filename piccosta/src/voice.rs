@@ -1,5 +1,5 @@
-// Voice, brought by the user. piccosta records and synthesizes nothing: two commands named in
-// settings do that, and piccosta passes text to and from them. Voice is a call with one session at
+// Voice, brought by the user. piccosta records and synthesizes nothing: commands named in
+// settings do that, and piccosta passes text and captured audio between them. Voice is a call with one session at
 // a time, the way the user is on a call with a person:
 //
 // - A call starts with `/call` in the terminal UI (the session shown there, or `/call assistant`)
@@ -27,33 +27,43 @@
 //   within LISTEN_FINISH_SECONDS of its stdin closing. The lines joined by spaces are the user's
 //   message, delivered to the session in the call the way `piccosta tell` delivers one (queued in
 //   its file when nobody runs it, for the next run to answer).
-// - `voice.speak`, a shell command, starts once for each turn said. piccosta writes it UTF-8
-//   lines, each a piece of the answer that ends at a sentence or a paragraph, the moment the model
-//   has written it, and closes its stdin when the turn ends. It says each line as it comes (Piper
-//   reads its stdin this way) and exits after the last. Turns are said one after another, never
-//   over each other.
+// - `voice.reply`, optional: the first voice, from the user's audio itself. When set, voice.listen
+//   must also save a complete mono WAV at $PICCOSTA_VOICE_AUDIO (a private path supplied for this
+//   hold). Nothing changes for listen when reply is unset. The reply command gets that WAV on
+//   stdin, plays its own audio, writes its reply as a UTF-8 line to stdout as soon as it knows
+//   it, and exits after its one sentence plays. Quick and the session generate meanwhile.
+//   $PICCOSTA_VOICE_REPLY_AUDIO is a scratch WAV path it can use, for example with
+//   `lfm reply --server "$socket" -o "$PICCOSTA_VOICE_REPLY_AUDIO" && player "$PICCOSTA_VOICE_REPLY_AUDIO"`.
+//   It runs in the same queue as speak, before quick and the session, never over either. Its
+//   process group ends with the call or session; capture and reply files are removed afterwards.
+// - `voice.speak`, a shell command, starts once per spoken turn. piccosta streams UTF-8 lines,
+//   closes stdin at the turn's end, and waits for playback to exit. With reply set, a ready session
+//   line drops early lines still in piccosta's queue; lines already handed to speak finish first.
+//   The command owns playback of the lines it accepts. Turns never speak over each other.
 // - `voice.call`, an optional shell command, starts with each call and is killed, with everything it
 //   started, when the call ends. It's for what listening and speaking share and shouldn't start
 //   over each push or turn, like a speech model held loaded (`lfm serve`) that the listen and speak
 //   commands use. A detached supervisor owns its process group until the call ends.
 // - `voice.quick`, optional: a fast model (provider/id) that answers each of the user's messages
-//   first, from the end of the conversation, while the session's model does the work. Its lines go
-//   to the speak command first, then the session's answer's, which wait their turn. It's spoken
-//   only: the session never sees its words, so its transcript and its prompt cache are as they'd
-//   be without it; what it cost is counted in the session's statistics.
+//   first, from the end of the conversation, while the session's model does the work. With reply
+//   set, at most two sentences enter the queue; otherwise all quick's lines precede the session.
+//   It's spoken only; its cost goes into session statistics.
+//   Quick sees reply's text. When early speech finishes or the session overtakes it, one trailing
+//   message says what was spoken, asking for only what's missing (which can be nothing).
+//   No system prompt or earlier message changes; the session never waits to speak its first line.
 
 use crate::agent::{AgentConfig, Event, EventSink};
-use crate::message::{AgentMessage, Message, SystemMessage, TextOrBlocks, Usage, UserMessage};
+use crate::message::{AgentMessage, CustomMessage, Message, SystemMessage, TextOrBlocks, Usage, UserMessage};
 use crate::model::ModelRegistry;
 use crate::provider::{Request, StreamEvent};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -74,15 +84,14 @@ const MAX_HOLD_SECONDS: u64 = 120;
 // everything it started are killed: a batch recognizer like whisper.cpp transcribes a two-minute
 // clip in a few seconds on a CPU, so thirty is room for a slow machine and still bounds the mic.
 const LISTEN_FINISH_SECONDS: u64 = 30;
-// The speech worker's bounds. A write to the speak command that takes longer than
-// SPEAK_WRITE_SECONDS means it has stopped reading (a pipe holds far more than it says in that
-// time), and the rest of that turn isn't said. After its stdin closes it gets SPEAK_EXIT_SECONDS
-// to finish saying what it has, about what a 900-token answer takes to say aloud, then it's killed.
+// A pipe holds much more than a line of speech: ten seconds without accepting a write means
+// the command has stopped reading. After stdin closes, allow five minutes to finish playback,
+// including paragraphs without sentence punctuation. A stalled command's whole group is killed.
+const SPEAK_WRITE_SECONDS: u64 = 10;
 // The quick model gets QUICK_SECONDS: it's meant to answer in one. A print run waits up to
 // DRAIN_SECONDS, once its answer is done, for what's still being said. A frontend that exits gives
 // the worker STOP_SECONDS to kill the speak command and end: a killed process is reaped at once, so
 // five is room for a loaded machine and still no wait anyone notices.
-const SPEAK_WRITE_SECONDS: u64 = 10;
 const SPEAK_EXIT_SECONDS: u64 = 300;
 const QUICK_SECONDS: u64 = 30;
 const DRAIN_SECONDS: u64 = 300;
@@ -103,7 +112,15 @@ const ANSWER_QUEUE: usize = 4096;
 const QUICK_CONTEXT_CHARS: usize = 24_000;
 // The kind of the session's usage entries for quick answers.
 pub const QUICK_KIND: &str = "voice-quick";
+const SAID_TYPE: &str = "voice-said";
+pub(crate) const INPUT_TYPE: &str = "voice-input";
+// The baseline is at most two sentences; the session, not this layer, owns the full answer.
+const QUICK_SENTENCES: usize = 2;
 const QUICK_PROMPT: &str = "You are the voice that answers first. The user has just spoken to their assistant, which is now working on the full answer and will speak it after you. Say at once, in one to three short sentences, what you can from what you know and the conversation below: answer when you can, else say what is being looked into. Don't claim to have done or checked anything. Write for speech: plain sentences, no markdown, lists or code.";
+pub const SILENT: &str = "[PICCOSTA_SILENT]";
+// What a message said on a call carries, so its answer is written to be heard.
+const SAID_ON_A_CALL: &str = "said on a voice call: answer in a few plain spoken sentences, no markdown or lists";
+const LAYERED_PROMPT: &str = "You are the quick baseline voice. The user has just spoken to their assistant, which is now working on the full answer. Say at once, in at most two tiny sentences, what you can from what you know and the conversation below: answer when you can, else say what is being looked into. Lead with the shortest useful fact. Each sentence is just a few words, one fact, never a restatement of the question or an elaboration. Don't claim to have done or checked anything. Don't repeat what the first voice already said; add what's missing. Write for speech: plain sentences, no markdown, lists or code.";
 
 // A shell command line, as `sh -c` runs it, in a process group of its own so it can be killed
 // along with whatever it starts.
@@ -233,26 +250,33 @@ async fn run_call(agent_dir: &Path, id: &str) -> Result<(), String> {
     command_lock.lock().map_err(|e| e.to_string())?;
     if !reading(agent_dir).map_err(|e| e.to_string())?.is_some_and(|(_, now)| now == id) { return Ok(()) }
     let settings = crate::config::Settings::load(agent_dir, std::env::current_dir().ok().as_deref());
-    let Some(command) = text_setting(&settings, "voice.call") else { return Ok(()) };
+    // This supervisor also owns captures left by a receiver that exited before saying them.
+    let _recordings = Recording(agent_dir.join("voice").join(uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?.to_string()));
+    let command = text_setting(&settings, "voice.call");
     // The call ending, or this process being told to end (a logout, a kill), takes the same way out,
     // so its command never outlives it. The signals are caught before the command starts, so none
     // can end this process between the two.
     use tokio::signal::unix::{signal, SignalKind};
     let caught = |kind| signal(kind).map_err(|error| format!("couldn't catch a signal: {error}"));
     let (mut term, mut hangup, mut interrupt) = (caught(SignalKind::terminate())?, caught(SignalKind::hangup())?, caught(SignalKind::interrupt())?);
-    let mut child = shell(&command).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log().map_err(|e| e.to_string())?).spawn().map_err(|e| e.to_string())?;
+    let mut child = command
+        .map(|command| {
+            shell(&command).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log().map_err(|e| e.to_string())?).spawn().map_err(|e| e.to_string())})
+        .transpose()?;
     tokio::select! {
         () = ended(agent_dir, id) => {}
         _ = term.recv() => {}
         _ = hangup.recv() => {}
         _ = interrupt.recv() => {}
     }
-    if let Some(pid) = child.id() {
-        // SAFETY: this unreaped child still owns the process-group number.
-        unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
-        tokio::time::sleep(CALL_EXIT_GRACE).await;
+    if let Some(child) = &mut child {
+        if let Some(pid) = child.id() {
+            // SAFETY: this unreaped child still owns the process-group number.
+            unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
+            tokio::time::sleep(CALL_EXIT_GRACE).await;
+        }
+        kill_group(child).await;
     }
-    kill_group(&mut child).await;
     Ok(())
 }
 
@@ -340,7 +364,17 @@ async fn hold(agent_dir: &Path, id: &str, target: &Path) -> Result<(), String> {
     let listen = text_setting(&settings, "voice.listen").ok_or("no listen command: set voice.listen in settings")?;
     let limit = settings.get("voice.maxSeconds").and_then(Value::as_u64).unwrap_or(MAX_HOLD_SECONDS);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
-    let mut listener = shell(&listen).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|error| format!("couldn't run voice.listen: {error}"))?;
+    let recording = if text_setting(&settings, "voice.reply").is_some() {
+        Some(Recording::new(agent_dir, id)?)
+    } else {
+        None
+    };
+    let mut command = shell(&listen);
+    if let Some(recording) = &recording {
+        command.env("PICCOSTA_VOICE_AUDIO", recording.0.join("input.wav"));
+    }
+    let mut listener = command
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|error| format!("couldn't run voice.listen: {error}"))?;
     let stdin = listener.stdin.take();
     let mut lines = tokio::io::BufReader::new(listener.stdout.take().ok_or("voice.listen has no stdout")?).lines();
     let mut heard = Vec::new();
@@ -385,8 +419,72 @@ async fn hold(agent_dir: &Path, id: &str, target: &Path) -> Result<(), String> {
         return Ok(());
     }
     // The assistant hears from the user with the time, as `piccosta tell` sends it.
+    // The session knows from its first word that its answer will be heard, not read: the words go
+    // with a note of it, in the user's own message (new text at the end, so no cache is disturbed).
+    let words = format!("{words} ({SAID_ON_A_CALL})");
     let text = if crate::manager::session_file(agent_dir).as_deref() == Some(target) { crate::manager::from_user(&words) } else { words };
+    if let Some(recording) = recording
+        && recording.0.join("input.wav").is_file()
+    {
+        if crate::runtime::send_voice(target, &text, &recording.0)? {
+            std::mem::forget(recording);
+        }
+        return Ok(());
+    }
     crate::runtime::send(target, &text, None).map(|_| ())
+}
+
+// The directory belongs to one capture, not to a session or the user's recorder. The speaker
+// owns it after delivery; an undelivered capture is removed by the hold instead.
+struct Recording(PathBuf);
+impl Recording {
+    fn new(agent_dir: &Path, call: &str) -> Result<Self, String> {
+        let dir = agent_dir
+            .join("voice")
+            .join(call)
+            .join(uuid::Uuid::now_v7().to_string());
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| e.to_string())?;
+        Ok(Self(dir))
+    }
+}
+impl Drop for Recording {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// The early voices complete while the main model works. The agent takes their note at its next
+// tool boundary (or before settling), then appends it as an ordinary message, never a prompt edit.
+#[derive(Clone, Default)]
+pub struct State(Arc<Mutex<Option<oneshot::Receiver<Option<CustomMessage>>>>>);
+impl State {
+    pub async fn finish(&self, cancel: &CancellationToken, wait: bool) -> Option<CustomMessage> {
+        let mut receiver = self.0.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+        // Tools don't wait for speech. Take a ready note, otherwise keep working; the first
+        // answer line will overtake the early voices and release the note before settling.
+        match receiver.try_recv() {
+            Ok(note) => return note,
+            Err(oneshot::error::TryRecvError::Empty) if !wait => {
+                *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(receiver);
+                return None;
+            }
+            Err(oneshot::error::TryRecvError::Closed) => return None,
+            _ => {}
+        }
+        tokio::select! { result = receiver => result.ok().flatten(), () = cancel.cancelled() => None }
+    }
+}
+
+enum Speech {
+    Text(String),
+    End,
+}
+
+// Only this queue feeds playback. Ready marks the end of quick's queued lines.
+enum Line {
+    Say(&'static str, String),
+    Ready,
 }
 
 // --- Speaking ---
@@ -404,7 +502,7 @@ struct Quick {
 // quick model reads (no quick model for a turn the user didn't start), and the session's answer as
 // it streams.
 struct Turn {
-    speak: String,
+    speak: Option<String>,
     // Cancelled as its session closes (jobs.rs shutdown), which ends it said or waiting.
     closed: CancellationToken,
     // The id of the call it's said in, whose end ends it too.
@@ -413,7 +511,10 @@ struct Turn {
     words: String,
     transcript: String,
     quick: Option<Quick>,
-    answer: mpsc::Receiver<String>,
+    reply: Option<String>,
+    recording: Option<Recording>,
+    earlier: Option<oneshot::Sender<Option<CustomMessage>>>,
+    answer: mpsc::Receiver<Speech>,
     started: Instant,
 }
 
@@ -476,7 +577,8 @@ pub async fn shutdown(drain: bool) {
         note(&format!("still speaking after {DRAIN_SECONDS} s; the rest isn't said"));
     }
     worker.stop.cancel();
-    let Some((thread, ended)) = worker.thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() else { return };
+    let Some((thread, ended)) = worker.thread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() else { return ;
+    };
     match tokio::time::timeout(Duration::from_secs(STOP_SECONDS), ended).await {
         Ok(_) => drop(thread.join()),
         Err(_) => note(&format!("the speech worker didn't stop within {STOP_SECONDS} s")),
@@ -501,45 +603,83 @@ pub fn spent_changes() -> watch::Receiver<Spent> {
 
 // A session's events, with its answers said while the user is on a call with it. Input: the
 // settings, the agent's config (for the quick model), the session, and where the events go on to.
-// Output: the sink to give the agent, which is `emit` itself when `voice.speak` isn't set.
-pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, session: &crate::session::Session, mut emit: EventSink) -> EventSink {
-    let Some(speak) = text_setting(settings, "voice.speak") else { return emit };
+// Output: the sink to give the agent. It also owns delivered recordings without a speak command.
+pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, session: &crate::session::Session, mut emit: EventSink,
+) -> EventSink {
+    let speak = text_setting(settings, "voice.speak");
     let closed = config.tool_shared.jobs.closed.clone();
+    let state = config.voice.clone();
+    let reply = text_setting(settings, "voice.reply");
     let quick = text_setting(settings, "voice.quick").map(|name| Quick {
         name,
         credentials: config.credentials.clone(),
         transport: config.transport.clone(),
         cwd: config.cwd.clone(),
     });
-    let (session_id, file, agent_dir) = (session.id().to_string(), session.file().map(Path::to_path_buf), crate::config::agent_dir());
+    let (session_id, file, agent_dir) = (session.id().to_string(), session.file().map(Path::to_path_buf), crate::config::agent_dir(),
+    );
     let mut transcript = String::new();
     session.context().messages.iter().for_each(|message| remember(&mut transcript, message));
     // The turn being said: where the session's answer goes, a piece at a time. Each message from
     // the user ends the one before's and starts its own, while the call is with this session; a
     // job's end or a lane's news starts one when none is under way.
-    let mut turn: Option<mpsc::Sender<String>> = None;
+    let mut turn: Option<mpsc::Sender<Speech>> = None;
     Box::new(move |event: &Event| {
         match event {
             Event::MessageStart { message: message @ (AgentMessage::User(_) | AgentMessage::Custom(_)) } => {
-                let user = matches!(message, AgentMessage::User(_));
+                if matches!(message, AgentMessage::Custom(note) if note.custom_type == SAID_TYPE) {
+                    return emit(event);
+                }
+                // Claim a delivered capture even if the call ended or speech was disabled meanwhile.
+                let recording = match message {
+                    AgentMessage::Custom(input) if input.custom_type == INPUT_TYPE => input.details.as_ref()
+                        .and_then(|d| d["recording"].as_str()).map(PathBuf::from)
+                        .filter(|dir| dir.parent().and_then(Path::parent) == Some(agent_dir.join("voice").as_path())
+                            && [dir.file_name(), dir.parent().and_then(Path::file_name)].into_iter()
+                                .all(|name| name.and_then(|n| n.to_str()).is_some_and(|n| uuid::Uuid::parse_str(n).is_ok())))
+                        .map(Recording),
+                    _ => None,
+                };
+                let user = matches!(message, AgentMessage::User(_))
+                    || matches!(message, AgentMessage::Custom(note) if note.custom_type == INPUT_TYPE);
                 if user || turn.is_none() {
-                    let on_call = current(&agent_dir).filter(|(called, _)| Some(called) == file.as_ref());
+                    let on_call = current(&agent_dir).filter(|(called, _)| Some(called) == file.as_ref() && (speak.is_some() || reply.is_some()));
                     turn = on_call.map(|(_, call)| (call, mpsc::channel(ANSWER_QUEUE))).and_then(|(call, (sender, answer))| {
-                        let words = if let AgentMessage::User(said) = message { said.content.text() } else { String::new() };
-                        let said = Turn { speak: speak.clone(), closed: closed.clone(), call, session_id: session_id.clone(), words, transcript: transcript.clone(), quick: quick.clone().filter(|_| user), answer, started: Instant::now() };
+                        let words = match message {
+                            AgentMessage::User(said) => said.content.text(),
+                            AgentMessage::Custom(said) if user => said.content.text(),
+                            _ => String::new(),
+                        };
+                        let (earlier, done) = oneshot::channel();
+                        let earlier = reply.is_some().then(|| {
+                            *state.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(done);
+                            earlier
+                        });
+                        // A recording plays only under the call it was made in (one from a call just
+                        // hung up is dropped, and so deleted, when another has started).
+                        let recording = recording.filter(|recording| recording.0.parent().and_then(Path::file_name).and_then(|name| name.to_str()) == Some(call.as_str()));
+                        let said = Turn { speak: speak.clone(), closed: closed.clone(), call, session_id: session_id.clone(), words,
+                            transcript: transcript.clone(), quick: quick.clone().filter(|_| user && speak.is_some()), reply: reply.clone(), recording,
+                            earlier, answer, started: Instant::now() };
                         worker().jobs.try_send(Job::Turn(Box::new(said))).map(|()| sender).inspect_err(|_| note("too many turns waiting to be said; this one isn't")).ok()
                     });
                 }
             }
             Event::MessageUpdate { assistant_message_event, .. } => {
                 if assistant_message_event.get("type").and_then(Value::as_str) == Some("text_delta")
-                    && let (Some(turn), Some(delta)) = (&turn, assistant_message_event.get("delta").and_then(Value::as_str))
+                    && let (Some(turn), Some(delta)) = (&turn, assistant_message_event.get("delta").and_then(Value::as_str),
+                    )
                 {
                     // Never waited on: what the worker has no room for is dropped.
-                    let _ = turn.try_send(delta.to_string());
+                    let _ = turn.try_send(Speech::Text(delta.to_string()));
                 }
             }
-            Event::MessageEnd { message } => remember(&mut transcript, message),
+            Event::MessageEnd { message } => {
+                if matches!(message, AgentMessage::Assistant(_)) && let Some(turn) = &turn {
+                    let _ = turn.try_send(Speech::End);
+                }
+                remember(&mut transcript, message);
+            }
             // The run is over: the speak command gets the rest, then its stdin closes.
             Event::AgentSettled { .. } => turn = None,
             _ => {}
@@ -553,7 +693,11 @@ pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, sessio
 fn remember(transcript: &mut String, message: &AgentMessage) {
     let (speaker, text) = match message {
         AgentMessage::User(user) => ("User", user.content.text()),
-        AgentMessage::Assistant(reply) => ("Assistant", TextOrBlocks::Blocks(reply.content.clone()).text()),
+        AgentMessage::Assistant(reply) => ("Assistant", TextOrBlocks::Blocks(reply.content.clone()).text(),
+        ),
+        AgentMessage::Custom(input) if input.custom_type == INPUT_TYPE => {
+            ("User", input.content.text())
+        }
         _ => return,
     };
     if text.trim().is_empty() {
@@ -566,100 +710,232 @@ fn remember(transcript: &mut String, message: &AgentMessage) {
     }
 }
 
-// Say one turn: start the speak command, give it the quick answer when there's a quick model, then
-// the session's answer, which has waited meanwhile; close its stdin and give it its time to finish.
-// A speak command that stops taking lines, a worker told to stop, the session closing or the call
-// ending ends the turn at once: the command and everything it started are killed, and the rest of
-// the answer is let go. A turn whose session closed or whose call ended while it waited isn't
-// started.
+// Generate concurrently, feed one playback process. With reply set, a ready session line drops
+// early lines still queued here, not lines already accepted by the command. Without reply,
+// quick's original prompt, line boundaries and order stay intact.
 async fn play(mut turn: Turn, stop: &CancellationToken) {
     let agent_dir = crate::config::agent_dir();
-    if turn.closed.is_cancelled() || over(&agent_dir, &turn.call) {
-        return;
-    }
-    let mut command = shell(&turn.speak);
-    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(log().map_or(Stdio::null(), Stdio::from));
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return note(&format!("couldn't run voice.speak: {error}")),
+    if turn.closed.is_cancelled() || over(&agent_dir, &turn.call) { return; }
+    // Start loading the synthesizer while the models work, once for the entire turn.
+    let mut child = if let Some(command) = &turn.speak {
+        match shell(command).stdin(Stdio::piped()).stdout(Stdio::null())
+            .stderr(log().map_or(Stdio::null(), Stdio::from)).spawn() {
+            Ok(child) => Some(child),
+            Err(error) => return note(&format!("couldn't run voice.speak: {error}")),
+        }
+    } else { None };
+    let group = Group(child.as_ref().and_then(tokio::process::Child::id));
+    let mut stdin = child.as_mut().and_then(|child| child.stdin.take());
+    let (lines, mut queue) = mpsc::unbounded_channel();
+    let session_lines = lines.clone();
+    let (text, first_text) = oneshot::channel::<String>();
+    let overtaken = CancellationToken::new();
+    let mut answer = std::mem::replace(&mut turn.answer, mpsc::channel(1).1);
+    let mut earlier = turn.earlier.take();
+    let recording = turn.recording.take();
+    let layered = turn.reply.is_some();
+    let (baseline_done, baseline) = oneshot::channel();
+    let session = async {
+        if !layered { let _ = baseline.await; }
+        let mut speaker = Speaker::new(session_lines, "session", usize::MAX, layered);
+        while let Some(piece) = answer.recv().await {
+            match piece {
+                Speech::Text(delta) => speaker.add(&delta, false),
+                Speech::End => speaker.add("", true),
+            }
+            if layered && speaker.sent > 0 { overtaken.cancel(); }
+        }
+        speaker.add("", true);
+        if layered && speaker.sent > 0 { overtaken.cancel(); }
     };
-    let (group, closed, call) = (child.id(), turn.closed.clone(), turn.call.clone());
-    let cut = stop.child_token();
-    let mut speaker = Speaker { stdin: child.stdin.take(), pending: String::new(), cut: cut.clone(), started: turn.started, source: "voice.quick", first: true, session_id: turn.session_id.clone() };
-    let said = async {
+    let quick = async {
+        let mut speaker = Speaker::new(lines, "voice.quick", if layered { QUICK_SENTENCES } else { usize::MAX }, layered);
+        let first = first_text.await.unwrap_or_default();
         if let Some(quick) = &turn.quick {
-            if tokio::time::timeout(Duration::from_secs(QUICK_SECONDS), quick_answer(quick, &turn, &mut speaker)).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(QUICK_SECONDS), quick_answer(quick, &turn, &mut speaker, &first, &overtaken)).await.is_err() {
                 note(&format!("voice.quick gave no answer within {QUICK_SECONDS} s"));
             }
-            speaker.add("", true).await;
+            if !overtaken.is_cancelled() { speaker.add("", true); }
         }
-        speaker.source = "session";
-        speaker.first = true;
-        while let Some(delta) = turn.answer.recv().await {
-            speaker.add(&delta, false).await;
+        let _ = speaker.lines.send(Line::Ready);
+        let _ = baseline_done.send(());
+    };
+    let playback = async {
+        let _group = group;
+        let mut said = if !overtaken.is_cancelled()
+            && let (Some(command), Some(recording)) = (&turn.reply, &recording)
+        { reply_audio(command, recording, &turn, stop, text).await.unwrap_or_default() }
+        else { drop(text); String::new() };
+        // The transcript has arrived and the audio reply is done. No later speech needs the WAVs.
+        drop(recording);
+        let mut first = [true; 2];
+        loop {
+            let Some(line) = queue.recv().await else { break };
+            let (source, text) = match line {
+                Line::Say(source, text) if source == "session" || !overtaken.is_cancelled() => (source, text),
+                Line::Say(..) => continue,
+                Line::Ready => ("", String::new()),
+            };
+            if (source == "session" || source.is_empty()) && let Some(earlier) = earlier.take() {
+                let note = (!said.trim().is_empty()).then(|| CustomMessage {
+                    custom_type: SAID_TYPE.into(),
+                    content: TextOrBlocks::Text(format!("During this call, answer in a few spoken sentences, only about what the user asked. piccosta's own notes, including machine load and disk space, are for you, not to read aloud. Said aloud already: {}; don't repeat it, add only what's missing. Your answer above is also being spoken; don't restate it either. If nothing is missing, write exactly {SILENT} and nothing else. That marker means silence, not a word to say. No acknowledgment, filler or stage direction.", said.trim())),
+                    display: false, details: None, timestamp: crate::clock::now_ms(),
+                });
+                let _ = earlier.send(note);
+            }
+            if text.is_empty() { continue; }
+            let Some(input) = &mut stdin else { continue; };
+            if !matches!(tokio::time::timeout(Duration::from_secs(SPEAK_WRITE_SECONDS), input.write_all(format!("{text}\n").as_bytes())).await, Ok(Ok(()))) {
+                note("voice.speak stopped taking lines; the rest of this turn isn't said");
+                if let Some(child) = &mut child { kill_group(child).await; }
+                break;
+            }
+            let index = usize::from(source == "session");
+            if first[index] {
+                note(&format!("{source} first line to voice.speak in {:.3} s (session {})", turn.started.elapsed().as_secs_f64(), turn.session_id));
+                first[index] = false;
+            }
+            if source != "session" { said.push(' '); said.push_str(&text); }
         }
-        speaker.add("", true).await;
-        speaker.stdin = None;
-        tokio::time::timeout(Duration::from_secs(SPEAK_EXIT_SECONDS), child.wait()).await.is_ok() || {
-            note(&format!("voice.speak still running {SPEAK_EXIT_SECONDS} s after its turn ended; killed"));
-            false
+        // A failed player must release the agent waiting for its note, too.
+        drop(earlier.take());
+        drop(stdin);
+        if let Some(child) = &mut child {
+            if tokio::time::timeout(Duration::from_secs(SPEAK_EXIT_SECONDS), child.wait()).await.is_err() {
+                note("voice.speak didn't finish its turn; killed");
+            }
+            kill_group(child).await;
         }
     };
-    let finished = tokio::select! { exited = said => exited, () = cut.cancelled() => false, () = closed.cancelled() => false, () = ended(&agent_dir, &call) => false };
-    if !finished {
-        kill_group(&mut child).await;
-    } else if let Some(group) = group {
-        // A speak command can exit leaving a child still playing (a backgrounded player); its group
-        // goes too. Linux keeps a group's number reserved while any member lives, so this reaches
-        // only them; with none left it finds nothing.
-        // SAFETY: killpg() only sends a signal.
-        unsafe { libc::killpg(group as i32, libc::SIGKILL) };
+    tokio::select! {
+        () = async { tokio::join!(session, quick, playback); } => {},
+        () = stop.cancelled() => {},
+        () = turn.closed.cancelled() => {},
+        () = ended(&agent_dir, &turn.call) => {},
     }
 }
 
-// The speak command's stdin, what the model has written that isn't ready to say yet, and the token
-// that ends the turn when the command stops taking lines.
+// A player's entire process group belongs to its turn, including on cancellation.
+struct Group(Option<u32>);
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 { unsafe { libc::killpg(group as i32, libc::SIGKILL) }; }
+    }
+}
+
+// Run the BYO audio reply in the speaker's queue. Its stdout is only the words it actually
+// played. A failure is silent to the later voices, not an invented acknowledgment.
+async fn reply_audio(
+    command: &str,
+    recording: &Recording,
+    turn: &Turn,
+    stop: &CancellationToken,
+    first_text: oneshot::Sender<String>,
+) -> Option<String> {
+    let input = std::fs::File::open(recording.0.join("input.wav")).ok()?;
+    let mut child = shell(command)
+        .env("PICCOSTA_VOICE_REPLY_AUDIO", recording.0.join("reply.wav"))
+        .stdin(input)
+        .stdout(Stdio::piped())
+        .stderr(log().map_or(Stdio::null(), Stdio::from))
+        .spawn()
+        .map_err(|e| note(&format!("couldn't run voice.reply: {e}")))
+        .ok()?;
+    // Dropping the outer speech future must kill the reply's player too, even in the middle
+    // of a read. The child stays unreaped until this guard exists.
+    let _group = Group(child.id());
+    let mut output = String::new();
+    let read = async {
+        use tokio::io::AsyncReadExt;
+        let mut lines = tokio::io::BufReader::new(child.stdout.take()?.take(QUICK_CONTEXT_CHARS as u64)).lines();
+        let first = lines.next_line().await.ok()?.unwrap_or_default();
+        let _ = first_text.send(first.clone());
+        output = first;
+        while let Some(line) = lines.next_line().await.ok()? { output.push(' '); output.push_str(&line); }
+        child.wait().await.ok().filter(|status| status.success())
+    };
+    let agent_dir = crate::config::agent_dir();
+    let finished = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(LISTEN_FINISH_SECONDS), read) => matches!(result, Ok(Some(_))),
+        () = stop.cancelled() => false,
+        () = turn.closed.cancelled() => false,
+        () = ended(&agent_dir, &turn.call) => false,
+    };
+    kill_group(&mut child).await;
+    if !finished {
+        note("voice.reply didn't finish; no reply text is passed on");
+        return None;
+    }
+    note(&format!(
+        "voice.reply finished in {:.3} s (session {})",
+        turn.started.elapsed().as_secs_f64(),
+        turn.session_id
+    ));
+    Some(output.trim().to_string())
+}
+
+// Split streamed text into individual queue entries, including whole non-streaming responses.
 struct Speaker {
-    stdin: Option<ChildStdin>,
+    lines: mpsc::UnboundedSender<Line>,
     pending: String,
-    cut: CancellationToken,
-    started: Instant,
     source: &'static str,
-    first: bool,
-    session_id: String,
+    limit: usize,
+    sent: usize,
+    sentences: bool,
 }
 
 impl Speaker {
-    // Add text the model wrote, and send the speak command the part that's ready: up to the last
-    // sentence end (., ! or ? before a space) or line break, or all of it once the text is
-    // `finished`. Each piece goes as one line, its line breaks made spaces. A speak command that
-    // has gone, or hasn't taken a line in SPEAK_WRITE_SECONDS, ends the turn.
-    async fn add(&mut self, text: &str, finished: bool) {
+    fn new(lines: mpsc::UnboundedSender<Line>, source: &'static str, limit: usize, sentences: bool) -> Self {
+        Self { lines, pending: String::new(), source, limit, sent: 0, sentences }
+    }
+
+    fn add(&mut self, text: &str, finished: bool) {
+        if self.sent == self.limit { return; }
         self.pending.push_str(text);
-        let pending = &self.pending;
-        let boundary = pending.char_indices().zip(pending.chars().skip(1)).filter(|((_, character), next)| *character == '\n' || (".!?".contains(*character) && next.is_whitespace()));
-        let Some(end) = (if finished { Some(pending.len()) } else { boundary.map(|((index, character), _)| index + character.len_utf8()).last() }) else { return };
-        let piece = self.pending.drain(..end).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-        if let (false, Some(stdin)) = (piece.is_empty(), &mut self.stdin) {
-            if matches!(tokio::time::timeout(Duration::from_secs(SPEAK_WRITE_SECONDS), stdin.write_all(format!("{piece}\n").as_bytes())).await, Ok(Ok(()))) {
-                if self.first {
-                    note(&format!("{} first line to voice.speak in {:.3} s (session {})", self.source, self.started.elapsed().as_secs_f64(), self.session_id));
-                    self.first = false;
-                }
-            } else {
-                note("voice.speak stopped taking lines; it's killed and the rest of this turn isn't said");
-                self.stdin = None;
-                self.cut.cancel();
+        while self.sent < self.limit {
+            let mut boundaries = self.pending.char_indices().zip(self.pending.chars().skip(1))
+                .filter(|((_, character), next)| *character == '\n' || (".!?".contains(*character) && next.is_whitespace()))
+                .map(|((index, character), _)| index + character.len_utf8());
+            let boundary = if self.sentences { boundaries.next() } else if finished { Some(self.pending.len()) } else { boundaries.last() };
+            let Some(end) = boundary.or_else(|| finished.then_some(self.pending.len())) else { break };
+            if end == 0 { break; }
+            let piece = spoken(&self.pending.drain(..end).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" "));
+            if !piece.is_empty() && piece != SILENT {
+                let _ = self.lines.send(Line::Say(self.source, piece));
+                self.sent += 1;
             }
         }
     }
+}
+
+// A line as speech: markdown's marks (a heading's #s, a list's bullet, a quote's >, emphasis and
+// code marks) aren't words, so whatever speaks it gets plain text.
+fn spoken(line: &str) -> String {
+    let line = line.trim_start();
+    let line = match line.trim_start_matches('#') {
+        rest if rest.len() < line.len() && rest.starts_with(' ') => rest,
+        _ => line,
+    };
+    let line = ["- ", "* ", "+ ", "• ", "> "].iter().find_map(|marker| line.strip_prefix(marker)).unwrap_or(line);
+    // An asterisk is emphasis when it touches a word on one side only, as markdown's flanking rule
+    // has it; with a word on both sides (2*3) or space on both (2 * 3) it's maths and stays.
+    let characters: Vec<char> = line.chars().collect();
+    let word = |at: Option<&char>| at.is_some_and(|character| character.is_alphanumeric());
+    let space = |at: Option<&char>| at.is_none_or(|character| character.is_whitespace());
+    let mark = |index: usize| {
+        let (before, after) = (index.checked_sub(1).and_then(|before| characters.get(before)), characters.get(index + 1));
+        !(word(before) && word(after)) && !(space(before) && space(after))
+    };
+    characters.iter().enumerate().filter(|&(index, &character)| character != '`' && !(character == '*' && mark(index))).map(|(_, character)| character).collect::<String>().trim().to_string()
 }
 
 // Ask the quick model for its answer to the turn's words, with the conversation's end, and give the
 // speaker its text as it streams (or all at once, from a provider that didn't stream it). Uncached,
 // with no saved session (a fresh routing id for HTTP), what it cost goes to SPENT, for the
 // session's statistics. A model that fails says nothing.
-async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Option<()> {
+async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker, first: &str, overtaken: &CancellationToken) -> Option<()> {
+    if overtaken.is_cancelled() { return None; }
     // Lists arrive in the background. A failed lookup at session creation mustn't disable every
     // later turn; read the current list here, waiting for startup only if this model is missing.
     let path = crate::config::agent_dir().join("models.json");
@@ -678,12 +954,15 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
     note(&format!("voice.quick trying {} (session {})", quick.name, turn.session_id));
     let credential = crate::auth::credential_for(&model.provider, config.as_ref(), &quick.credentials).await.map_err(|error| note(&format!("voice.quick: {error}"))).ok()?;
     let messages = [
-        Message::System(SystemMessage { content: TextOrBlocks::Text(QUICK_PROMPT.into()), sections: None, tools_added: None, tools_removed: None, timestamp: 0 }),
-        Message::User(UserMessage { content: TextOrBlocks::Text(format!("The conversation so far, its end:\n\n{}The user just said: {}", turn.transcript, turn.words)), timestamp: crate::clock::now_ms() }),
+        Message::System(SystemMessage { content: TextOrBlocks::Text(if turn.reply.is_some() { LAYERED_PROMPT } else { QUICK_PROMPT }.into()), sections: None, tools_added: None, tools_removed: None, timestamp: 0 ,
+        }),
+        Message::User(UserMessage { content: TextOrBlocks::Text(format!("The conversation so far, its end:\n\n{}The user just said: {}{}", turn.transcript, turn.words,
+            if turn.reply.is_some() { format!("\n\nThe first voice already said: {first}") } else { String::new() })),  timestamp: crate::clock::now_ms() ,
+        }),
     ];
     let session_id = uuid::Uuid::now_v7().to_string();
     let (sender, mut events) = mpsc::unbounded_channel();
-    let cancel = CancellationToken::new();
+    let cancel = overtaken.child_token();
     let _cancel = cancel.clone().drop_guard();
     let request = Request {
         model: &model,
@@ -695,7 +974,7 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
         thinking_level: crate::provider::clamp_thinking_level(&model, "off"),
         session_file: None,
         cwd: &quick.cwd,
-        cancel,
+        cancel: cancel.clone(),
     };
     let mut streamed = false;
     let read = async {
@@ -705,7 +984,8 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
                     note(&format!("voice.quick first text in {:.3} s (session {})", turn.started.elapsed().as_secs_f64(), turn.session_id));
                 }
                 streamed = true;
-                speaker.add(&delta, false).await;
+                if !overtaken.is_cancelled() { speaker.add(&delta, false); }
+                if speaker.sent == speaker.limit { cancel.cancel(); }
             }
         }
     };
@@ -715,10 +995,15 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
         if text.trim().is_empty() {
             note("voice.quick returned no speech");
         }
-        speaker.add(&text, false).await;
+        if !overtaken.is_cancelled() { speaker.add(&text, true); }
     }
     if let Some(error) = &reply.error_message {
         note(&format!("voice.quick: {error}"));
     }
-    (reply.usage.input + reply.usage.output > 0).then(|| SPENT.send_modify(|spent| spent.push((turn.session_id.clone(), reply.provider, reply.model, reply.usage))))
+    (reply.usage.input + reply.usage.output > 0).then(|| {
+        SPENT.send_modify(|spent| {
+            spent.push((turn.session_id.clone(), reply.provider, reply.model, reply.usage,))
+}
+)
+    })
 }

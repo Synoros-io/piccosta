@@ -278,6 +278,7 @@ pub struct AgentConfig {
     pub transport: String,
     // Background jobs' finish messages.
     pub notices: mpsc::UnboundedReceiver<CustomMessage>,
+    pub voice: crate::voice::State,
     pub gate: Option<Gate>,
     // Print and json mode: hold the run open while a background job runs, so its finish message
     // becomes a turn before the process exits.
@@ -813,7 +814,15 @@ impl Agent {
             let aborted = self.cancel.is_cancelled();
             // Background jobs that finished during the turn, and what the user queued to steer,
             // go into the next one.
-            let steering = if aborted { Vec::new() } else { self.steering() };
+            let mut steering = if aborted { Vec::new() } else { self.steering() };
+            if !aborted && let Some(mut note) = self.config.voice.finish(&self.cancel, !has_calls).await {
+                // Name the draft too: "above" alone can make the model add its own answer again.
+                let draft = TextOrBlocks::Blocks(assistant.content.clone()).text();
+                if !draft.trim().is_empty() {
+                    note.content = TextOrBlocks::Text(format!("{} Also already being spoken: {}", note.content.text(), draft));
+                }
+                steering.push(AgentMessage::Custom(note));
+            }
             if aborted || (!has_calls && steering.is_empty()) {
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
                 return Ok(RunOutcome { aborted, retry: None, last_assistant: Some((assistant, entry_id)) });

@@ -1,6 +1,5 @@
-// lfm: LFM3-Audio-2B as the two commands of piccosta's voice mode, speech in and text out (`listen`), text in
-// and speech out (`speak`), through stdin and stdout, each loading the model itself or using the one an `lfm serve`
-// holds for the length of a call.
+// lfm: speech to text (`listen`), text to speech (`speak`), and the model's own spoken answer
+// (`reply`). Each loads the model itself or uses the one `lfm serve` holds for a call.
 
 use lfm::{VERBOSE, audio, codec::Codec, model::Model, note, quant::Format, tensor::Result};
 use std::{
@@ -21,7 +20,8 @@ const USAGE: &str = "\
 usage: lfm listen [options] [FILE]   transcribe 16 kHz WAV speech (FILE, or stdin) to stdout, once it ends
        lfm speak [options] [TEXT]    speak TEXT as a 24 kHz WAV on stdout, or else each line of stdin as it
                                      comes, into one WAV stream a player can play as it comes
-       lfm serve [options] SOCKET    hold the model for listen and speak --server SOCKET until killed
+       lfm reply [options] [FILE]    answer WAV speech: text on stdout, 24 kHz WAV at -o FILE (required)
+       lfm serve [options] SOCKET    hold the model for listen, speak and reply --server SOCKET until killed
        lfm decode [options] [FILE]   decode speech codes (a frame of codes a line) to a WAV on stdout
 options:
   --model DIR     the LFM3-Audio-2B checkpoint directory (default: $LFM_MODEL_DIR); its files are read in
@@ -33,14 +33,15 @@ options:
   --device NAME   where the language model and depth decoder run: cpu, or gpu when lfm is built with its
                   gpu feature (default: $LFM_DEVICE, else cpu)
   --system TEXT   the system prompt: the task, its language and the voice
-  --max N         at most N text tokens (listen) or speech frames (speak, decode)
+  --max N         at most N text tokens (listen), speech frames (speak, decode), or mixed slots (reply)
   --max-input N   refuse input over N bytes (default: $LFM_MAX_INPUT, else 64 MiB)
   --max-audio N   refuse speech over N seconds (default: $LFM_MAX_AUDIO, else 300)
   --max-prompt N  refuse prompts over N rows of text and speech (default: $LFM_MAX_PROMPT, else 4096)
   --seed N        the speech sampling seed (default: the clock)
-  --greedy        speak deterministically: the likeliest codes, codebooks in order
-  --raw           listen to headerless 16-bit mono PCM at 16 kHz (pw-record --container raw) instead of a WAV
-  --server SOCKET listen or speak (stdin only) with the model of the lfm serve at SOCKET; the options that
+  --greedy        generate speech deterministically: the likeliest codes, codebooks in order
+  --raw           listen/reply to headerless 16-bit mono PCM at 16 kHz instead of a WAV
+  --server SOCKET listen, speak or reply (stdin only) with the model of lfm serve; reply still needs -o.
+                  The options that
                   shape the model's work are the server's, and a client takes none but --raw
   -o FILE         write the WAV to FILE instead of stdout
   -v              timings on stderr";
@@ -49,6 +50,13 @@ options:
 // for a transcript, 256 frames (20 seconds) of speech.
 const LISTEN_PROMPT: &str = "Perform ASR in English.";
 const SPEAK_PROMPT: &str = "Perform TTS in American English using a female voice.";
+// Even one factual sentence can take seconds to say; leave the full answer to the session.
+const REPLY_PROMPT: &str = "Respond with interleaved text and audio. Give only a tiny acknowledgment: Okay. Or a one-word answer if you know. Another assistant handles the full answer. Never explain, restate the question, ask a question back, or claim to have done anything.";
+// A short reply shares TTS's twenty-second cap, counted in mixed text/speech slots.
+const REPLY_MAX_SLOTS: usize = SPEAK_MAX_FRAMES;
+// As in Liquid's streaming rig: first sound after 160 ms of speech, then 480 ms chunks.
+const FIRST_REPLY_FRAMES: usize = 2;
+const REPLY_CHUNK_FRAMES: usize = 6;
 const LISTEN_MAX_TOKENS: usize = 1024;
 const SPEAK_MAX_FRAMES: usize = 256;
 
@@ -148,18 +156,22 @@ fn run() -> Result<()> {
         }
     }
     match (command.as_str(), server) {
-        ("listen" | "speak", Some(_)) if !rest.is_empty() => {
+        ("listen" | "speak"| "reply", Some(_)) if !rest.is_empty() => {
             return Err("--server reads stdin, not FILE or TEXT".into());
         }
-        ("listen" | "speak", Some(socket)) => {
-            return client(&socket, if raw { "listen --raw" } else { &command });
+        ("listen" | "speak"| "reply", Some(socket)) => {
+            let request = if raw { format!("{command} --raw") } else { command.clone() };
+            return client(&socket,  &request, output);
         }
         // a server says what both commands ask, so it takes neither's prompt or budget
         ("serve", None) if system.is_some() || max.is_some() => {
             return Err("lfm serve listens and speaks, so it takes no --system or --max".into());
         }
-        ("listen" | "speak" | "decode" | "serve", None) => {}
+        ("listen" | "speak" | "reply" | "decode" | "serve", None) => {}
         _ => return Err(USAGE.into()),
+    }
+    if command == "reply" && output.is_none() {
+        return Err("lfm reply needs -o FILE for its audio; stdout is its text".into());
     }
     // a flag's or variable's whole number, at least one: rayon would read a zero thread count as "its own choice"
     let positive = |setting: Option<(String, String)>, default: u64| match setting {
@@ -244,9 +256,9 @@ fn run() -> Result<()> {
     }
     // What the model does, for this command or for a server's clients one at a time: speech to the transcript's
     // line, or text to its speech as 16-bit PCM.
-    let mut work = |job: Job| -> Result<Vec<u8>> {
+    let mut work = |job: Job, put: &mut dyn FnMut(Vec<u8>) -> Result<()>| -> Result<Vec<u8>> {
         match job {
-            Job::Hear(mut input, raw, streamed) => {
+            Job::Hear(mut input, raw, streamed, reply) => {
                 if raw {
                     // The raw input is complete now, so its synthetic WAV header has a known length.
                     let header = audio::wav_header(model.mel.rate, input.len() as u32);
@@ -259,6 +271,36 @@ fn run() -> Result<()> {
                 if rate != model.mel.rate {
                     let wanted = model.mel.rate;
                     return Err(format!("the audio is {rate} Hz; resample it to {wanted} Hz (ffmpeg -ar {wanted})"));
+                }
+                if reply {
+                    let codec = codec.as_ref().ok_or("no codec")?;
+                    let (mut stream, mut sent) = (codec.stream(), 0);
+                    // Each result is a text length, its UTF-8 bytes, then WAV/PCM bytes. Audio
+                    // chunks have no text; the last result carries the answer's text, no audio.
+                    put([0u32.to_le_bytes().to_vec(), audio::wav_header(codec.rate, u32::MAX)].concat())?;
+                    let began = Instant::now();
+                    let mut chunks = |frames: &[Vec<u32>], done: bool| {
+                        let count = if sent == 0 { FIRST_REPLY_FRAMES } else { REPLY_CHUNK_FRAMES };
+                        if done || frames.len() - sent >= count {
+                            let samples = codec.decode_chunk(&frames[sent..], &mut stream, done)?;
+                            if sent == 0 && !samples.is_empty() {
+                                note("reply first audio", began);
+                            }
+                            sent = frames.len();
+                            put([0u32.to_le_bytes().to_vec(), audio::pcm(&samples)].concat())?;
+                        }
+                        Ok(())
+                    };
+                    let (text, frames) = model.reply(
+                        &samples,
+                        system.as_deref().unwrap_or(REPLY_PROMPT),
+                        max.unwrap_or(REPLY_MAX_SLOTS),
+                        &mut sampler,
+                        &mut chunks,
+                    )?;
+                    lfm::tensor::dump("frames", &frames.iter().flatten().map(|&code| code as f32).collect::<Vec<_>>());
+                    return Ok(
+                        [((text.len() + 1) as u32).to_le_bytes().to_vec(), format!("{text}\n").into_bytes()].concat());
                 }
                 let system = system.as_deref().unwrap_or(LISTEN_PROMPT);
                 let text = model.transcribe(&samples, system, max.unwrap_or(LISTEN_MAX_TOKENS))?;
@@ -283,10 +325,16 @@ fn run() -> Result<()> {
     match (command.as_str(), listener) {
         ("listen", _) => {
             let input = read_input(rest.first(), max_input)?;
-            print!("{}", String::from_utf8_lossy(&work(Job::Hear(input, raw, rest.is_empty()))?));
+            print!("{}", String::from_utf8_lossy(&work(Job::Hear(input, raw, rest.is_empty(), false), &mut |_| Ok(()))?));
+        }
+        ("reply", _) => {
+            let input = read_input(rest.first(), max_input)?;
+            let mut out = write_output(output)?.1;
+            let bytes = work(Job::Hear(input, raw, rest.is_empty(), true), &mut |bytes| put_answer(&bytes, &mut out))?;
+            put_answer(&bytes, &mut out)?;
         }
         ("speak", _) if !rest.is_empty() => {
-            let pcm = work(Job::Say(rest.join(" ").trim().into()))?;
+            let pcm = work(Job::Say(rest.join(" ").trim().into()), &mut |_| Ok(()))?;
             let (name, mut out) = write_output(output)?;
             out.write_all(&[audio::wav_header(rate, pcm.len() as u32), pcm].concat())
                 .map_err(|e| format!("{name}: {e}"))?;
@@ -297,7 +345,7 @@ fn run() -> Result<()> {
                 std::io::stdin().lock(),
                 rate,
                 max_input,
-                |text| work(Job::Say(text.into())),
+                |text| work(Job::Say(text.into()), &mut |_| Ok(())),
                 |result| match result {
                     Ok(bytes) => out.write_all(&bytes).and_then(|()| out.flush()).map_err(|e| format!("{name}: {e}")),
                     Err(error) => {
@@ -333,7 +381,8 @@ fn run() -> Result<()> {
                 }
             });
             for (job, reply) in queue {
-                let _ = reply.send(work(job));
+                let result = work(job, &mut |bytes| reply.send(Ok(bytes)).map_err(|e| e.to_string()));
+                let _ = reply.send(result);
             }
         }
         _ => unreachable!(),
@@ -346,7 +395,7 @@ fn run() -> Result<()> {
 
 // A job for the model: speech to hear (a WAV, or with true bare 16-bit samples), or a line of text to say.
 enum Job {
-    Hear(Vec<u8>, bool, bool),
+    Hear(Vec<u8>, bool, bool, bool),
     Say(String),
 }
 
@@ -414,20 +463,17 @@ fn send_reply(out: &mut UnixStream, result: Result<Vec<u8>>) -> Result<()> {
 // a bounded input, and socket deadlines; a full model queue refuses work instead of retaining it.
 fn serve(client: &mut UnixStream, jobs: mpsc::SyncSender<(Job, Reply)>, rate: u32, limit: u64) -> Result<()> {
     send_reply(client, Ok(Vec::new()))?;
-    let ask = |job| {
-        let (reply, answer) = mpsc::channel();
-        jobs.try_send((job, reply)).map_err(|e| format!("model queue unavailable: {e}"))?;
-        answer.recv().map_err(|e| format!("the model: {e}"))?
-    };
     let mut input = BufReader::new(client.try_clone().map_err(|e| e.to_string())?);
     let mut request = String::new();
     (&mut input).take(MAX_LINE_BYTES).read_line(&mut request).map_err(|e| format!("the client: {e}"))?;
     client.set_read_timeout(None).map_err(|e| format!("the client: {e}"))?;
     match request.trim() {
-        "speak" => {
-            say_lines(input, rate, limit, |text| ask(Job::Say(text.into())), |result| send_reply(client, result))
-        }
-        hear @ ("listen" | "listen --raw") => {
+        "speak" => say_lines(input, rate, limit, |text| {
+            let (reply, answer) = mpsc::channel();
+            jobs.try_send((Job::Say(text.into()), reply)).map_err(|e| e.to_string())?;
+            answer.recv().map_err(|e| e.to_string())?
+        }, |result| send_reply(client, result)),
+        hear @ ("listen" | "listen --raw" | "reply" | "reply --raw") => {
             let (mut speech, mut chunk) = (Vec::new(), [0; AUDIO_CHUNK_BYTES]);
             loop {
                 let left = limit.saturating_sub(speech.len() as u64).saturating_add(1);
@@ -441,9 +487,15 @@ fn serve(client: &mut UnixStream, jobs: mpsc::SyncSender<(Job, Reply)>, rate: u3
                 speech.extend_from_slice(&chunk[..count]);
                 send_reply(client, Ok(Vec::new()))?;
             }
-            send_reply(client, ask(Job::Hear(speech, hear == "listen --raw", true)))
+            let(reply, answer) = mpsc::channel();
+            jobs.try_send((Job::Hear(speech, hear .ends_with(" --raw"), true, hear.starts_with("reply")), reply))
+                .map_err(|e| format!("model queue unavailable: {e}"))?;
+            for result in answer {
+                send_reply(client, result)?;
+            }
+            Ok(())
         }
-        other => Err(format!("a client asked for {other:?}, not listen, listen --raw or speak")),
+        other => Err(format!("a client asked for {other:?}, not listen, reply or speak")),
     }
 }
 
@@ -465,7 +517,15 @@ fn receive_reply(server: &mut UnixStream) -> Result<Option<Result<Vec<u8>>>> {
 // Connect without ever waiting in a full accept backlog. Startup has one deadline, including the
 // ready reply; after it, only a server that stops reading has a bound (IDLE_WAIT), since waiting for
 // audio while the model is quiet is a normal part of a call.
-fn client(socket: &str, request: &str) -> Result<()> {
+fn client(socket: &str, request: &str, output: Option<String>) -> Result<()> {
+    let mut audio = if request.starts_with("reply") {
+        if output.is_none() {
+            return Err("lfm reply needs -o FILE for its audio; stdout is its text".into());
+        }
+        Some(write_output(output)?.1)
+    } else {
+        None
+    };
     let fail = |e: std::io::Error| format!("{socket}: {e}");
     let deadline = Instant::now() + STARTUP_WAIT;
     let mut server: UnixStream = loop {
@@ -508,6 +568,7 @@ fn client(socket: &str, request: &str) -> Result<()> {
     let (mut out, mut refused) = (std::io::stdout().lock(), false);
     while let Some(reply) = receive_reply(&mut server)? {
         match reply {
+            Ok(bytes) if !bytes.is_empty() && audio.is_some() => put_answer(&bytes, audio.as_mut().unwrap())?,
             Ok(bytes) => out.write_all(&bytes).and_then(|()| out.flush()).map_err(|e| format!("stdout: {e}"))?,
             Err(error) => {
                 eprintln!("lfm: {error}");
@@ -516,6 +577,17 @@ fn client(socket: &str, request: &str) -> Result<()> {
         }
     }
     if refused { Err("server refused input".into()) } else { Ok(()) }
+}
+
+// Split a reply's length-prefixed UTF-8 text and WAV. A malformed server result never becomes
+// a length used for indexing unchecked memory.
+fn put_answer(bytes: &[u8], audio: &mut dyn Write) -> Result<()> {
+    let size = bytes.get(..4).ok_or("reply has no text length")?;
+    let end =
+        4usize.checked_add(u32::from_le_bytes(size.try_into().unwrap()) as usize).ok_or("reply length overflow")?;
+    let text = bytes.get(4..end).ok_or("reply text is truncated")?;
+    audio.write_all(bytes.get(end..).ok_or("reply audio is truncated")?).map_err(|e| e.to_string())?;
+    std::io::stdout().write_all(text).map_err(|e| e.to_string())
 }
 
 // The bytes of FILE, or of stdin when there is none, refused past `limit` (read_limited).
@@ -553,6 +625,7 @@ fn write_output(file: Option<String>) -> Result<(String, Box<dyn Write>)> {
     if lfm::tensor::is_mapped(&out.metadata().map_err(fail)?) {
         return Err(format!("{path} is a checkpoint file lfm is reading; write the WAV somewhere else"));
     }
-    out.set_len(0).map_err(fail)?;
+    // Pipes let a reply's audio reach a player while its text stays on stdout.
+    if out.metadata().map_err(fail)?.is_file() { out.set_len(0).map_err(fail)?; }
     Ok((path, Box::new(out)))
 }

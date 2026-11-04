@@ -531,6 +531,7 @@ pub struct Tokens {
     audio_out: u32,
     audio_start: u32,
     mixed_start: u32,
+    text_end: u32,
 }
 
 // One part of a prompt: a token, plain text to encode, or a run of rows the speech encoder fills.
@@ -555,6 +556,8 @@ enum Decoder {
     Gpu(Box<gpu::Session>),
 }
 
+type FrameStream<'a> = dyn FnMut(&[Vec<u32>], bool) -> Result<()> + 'a;
+
 pub struct Model {
     pub tokenizer: Tokenizer,
     pub mel: MelSpectrogram,
@@ -568,6 +571,7 @@ pub struct Model {
     codebook_size: usize,
     eos_code: u32,
     generation: Value,
+    interleaved: (usize, usize),
     // the most rows a prompt may give the language model, text tokens and speech rows together; the caller's
     // resource budget, unlimited until it sets one
     pub max_prompt: usize,
@@ -683,9 +687,9 @@ impl Model {
             audio_out: id("<|audio_out|>")?,
             audio_start: id("<|audio_start|>")?,
             mixed_start: id("<|mixed_start|>")?,
+            text_end: id("<|text_end|>")?,
         };
-        // a turn ends at any of the generation config's end tokens, and at <|text_end|> outside interleaved
-        // speech, which this port does not generate
+        // Outside interleaved speech, <|text_end|> ends the turn too.
         let mut stop: Vec<u32> = match &generation["eos_token_id"] {
             Value::Array(ids) => ids.iter().filter_map(Value::as_u64).map(|id| id as u32).collect(),
             single => single.as_u64().map(|id| id as u32).into_iter().collect(),
@@ -731,6 +735,10 @@ impl Model {
             codebook_size,
             tokenizer,
             generation,
+            interleaved: (
+                number(&config["interleaved_n_text"], "interleaved_n_text")? as usize,
+                number(&config["interleaved_n_audio"], "interleaved_n_audio")? as usize,
+            ),
             max_prompt: usize::MAX,
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -785,7 +793,7 @@ impl Model {
         );
         let prompt = self.prompt(system, Part::Audio(audio.len() / self.lm.hidden), false);
         let suppress = [self.tokens.audio_start, self.tokens.mixed_start];
-        let reply = self.generate(self.embed(&prompt, &audio)?, false, &suppress, max_tokens, &mut self.sampler(0))?;
+        let reply = self.generate(self.embed(&prompt, &audio)?, false, &suppress, max_tokens, &mut self.sampler(0), None)?;
         Ok(self.tokenizer.decode(&reply.0))
     }
 
@@ -793,7 +801,25 @@ impl Model {
     // English using a female voice."), at most `max_frames` of them.
     pub fn speak(&self, text: &str, system: &str, max_frames: usize, sampler: &mut Sampler) -> Result<Vec<Vec<u32>>> {
         let prompt = self.prompt(system, Part::Text(crate::normalize::english(text).into_owned()), true);
-        Ok(self.generate(self.embed(&prompt, &[])?, true, &[self.tokens.mixed_start], max_frames, sampler)?.1)
+        Ok(self.generate(self.embed(&prompt, &[])?, true, &[self.tokens.mixed_start], max_frames, sampler, None)?.1)
+    }
+
+    // A spoken answer to the audio, not its transcript. Liquid's interleaved mode alternates the
+    // checkpoint's text and speech block sizes, then speaks the tail after <|text_end|>.
+    pub fn reply(
+        &self,
+        samples: &[f32],
+        system: &str,
+        max_slots: usize,
+        sampler: &mut Sampler,
+        emit: &mut FrameStream<'_>,
+    ) -> Result<(String, Vec<Vec<u32>>)> {
+        let mel = self.mel.compute(samples, self.max_prompt.saturating_mul(DOWNSAMPLING))?;
+        let audio = self.encoder.encode(&mel, self.mel.mels());
+        let mut prompt = self.prompt(system, Part::Audio(audio.len() / self.lm.hidden), false);
+        prompt.push(Part::Token(self.tokens.mixed_start));
+        let (text, frames) = self.generate(self.embed(&prompt, &audio)?, false, &[], max_slots, sampler, Some(emit))?;
+        Ok((self.tokenizer.decode(&text), frames))
     }
 
     // The ChatML turns of the checkpoint's chat template: <|startoftext|>, then <|im_start|>role\ncontent<|im_end|>\n
@@ -855,7 +881,13 @@ impl Model {
         suppress: &[u32],
         max_slots: usize,
         sampler: &mut Sampler,
+        mut emit: Option<&mut FrameStream<'_>>,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>)> {
+        let mut interleaved = emit.as_ref().map(|_| self.interleaved);
+        if interleaved.is_some_and(|(text, audio)| text == 0 || audio == 0) {
+            return Err("interleaved block sizes must be positive".into());
+        }
+        let (mut left, mut text_done) = (interleaved.map_or(0, |sizes| sizes.0), false);
         let mut start = Instant::now();
         let (mut text, mut frames) = (Vec::new(), Vec::new());
         let banned: Vec<u32> = suppress.iter().chain([&self.tokens.audio, &self.tokens.audio_out]).copied().collect();
@@ -879,20 +911,53 @@ impl Model {
                 if codes.contains(&self.eos_code) {
                     // any end-of-audio code ends the speech, and the frame goes back in as all end-of-audio codes
                     speaking = false;
+                    interleaved = None;
                     codes.fill(self.eos_code);
                 } else {
                     frames.push(codes.clone());
+                if let Some(emit) = &mut emit {
+                        emit(&frames, false)?;
+                    }
                 }
                 Input::Frame(codes)
             } else {
-                let token = picked[0];
-                if self.stop.contains(&token) {
+                // Close reply text at the first sentence boundary, before feeding another word.
+                // Let its speech tail finish normally; cutting frames here would clip the sentence.
+                let token = if emit.is_some()
+                    && self.tokenizer.decode(&text).trim_end().ends_with(['.', '!', '?'])
+                    && self.tokenizer.decode(&[picked[0]]).starts_with(char::is_whitespace)
+                { self.tokens.text_end } else { picked[0] };
+                if token == self.tokens.text_end && interleaved.is_some() {
+                    text_done = true;
+                    speaking = true;
+                } else if self.stop.contains(&token) {
                     break;
                 }
-                text.push(token);
-                speaking = token == self.tokens.audio_start;
+                else {
+                    text.push(token);
+                if interleaved.is_none() {
+                        speaking = token == self.tokens.audio_start;
+                if token == self.tokens.mixed_start {
+                            interleaved = Some(self.interleaved);
+                            left = self.interleaved.0;
+                            text_done = false;
+                        }
+                    }
+                }
                 Input::Token(token)
             };
+            if let Some((text_slots, audio_slots)) = interleaved
+                && !text_done
+            {
+                left -= 1;
+                if left == 0 {
+                    speaking = !speaking;
+                    left = if speaking { audio_slots } else { text_slots };
+                }
+            }
+        }
+        if let Some(emit) = &mut emit {
+            emit(&frames, true)?;
         }
         let depth = match decoder {
             Decoder::Cpu(_, time) if !frames.is_empty() => format!(" ({time:.3} s of it in the depth decoder)"),

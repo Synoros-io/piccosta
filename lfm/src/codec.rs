@@ -3,7 +3,7 @@
 // and changed from them: rewritten in Rust, the decoder only.
 
 use crate::audio::MAX_FFT;
-use crate::model::{AttentionKind, Stack};
+use crate::model::{AttentionKind, Cache, Stack};
 use crate::tensor::{Linear, Matrix, Result, Weights, dump, matmul};
 use serde_json::Value;
 use std::{f64::consts::PI, path::Path};
@@ -30,6 +30,16 @@ pub struct Codec {
     window: Vec<f32>,
     frame_stack: usize,
     hop: usize,
+}
+
+// A decoder cache and the overlap-add tail that later frames still contribute to. This is
+// LiquidCodecStreamingCache: neither a chunk boundary nor its trim is a new utterance.
+pub struct Stream {
+    cache: Cache,
+    audio: Vec<f32>,
+    envelope: Vec<f32>,
+    started: bool,
+    finished: bool,
 }
 
 impl Codec {
@@ -108,13 +118,29 @@ impl Codec {
     // The audio of `frames`, one code per codebook each: frame_stack·hop samples a frame (1920 at 24 kHz).
     // A frame with the wrong number of codes, or a code past the quantizer's range, is refused.
     pub fn decode(&self, frames: &[Vec<u32>]) -> Result<Vec<f32>> {
+        let audio = self.decode_chunk(frames, &mut self.stream(), true)?;
+        dump("codec.audio", &audio);
+        Ok(audio)
+    }
+
+    pub fn stream(&self) -> Stream {
+        Stream { cache: self.stack.cache(), audio: Vec::new(), envelope: Vec::new(), started: false, finished: false }
+    }
+
+    // Decode only new frames. Until finalize, retain the samples the next chunk overlaps; the
+    // concatenated output is the same length and waveform as decoding all the frames at once.
+    pub fn decode_chunk(&self, frames: &[Vec<u32>], stream: &mut Stream, finalize: bool) -> Result<Vec<f32>> {
+        if stream.finished {
+            return Err("the codec stream is already finalized".into());
+        }
         let codes = self.levels.iter().product::<u32>();
         for (index, frame) in frames.iter().enumerate() {
             if frame.len() != self.codebooks || frame.iter().any(|&code| code >= codes) {
                 return Err(format!("frame {index} is not {} codes each below {codes}", self.codebooks));
             }
         }
-        if frames.is_empty() {
+        if frames.is_empty() && !stream.started {
+            stream.finished = finalize;
             return Ok(Vec::new());
         }
         // Finite scalar quantization: a code is a mixed-radix number over `levels`, and each digit, centred and
@@ -132,7 +158,9 @@ impl Codec {
         // each codec frame becomes frame_stack STFT frames: upsampling by a whole factor repeats it
         let mut x: Vec<f32> =
             embeddings.chunks(self.stack.hidden).flat_map(|row| row.repeat(self.frame_stack)).collect();
-        self.stack.forward(&mut x, &mut self.stack.cache());
+        if !x.is_empty() {
+            self.stack.forward(&mut x, &mut stream.cache);
+        }
         // each row's log magnitudes and phases become its complex spectrum, real parts then imaginary parts
         let out = self.lin.forward(&x);
         let bins = self.lin.weight.rows() / 2;
@@ -148,18 +176,29 @@ impl Codec {
         // windowed overlap-add, divided by the summed squared windows, without the first and last half overlap
         let fft = self.inverse.rows();
         let count = pieces.len() / fft;
+        let trim = (fft - self.hop) / 2;
+        let length = if count == 0 { 2 * trim } else { (count - 1) * self.hop + fft };
         let (mut audio, mut envelope) =
-            (vec![0f32; (count - 1) * self.hop + fft], vec![0f32; (count - 1) * self.hop + fft]);
+            (vec![0f32; length], vec![0f32; length]);
         for (index, piece) in pieces.chunks(fft).enumerate() {
             for (i, (value, w)) in piece.iter().zip(&self.window).enumerate() {
                 audio[index * self.hop + i] += value * w;
                 envelope[index * self.hop + i] += w * w;
             }
         }
-        let trim = (fft - self.hop) / 2;
-        let audio: Vec<f32> =
-            audio[trim..audio.len() - trim].iter().zip(&envelope[trim..]).map(|(a, e)| a / e).collect();
-        dump("codec.audio", &audio);
-        Ok(audio)
+        for (value, held) in audio.iter_mut().zip(&stream.audio) {
+            *value += held;
+        }
+        for (value, held) in envelope.iter_mut().zip(&stream.envelope) {
+            *value += held;
+        }
+        let begin = if stream.started { 0 } else { trim };
+        let end = audio.len() - if finalize { trim } else { 2 * trim };
+        let samples = audio[begin..end].iter().zip(&envelope[begin..end]).map(|(a, e)| a / e).collect();
+        stream.audio = if finalize { Vec::new() } else { audio.split_off(end) };
+        stream.envelope = if finalize { Vec::new() } else { envelope.split_off(end) };
+        stream.started = true;
+        stream.finished = finalize;
+        Ok(samples)
     }
 }

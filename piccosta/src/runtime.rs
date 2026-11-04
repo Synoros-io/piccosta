@@ -72,6 +72,7 @@ const READ_WAIT: Duration = Duration::from_secs(1);
 pub enum Command {
     Prompt(String, Vec<Content>),
     Message(String),
+    Voice(crate::message::CustomMessage),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
     Model(String),
@@ -167,9 +168,12 @@ impl Drop for Claim {
             lock(&self.gate).take();
             let mut session = Session::open(&self.file, self.file.parent().unwrap_or(Path::new("/"))).ok();
             while let Ok(command) = self.taken.try_recv() {
-                if let (Command::Message(text), Some(session)) = (command, session.as_mut())
-                    && !text.is_empty()
-                {
+                let text = match command {
+                    Command::Message(text) => Some(text),
+                    Command::Voice(input) => Some(input.content.text()),
+                    _ => None,
+                };
+                if let (Some(text), Some(session)) = (text, session.as_mut()) && !text.is_empty() {
                     let _ = session.queue(&text);
                 }
             }
@@ -260,6 +264,10 @@ fn listen(listener: tokio::net::UnixListener, gate: Gate, watch: Arc<Mutex<Watch
                     let (parent, job) = (std::env::var(crate::tools::subagent::SESSION_ENV).ok(), std::env::var(crate::tools::subagent::CHILD_ENV).ok());
                     json!({"working": since.is_some(), "since": since, "parent": parent, "job": job})
                 }
+                "voice" => json!({"ok": send(Command::Voice(crate::message::CustomMessage {
+                    custom_type: crate::voice::INPUT_TYPE.into(), content: crate::message::TextOrBlocks::Text(request["text"].as_str().unwrap_or_default().into()),
+                    display: true, details: Some(json!({"recording": request["recording"]})), timestamp: crate::clock::now_ms(),
+                }))}),
                 "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string()))}),
                 kind @ ("stop" | "close") => {
                     let (answer, answered) = oneshot::channel();
@@ -480,6 +488,17 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
     }
 }
 
+// A recording goes only to a live runtime. With nobody listening the transcript is queued as
+// usual, but its audio isn't left on disk waiting for a call that may never come back.
+pub(crate) fn send_voice(file: &Path, text: &str, recording: &Path) -> Result<bool, String> {
+    match ask(file, json!({"do": "voice", "text": text, "recording": recording}), ASK_WAIT) {
+        Asked::Nobody => send(file, text, None).map(|_| false),
+        Asked::Answered(answer) if answer["ok"] == true => Ok(true),
+        Asked::Answered(Value::Null) | Asked::Silent(_) => Ok(true),
+        _ => Err("the call's session didn't take its recording".into()),
+    }
+}
+
 // The runs launch started that have ended, for a manager watching its lanes.
 static ENDED: Mutex<Vec<Run>> = Mutex::new(Vec::new());
 
@@ -623,7 +642,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 work => work,
             };
-            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(..)));
+            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(..) | Command::Voice(..)));
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
             let result = {
@@ -696,6 +715,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         for command in left.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
             match command {
                 Command::Message(text) if !text.is_empty() => handle.steer(text),
+                Command::Voice(input) => handle.steer(input.content.text()),
                 Command::Stop(Some(answer)) | Command::Close(Some(answer)) => {
                     let _ = answer.send(());
                 }
@@ -753,6 +773,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
     match command {
         Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,
         Command::Message(text) => host.answer(agent, team, &text, Vec::new()).await,
+        Command::Voice(input) => agent.take_notice(input).await,
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;
             Ok(())

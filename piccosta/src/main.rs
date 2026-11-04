@@ -216,8 +216,11 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     if json || !team.models.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
+    // An answer that's only the call's silence marker says nothing here either.
     for block in &answer.content {
-        if let Content::Text { text, .. } = block {
+        if let Content::Text { text, .. } = block
+            && text.trim() != piccosta::voice::SILENT
+        {
             write_line(text);
         }
     }

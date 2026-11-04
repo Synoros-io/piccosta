@@ -118,6 +118,9 @@ pub fn report(text: &str, width: u16, tex: &mut Tex) -> Rows {
 // The model's response: thinking, text and tool calls in order, then how it ended when that
 // wasn't normally. `frame` turns running tools' spinners.
 pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut Tex) -> Rows {
+    // Keep the silence marker invisible while streaming too, including split tokens and blocks.
+    let text: String = blocks.iter().filter_map(|block| if let Block::Text(text) = block { Some(text.as_str()) } else { None }).collect();
+    let silent = crate::voice::SILENT.starts_with(text.trim());
     let mut writer = Writer::new(tex, width);
     for block in blocks {
         match block {
@@ -138,7 +141,8 @@ pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, t
                 writer.blank();
             }
             Block::Thinking(_) => {}
-            Block::Text(text) => writer.markdown(text),
+            Block::Text(text) if !silent => writer.markdown(text),
+            Block::Text(_) => {},
             Block::Call { id, name, arguments } => {
                 let view = tools.get(id).cloned().unwrap_or(ToolView { running: ended.is_none(), ..Default::default() });
                 writer.tool(name, arguments, &view, flags, frame);

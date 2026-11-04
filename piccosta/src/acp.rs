@@ -159,6 +159,9 @@ struct Live {
     error: Option<String>,
     // The assistant message streaming in, numbered for its messageId.
     message: u64,
+    // The message's text while it could still be the call's silence marker (voice.rs SILENT): it's
+    // sent once it's clearly not, and never when it is.
+    held: String,
     open: HashMap<String, OpenCall>,
     titled: bool,
     // The context the last response filled and the session's cost so far, for usage_update
@@ -552,19 +555,33 @@ impl Acp {
             return;
         }
         match event {
-            Event::MessageStart { message: AgentMessage::Assistant(_), .. } => live.message += 1,
+            Event::MessageStart { message: AgentMessage::Assistant(_), .. } => {
+                live.message += 1;
+                live.held.clear();
+            }
             Event::MessageUpdate { assistant_message_event, .. } => {
                 let kind = match assistant_message_event.get("type").and_then(Value::as_str) {
                     Some("text_delta") => "agent_message_chunk",
                     Some("thinking_delta") => "agent_thought_chunk",
                     _ => return,
                 };
-                let delta = assistant_message_event.get("delta").and_then(Value::as_str).unwrap_or("");
+                let mut delta = assistant_message_event.get("delta").and_then(Value::as_str).unwrap_or("").to_string();
+                if kind == "agent_message_chunk" {
+                    live.held.push_str(&delta);
+                    if crate::voice::SILENT.starts_with(live.held.trim_start()) {
+                        return;
+                    }
+                    delta = std::mem::take(&mut live.held);
+                }
                 if !delta.is_empty() {
-                    update(session, json!({"sessionUpdate": kind, "messageId": format!("live-{}", live.message), "content": text_block(delta)}));
+                    update(session, json!({"sessionUpdate": kind, "messageId": format!("live-{}", live.message), "content": text_block(&delta)}));
                 }
             }
             Event::MessageEnd { message: AgentMessage::Assistant(assistant), .. } => {
+                let held = std::mem::take(&mut live.held);
+                if !held.trim().is_empty() && held.trim() != crate::voice::SILENT {
+                    update(session, json!({"sessionUpdate": "agent_message_chunk", "messageId": format!("live-{}", live.message), "content": text_block(&held)}));
+                }
                 let usage = &assistant.usage;
                 let used = usage.input + usage.output + usage.cache_read + usage.cache_write;
                 live.cost.add(usage, &assistant.provider);
@@ -771,7 +788,7 @@ impl Acp {
         });
         let live = Live {
             serial, host, shared, runs, commands, task, model: live_model, thinking: live_thinking, approvals, owed: VecDeque::new(), muted: 0, prompt: None, cancelled: false,
-            prompts: 0, stop: None, error: None, message: 0, open: HashMap::new(), titled, used, cost,
+            prompts: 0, stop: None, error: None, message: 0, held: String::new(), open: HashMap::new(), titled, used, cost,
         };
         self.sessions.insert(id.clone(), live);
         Ok(id)
@@ -1037,7 +1054,7 @@ fn replay(session: &str, from: &Session, cwd: &Path, terminals: bool) {
                 for block in &assistant.content {
                     match block {
                         Content::Thinking { thinking, .. } if !thinking.is_empty() => chunk("agent_thought_chunk", thinking),
-                        Content::Text { text, .. } if !text.is_empty() => chunk("agent_message_chunk", text),
+                        Content::Text { text, .. } if !text.is_empty() && text.trim() != crate::voice::SILENT => chunk("agent_message_chunk", text),
                         Content::ToolCall { id: call_id, name, arguments, .. } => {
                             let (output, failed) = outcomes.get(call_id).cloned().unwrap_or_else(|| ("No result was recorded.".into(), true));
                             let output = output_text(&json!({"content": [{"type": "text", "text": output}]}));
