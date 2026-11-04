@@ -449,7 +449,7 @@ fn note_usage(answer: &Value) {
         let resets_at = window["resets_at"].as_str().and_then(|time| crate::clock::ms_from_iso(&time.replace("+00:00", "Z"))).map(|ms| ms / 1000);
         windows.insert(name.clone(), json!({"usedPercent": used, "resetsAt": resets_at}));
     }
-    let extra = &limits["extra_usage"];
+    let extra = &answer["rate_limits"]["extra_usage"];
     if extra["is_enabled"] == true {
         let cents = 10f64.powi(extra["decimal_places"].as_i64().unwrap_or(2) as i32);
         let money = |field: &str| extra[field].as_f64().map(|amount| format!("{:.2}", amount / cents));

@@ -616,10 +616,19 @@ fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
     if std::env::var_os("TMUX").is_some() {
         print!("{MODIFY_OTHER_KEYS_ON}");
     }
-    // A panic puts the terminal back first, except inside a typesetter, where it's caught.
+    // A panic on the terminal UI's own thread ends piccosta, so it puts the terminal back first
+    // (except inside a typesetter, where it's caught). One on another thread ends only that task,
+    // which tokio catches, so the screen stays as it is and the panic goes to PANIC_LOG in the
+    // agent dir: a background job that fails can't take the terminal and its sessions down.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if tex::DRAWING.with(std::cell::Cell::get) {
+            return;
+        }
+        if std::thread::current().name() != Some("main") {
+            use std::io::Write;
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(crate::config::agent_dir().join(PANIC_LOG));
+            let _ = log.and_then(|mut log| writeln!(log, "{} {info}", crate::clock::now_ms()));
             return;
         }
         restore();
@@ -627,6 +636,9 @@ fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
     }));
     ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
 }
+
+// Where a background task's panic is written, in the agent dir.
+const PANIC_LOG: &str = "panic.log";
 
 // xterm's modifyOtherKeys, mode 1 (keys that have no code of their own get one), and off again.
 const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;1m";
