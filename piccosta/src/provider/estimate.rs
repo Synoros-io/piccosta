@@ -12,10 +12,6 @@ use crate::message::{Content, Message, StopReason, TextOrBlocks, Usage};
 const CHARS_PER_TOKEN: f64 = 3.5;
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
-fn utf16_length(text: &str) -> usize {
-    text.encode_utf16().count()
-}
-
 // The context size a response reported: its total, or the sum of its parts when there's no total.
 pub fn context_tokens(usage: &Usage) -> u64 {
     if usage.total_tokens > 0 {
@@ -33,7 +29,7 @@ fn text_and_image_chars(blocks: &[Content]) -> usize {
     blocks
         .iter()
         .map(|block| match block {
-            Content::Text { text, .. } => utf16_length(text),
+            Content::Text { text, .. } => crate::js::utf16_len(text),
             _ => ESTIMATED_IMAGE_CHARS,
         })
         .sum()
@@ -43,13 +39,13 @@ fn text_and_image_chars(blocks: &[Content]) -> usize {
 pub fn message_tokens(message: &Message) -> u64 {
     match message {
         Message::System(system) => {
-            let tools = |list: Option<String>| list.map(|json| tokens_for_chars(utf16_length(&json))).unwrap_or(0);
-            tokens_for_chars(utf16_length(&transcript::system_message_text(system)))
+            let tools = |list: Option<String>| list.map(|json| tokens_for_chars(crate::js::utf16_len(&json))).unwrap_or(0);
+            tokens_for_chars(crate::js::utf16_len(&transcript::system_message_text(system)))
                 + tools(system.tools_added.as_ref().filter(|list| !list.is_empty()).and_then(|list| serde_json::to_string(list).ok()))
                 + tools(system.tools_removed.as_ref().filter(|list| !list.is_empty()).and_then(|list| serde_json::to_string(list).ok()))
         }
         Message::User(user) => match &user.content {
-            TextOrBlocks::Text(text) => tokens_for_chars(utf16_length(text)),
+            TextOrBlocks::Text(text) => tokens_for_chars(crate::js::utf16_len(text)),
             TextOrBlocks::Blocks(blocks) => tokens_for_chars(text_and_image_chars(blocks)),
         },
         Message::ToolResult(result) => tokens_for_chars(text_and_image_chars(&result.content)),
@@ -58,10 +54,10 @@ pub fn message_tokens(message: &Message) -> u64 {
                 .content
                 .iter()
                 .map(|block| match block {
-                    Content::Text { text, .. } => utf16_length(text),
-                    Content::Thinking { thinking, .. } => utf16_length(thinking),
+                    Content::Text { text, .. } => crate::js::utf16_len(text),
+                    Content::Thinking { thinking, .. } => crate::js::utf16_len(thinking),
                     Content::ToolCall { name, arguments, .. } => {
-                        utf16_length(name) + utf16_length(&serde_json::Value::Object(arguments.clone()).to_string())
+                        crate::js::utf16_len(name) + crate::js::utf16_len(&serde_json::Value::Object(arguments.clone()).to_string())
                     }
                     Content::Image { .. } => 0,
                 })

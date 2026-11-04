@@ -13,13 +13,15 @@ use super::codex_ws::{self, Failure, Target};
 use super::responses::{self, ConvertOptions, StreamState};
 use super::transcript;
 use super::{clamp_thinking_level, new_output, user_agent, Request, StreamEvent, BODY_IDLE_TIMEOUT, HEADER_TIMEOUT};
-use crate::message::{AssistantMessage, Message, StopReason};
+use crate::message::{AssistantMessage, Message};
 use crate::model::Model;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::mpsc;
 
 const API: &str = "openai-codex-responses";
-const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 // The instructions Codex gets when the conversation has no system prompt (openai-codex-responses.ts:578).
 const FALLBACK_INSTRUCTIONS: &str = "You are a helpful assistant.";
 // Providers whose two-part "call|item" tool-call ids are kept when replayed to Codex (line 65).
@@ -28,6 +30,34 @@ const TOOL_CALL_PROVIDERS: [&str; 3] = ["openai", "openai-codex", "opencode"];
 const MAX_PROMPT_CACHE_KEY_CHARS: usize = 64;
 // Response statuses Codex reports that the Responses stream understands; any other reads as none.
 const KNOWN_STATUSES: [&str; 6] = ["completed", "incomplete", "failed", "cancelled", "queued", "in_progress"];
+// How long Codex's answers run, unless settings say `codex.verbosity` (low, medium or high). pi asks
+// for low when its caller names none (openai-codex-responses.ts:560), and so does piccosta.
+const DEFAULT_VERBOSITY: &str = "low";
+
+// Each session's verbosity, read from its own project's settings on its first request and kept
+// for the session: the websocket continues a response only while everything but the input is
+// unchanged, so a settings edit mid-session would make every later turn resend the conversation.
+// One-shot requests (a compaction's summary) read it fresh and aren't kept. The map is cleared past
+// VERBOSITY_SESSIONS so a long-running process can't grow it without end; a session then reads
+// its setting again, which only matters if the setting was edited in between.
+static VERBOSITY: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const VERBOSITY_SESSIONS: usize = 1024;
+
+fn verbosity(request: &Request<'_>) -> String {
+    let read = || {
+        let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(request.cwd));
+        settings.get("codex.verbosity").and_then(Value::as_str).unwrap_or(DEFAULT_VERBOSITY).to_string()
+    };
+    match (request.session_id.filter(|_| request.cache), VERBOSITY.lock()) {
+        (Some(session), Ok(mut sessions)) => {
+            if sessions.len() >= VERBOSITY_SESSIONS && !sessions.contains_key(session) {
+                sessions.clear();
+            }
+            sessions.entry(session.to_string()).or_insert_with(read).clone()
+        }
+        _ => read(),
+    }
+}
 
 // <base>/codex/responses, accepting a base that already ends in /codex or the full path.
 pub(crate) fn endpoint(base_url: &str) -> String {
@@ -60,7 +90,7 @@ pub(super) fn supports_strict(model: &Model) -> bool {
 }
 
 // The request body (openai-codex-responses.ts:542-622), keys in pi's order.
-pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, thinking_level: &str) -> Value {
+pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, thinking_level: &str, verbosity: &str) -> Value {
     let transcript_messages = transcript::resolve_transcript(messages, model.compat_flag("supportsMidConvoSystemMessages"));
     let support = responses::tool_support(model);
     let (request_tools, _) = transcript::request_tools(&transcript_messages, support);
@@ -85,7 +115,7 @@ pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, 
     body.insert("stream".into(), true.into());
     body.insert("instructions".into(), if instructions.is_empty() { FALLBACK_INSTRUCTIONS.into() } else { instructions.into() });
     body.insert("input".into(), Value::Array(input));
-    body.insert("text".into(), json!({"verbosity": "low"}));
+    body.insert("text".into(), json!({"verbosity": verbosity}));
     body.insert("include".into(), json!(["reasoning.encrypted_content"]));
     if let Some(key) = cache_key {
         body.insert("prompt_cache_key".into(), key.into());
@@ -152,28 +182,86 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let mut send = |event: StreamEvent| {
         let _ = events.send(event);
     };
-    let output = new_output(model, API);
-    let mut state = StreamState::new(model, output);
-    let result = tokio::select! {
-        result = run(request, &mut state, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let mut state = StreamState::new(model, new_output(model, API));
+    let result = super::abortable(request, run(request, &mut state, &mut send)).await;
     let mut output = state.output;
-    if let Err(message) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    }
+    super::settle(request, &mut output, result);
     output
 }
 
-// How much of the Codex plan is used, from a response's headers (its primary and secondary
-// windows, as percents), for the model scale. The headers don't say when a window resets.
+// How much of the Codex plan is used, for the model scale: each of its windows (primary and
+// secondary) as x-codex-<window>-used-percent, -window-minutes and -reset-at (epoch seconds), the
+// names the Codex CLI reads (codex-rs/codex-api/src/rate_limits.rs). `header` gives one by name.
+// A plan with one window sends the other as 0% of 0 minutes with an empty reset: that window is
+// off, and any reading kept for it goes. With no reset time, the window's length from now stands
+// in for it. A window with a field that isn't a finite, non-negative number (or a percent over
+// 100) is a bad reading and leaves the stored one alone.
 pub(super) fn record_usage(header: impl Fn(&str) -> Option<String>) {
     for window in ["primary", "secondary"] {
-        if let Some(used) = header(&format!("x-codex-{window}-used-percent")).and_then(|value| value.parse::<f64>().ok()) {
-            crate::scale::record("codex", window, used, None);
+        // Ok(None) for a field that's missing or blank, Err for one that's there but no good.
+        let field = |name: &str| match header(&format!("x-codex-{window}-{name}")).filter(|value| !value.trim().is_empty()) {
+            None => Ok(None),
+            Some(value) => value.trim().parse::<f64>().ok().filter(|number| number.is_finite() && *number >= 0.0).map(Some).ok_or(()),
+        };
+        let (Ok(Some(used)), Ok(minutes), Ok(reset)) = (field("used-percent"), field("window-minutes"), field("reset-at")) else { continue };
+        if used > 100.0 {
+            continue;
+        }
+        if used == 0.0 && minutes == Some(0.0) && reset.is_none() {
+            crate::scale::forget("codex", window);
+            continue;
+        }
+        let resets_at = reset.or_else(|| minutes.filter(|minutes| *minutes > 0.0).map(|minutes| (crate::clock::now_ms() / 1000) as f64 + minutes * 60.0));
+        crate::scale::record("codex", window, used, resets_at);
+    }
+}
+
+// Ask Codex how much of the plan is used, as the Codex CLI's /status does: GET <base>/wham/usage
+// (codex-rs/backend-client/src/client.rs), which spends nothing. Its rate_limit has a
+// primary_window and a secondary_window (null when the plan has one), each with used_percent,
+// limit_window_seconds and reset_at (epoch seconds); credits has_credits, unlimited and a balance.
+pub async fn ask_usage(model: &Model, credential: &crate::auth::Credential) -> Result<(), String> {
+    let base = endpoint(&model.base_url);
+    let url = format!("{}/wham/usage", base.trim_end_matches("/codex/responses"));
+    let response = super::http_client().build().map_err(|error| error.to_string())?.get(url)
+        .header("originator", super::client_name())
+        .header("Authorization", format!("Bearer {}", credential.key))
+        .header("chatgpt-account-id", credential.account_id.as_deref().unwrap_or_default())
+        .timeout(HEADER_TIMEOUT).send().await.map_err(|error| error.to_string())?;
+    let answer: Value = response.error_for_status().map_err(|error| error.to_string())?.json().await.map_err(|error| error.to_string())?;
+    let mut windows = Map::new();
+    for window in ["primary", "secondary"] {
+        let reading = &answer["rate_limit"][format!("{window}_window")];
+        if let Some(used) = reading["used_percent"].as_f64() {
+            windows.insert(window.into(), json!({"usedPercent": used, "resetsAt": reading["reset_at"], "windowMinutes": reading["limit_window_seconds"].as_u64().map(|seconds| seconds / 60)}));
         }
     }
+    let credits = &answer["credits"];
+    if credits["unlimited"] == true || credits["has_credits"] == true {
+        let balance = if credits["unlimited"] == true { "unlimited".into() } else { credits["balance"].as_str().unwrap_or("0").to_string() };
+        windows.insert("extra".into(), json!({"note": format!("credits {balance}")}));
+    }
+    crate::scale::replace("codex", windows);
+    Ok(())
+}
+
+// The same reading from a websocket event: Codex sends `codex.rate_limits` with each response
+// (rate_limits.<window>.used_percent, window_minutes, reset_at), and an error event may carry the
+// response headers it would have had (`headers`). Output: whether the event was a reading only.
+pub(super) fn record_event_usage(event: &Value) -> bool {
+    // A null field reads as a blank one.
+    let text = |value: &Value| if value.is_null() { String::new() } else { value.as_str().map_or_else(|| value.to_string(), str::to_string) };
+    if event.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+        record_usage(|name| {
+            let (window, field) = name.strip_prefix("x-codex-")?.split_once('-')?;
+            event.pointer(&format!("/rate_limits/{window}/{}", field.replace('-', "_"))).map(text)
+        });
+        return true;
+    }
+    if let Some(headers) = event.get("headers").filter(|headers| headers.is_object()) {
+        record_usage(|name| headers.get(name).map(text));
+    }
+    false
 }
 
 async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn FnMut(StreamEvent)) -> Result<(), String> {
@@ -181,7 +269,7 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     let account_id = request.credential.account_id.as_deref().ok_or("Failed to extract accountId from token")?;
     // An uncached request sends no key and no session headers (openai-codex-responses.ts:280-281).
     let cache_key: Option<String> = request.session_id.filter(|_| request.cache).map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
-    let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level);
+    let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level, &verbosity(request));
 
     // The websocket first, unless the transport says SSE or this session already fell back
     // (openai-codex-responses.ts:311-378). A missing continuation on the server, or the
@@ -191,7 +279,7 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     if request.transport != "sse" && !codex_ws::fallback_active(cache_key.as_deref()) {
         // Without a cached session the socket's request id is a fresh one (line 287).
         let request_id = cache_key.clone().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-        let mut headers = vec![("originator".to_string(), "pi".to_string()), ("User-Agent".to_string(), user_agent())];
+        let mut headers = vec![("originator".to_string(), super::client_name().to_string()), ("User-Agent".to_string(), user_agent())];
         headers.extend(model.headers.iter().flatten().map(|(name, value)| (name.clone(), value.clone())));
         headers.extend([
             ("Authorization".to_string(), format!("Bearer {}", request.credential.key)),
@@ -238,14 +326,12 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
         }
     }
 
-    let mut http = reqwest::Client::builder()
-        .user_agent(user_agent())
+    let mut http = super::http_client()
         .build()
         .map_err(|error| error.to_string())?
         .post(endpoint(&model.base_url))
-        // Codex wants an originator on every request. pi sends "pi"; it's kept until another value
-        // is known to be accepted.
-        .header("originator", "pi");
+        // Codex wants an originator on every request.
+        .header("originator", super::client_name());
     for (name, value) in model.headers.iter().flatten() {
         http = http.header(name, value);
     }

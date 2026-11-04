@@ -76,16 +76,11 @@ impl Tool for EditTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Make precise file edits with exact text replacement, including multiple disjoint edits in one call")
+        Some("replace exact pieces of a file's text, several in one call")
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
-        &[
-            "Use edit for precise changes (edits[].oldText must match exactly)",
-            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-            "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-            "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-        ]
+        &["Each oldText in an edit call must appear exactly once in the file as it was before the call, kept just long enough to be unique; changes to one file go in one call, and changes that touch or overlap go in one entry"]
     }
 
     // Shapes models send instead of an `edits` array (edit.ts:103-134): the array as a JSON string
@@ -134,7 +129,8 @@ impl Tool for EditTool {
             let _turn = context.shared.mutations.lock(&absolute).await;
             match edit_file(&arguments.path, &absolute, &arguments.edits, context).await {
                 Ok(output) => Ok(output),
-                Err(message) if context.cancel.is_cancelled() => Err(message),
+                // A FIFO or device was refused without opening it; the diagnosis would open it.
+                Err(message) if context.cancel.is_cancelled() || paths::refuse_special(&absolute).is_err() => Err(message),
                 Err(message) => {
                     // The diagnosis reads the file and may scan it for a while; it runs off the
                     // async workers. If it fails the model still gets pi's message.
@@ -162,6 +158,7 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
         }
         return Err(format!("Could not edit file: {path}. Error code: {}.", paths::error_code(&error)));
     }
+    paths::refuse_special(absolute)?;
     let bytes = tokio::fs::read(absolute).await.map_err(|error| paths::fs_error(&error, "read", None))?;
     if let Some(message) = aborted() {
         return Err(message);

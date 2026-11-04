@@ -235,7 +235,7 @@ impl Matrix {
         // corrupt every result it touched.
         let finite = match data {
             Data::Q8(_, scales) => scales.iter().all(|&scale| (scale * 128.0).is_finite()),
-            Data::Q4(_, pairs) => pairs.chunks_exact(2).all(|pair| {
+            Data::Q4(_, pairs) => pairs.as_chunks::<2>().0.iter().all(|pair| {
                 let (scale, minimum) = (bf16(pair[0]), bf16(pair[1]));
                 minimum.is_finite() && (minimum + 15.0 * scale).is_finite()
             }),

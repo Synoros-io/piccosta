@@ -6,27 +6,29 @@
 // - The shell is settings' shellPath, else /bin/bash, else bash on PATH, else sh, run as
 //   `<shell> -c "<shellCommandPrefix>\n<command>"`, in its own session (setsid), stdin closed,
 //   stdout and stderr on one pipe, read as one stream.
-// - PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL and PI_REASONING_LEVEL describe the
-//   session; the agent dir's bin/ goes on the front of PATH.
+// - PICCOSTA_SESSION_ID, PICCOSTA_SESSION_FILE, PICCOSTA_PROVIDER, PICCOSTA_MODEL and
+//   PICCOSTA_REASONING_LEVEL describe the session; the agent dir's bin/ goes on the front of PATH.
 // - A timeout or an abort SIGKILLs a bash command's whole process group. Subagents get SIGTERM
 //   first so their own shell groups are cleaned up. After the shell exits, output is
 //   still read until the pipe closes or nothing arrives for 100 ms, so a descendant that keeps
 //   the pipe open can't hang the call (pi#5303).
 // - A shell is waited on through a pidfd and reaped by hand rather than through tokio, so one
-//   in the background can be handed to the image /restart execs (hand_over, adopt): it stays
-//   this process's child, and its pipe goes across the exec.
+//   in the background can be handed to the image /restart execs (jobs.rs hand_over, adopt): it
+//   stays this process's child, and its pipe goes across the exec. Each is listed in its
+//   session's jobs (jobs.rs shells) while it runs, and this piccosta's watcher knows its group
+//   (reaper.rs), which it stops when this piccosta dies.
 // - The model sees the last 2000 lines or 50 KB, raw (ANSI codes and CRs included), with pi's
 //   notice saying what was cut and where the full output is.
 // - A non-zero exit is an error result whose text ends "Command exited with code N".
 
-use super::jobs::{self, HandedJob, JobEnd, Tail};
+use super::jobs::{self, signal_group, HandedJob, JobEnd, Shell, Tail};
 use super::output::OutputAccumulator;
 use super::truncate::{self, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use super::{pathhint, Tool, ToolContext, ToolFuture, ToolOutput, ToolUpdate};
 use crate::message::{Content, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -57,10 +59,15 @@ const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 // Print mode closes Claude before killing its shells. Claude's two CLOSE_GRACE waits can take
 // four seconds (provider/claude/mod.rs); leave another second for shell cleanup and scheduling.
-pub(super) const SUBAGENT_STOP_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const SUBAGENT_STOP_GRACE: Duration = Duration::from_secs(5);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
-// The environment variables that describe the session to commands (bash.ts:186-212).
-const SESSION_VARIABLES: [&str; 5] = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
+// How often a shell that has exited is checked for what it left running in its group. A group's
+// number can pass on only once it's empty, and the kernel hands pids out in turn up to pid_max
+// (4M on 64-bit), so a second is far too soon for another group to have it.
+const GROUP_POLL: Duration = Duration::from_secs(1);
+// The environment variables that describe the session to commands (bash.ts:186-212, under
+// piccosta's own names).
+const SESSION_VARIABLES: [&str; 5] = [super::subagent::SESSION_ENV, "PICCOSTA_SESSION_FILE", "PICCOSTA_PROVIDER", "PICCOSTA_MODEL", "PICCOSTA_REASONING_LEVEL"];
 
 enum Event {
     Data(Vec<u8>),
@@ -99,13 +106,13 @@ impl Tool for BashTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Execute bash commands (ls, grep, find, etc.)")
+        Some("run a shell command in the project directory")
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[
-            "You can inspect PI_* environment variables for current model and session details.",
-            "A command still running after a minute moves to the background on its own, and its result comes to you as a message when it ends: don't wait on it, sleep or poll. A timeout only stops a command that must not run longer; leave it out otherwise.",
+            "Commands see this session's id, file, provider, model and thinking level as PICCOSTA_SESSION_ID, PICCOSTA_SESSION_FILE, PICCOSTA_PROVIDER, PICCOSTA_MODEL and PICCOSTA_REASONING_LEVEL",
+            "A command that runs long moves to the background on its own, and its result comes to you as a message when it ends: don't wait on it, sleep or poll. A timeout only stops a command that must not run longer; leave it out otherwise.",
         ]
     }
 
@@ -188,98 +195,32 @@ fn shell_path(custom: Option<&str>) -> Result<PathBuf, String> {
     Ok(on_path.unwrap_or_else(|| PathBuf::from("sh")))
 }
 
-// Signal a command's process group, or the process alone if the group is already gone
-// (shell.ts:205-216). The shell leads its own group, so the group id is its pid.
-fn signal_group(pid: u32, signal: i32) {
-    let Ok(pid) = i32::try_from(pid) else { return };
-    // SAFETY: kill() takes plain integers; a stale pid at worst fails with ESRCH.
-    unsafe {
-        if libc::kill(-pid, signal) != 0 {
-            libc::kill(pid, signal);
-        }
-    }
-}
-
-// Every shell this process started that hasn't exited. On a signal or quit they're killed with
-// their groups, so no command outlives piccosta, whether or not its tool call saw the abort.
-struct Running {
-    pid: u32,
-    own: bool,
-    kill_at: Option<Instant>,
-    // Its output pipe, held here so the descriptor stays open as long as the shell is listed.
-    pipe: Arc<Receiver>,
-    // Handed to the next image (/restart): this one no longer reaps it or kills it.
-    handed: bool,
-}
-
-static RUNNING: std::sync::Mutex<Vec<Running>> = std::sync::Mutex::new(Vec::new());
-
-fn running() -> std::sync::MutexGuard<'static, Vec<Running>> {
-    RUNNING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-// Repeated stops share the first deadline: a background job's stop and its watcher can race.
-pub fn kill_group(pid: u32) {
-    if let Some(child) = running().iter_mut().find(|child| child.pid == pid && child.own) {
-        if child.kill_at.is_none() {
-            child.kill_at = Some(Instant::now() + SUBAGENT_STOP_GRACE);
-            signal_group(pid, libc::SIGTERM);
-        }
-    } else {
-        signal_group(pid, libc::SIGKILL);
-    }
-}
-
-async fn stop_group(pid: u32) {
-    kill_group(pid);
-    let deadline = running().iter().find(|child| child.pid == pid).and_then(|child| child.kill_at);
+// Stop a shell's group (jobs.rs kill_group), and SIGKILL one of piccosta's own at its deadline.
+async fn stop_group(jobs: &jobs::Jobs, pid: u32) {
+    jobs.kill_group(pid);
+    let deadline = jobs.shells().iter().find(|shell| shell.pid == pid).and_then(|shell| shell.kill_at);
     if let Some(deadline) = deadline {
         tokio::time::sleep_until(deadline.into()).await;
-        signal_group(pid, libc::SIGKILL);
-    }
-}
-
-// Stop every shell this image still owns: all but the ones handed to the next image.
-pub fn kill_all_running() {
-    let pids: Vec<_> = running().iter().filter(|child| !child.handed).map(|child| child.pid).collect();
-    for pid in pids {
-        kill_group(pid);
-    }
-    // This also runs just before process::exit, when an async escalation would never finish.
-    let deadline = running().iter().filter(|child| !child.handed).filter_map(|child| child.kill_at).max();
-    if let Some(deadline) = deadline {
-        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-    }
-    running().retain(|child| {
-        if !child.handed {
-            signal_group(child.pid, libc::SIGKILL);
+        // A shell that has exited by then leaves only its group, signalled only if it's still its own.
+        if jobs.shells().iter().find(|shell| shell.pid == pid).is_none_or(|shell| shell.exited) {
+            jobs::kill_leftovers(pid, libc::SIGKILL);
+        } else {
+            signal_group(pid, libc::SIGKILL);
         }
-        child.handed
-    });
+    }
 }
 
-// Hand a background shell to the image /restart is about to exec: from now on this image neither
-// reaps it nor kills it (its pipe is still read into the log until the exec). Output: whether it's
-// a command of piccosta's own, and its pipe's descriptor; None when it isn't running.
-pub fn hand_over(pid: u32) -> Option<(bool, i32)> {
-    let mut running = running();
-    let child = running.iter_mut().find(|child| child.pid == pid && !child.handed)?;
-    child.handed = true;
-    super::reaper::keep_across_exec(child.pipe.as_raw_fd());
-    Some((child.own, child.pipe.as_raw_fd()))
-}
-
-// Take back a background job the image before this one handed over: its shell is still this
-// process's child and its pipe came across the exec. It's watched and finished the way
-// to_background does it, so its end reaches the session as if nothing happened. The reaper
-// already lists its group.
+// Take back a background job the image before this one handed over (jobs.rs hand_over): its shell
+// is still this process's child and its pipe came across the exec. It's watched and finished the
+// way to_background does it, so its end reaches the session as if nothing happened.
 pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Result<()> {
+    // The watcher already lists its group, and came across too.
     let pipe = Arc::new(Receiver::from_owned_fd(super::reaper::inherited(handed.pipe))?);
     let kill = CancellationToken::new();
     let job = shared.jobs.adopt(&handed, kill.clone())?;
-    running().push(Running { pid: handed.pid, own: handed.own, kill_at: None, pipe: pipe.clone(), handed: false });
+    shared.jobs.shells().push(Shell { pid: handed.pid, own: handed.own, kill_at: None, pipe: pipe.clone(), handed: false, exited: false });
     let (event_sender, events) = mpsc::unbounded_channel();
-    tokio::spawn(watch(pipe, handed.pid, kill, None, event_sender));
+    tokio::spawn(watch(shared.clone(), pipe, handed.pid, kill, None, event_sender));
     let tail = Tail::from_log(&job.log_path);
     tokio::spawn(log_until_done(shared, job, handed.command, tail, events));
     Ok(())
@@ -305,11 +246,11 @@ fn spawn(command: &str, context: &ToolContext, desktop: Option<&super::computer:
     for name in SESSION_VARIABLES {
         process.env_remove(name);
     }
-    process.env("PI_SESSION_ID", &context.session_id);
-    if let Some(file) = &context.session_file {
-        process.env("PI_SESSION_FILE", file);
+    let [id, file, provider, model, level] = SESSION_VARIABLES;
+    process.env(id, &context.session_id).env(provider, &context.provider).env(model, &context.model_id).env(level, &context.thinking_level);
+    if let Some(path) = &context.session_file {
+        process.env(file, path);
     }
-    process.env("PI_PROVIDER", &context.provider).env("PI_MODEL", &context.model_id).env("PI_REASONING_LEVEL", &context.thinking_level);
     if let Some(desktop) = desktop {
         desktop.hide(&mut process);
     }
@@ -341,6 +282,26 @@ fn spawn(command: &str, context: &ToolContext, desktop: Option<&super::computer:
     Ok((child.id(), Arc::new(pipe)))
 }
 
+// Start a program (`argv`) on a desktop the way a command starts, listed among the session's shells
+// and watched until it exits, so the session's end stops it as it stops its commands (jobs.rs
+// shutdown): what the computer's open does. Its output goes to `log`, when one can be made there.
+// Output: its pid.
+pub fn launch(argv: &[String], context: &ToolContext, desktop: &super::computer::Desktop, log: Option<PathBuf>) -> Result<u32, String> {
+    let line = format!("exec {}", argv.iter().map(|word| super::subagent::quote(word)).collect::<Vec<_>>().join(" "));
+    let (pid, pipe) = spawn(&line, context, Some(desktop))?;
+    context.shared.jobs.shells().push(Shell { pid, own: false, kill_at: None, pipe: pipe.clone(), handed: false, exited: false });
+    super::reaper::track(pid, true);
+    let (events, mut output) = mpsc::unbounded_channel();
+    tokio::spawn(watch(context.shared.clone(), pipe, pid, CancellationToken::new(), None, events));
+    let mut log = log.and_then(|log| std::fs::File::create(log).ok());
+    tokio::spawn(async move {
+        while let (Some(Event::Data(data)), Some(log)) = (output.recv().await, &mut log) {
+            let _ = std::io::Write::write_all(log, &data);
+        }
+    });
+    Ok(pid)
+}
+
 // Read the pipe into the channel until it closes.
 async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
@@ -360,22 +321,16 @@ async fn pump(pipe: Arc<Receiver>, chunks: mpsc::UnboundedSender<Vec<u8>>) {
 
 // Wait for a shell to exit, through a pidfd, then reap it. One handed to the next image (/restart)
 // is left unreaped and this never returns: the next image reaps it and reports its end.
-async fn exit_of(pid: u32) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::fd::FromRawFd;
+async fn exit_of(jobs: &jobs::Jobs, pid: u32) -> std::io::Result<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
-    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor (close-on-exec) or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor just made and owned by nothing else, which the OwnedFd keeps open as
-    // long as the AsyncFd holds it.
-    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd::from_raw_fd(fd)) }.map_err(std::io::Error::from)?;
+    let shell = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
+    // SAFETY: the pidfd is owned by the AsyncFd, which keeps it open as long as it's registered.
+    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(shell.fd) }.map_err(std::io::Error::from)?;
     let _ready = pidfd.readable().await?;
     // The check and the reap happen under the list's lock, so hand_over can't come between them.
     let reaped = {
-        let running = running();
-        let handed = running.iter().any(|child| child.pid == pid && child.handed);
+        let shells = jobs.shells();
+        let handed = shells.iter().any(|shell| shell.pid == pid && shell.handed);
         let mut status = 0;
         // SAFETY: waitpid on our own child, which has exited, into a local status.
         (!handed).then(|| if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(std::process::ExitStatus::from_raw(status)) })
@@ -388,10 +343,11 @@ async fn exit_of(pid: u32) -> std::io::Result<std::process::ExitStatus> {
 
 // Own the child until it's done: forward its output, kill it on `kill` or at the timeout, and
 // report how it ended. Runs as its own task so a command can outlive the tool call that started it.
-async fn watch(pipe: Arc<Receiver>, pid: u32, kill: CancellationToken, timeout: Option<Duration>, events: mpsc::UnboundedSender<Event>) {
+async fn watch(shared: Arc<super::ToolShared>, pipe: Arc<Receiver>, pid: u32, kill: CancellationToken, timeout: Option<Duration>, events: mpsc::UnboundedSender<Event>) {
+    let jobs = &shared.jobs;
     let (chunk_sender, mut chunks) = mpsc::unbounded_channel();
     let reader = tokio::spawn(pump(pipe, chunk_sender));
-    let exit = exit_of(pid);
+    let exit = exit_of(jobs, pid);
     tokio::pin!(exit);
 
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
@@ -416,11 +372,11 @@ async fn watch(pipe: Arc<Receiver>, pid: u32, kill: CancellationToken, timeout: 
             }
             () = tokio::time::sleep_until(grace_until.unwrap_or_else(tokio::time::Instant::now)), if grace_until.is_some() && status.is_some() => break,
             () = kill.cancelled(), if killed.is_none() => {
-                stop_group(pid).await;
+                stop_group(jobs, pid).await;
                 killed = Some(Outcome::Aborted);
             }
             () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() && killed.is_none() => {
-                stop_group(pid).await;
+                stop_group(jobs, pid).await;
                 killed = Some(Outcome::TimedOut);
             }
         }
@@ -436,26 +392,26 @@ async fn watch(pipe: Arc<Receiver>, pid: u32, kill: CancellationToken, timeout: 
         (None, Some(Err(error))) => Outcome::Failed(error.to_string()),
         (None, None) => Outcome::Failed("Command terminated without an exit code".into()),
     };
-    // A stopped wrapper can close its pipes before this watcher sees the kill token. Keep its
-    // pending escalation registered until it has run, whichever select branch finished first.
-    let mut kill_at = None;
-    running().retain(|child| {
-        if child.pid != pid {
-            return true;
-        }
-        kill_at = child.kill_at;
-        kill_at.is_some()
+    // A stopped wrapper can close its pipes before this watcher sees the kill token. Its pending
+    // escalation runs, whichever select branch finished first.
+    let kill_at = jobs.shells().iter_mut().find(|shell| shell.pid == pid).and_then(|shell| {
+        shell.exited = true;
+        shell.kill_at
     });
     if let Some(deadline) = kill_at {
         tokio::time::sleep_until(deadline.into()).await;
-        let mut children = running();
-        if children.iter().any(|child| child.pid == pid) {
-            signal_group(pid, libc::SIGKILL);
-            children.retain(|child| child.pid != pid);
-        }
+        super::jobs::kill_leftovers(pid, libc::SIGKILL);
     }
-    super::reaper::track(pid, false);
     let _ = events.send(Event::Done(outcome));
+    // What the shell left running in its group (`sleep 600 &`, an app a launcher started) is still
+    // the session's: the group stays listed, and with the watcher, until it's empty, so the
+    // session's close kills it (jobs.rs shutdown), through kill_leftovers, which never reaches a
+    // process that took the number after the group emptied.
+    while super::jobs::leftovers(pid) {
+        tokio::time::sleep(GROUP_POLL).await;
+    }
+    jobs.shells().retain(|shell| shell.pid != pid);
+    super::reaper::track(pid, false);
 }
 
 // pi's notice under truncated output (bash.ts:340-356).
@@ -524,12 +480,16 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
         false => None,
     };
     let (pid, pipe) = spawn(&command, context, desktop.as_ref())?;
-    running().push(Running { pid, own: arguments.own, kill_at: None, pipe: pipe.clone(), handed: false });
+    shared.jobs.shells().push(Shell { pid, own: arguments.own, kill_at: None, pipe: pipe.clone(), handed: false, exited: false });
     super::reaper::track(pid, true);
     let started = Instant::now();
     let kill = CancellationToken::new();
+    // A script's command dies when its call is dropped (the script ended with it still running),
+    // unless it has moved to the background, where its job owns it. Any other call dropped leaves
+    // its command running.
+    let kill_on_drop = context.stay_in_foreground.then(|| kill.clone().drop_guard());
     let (event_sender, mut events) = mpsc::unbounded_channel();
-    tokio::spawn(watch(pipe, pid, kill.clone(), timeout, event_sender));
+    tokio::spawn(watch(shared.clone(), pipe, pid, kill.clone(), timeout, event_sender));
 
     let spill_jobs = shared.clone();
     let spill_cwd = context.cwd.clone();
@@ -538,8 +498,17 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
     // when the user sends a message now. A timeout only kills a command (watch enforces it there
     // too); it never holds one in the foreground, where a long one would block the session.
     // longcmd kept commands with a timeout in the foreground.
+    // A command a script runs stays in the foreground unless it asks for the background, whatever
+    // the soft limit (script.rs moves the whole script instead).
+    let can_move = arguments.background || !context.stay_in_foreground;
+    // With no wait at all (background: true, or a soft limit of 0) it goes now: a zero sleep fires
+    // on the timer's next tick, by which time a quick command's output has won the loop below.
+    if can_move && (arguments.background || shared.jobs.soft_limit.is_zero()) {
+        kill_on_drop.map(tokio_util::sync::DropGuard::disarm);
+        return Ok(Run::Background(to_background(arguments, context, &mut output, pid, kill.clone(), started, Tail::default(), events)));
+    }
     let mut tail = Tail::default();
-    let soft_limit = tokio::time::sleep(if arguments.background { Duration::ZERO } else { shared.jobs.soft_limit });
+    let soft_limit = tokio::time::sleep(shared.jobs.soft_limit);
     tokio::pin!(soft_limit);
     let _detachable = shared.jobs.detachable();
     let detach = shared.jobs.detach.notified();
@@ -588,7 +557,8 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
                     () = &mut soft_limit => {}
                     () = &mut detach => {}
                 }
-            }, if !kill.is_cancelled() => {
+            }, if can_move && !kill.is_cancelled() => {
+                kill_on_drop.map(tokio_util::sync::DropGuard::disarm);
                 return Ok(Run::Background(to_background(arguments, context, &mut output, pid, kill.clone(), started, std::mem::take(&mut tail), events)));
             }
             () = context.cancel.cancelled(), if !kill.is_cancelled() => kill.cancel(),

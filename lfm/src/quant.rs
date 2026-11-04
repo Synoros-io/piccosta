@@ -278,7 +278,7 @@ unsafe fn dot_q4_avx2(x: &[f32], codes: &[u8], scales: &[u16]) -> f32 {
     use std::arch::x86_64::*;
     let nibble = _mm_set1_epi8(0x0F);
     let mut sums = [_mm256_setzero_ps(); 4];
-    for (group, x) in x.chunks_exact(GROUP).enumerate() {
+    for (group, x) in x.as_chunks::<GROUP>().0.iter().enumerate() {
         let scale = _mm256_set1_ps(bf16(scales[2 * group]));
         let minimum = _mm256_set1_ps(bf16(scales[2 * group + 1]));
         // SAFETY: the caller checked that there are GROUP/2 bytes of codes for every group of x.

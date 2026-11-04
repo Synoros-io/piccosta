@@ -45,6 +45,12 @@ pub fn is_same_model(message: &AssistantMessage, model: &Model) -> bool {
     message.provider == model.provider && message.api == model.api && message.model == model.id
 }
 
+// A tool-call id as Anthropic and Google take it: each character outside [a-zA-Z0-9_-] made "_",
+// then the first `limit` of them (pi's convertMessages, google-shared.ts).
+pub fn safe_id(id: &str, limit: usize) -> String {
+    id.chars().map(|character| if character.is_ascii_alphanumeric() || character == '_' || character == '-' { character } else { '_' }).take(limit).collect()
+}
+
 // The history adjusted for `model`. Input: the conversation and a function that rewrites another
 // model's tool-call id for this API (given the id and the message that made the call). Output:
 // the conversation to convert to the wire format.

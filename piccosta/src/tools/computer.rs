@@ -118,13 +118,22 @@ pub struct Settings {
     display: String,
     xvfb: String,
     size: String,
-    user: Arc<Mutex<Option<User>>>,
+    held: Arc<Mutex<Held>>,
+}
+
+// The session's claim on the desktop, and whether the session has closed, after which it makes no
+// new one. Both change under one mutex, so a claim still starting the desktop as the session
+// closes either finishes first and is let go with it, or finds it closed.
+#[derive(Default)]
+struct Held {
+    user: Option<User>,
+    closed: bool,
 }
 
 impl Settings {
     pub fn new(settings: &crate::config::Settings) -> Settings {
         let text = |key: &str, default: &str| settings.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).unwrap_or(default).to_string();
-        Settings { display: text("computer.display", DEFAULT_DISPLAY), xvfb: text("computer.xvfb", DEFAULT_XVFB), size: text("computer.size", DEFAULT_SIZE), user: Arc::default() }
+        Settings { display: text("computer.display", DEFAULT_DISPLAY), xvfb: text("computer.xvfb", DEFAULT_XVFB), size: text("computer.size", DEFAULT_SIZE), held: Arc::default() }
     }
 
     // The hidden desktop's folder: in XDG_RUNTIME_DIR (the agent dir without one), named by
@@ -140,6 +149,19 @@ impl Settings {
     pub async fn claim(&self) -> Result<Desktop, String> {
         let settings = self.clone();
         tokio::task::spawn_blocking(move || hidden(&settings)).await.map_err(|error| error.to_string())?
+    }
+
+    // Let go of this session's claim as it closes (runtime.rs), stopping the desktop when no other
+    // session holds one (User's drop), after the session's apps have been stopped. The claim is
+    // dropped after the mutex is let go: its drop takes the start lock, which a claim being made
+    // holds while it waits for this mutex, so the locks are only ever taken start lock first.
+    pub fn release(&self) {
+        let user = {
+            let mut held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            held.closed = true;
+            held.user.take()
+        };
+        drop(user);
     }
 }
 
@@ -364,11 +386,14 @@ fn hidden(settings: &Settings) -> Result<Desktop, String> {
     // SAFETY: flock on descriptors this function and the session's User own; the start lock goes
     // when `lock` is dropped.
     unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) };
-    let mut user = settings.user.lock().unwrap();
-    if user.is_none() {
+    let mut held = settings.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if held.closed {
+        return Err("This session has closed; it doesn't use the desktop any more.".into());
+    }
+    if held.user.is_none() {
         let file = std::fs::File::create(dir.join("users")).map_err(error)?;
         unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_SH) };
-        *user = Some(User { file, dir: dir.clone() });
+        held.user = Some(User { file, dir: dir.clone() });
     }
     let desktop = Desktop { display: settings.display.clone(), dir: Some(dir.clone()) };
     // What's checked here is a moment: an Xvfb that exits after it, its display taken by another
@@ -508,7 +533,7 @@ impl Tool for ComputerTool {
                 _ => context.shared.computer.claim().await?,
             };
             tokio::select! {
-                result = act(&desktop, &arguments, context.model_accepts_images) => result,
+                result = act(&desktop, &arguments, context) => result,
                 () = context.cancel.cancelled() => Err("Operation aborted".to_string()),
             }
         })
@@ -516,8 +541,9 @@ impl Tool for ComputerTool {
 }
 
 // Carry out one action on a desktop. Output: the screenshot after it (tree: the tree as text;
-// open: the app's pid, then the screenshot).
-async fn act(desktop: &Desktop, arguments: &Arguments, accepts_images: bool) -> Result<ToolOutput, String> {
+// open: the app's pid, then the screenshot). An app opened is the session's, stopped as it closes
+// (bash.rs launch).
+async fn act(desktop: &Desktop, arguments: &Arguments, context: &ToolContext) -> Result<ToolOutput, String> {
     // xdotool words for moving the pointer to a point given in screenshot pixels.
     let scale = SCALES.lock().unwrap().get(&desktop.display).copied().unwrap_or(1.0);
     let to = |point: [f64; 2]| vec!["mousemove".to_string(), ((point[0] * scale).round() as i64).to_string(), ((point[1] * scale).round() as i64).to_string()];
@@ -532,7 +558,7 @@ async fn act(desktop: &Desktop, arguments: &Arguments, accepts_images: bool) -> 
         "open" => {
             let command = arguments.command.clone().filter(|command| !command.is_empty()).ok_or("open needs a command")?;
             let log = desktop.dir.as_ref().map(|dir| dir.join("open.log"));
-            let (pid, _) = detach(desktop.command(&command[0]).args(&command[1..]), log.clone())?;
+            let pid = super::bash::launch(&command, context, desktop, log.clone())?;
             let output = log.map_or(String::new(), |log| format!(", its output in {}", log.display()));
             note = Some(format!("Started {command:?} on {} (pid {pid}{output}).", desktop.display));
             Vec::new()
@@ -577,19 +603,19 @@ async fn act(desktop: &Desktop, arguments: &Arguments, accepts_images: bool) -> 
         _ => tokio::time::sleep(SETTLE).await,
     }
     let mut content: Vec<Content> = note.map(Content::text).into_iter().collect();
-    content.extend(screenshot(desktop, accepts_images).await?);
+    content.extend(screenshot(desktop, context.model_accepts_images, context.image_limits).await?);
     Ok(ToolOutput { content, details: None, is_error: false })
 }
 
 // The whole screen, as image.rs prepares any image for a model, with a line saying its size. Its
 // scale is kept for the next call's coordinates. A model that doesn't take images gets the line
 // and a pointer to the tree.
-async fn screenshot(desktop: &Desktop, accepts_images: bool) -> Result<Vec<Content>, String> {
+async fn screenshot(desktop: &Desktop, accepts_images: bool, limits: image::Limits) -> Result<Vec<Content>, String> {
     let png = desktop.run("import", &["-window".into(), "root".into(), "png:-".into()]).await?;
     // A PNG's size is in its IHDR chunk, bytes 16 to 24.
     let size = |range: std::ops::Range<usize>| png.get(range).and_then(|bytes| bytes.try_into().ok()).map(u32::from_be_bytes).unwrap_or(0);
     let (width, height) = (size(16..20), size(20..24));
-    let prepared = image::prepare(&png, "image/png")?;
+    let prepared = image::prepare(&png, "image/png", limits)?;
     SCALES.lock().unwrap().insert(desktop.display.clone(), width as f64 / prepared.width.max(1) as f64);
     let mut line = format!("Screenshot of {}, {}x{}", desktop.display, prepared.width, prepared.height);
     if prepared.width != width {

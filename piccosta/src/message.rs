@@ -142,6 +142,38 @@ pub struct Cost {
     pub cache_write: f64,
     #[serde(serialize_with = "json_number::serialize")]
     pub total: f64,
+    // How it was billed when it was made: by a plan's quota (true), or by the token. None in a
+    // response saved before piccosta kept it (responses::Tally says what that counts as).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<bool>,
+    #[serde(default, skip_serializing_if = "CostState::is_known")]
+    pub state: CostState,
+    // How many pending turns before this one its total pays for: Claude Code reckons a tool turn's
+    // cost on the turn that answers it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub settles: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
+// Whether a cost's numbers are what the response cost: known; unknown, billed by the token at prices
+// nobody gave (responses::calculate_cost), so they're zero and mean nothing; or pending, zero until
+// a later turn's `settles` pays for it, and unknown if none ever does (its query was stopped first).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostState {
+    #[default]
+    Known,
+    Pending,
+    Unknown,
+}
+
+impl CostState {
+    fn is_known(&self) -> bool {
+        *self == CostState::Known
+    }
 }
 
 // Why a response ended. `Pending` and `Deferred` belong to pi's deferred batch requests, which
@@ -207,10 +239,6 @@ pub enum SystemSnapshot {
 pub struct UserMessage {
     pub content: TextOrBlocks,
     pub timestamp: i64,
-    // Whether the user said it rather than typed it (voice.rs): the session keeps it, the model
-    // never sees it, and the answer to it is spoken.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub spoken: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,7 +399,7 @@ pub fn bash_execution_text(execution: &BashExecutionMessage) -> String {
 
 // A user message holding one text block, the form all of pi's own roles take for the model.
 fn user_text(text: String, timestamp: i64) -> Message {
-    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp, spoken: false })
+    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp })
 }
 
 // What the model sees of a conversation (core/messages.ts:148-196). Input: the session's messages
@@ -394,7 +422,6 @@ pub fn to_model_messages(messages: &[AgentMessage]) -> Vec<Message> {
             AgentMessage::Custom(custom) => Message::User(UserMessage {
                 content: TextOrBlocks::Blocks(custom.content.clone().into_blocks()),
                 timestamp: custom.timestamp,
-                spoken: false,
             }),
             AgentMessage::BranchSummary(branch) => user_text(
                 format!("{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}", branch.summary),

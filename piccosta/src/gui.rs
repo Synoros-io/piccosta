@@ -24,7 +24,7 @@ const T3_QUIET: [(&str, &str); 2] = [("T3CODE_TELEMETRY_ENABLED", "false"), ("DO
 // Input: the GUI's name and what follows it on the command line (a directory, else this one).
 // Output: an error to show, or nothing once the GUI is started (T3 replaces this process).
 pub fn open(name: &str, arguments: &[String]) -> Result<(), String> {
-    let settings = crate::config::Settings::load(&crate::config::agent_dir(), &std::env::current_dir().unwrap_or_default());
+    let settings = crate::config::Settings::load(&crate::config::agent_dir(), std::env::current_dir().ok().as_deref());
     let dir = std::fs::canonicalize(arguments.first().map_or(".", String::as_str)).map_err(|error| format!("{}: {error}", arguments.first().map_or(".", String::as_str)))?;
     let exe = this_program()?;
     let names: &[&str] = if name == "zed" { &ZED_NAMES } else { &T3_NAMES };

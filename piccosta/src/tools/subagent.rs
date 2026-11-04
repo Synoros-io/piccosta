@@ -47,7 +47,7 @@ pub struct SubagentTool {
 }
 
 // Text as one single-quoted shell word.
-fn quote(text: &str) -> String {
+pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
@@ -69,12 +69,14 @@ impl SubagentTool {
         (!jobs.is_empty()).then(|| SubagentTool { jobs, agent_dir: agent_dir.to_path_buf() })
     }
 
-    // The job's models that are in the registry and have a login, in its order (the calling
-    // session's own model for a job that lists none), and a line for each one left out and why.
+    // The job's models that a connected account serves and that have a login, in its order, and a
+    // line for each one left out and why. A job that lists none, or none of whose models can run,
+    // runs on the calling session's own model.
     async fn available(&self, job: &Job, context: &ToolContext) -> Result<(Vec<String>, Vec<String>), String> {
         let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name)?);
+        let own = format!("{}/{}", context.provider, context.model_id);
         if models.is_empty() {
-            return Ok((vec![format!("{}/{}", context.provider, context.model_id)], Vec::new()));
+            return Ok((vec![own], Vec::new()));
         }
         let registry = ModelRegistry::load(&self.agent_dir.join("models.json"))?;
         let paths = CredentialPaths::from_environment(&self.agent_dir);
@@ -84,7 +86,7 @@ impl SubagentTool {
             let (id, level) = crate::scale::split(name);
             let level = level.map_or(String::new(), |level| format!(":{level}"));
             let Ok(model) = registry.resolve(id) else {
-                skipped.push(format!("[subagent {}: skipped {name}, which is not in models.json]", job.name));
+                skipped.push(format!("[subagent {}: skipped {name}, which no connected account serves]", job.name));
                 continue;
             };
             match credential_for(&model.provider, registry.provider_config(&model.provider), &paths).await {
@@ -93,7 +95,8 @@ impl SubagentTool {
             }
         }
         if found.is_empty() {
-            return Err(format!("None of the {} job's models can run: {}. Log in to one, or change its models in {} (/scale edit).", job.name, skipped.join(" "), crate::scale::path(&self.agent_dir).display()));
+            skipped.push(format!("[subagent {}: none of its models can run, so it runs on {own}; /scale edit changes them]", job.name));
+            found.push(own);
         }
         Ok((found, skipped))
     }
@@ -132,7 +135,7 @@ impl SubagentTool {
         self.jobs
             .iter()
             .map(|job| {
-                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| entry.models.join(", else ")).unwrap_or_default();
+                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| crate::scale::available(&self.agent_dir, &entry).join(", else ")).unwrap_or_default();
                 let models = if models.is_empty() { "your own model".to_string() } else { models };
                 let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
                 let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
@@ -188,76 +191,8 @@ impl Tool for SubagentTool {
     }
 }
 
-// The program name a piccosta process has in /proc/<pid>/comm.
-pub const PROCESS_NAME: &str = "piccosta";
 // The variable bash sets to the session that ran a command, which everything it starts inherits.
-pub const SESSION_ENV: &str = "PI_SESSION_ID";
-// How a piccosta is pointed at another agent dir (config.rs agent_dir).
-const AGENT_DIR_VARIABLE: &str = "PICCOSTA_AGENT_DIR=";
-// Where /proc/<pid>/stat keeps the start time: field 22 (proc_pid_stat(5)), counted among the
-// fields after the name's ')', which start at field 3.
-const STAT_STARTTIME_AFTER_NAME: usize = 22 - 3;
-
-// A piccosta run a session's tools started: a subagent job, or `piccosta -p` run by hand.
-pub struct RunningAgent {
-    pub job: Option<String>,
-    pub model: Option<String>,
-    pub running_for: std::time::Duration,
-    // Its session file, which it holds open (and locked) while it runs; None for one kept in memory.
-    pub session: Option<PathBuf>,
-}
-
-// The piccosta processes started from these sessions (by id), found through /proc in one walk: those
-// whose environment names one of them as the session that started them. The environment carries
-// over to what a command leaves running with `&` after its shell exits, which the process tree
-// doesn't. Output: each session's agents. Where there's no /proc there are none.
-pub fn running_under(session_ids: &[&str]) -> std::collections::HashMap<String, Vec<RunningAgent>> {
-    let mut found: std::collections::HashMap<String, Vec<RunningAgent>> = std::collections::HashMap::new();
-    let wanted: Vec<String> = session_ids.iter().map(|id| format!("{SESSION_ENV}={id}")).collect();
-    let job_prefix = format!("{CHILD_ENV}=");
-    let (own_agent_dir, default_agent_dir) = (crate::config::agent_dir(), crate::config::data_home().join("piccosta").join("agent"));
-    let Some(uptime) = std::fs::read_to_string("/proc/uptime").ok().and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok()) else { return found };
-    // SAFETY: sysconf only reads a configuration value.
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
-    let Ok(entries) = std::fs::read_dir("/proc") else { return found };
-    let agents = entries.flatten().filter_map(|entry| {
-            let dir = entry.path();
-            entry.file_name().to_str()?.parse::<u32>().ok()?;
-            if std::fs::read_to_string(dir.join("comm")).ok()?.trim_end() != PROCESS_NAME {
-                return None;
-            }
-            let environ = std::fs::read(dir.join("environ")).ok()?;
-            let variables: Vec<&[u8]> = environ.split(|byte| *byte == 0).collect();
-            // A piccosta's reaper (tools/reaper.rs) shares its environment but is no agent.
-            let reaper = format!("{}=", super::reaper::REAPER_ENV);
-            let started_by = wanted.iter().find(|wanted| variables.contains(&wanted.as_bytes()))?;
-            if variables.iter().any(|variable| variable.starts_with(reaper.as_bytes())) {
-                return None;
-            }
-            // One that keeps its sessions in another agent dir (a test run with a scratch one) isn't
-            // among this user's agents.
-            let agent_dir = variables.iter().find_map(|variable| variable.strip_prefix(AGENT_DIR_VARIABLE.as_bytes())).map(|dir| PathBuf::from(String::from_utf8_lossy(dir).into_owned()));
-            if agent_dir.as_deref().filter(|dir| !dir.as_os_str().is_empty()).map_or(own_agent_dir != default_agent_dir, |dir| *dir != own_agent_dir) {
-                return None;
-            }
-            let job = variables.iter().find_map(|variable| variable.strip_prefix(job_prefix.as_bytes())).map(|name| String::from_utf8_lossy(name).into_owned());
-            let command_line = std::fs::read(dir.join("cmdline")).ok()?;
-            let arguments: Vec<String> = command_line.split(|byte| *byte == 0).map(|argument| String::from_utf8_lossy(argument).into_owned()).collect();
-            // Its model, or the kind of work it was started for (a manager's lane, --use exploration).
-            let value_of = |flag: &str| arguments.iter().position(|argument| argument == flag).and_then(|index| arguments.get(index + 1)).cloned();
-            let model = value_of("--model").or_else(|| value_of("--use"));
-            let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
-            let started_ticks: f64 = stat.rsplit_once(')')?.1.split_whitespace().nth(STAT_STARTTIME_AFTER_NAME)?.parse().ok()?;
-            let running_for = std::time::Duration::from_secs_f64((uptime - started_ticks / ticks_per_second).max(0.0));
-            let open_files = std::fs::read_dir(dir.join("fd")).into_iter().flatten().flatten();
-            let session = open_files.filter_map(|fd| std::fs::read_link(fd.path()).ok()).find(|path| path.extension().is_some_and(|extension| extension == "jsonl"));
-            Some((started_by[SESSION_ENV.len() + 1..].to_string(), RunningAgent { job, model, running_for, session }))
-        });
-    for (session_id, agent) in agents {
-        found.entry(session_id).or_default().push(agent);
-    }
-    found
-}
+pub const SESSION_ENV: &str = "PICCOSTA_SESSION_ID";
 
 // The tools a job's subagent runs with, for an approval card: its own list, or "all tools".
 pub fn tools_of(job: &str) -> String {

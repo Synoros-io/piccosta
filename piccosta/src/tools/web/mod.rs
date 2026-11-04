@@ -53,7 +53,7 @@ impl WebShared {
     // where credentials live.
     pub fn new(settings: WebSettings, agent_dir: &Path, registry: &crate::model::ModelRegistry, credentials: crate::auth::CredentialPaths) -> WebShared {
         let clones = github::Clones::new(agent_dir, settings.github_clone_path.as_deref());
-        let search_targets = openai_search::targets(registry, settings.search_model.as_deref());
+        let search_targets = openai_search::targets(registry, settings.search_model.as_deref(), agent_dir);
         WebShared { settings, client: OnceLock::new(), fetch_slots: Semaphore::new(FETCH_CONCURRENCY), store: store::Store::new(agent_dir), clones, search_targets, credentials }
     }
 
@@ -184,13 +184,13 @@ fn format_search_summary(results: &[search::SearchResult], answer: &str) -> Stri
 
 // Keep the search text and its guidance under the output cap, cutting the text and saying so
 // (web-tool-core.ts boundSearchPresentation). Output: (text, truncated, original, returned, omitted).
-fn bound_search_presentation(text: &str, guidance: &str, truncation_guidance: &str, max_chars: usize) -> (String, bool, usize, usize, usize) {
+fn bound_search_presentation(text: &str, guidance: &str, max_chars: usize) -> (String, bool, usize, usize, usize) {
     let text_length = crate::js::utf16_len(text);
     let full = format!("{text}{guidance}");
     if crate::js::utf16_len(&full) <= max_chars {
         return (full, false, text_length, text_length, 0);
     }
-    let marker = format!("\n\n---\n[Output truncated.]{truncation_guidance}");
+    let marker = format!("\n\n---\n[Output truncated.]{guidance}");
     let prefix_length = max_chars.saturating_sub(crate::js::utf16_len(&marker));
     let units = utf16(text);
     let bounded = format!("{}{marker}", from_utf16(&units[..prefix_length.min(units.len())]));
@@ -221,8 +221,12 @@ impl Tool for WebSearchTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.")
+        Some("search the web; two to four differently worded `queries` find more than one")
     }
 
     // A list sent as a JSON string becomes the list (tool-arguments.ts parseStringifiedArrays).
@@ -288,31 +292,13 @@ impl Tool for WebSearchTool {
                     }
                 }
             }
-            let inline_content = if include_content && !all_urls.is_empty() { Some(extract::fetch_all(&all_urls, Mode::Readable, false, web, &context.cancel).await) } else { None };
+            let inline_content = if include_content && !all_urls.is_empty() { Some(extract::fetch_all(&all_urls, Mode::Readable, false, web, context.image_limits, &context.cancel).await) } else { None };
             if context.cancel.is_cancelled() {
                 return Err("Operation aborted".to_string());
             }
             Ok(build_search_return(web, &query_list, &results, inline_content, include_content))
         })
     }
-}
-
-// build_search_return from stored-search JSON (pi-web-access's QueryResultData shape), for
-// checking the output against pi-web-access's on the same results.
-pub fn build_search_return_json(web: &WebShared, query_list: &[String], results: &Value, inline_content: Option<Vec<Extracted>>, include_content: bool) -> ToolOutput {
-    let results: Vec<QueryData> = results
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|r| QueryData {
-            query: r["query"].as_str().unwrap_or("").to_string(),
-            answer: r["answer"].as_str().unwrap_or("").to_string(),
-            results: r["results"].as_array().into_iter().flatten().map(|x| search::SearchResult { title: x["title"].as_str().unwrap_or("").into(), url: x["url"].as_str().unwrap_or("").into(), snippet: x["snippet"].as_str().unwrap_or("").into() }).collect(),
-            error: r["error"].as_str().map(str::to_string),
-            provider: match r["provider"].as_str() { Some("searxng") => Some("searxng"), Some("openai") => Some("openai"), _ => None },
-        })
-        .collect();
-    build_search_return(web, query_list, &results, inline_content, include_content)
 }
 
 // The search's text, its stored ids and its details (web-tool-core.ts buildSearchReturn).
@@ -345,7 +331,7 @@ fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryD
     let search_id = store::generate_id();
     web.store.store_search(&search_id, Value::Array(results.iter().map(QueryData::to_json).collect()));
 
-    let guidance = |_for_truncation: bool| {
+    let guidance = {
         let mut value = String::new();
         if let (Some(id), Some(content)) = (&fetch_id, &inline_content) {
             value += &format!("\n---\nFull content for {} sources is ready as responseId \"{id}\". ", content.len());
@@ -357,7 +343,7 @@ fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryD
         value
     };
     let trimmed = crate::js::trim(&output).to_string();
-    let (text, truncated, original, returned, omitted) = bound_search_presentation(&trimmed, &guidance(false), &guidance(true), max_chars);
+    let (text, truncated, original, returned, omitted) = bound_search_presentation(&trimmed, &guidance, max_chars);
     let details = json!({
         "queries": query_list,
         "queryCount": query_list.len(),
@@ -404,8 +390,12 @@ impl Tool for FetchContentTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use to fetch URL content, direct images, GitHub repos, and PDFs.")
+        Some("get what a URL holds: a page, an image, a GitHub repo or a PDF")
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
@@ -435,7 +425,7 @@ impl Tool for FetchContentTool {
                 return Ok(text_output("Error: No URL provided. Use the 'url' parameter, or 'urls' for parallel fetches.".into(), json!({"error": "No URL provided"}), false));
             }
             send_update(context, format!("Fetching {} URL(s)...", url_list.len()), json!({"phase": "fetch", "progress": 0}));
-            let results = extract::fetch_all(&url_list, mode, force_clone, web, &context.cancel).await;
+            let results = extract::fetch_all(&url_list, mode, force_clone, web, context.image_limits, &context.cancel).await;
             if context.cancel.is_cancelled() {
                 return Err("Operation aborted".to_string());
             }
@@ -547,7 +537,7 @@ impl Tool for GetSearchContentTool {
                     "url": {"type": "string", "description": "Get content for this URL"},
                     "urlIndex": {"type": "integer", "minimum": 0, "description": "Get content for URL at index"},
                     "offset": {"type": "integer", "minimum": 0, "description": "Character offset in stored search or fetched URL content (default 0). Ignored when findText is supplied."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": GET_CONTENT_LIMIT_MAX, "description": "Requested maximum stored-content characters (default and max use maxInlineContentChars). Search-page continuation guidance shares the global output cap and may reduce returnedChars. Ignored when findText is supplied."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Requested maximum stored-content characters (default and max use maxInlineContentChars). Search-page continuation guidance shares the global output cap and may reduce returnedChars. Ignored when findText is supplied."},
                     "findText": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 500}, {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500}, "minItems": 1, "maxItems": 10}], "description": "Text or texts to find in the selected stored content. When supplied, offset and limit are ignored."},
                     "findMode": {"type": "string", "enum": ["exact", "case-insensitive", "fuzzy"], "description": "Matching mode for findText (default: case-insensitive). Requires findText."}
                 }
@@ -556,18 +546,18 @@ impl Tool for GetSearchContentTool {
         }
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Use after web_search or fetch_content to retrieve stored content via responseId. Use findText to locate passages without paging through the full content.")
+        Some("read more of a stored web_search or fetch_content result by its responseId; findText finds passages in it")
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move { Ok(get_search_content(&context.shared.web, arguments)) })
     }
 }
-
-// The schema's ceiling for limit: the default output cap. A session that raises
-// web.maxInlineContentChars can still ask for up to its own cap; validation uses this schema.
-const GET_CONTENT_LIMIT_MAX: usize = 30_000;
 
 // An index argument as a position. Validation hands numbers on as floats, so 0 arrives as 0.0.
 fn as_index(value: &Value) -> Option<usize> {

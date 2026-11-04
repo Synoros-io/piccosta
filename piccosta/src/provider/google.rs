@@ -43,12 +43,7 @@ fn assistant_part(block: &Content, same_model: bool) -> Option<Value> {
 fn build_body(request: &Request<'_>) -> Result<Value, String> {
     let model = request.model;
     let resolved = transcript::resolve_transcript(request.messages, false);
-    let normalize = |id: &str, _: &AssistantMessage| {
-        id.chars()
-            .map(|character| if character.is_ascii_alphanumeric() || character == '_' || character == '-' { character } else { '_' })
-            .take(TOOL_ID_LIMIT)
-            .collect()
-    };
+    let normalize = |id: &str, _: &AssistantMessage| transform::safe_id(id, TOOL_ID_LIMIT);
     let messages = transform::transform_messages(&resolved, model, &normalize);
     let mut contents: Vec<Value> = Vec::new();
     let mut system = String::new();
@@ -200,26 +195,21 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let mut send = |event| {
         let _ = events.send(event);
     };
-    let result = tokio::select! {
-        result = async {
-            let body = build_body(request)?;
-            // The catalog base already includes the API version. Path-encode the id so a user
-            // model cannot turn its id into a query string or a different endpoint.
-            let mut url = reqwest::Url::parse(&format!("{}/", request.model.base_url.trim_end_matches('/'))).map_err(|error| error.to_string())?;
-            url.path_segments_mut().map_err(|_| "Google base URL cannot hold path segments".to_string())?.pop_if_empty().push("models").push(&format!("{}:streamGenerateContent", request.model.id));
-            url.query_pairs_mut().append_pair("alt", "sse");
-            let extra = vec![("x-goog-api-key", request.credential.key.clone())];
-            let response = super::post_openai(request.model, url.into(), request.credential, request.session_id, extra, &body).await?;
-            send(StreamEvent::Start);
-            super::sse::read_events(response, BODY_IDLE_TIMEOUT, "Google", |chunk| handle(chunk, &mut output, request.model, &mut send)).await?;
-            if output.stop_reason == StopReason::Pending { return Err("Google stream ended without a finish reason".into()); }
-            Ok(())
-        } => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
-    if let Err(error) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(error);
-    }
+    let result = super::abortable(request, async {
+        let body = build_body(request)?;
+        // The catalog base already includes the API version. Path-encode the id so a user
+        // model cannot turn its id into a query string or a different endpoint.
+        let mut url = reqwest::Url::parse(&format!("{}/", request.model.base_url.trim_end_matches('/'))).map_err(|error| error.to_string())?;
+        url.path_segments_mut().map_err(|_| "Google base URL cannot hold path segments".to_string())?.pop_if_empty().push("models").push(&format!("{}:streamGenerateContent", request.model.id));
+        url.query_pairs_mut().append_pair("alt", "sse");
+        let extra = vec![("x-goog-api-key", request.credential.key.clone())];
+        let response = super::post_openai(request.model, url.into(), request.credential, request.session_id, extra, &body).await?;
+        send(StreamEvent::Start);
+        super::sse::read_events(response, BODY_IDLE_TIMEOUT, "Google", |chunk| handle(chunk, &mut output, request.model, &mut send)).await?;
+        if output.stop_reason == StopReason::Pending { return Err("Google stream ended without a finish reason".into()); }
+        Ok(())
+    })
+    .await;
+    super::settle(request, &mut output, result);
     output
 }

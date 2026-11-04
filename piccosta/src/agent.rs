@@ -152,22 +152,23 @@ pub type EventSink = Box<dyn FnMut(&Event) + Send>;
 // needs the user's yes to, if any (Tool::approval), which the gate asks whatever its mode: Ok to
 // run it, or the reason it was refused, which becomes the call's error result. A frontend that
 // asks the user sets one (rpc mode for T3 Code's approvals); without one every call runs but
-// those with a question.
-pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>, Option<&'static str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>>;
+// those with a question. A script's calls (tools/script.rs) ask it too, from the script's own
+// tasks, so it's Send.
+pub type Gate = Arc<dyn Fn(String, String, Map<String, Value>, Option<&'static str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
 // A session's controls for whoever drives it while it runs: abort the current run, and queue
 // messages for it. Steering goes in after the current turn's tool calls, a follow-up when the
-// model would otherwise stop (pi's steer and followUp, each one at a time by default).
+// model would otherwise stop (pi's steer and followUp, each one at a time by default). The Notify
+// wakes print mode's wait for background jobs when a message is queued.
 #[derive(Clone, Default)]
-pub struct Handle(Arc<std::sync::Mutex<Inbox>>);
+pub struct Handle(Arc<(std::sync::Mutex<Inbox>, tokio::sync::Notify)>);
 
 #[derive(Default)]
 struct Inbox {
     // The token of the run in progress; each prompt puts in a fresh one, so a handle taken before
     // the prompt still aborts it.
     cancel: CancellationToken,
-    // Each with whether it was spoken (voice.rs).
-    steer: Vec<(String, bool)>,
+    steer: Vec<String>,
     follow_up: Vec<String>,
     steering_all: bool,
     follow_up_all: bool,
@@ -178,20 +179,14 @@ impl Handle {
         self.lock().cancel.cancel();
     }
 
-    // Stop the run without killing its commands, the way every interrupt does (Esc, an rpc abort,
-    // ACP's cancel). Input: the session's jobs. The move goes out before the abort, and bash's
-    // biased select takes it first, so each running command goes on as a background job.
-    pub fn interrupt(&self, jobs: &crate::tools::jobs::Jobs) {
-        jobs.detach_all();
-        self.abort();
-    }
-
-    pub fn steer(&self, text: String, spoken: bool) {
-        self.lock().steer.push((text, spoken));
+    pub fn steer(&self, text: String) {
+        self.lock().steer.push(text);
+        self.0.1.notify_one();
     }
 
     pub fn follow_up(&self, text: String) {
         self.lock().follow_up.push(text);
+        self.0.1.notify_one();
     }
 
     pub fn set_steering_mode(&self, mode: &str) {
@@ -205,31 +200,34 @@ impl Handle {
     // What's queued and not sent yet: steering, then follow-ups.
     pub fn queued(&self) -> (Vec<String>, Vec<String>) {
         let inbox = self.lock();
-        (inbox.steer.iter().map(|(text, _)| text.clone()).collect(), inbox.follow_up.clone())
+        (inbox.steer.clone(), inbox.follow_up.clone())
     }
 
     // Take back everything queued (pi's clear_queue), e.g. to put it back in the editor on abort.
     pub fn clear(&self) -> (Vec<String>, Vec<String>) {
         let mut inbox = self.lock();
-        (std::mem::take(&mut inbox.steer).into_iter().map(|(text, _)| text).collect(), std::mem::take(&mut inbox.follow_up))
+        (std::mem::take(&mut inbox.steer), std::mem::take(&mut inbox.follow_up))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-fn dequeue<T>(queue: &mut Vec<T>, all: bool) -> Vec<T> {
+fn dequeue(queue: &mut Vec<String>, all: bool) -> Vec<String> {
     let count = if all { queue.len() } else { queue.len().min(1) };
     queue.drain(..count).collect()
 }
 
-// The user's text, then any images they attached (pi puts them after the text), and whether they
-// said it.
-fn user_message(text: &str, images: Vec<Content>, spoken: bool) -> AgentMessage {
+fn user_message(text: &str) -> AgentMessage {
+    with_images(text, Vec::new())
+}
+
+// The user's text, then any images they attached (pi puts them after the text).
+fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
     let mut blocks = vec![Content::text(text)];
     blocks.extend(images);
-    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms(), spoken })
+    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms() })
 }
 
 // A stream event in pi's json form (json-event.ts:16-35): its type and content index, the delta or
@@ -271,7 +269,7 @@ pub struct AgentConfig {
     // The system prompt as sections (prompt.rs).
     pub sections: IndexMap<String, String>,
     // Whether the prompt carries the session's AGENTS.md files (--no-context-files turns them off);
-    // they're read again before each run.
+    // they're looked at before each run, for an edit (prompt_update).
     pub context_files: bool,
     pub retry: RetrySettings,
     // When to compact, resolved for this model.
@@ -287,6 +285,8 @@ pub struct AgentConfig {
     // The manager's home, for the manager service: its compactions keep only the newest of the
     // user's words verbatim and add its ledger's newest entries (manager.rs).
     pub manager_home: Option<PathBuf>,
+    // The session's socket, which its runtime listens on (runtime.rs).
+    pub claim: Option<crate::runtime::Claim>,
 }
 
 pub struct Agent {
@@ -364,6 +364,23 @@ impl Agent {
         self.handle.clone()
     }
 
+    // Have `watch` see every event before whoever the events go to (the runtime's turn ends).
+    pub fn tap(&mut self, mut watch: impl FnMut(&Event) + Send + 'static) {
+        let mut emit = std::mem::replace(&mut self.emit, Box::new(|_| {}));
+        self.emit = Box::new(move |event| {
+            watch(event);
+            emit(event);
+        });
+    }
+
+    pub fn take_claim(&mut self) -> Option<crate::runtime::Claim> {
+        self.config.claim.take()
+    }
+
+    pub fn manager_home(&self) -> Option<PathBuf> {
+        self.config.manager_home.clone()
+    }
+
     // A fresh cancel token for the run about to start, the one the handle aborts.
     fn fresh_cancel(&mut self) {
         self.cancel = CancellationToken::new();
@@ -383,19 +400,20 @@ impl Agent {
         &self.config.thinking_level
     }
 
-    // Switch models for the next request. The prompt sections and compaction settings depend on
-    // the model, so the caller resolves them again; the thinking level is clamped to the new
-    // model. The session records both changes. Picking the model the session is already on records
+    // Switch models for the next request. The prompt sections, tools (the script mode) and
+    // compaction settings depend on the model, so the caller resolves them again; the thinking
+    // level is clamped to the new model. The session records both changes. Picking the model the session is already on records
     // nothing: a model change lets the prompt be brought up to date, which rewrites the cache, and a
     // frontend that sets the model it's already on after each run left a model change after every
     // answer in real sessions (2026-11-01).
-    pub fn set_model(&mut self, model: Model, sections: IndexMap<String, String>, compaction: CompactionSettings) -> std::io::Result<()> {
+    pub fn set_model(&mut self, model: Model, sections: IndexMap<String, String>, tools: Vec<Arc<dyn Tool>>, compaction: CompactionSettings) -> std::io::Result<()> {
         if (&model.provider, &model.id) != (&self.config.model.provider, &self.config.model.id) {
             let base = self.session.next_base();
             self.session.append(SessionEntry::ModelChange { base, provider: model.provider.clone(), model_id: model.id.clone() })?;
         }
         self.config.model = model;
         self.config.sections = sections;
+        self.config.tools = tools;
         // The new model's compaction numbers, with the session's on/off kept (/autocompact).
         self.config.compaction = CompactionSettings { enabled: self.config.compaction.enabled, ..compaction };
         let level = self.config.thinking_level.clone();
@@ -450,72 +468,53 @@ impl Agent {
         self.run_auto_compaction(Reason::Manual, false, instructions).await.map(drop)
     }
 
-    // The system message that brings the session's prompt and tools up to date, or None when they
-    // already are (system-prompt.ts diffSystemPromptSections, agent-loop.ts declareToolChanges).
-    // A session keeps the prompt it has: any change to it rewrites the provider's whole prompt
-    // cache (a new build's prompt text did that to every running session on its next turn,
-    // 11.9M tokens written in a day, 2026-11-01). So it's brought up to date only when it has none
-    // yet, at a compaction or a model change (which start a new cache anyway), or when what it's
-    // built from changed: its context files (prompt::INPUT_SECTIONS) or what a tool can be called
-    // with, its name and parameters (a subagent job added or removed changes the job enum in the
-    // subagent tool's parameters). A tool's description, like the prompt's wording, waits.
-    fn system_update(&self) -> Option<SystemMessage> {
-        let messages = crate::message::to_model_messages(&self.session.context().messages);
-        let current = transcript::current_system_message(&messages);
-        let previous: IndexMap<String, String> = current
-            .as_ref()
-            .and_then(|system| system.sections.as_ref())
-            .map(|sections| sections.iter().filter_map(|(name, text)| text.clone().map(|text| (name.clone(), text))).collect())
-            .unwrap_or_default();
-        let current_tools: Vec<ToolDefinition> = current.and_then(|system| system.tools_added).unwrap_or_default();
-        let desired: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
-        let callable = |tool: &ToolDefinition| current_tools.iter().any(|held| (&held.name, &held.parameters) == (&tool.name, &tool.parameters));
-        let tools_changed = desired.len() != current_tools.len() || !desired.iter().all(callable);
-        let inputs_changed = crate::prompt::INPUT_SECTIONS.iter().any(|name| previous.get(*name) != self.config.sections.get(*name)) || tools_changed;
-        // The newest of a system message, a compaction or a model change, walking back from the leaf.
-        let since_reset = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
+    // The prompt the session runs with is built once and kept in it, as its system message, so
+    // every request repeats it byte for byte: any change to it rewrites the provider's whole prompt
+    // cache (a new build's wording did that to every running session on its next turn, 11.9M tokens
+    // written in a day, 2026-11-01). It's built again only when what it's made from changes: the
+    // session has none yet; it was compacted or put on another model since (each starts a new cache
+    // anyway); or its AGENTS.md files now differ from the instructions its prompt holds, compared
+    // file text to file text (prompt::instructions), so piccosta's wording around them doesn't
+    // count. Until then a new build's wording, a tool's description or a changed scale wait.
+    // Output: the system message to add, None when nothing differs.
+    fn prompt_update(&mut self) -> Option<SystemMessage> {
+        let event = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
             SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
             SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
             _ => None,
         });
-        if !previous.is_empty() && since_reset != Some(true) && !inputs_changed {
+        let messages = crate::message::to_model_messages(&self.session.context().messages);
+        let held = transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
+        let now = if self.config.context_files { crate::prompt::context_now(&self.config.cwd, &crate::config::agent_dir()) } else { Some(None) };
+        let edited = now.as_ref().is_some_and(|project| crate::prompt::instructions(project.as_deref()) != crate::prompt::instructions(held.as_deref()));
+        if !event.is_none_or(|event| event) && !edited {
             return None;
         }
-        let mut patch: IndexMap<String, Option<String>> = IndexMap::new();
-        for (name, text) in &self.config.sections {
-            if previous.get(name) != Some(text) {
-                patch.insert(name.clone(), Some(text.clone()));
-            }
+        if let Some(project) = now {
+            crate::prompt::set_project_context(&mut self.config.sections, project);
         }
-        for name in previous.keys() {
-            if !self.config.sections.contains_key(name) {
-                patch.insert(name.clone(), None);
-            }
-        }
+        self.prompt_patch()
+    }
 
-        let added: Vec<ToolDefinition> = desired.iter().filter(|tool| !current_tools.contains(tool)).cloned().collect();
-        let removed: Vec<ToolReference> = current_tools
-            .iter()
-            .filter(|tool| !desired.iter().any(|wanted| wanted.name == tool.name))
-            .map(|tool| ToolReference { name: tool.name.clone() })
-            .collect();
-        if patch.is_empty() && added.is_empty() && removed.is_empty() {
-            return None;
-        }
-        Some(SystemMessage {
+    // What makes the prompt the session holds the one this build makes now: the sections that
+    // differ (None for one that went), the tools added or changed, and the tools gone. None when
+    // it's the same.
+    fn prompt_patch(&self) -> Option<SystemMessage> {
+        let current = transcript::current_system_message(&crate::message::to_model_messages(&self.session.context().messages));
+        let held: IndexMap<String, Option<String>> = current.as_ref().and_then(|system| system.sections.clone()).unwrap_or_default();
+        let held_tools = current.and_then(|system| system.tools_added).unwrap_or_default();
+        let tools: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
+        let mut patch: IndexMap<String, Option<String>> = self.config.sections.iter().filter(|(name, text)| held.get(*name) != Some(&Some((*text).clone()))).map(|(name, text)| (name.clone(), Some(text.clone()))).collect();
+        patch.extend(held.keys().filter(|name| !self.config.sections.contains_key(*name)).map(|name| (name.clone(), None)));
+        let added: Vec<ToolDefinition> = tools.iter().filter(|tool| !held_tools.contains(tool)).cloned().collect();
+        let removed: Vec<ToolReference> = held_tools.iter().filter(|held| !tools.iter().any(|tool| tool.name == held.name)).map(|held| ToolReference { name: held.name.clone() }).collect();
+        (!patch.is_empty() || !added.is_empty() || !removed.is_empty()).then(|| SystemMessage {
             content: TextOrBlocks::Text(String::new()),
             sections: (!patch.is_empty()).then_some(patch),
             tools_added: (!added.is_empty()).then_some(added),
             tools_removed: (!removed.is_empty()).then_some(removed),
             timestamp: clock::now_ms(),
         })
-    }
-
-    // Read the session's AGENTS.md files again, unless they're off.
-    fn reload_context_files(&mut self) {
-        if self.config.context_files {
-            crate::prompt::reload_context_files(&mut self.config.sections, &self.config.cwd, &crate::config::agent_dir());
-        }
     }
 
     // Add a message to the session and announce it. Custom messages are their own entry type.
@@ -535,20 +534,17 @@ impl Agent {
         Ok(id)
     }
 
-    // Send the user's prompt and run until the model is done (and any retry or background job
-    // it waits on). Output: an error only when the session can't be written; model failures end
-    // up in the session as failed assistant messages, as in pi.
-    pub async fn prompt(&mut self, text: &str) -> Result<(), String> {
-        self.run_from(user_message(text, Vec::new(), false)).await
-    }
-
-    // A prompt with images attached (rpc mode's `images`), and whether the user said it.
-    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>, spoken: bool) -> Result<(), String> {
+    // Send the user's prompt, with any images (rpc mode's `images`), and run until the model is
+    // done (and any retry or background job it waits on). An empty one with none answers only
+    // what's queued in the session. Output: an error only when the session can't be written; model
+    // failures end up in the session as failed assistant messages, as in pi.
+    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>) -> Result<(), String> {
         // A prompt in a closed session opens it again.
         if let Some(file) = self.session.file() {
             crate::session::set_closed(&crate::config::agent_dir(), file, false);
         }
-        self.run_from(user_message(text, images, spoken)).await
+        let first = (!text.is_empty() || !images.is_empty()).then(|| with_images(text, images));
+        self.run_from(first).await
     }
 
     pub fn set_gate(&mut self, gate: Gate) {
@@ -564,7 +560,7 @@ impl Agent {
     // Run a turn on a background job's finish message, as longcmd does in pi when the session
     // is idle.
     pub async fn take_notice(&mut self, notice: CustomMessage) -> Result<(), String> {
-        self.run_from(AgentMessage::Custom(notice)).await
+        self.run_from(Some(AgentMessage::Custom(notice))).await
     }
 
     // Keep a job's message for the next prompt, which it goes in ahead of: a kill the user asked
@@ -573,7 +569,13 @@ impl Agent {
         self.held.push(notice);
     }
 
-    async fn run_from(&mut self, first: AgentMessage) -> Result<(), String> {
+    // A run, starting with the messages queued in the session (sent while nothing ran it, or left
+    // by a stop), then `first`.
+    async fn run_from(&mut self, first: Option<AgentMessage>) -> Result<(), String> {
+        let queued: Vec<AgentMessage> = self.session.queued().iter().map(|text| user_message(text)).collect();
+        if queued.is_empty() && first.is_none() {
+            return Ok(());
+        }
         self.fresh_cancel();
         // Compact first when the last response left the context past the threshold; the new
         // prompt replaces any retry that schedules (agent-session.ts _prepareRun, _startRun).
@@ -581,16 +583,17 @@ impl Agent {
             self.check_compaction(&assistant, Some(&entry_id), false).await?;
         }
         let mut starting: Vec<AgentMessage> = self.held.drain(..).map(AgentMessage::Custom).collect();
-        starting.push(first);
+        starting.extend(queued);
+        starting.extend(first);
         let mut aborted = false;
         loop {
-            self.reload_context_files();
-            if let Some(system) = self.system_update() {
+            if let Some(system) = self.prompt_update() {
                 starting.insert(0, AgentMessage::System(system));
             }
             let outcome = self.run(std::mem::take(&mut starting)).await?;
             // The end of a run, which a Claude query still parked on tool calls doesn't outlive.
             provider::claude::end_run(self.session.id());
+            crate::scale::after_turn();
             if outcome.aborted {
                 aborted = true;
                 break;
@@ -620,25 +623,15 @@ impl Agent {
             }
             // What the user queued that no turn took (follow-ups, and steering that came after
             // the last turn) starts the next run.
-            let queued = {
-                let mut inbox = self.handle.lock();
-                if inbox.steer.is_empty() {
-                    let all = inbox.follow_up_all;
-                    dequeue(&mut inbox.follow_up, all).into_iter().map(|text| (text, false)).collect()
-                } else {
-                    let all = inbox.steering_all;
-                    dequeue(&mut inbox.steer, all)
-                }
-            };
+            let queued = self.take_queued();
             if !queued.is_empty() {
-                self.announce_queue();
-                starting.extend(queued.into_iter().map(|(text, spoken)| user_message(&text, Vec::new(), spoken)));
+                starting.extend(queued);
                 continue;
             }
             if self.config.hold_for_jobs && self.config.tool_shared.jobs.running_count() > 0 {
                 match self.wait_for_job().await {
-                    Some(notice) => {
-                        starting.push(AgentMessage::Custom(notice));
+                    Some(messages) => {
+                        starting.extend(messages);
                         continue;
                     }
                     None => {
@@ -665,16 +658,43 @@ impl Agent {
         Ok(())
     }
 
+    // The next of what's queued (steering first, then follow-ups), as user messages, and said.
+    fn take_queued(&mut self) -> Vec<AgentMessage> {
+        let queued = {
+            let mut inbox = self.handle.lock();
+            if inbox.steer.is_empty() {
+                let all = inbox.follow_up_all;
+                dequeue(&mut inbox.follow_up, all)
+            } else {
+                let all = inbox.steering_all;
+                dequeue(&mut inbox.steer, all)
+            }
+        };
+        if !queued.is_empty() {
+            self.announce_queue();
+        }
+        queued.iter().map(|text| user_message(text)).collect()
+    }
+
     // Print and json mode with a job still running after the model's last turn: wait for its
-    // finish message (longcmd.ts:533-554). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs
-    // are killed and their messages say why.
-    async fn wait_for_job(&mut self) -> Option<CustomMessage> {
-        let jobs = &self.config.tool_shared.jobs;
+    // finish message (longcmd.ts:533-554), or a message queued meanwhile (one sent to its
+    // runtime). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs are killed and
+    // their messages say why. Output: what starts the next turn, None when the wait was stopped.
+    async fn wait_for_job(&mut self) -> Option<Vec<AgentMessage>> {
+        let shared = self.config.tool_shared.clone();
+        let jobs = &shared.jobs;
         let cap = jobs.hold.map(|hold| tokio::time::Instant::now() + hold);
         let mut killed = false;
+        let handle = self.handle.clone();
         loop {
             tokio::select! {
-                notice = self.config.notices.recv() => return notice,
+                notice = self.config.notices.recv() => return notice.map(|notice| vec![AgentMessage::Custom(notice)]),
+                () = handle.0.1.notified() => {
+                    let queued = self.take_queued();
+                    if !queued.is_empty() {
+                        return Some(queued);
+                    }
+                }
                 () = self.cancel.cancelled() => return None,
                 () = tokio::time::sleep_until(cap.unwrap_or_else(tokio::time::Instant::now)), if cap.is_some() && !killed => {
                     killed = true;
@@ -808,7 +828,7 @@ impl Agent {
             let all = inbox.steering_all;
             dequeue(&mut inbox.steer, all)
         };
-        messages.extend(steer.into_iter().map(|(text, spoken)| user_message(&text, Vec::new(), spoken)));
+        messages.extend(steer.iter().map(|text| user_message(text)));
         messages
     }
 
@@ -912,6 +932,12 @@ impl Agent {
         // is recorded with its cause, and the session's views show it as one line.
         if let Some(miss) = crate::cache::check(&self.session, &id, provider::claude::take_rewrite(self.session.id())) {
             let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: crate::cache::MISS_TYPE.into(), data: Some(miss) };
+            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+            (self.emit)(&Event::EntryAppended { entry });
+        }
+        // The bridge's one notice, that Claude Code is newer than the version it was checked against.
+        if let Some(text) = provider::claude::take_notice() {
+            let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: provider::claude::NOTICE_TYPE.into(), data: Some(json!({"text": text})) };
             self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
             (self.emit)(&Event::EntryAppended { entry });
         }
@@ -1180,8 +1206,7 @@ impl Agent {
         // The compacted context starts a new cache anyway, so the prompt is brought up to date now,
         // before the first response on it: a compaction inside a tool loop goes straight on to the
         // next response, and an update left for the next run would rewrite the cache a second time.
-        self.reload_context_files();
-        if let Some(system) = self.system_update() {
+        if let Some(system) = self.prompt_update() {
             let message = AgentMessage::System(system);
             (self.emit)(&Event::MessageStart { message: message.clone() });
             (self.emit)(&Event::MessageEnd { message: message.clone() });
@@ -1227,8 +1252,11 @@ impl Agent {
             model_id: self.config.model.id.clone(),
             thinking_level: self.config.thinking_level.clone(),
             model_accepts_images: self.config.model.input.iter().any(|kind| kind == "image"),
+            image_limits: tools::image::Limits::of(self.config.model.input_limits.as_ref()),
             cancel: self.cancel.clone(),
             updates: None,
+            stay_in_foreground: false,
+            gate: None,
             shared: self.config.tool_shared.clone(),
         }
     }
@@ -1312,7 +1340,7 @@ impl Agent {
                     }
                 }
             });
-            let context = ToolContext { updates: Some(sender), ..self.tool_context() };
+            let context = ToolContext { updates: Some(sender), gate: self.config.gate.clone().map(|gate| (id.clone(), gate)), ..self.tool_context() };
             let (call_id, call_name) = (id.clone(), name.clone());
             pending.push(async move {
                 let started = Instant::now();

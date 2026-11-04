@@ -1,50 +1,39 @@
-// The system prompt: pi's sections, with piccosta's changes made as the sections are built.
+// The system prompt: piccosta's own text, in sections.
 //
-// Based on pi 1.4.0 (MIT, see LICENSE.md): packages/coding-agent/src/core/system-prompt.ts
-// (the sections) and resource-loader.ts (which AGENTS.md / CLAUDE.md files load). The sections are
-// what a session's system message stores, rendered joined by blank lines; each one but the
-// preamble is wrapped in a tag of its own name, so a later change can name what it replaces.
+// The sections, and which AGENTS.md / CLAUDE.md files load, are based on pi 1.4.0 (MIT, see
+// LICENSE.md): packages/coding-agent/src/core/system-prompt.ts and resource-loader.ts. None of
+// pi's wording is kept. A session's system message stores the sections, rendered joined by blank
+// lines; each one but the preamble is wrapped in a tag of its own name, so a later change can name
+// what it replaces. In order: a short preamble, the tools (each tool's own line), the rules (each
+// tool's guidelines and piccosta's own), the addendum (APPEND_SYSTEM.md, --append-system-prompt,
+// a manager's part), the project's context files, the cwd, and the constitution when it's on.
 //
-// piccosta's changes, which pi did as extensions rewriting the finished prompt:
-// - lean: no "Pi documentation" section. It points the model at pi's own README and examples,
-//   which matter only when you're building pi, and it was about 40% of pi 0.85's system text
-//   (bench/results/overhead/report.md).
-// - lean: a line in a context file that is only `@some/file.md` is replaced by that file, the way
+// - A line in a context file that is only `@some/file.md` is replaced by that file, the way
 //   Claude Code does. Paths are relative to the importing file, `~/` is home. One level deep: an
 //   imported file's own imports stay as written. A file never imports itself or a context file
 //   already in the prompt, and an import that can't be read keeps its `@` line, so nothing
 //   disappears silently.
-// - constitution: piccosta's constitution (prompts/constitution.md) goes last, as plain text after the tagged sections, once,
-//   the same every request, so after the first call it comes from the prompt cache.
-// In pi these forced the whole prompt every run, so the session stored one prompt and sent
-// another; built here as sections, the session holds exactly what the model gets.
+// - The constitution (prompts/constitution.md) goes last, as plain text after the tagged sections,
+//   once, the same every request, so after the first call it comes from the prompt cache.
 
 use crate::tools::Tool;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// pi's opening line, when no SYSTEM.md replaces it (system-prompt.ts:156-157).
-const PREAMBLE: &str = "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+// The opening line, when no SYSTEM.md replaces it.
+const PREAMBLE: &str = "You are a coding agent in piccosta. You work in the user's project: read its code, run its commands and change its files.";
 // The context files a directory can hold, first one found wins (resource-loader.ts:185).
 const CONTEXT_FILE_NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 // The largest import inlined: pi's read cap. Anything the model couldn't read in one read call
 // doesn't belong in every request either.
 const IMPORT_MAX_BYTES: usize = crate::tools::truncate::DEFAULT_MAX_BYTES;
 
-// The sections built from the session's own files rather than piccosta's text: its AGENTS.md /
-// CLAUDE.md files and its directory. A running session takes a change to these at once; a change to
-// any other section (a new build's wording, the constitution, SYSTEM.md, APPEND_SYSTEM.md, the
-// manager's part) waits for its next compaction or model change (agent.rs system_update).
-pub const INPUT_SECTIONS: [&str; 2] = ["project_context", "cwd"];
 // How recently a context file may have been written for its new text to be taken: a save that
 // truncates the file and then writes it is mid-way for milliseconds, and a read then would put half
 // a file in the prompt and the whole one in the next, two rewrites for one edit. Two seconds is far
 // past any such save and well short of the time to the next message.
 const SAVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-// The last good bytes of every context file and import read in this piccosta process, by path.
-static SNAPSHOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
 
 // The constitution is off unless asked for: benchmarks gave mixed results with it, and it is about
 // 2,200 tokens on every request (2026-11-02). PICCOSTA_CONSTITUTION holds the text itself (how the
@@ -60,8 +49,8 @@ pub struct ContextFile {
     pub content: String,
 }
 
-// What reading the context files ran into: the files that couldn't be read and had no last good
-// bytes to stand in, and whether one was still being saved with none (piccosta just started).
+// What reading the context files ran into: the files that couldn't be read, and whether one was
+// written so recently that it may be mid-save.
 #[derive(Default)]
 struct Reads {
     failures: Vec<String>,
@@ -69,31 +58,19 @@ struct Reads {
 }
 
 impl Reads {
-    // A file's bytes, or None when it's not there (only a not-found says so). A file that can't be
-    // read, or was written under SAVE_SETTLE ago, gives its last good bytes instead, so each file
-    // keeps its own and the rest still update; one with none that can't be read is a failure.
+    // A file's bytes, or None when it's not there (only a not-found says so) or can't be read (a
+    // failure). One written under SAVE_SETTLE ago is read, and marks the reads unsettled.
     fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
-        let read = std::fs::metadata(path).and_then(|metadata| Ok((metadata.modified()?, std::fs::read(path)?)));
-        let mut snapshots = SNAPSHOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match read {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                snapshots.remove(path);
-                None
-            }
-            Ok((written, bytes)) if !written.elapsed().is_ok_and(|age| age < SAVE_SETTLE) => {
-                snapshots.insert(path.to_path_buf(), bytes.clone());
+        match std::fs::metadata(path).and_then(|metadata| Ok((metadata.modified()?, std::fs::read(path)?))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok((written, bytes)) => {
+                self.unsettled |= written.elapsed().is_ok_and(|age| age < SAVE_SETTLE);
                 Some(bytes)
             }
-            // Still being saved: its last good bytes, or with none these, marked unsettled, so a
-            // session that holds instructions keeps them and a new one starts with what's there.
-            Ok((_, bytes)) => snapshots.get(path).cloned().or_else(|| {
-                self.unsettled = true;
-                Some(bytes)
-            }),
-            Err(error) => snapshots.get(path).cloned().or_else(|| {
+            Err(error) => {
                 self.failures.push(format!("Could not read {}: {error}", path.display()));
                 None
-            }),
+            }
         }
     }
 }
@@ -191,16 +168,8 @@ fn context_files(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<Context
 }
 
 fn import_target(raw: &str, importing_file: &Path) -> PathBuf {
-    let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let path = if raw == "~" {
-        home()
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        home().join(rest)
-    } else if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
-    } else {
-        importing_file.parent().unwrap_or(Path::new("/")).join(raw)
-    };
+    let path = crate::tools::paths::expand_home(raw);
+    let path = if path.is_absolute() { path } else { importing_file.parent().unwrap_or(Path::new("/")).join(path) };
     crate::tools::paths::canonical(&crate::tools::paths::resolve(&path.to_string_lossy(), Path::new("/")))
 }
 
@@ -259,7 +228,7 @@ pub struct PromptInputs<'a> {
     pub cwd: &'a Path,
     pub agent_dir: &'a Path,
     pub tools: &'a [Arc<dyn Tool>],
-    // The agent dir's SYSTEM.md (replaces pi's preamble, tool list and rules) and APPEND_SYSTEM.md.
+    // The agent dir's SYSTEM.md (replaces the preamble, tool list and rules) and APPEND_SYSTEM.md.
     pub custom_prompt: Option<String>,
     pub append_prompt: Option<String>,
     pub constitution: Option<String>,
@@ -269,29 +238,18 @@ pub struct PromptInputs<'a> {
     pub held_context: Option<String>,
 }
 
-// pi's rules: one line for shell file work, each tool's guidelines in tool order, then two of its
-// own, each once (system-prompt.ts:93-128).
+// The rules: each tool's guidelines in tool order, then piccosta's own, each once.
 fn rules(tools: &[Arc<dyn Tool>]) -> String {
-    let mut rules: Vec<String> = Vec::new();
-    let mut add = |rule: &str| {
-        let rule = crate::js::trim(rule);
-        if !rule.is_empty() && !rules.iter().any(|seen| seen == rule) {
-            rules.push(rule.to_string());
-        }
-    };
-    let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    if names.contains(&"bash") && !names.iter().any(|name| matches!(*name, "grep" | "find" | "ls")) {
-        add("Use bash for file operations like ls, rg, find");
-    }
-    for tool in tools {
-        for guideline in tool.prompt_guidelines() {
-            add(guideline);
-        }
-    }
+    let mut rules: Vec<&str> = Vec::new();
     // People watch a session work: a run of tool calls with no word between them reads as a hang.
-    add("Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first");
-    add("Be concise in your responses");
-    add("Show file paths clearly when working with files");
+    let talk = "Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first";
+    // Late in long sessions models write notes, reports and plans nobody asked for, and leave them.
+    let files = "Don't create documents (notes, reports, plans, summaries) unless the user asked for one; put what you found in your reply. Delete files you made for your own use before you finish";
+    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([talk, files]) {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
     rules.iter().map(|rule| format!("- {rule}")).collect::<Vec<_>>().join("\n")
 }
 
@@ -307,7 +265,7 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
             let listed: Vec<String> =
                 inputs.tools.iter().filter_map(|tool| tool.prompt_snippet().map(|snippet| format!("- {}: {snippet}", tool.name()))).collect();
             let list = if listed.is_empty() { "(none)".to_string() } else { listed.join("\n") };
-            raw.insert("tools".into(), format!("{list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."));
+            raw.insert("tools".into(), list);
             raw.insert("rules".into(), rules(inputs.tools));
         }
     }
@@ -315,9 +273,9 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
         raw.insert("addendum".into(), append.clone());
     }
     let mut reads = Reads::default();
-    let project = inputs.context_files.then(|| project_context(inputs.cwd, inputs.agent_dir, &mut reads)).flatten();
-    // A file that can't be read with no last good bytes in this process (piccosta just started): a
-    // session that holds instructions keeps them, rather than lose that file's.
+    let project = inputs.context_files.then(|| project_context(&expanded(inputs.cwd, inputs.agent_dir, &mut reads))).flatten();
+    // A file that can't be read, or may be mid-save: a session that holds instructions keeps them
+    // as they were, rather than lose that file's or take half of it.
     let held = inputs.held_context.as_deref().and_then(|held| held.strip_prefix("<project_context>\n")?.strip_suffix("\n</project_context>"));
     let project = if reads.failures.is_empty() && !reads.unsettled { project } else { held.map(String::from).or(project) };
     if let Some(project) = project {
@@ -344,50 +302,54 @@ fn tagged(name: &str, content: &str) -> String {
     format!("<{name}>\n{content}\n</{name}>")
 }
 
-// The project_context section's text: every context file for the session, imports expanded, or
-// None when there are none.
-fn project_context(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Option<String> {
+// Every context file for the session (path, text), imports expanded.
+fn expanded(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<(PathBuf, String)> {
     let files = context_files(cwd, agent_dir, reads);
     let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
-    let mut parts = vec!["Project-specific instructions and guidelines:".to_string()];
-    for file in &files {
-        parts.push(format!("<project_instructions path=\"{}\">\n{}\n</project_instructions>", file.path.display(), expand_imports(file, &in_prompt, reads)));
+    files.iter().map(|file| (file.path.clone(), expand_imports(file, &in_prompt, reads))).collect()
+}
+
+// The project_context section's text for those files, or None when there are none.
+fn project_context(files: &[(PathBuf, String)]) -> Option<String> {
+    let mut parts = vec!["The user's instructions for this project, from its AGENTS.md and CLAUDE.md files, outermost first:".to_string()];
+    for (path, text) in files {
+        parts.push(format!("<project_instructions path=\"{}\">\n{text}\n</project_instructions>", path.display()));
     }
     (!files.is_empty()).then(|| parts.join("\n\n"))
 }
 
-// Read a running session's context files again into its sections, so an AGENTS.md edited, added or
-// removed since it opened reaches the next request. The section keeps its place, and a new one goes
-// where sections() puts it, just before cwd. A file that can't be read, or is still being saved,
-// goes in as it last read whole (Reads::read); one that never did leaves the section as it was,
-// since dropping instructions that are still there would rewrite the cache now and again once
-// they read. The next run reads them again.
-pub fn reload_context_files(sections: &mut IndexMap<String, String>, cwd: &Path, agent_dir: &Path) {
+// A running session's project_context section as its context files are now (agent.rs
+// prompt_update): Some(None) when there are none, and None when one can't be read whole now (a
+// failure, or written in the last SAVE_SETTLE, maybe mid-save).
+pub fn context_now(cwd: &Path, agent_dir: &Path) -> Option<Option<String>> {
     let mut reads = Reads::default();
-    let project = project_context(cwd, agent_dir, &mut reads);
-    if !reads.failures.is_empty() || reads.unsettled {
-        return;
-    }
-    match project {
-        Some(project) => {
-            let text = tagged("project_context", &project);
-            match sections.get_index_of("project_context") {
-                Some(index) => sections[index] = text,
-                None => {
-                    let before_cwd = sections.get_index_of("cwd").unwrap_or(sections.len());
-                    sections.shift_insert(before_cwd, "project_context".into(), text);
-                }
-            }
+    let files = expanded(cwd, agent_dir, &mut reads);
+    (reads.failures.is_empty() && !reads.unsettled).then(|| project_context(&files).map(|project| tagged("project_context", &project)))
+}
+
+// The instructions a project_context section holds: each file's path and text, below the header
+// line, which is piccosta's wording. "" for none.
+pub fn instructions(section: Option<&str>) -> &str {
+    section.and_then(|text| text.split_once("\n\n")).map_or("", |(_, files)| files)
+}
+
+// Put a project_context section in a prompt's sections, or take it out (None). It keeps its place,
+// and a new one goes where sections() puts it, just before cwd.
+pub fn set_project_context(sections: &mut IndexMap<String, String>, project: Option<String>) {
+    match (project, sections.get_index_of("project_context")) {
+        (Some(text), Some(index)) => sections[index] = text,
+        (Some(text), None) => {
+            let before_cwd = sections.get_index_of("cwd").unwrap_or(sections.len());
+            sections.shift_insert(before_cwd, "project_context".into(), text);
         }
-        None => {
+        (None, _) => {
             sections.shift_remove("project_context");
         }
     }
 }
 
 // The agent dir's SYSTEM.md and APPEND_SYSTEM.md, when present (resource-loader.ts:1213-1239).
-// pi also reads them from a trusted project's .pi/; piccosta has no project trust, so only the
-// agent dir's count.
+// Only the agent dir's count: piccosta has no project trust to let a repo replace its prompt.
 pub fn custom_prompts(agent_dir: &Path) -> (Option<String>, Option<String>) {
     let read = |name: &str| std::fs::read_to_string(agent_dir.join(name)).ok();
     (read("SYSTEM.md"), read("APPEND_SYSTEM.md"))

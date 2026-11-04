@@ -85,18 +85,10 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         let _ = events.send(event);
     };
     let mut state = StreamState::new(request.model, new_output(request.model, API));
-    let result = tokio::select! {
-        result = run(request, &mut state, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let result = super::abortable(request, run(request, &mut state, &mut send)).await;
     let mut output = state.output;
-    if let Err(message) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    } else if output.stop_reason == StopReason::Pending {
-        output.stop_reason = StopReason::Error;
-        output.error_message = Some("OpenAI Responses stream ended without a stop reason".to_string());
-    }
+    let ended = result.and_then(|()| if output.stop_reason == StopReason::Pending { Err("OpenAI Responses stream ended without a stop reason".to_string()) } else { Ok(()) });
+    super::settle(request, &mut output, ended);
     output
 }
 
@@ -108,11 +100,12 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     let cache_key: Option<String> = cache_session.map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
     let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level);
 
-    // Session affinity, by the format the provider asks for (openai-responses.ts:293-303). The
-    // catalog's opencode models ask for "openai-nosession".
+    // Session affinity, by the format the provider asks for (openai-responses.ts:293-303).
+    // opencode's models ask for "openai-nosession" (pi's catalog).
     let mut affinity = Vec::new();
     if let Some(session) = cache_session {
-        if model.compat_str("sessionAffinityFormat").unwrap_or("openai") == "openai" {
+        let format = model.compat_str("sessionAffinityFormat").unwrap_or(if super::is_opencode(model) { "openai-nosession" } else { "openai" });
+        if format == "openai" {
             affinity.push(("session_id", session.to_string()));
         }
         affinity.push(("x-client-request-id", session.to_string()));

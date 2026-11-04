@@ -1,5 +1,23 @@
 // Voice, brought by the user. piccosta records and synthesizes nothing: two commands named in
-// settings do that, and piccosta passes text to and from them. The protocol:
+// settings do that, and piccosta passes text to and from them. Voice is a call with one session at
+// a time, the way the user is on a call with a person:
+//
+// - A call starts with `/call` in the terminal UI (the session shown there, or `/call assistant`)
+//   or `piccosta call [assistant | <session id or name>]` (the assistant when none is named). It's
+//   a record in the agent dir naming the session's file and an id of its own; starting another ends
+//   it, and so do `/hangup`, `piccosta hangup` and closing that session (a socket close, the UI's
+//   /close).
+// - Push-to-talk talks into the call. With none, `piccosta voice start` and `voice stop` do nothing
+//   and exit 0, so the button can be the one the user already talks to people with.
+// - What push-to-talk hears, and what's said, belongs to the call it started in, by its id: once
+//   the record holds another id or none, listening stops with nothing delivered and speaking stops
+//   within CALL_POLL, whichever process ended the call.
+// - During a call, every answer the session gives is said, whatever started the turn: something
+//   the user said or typed, a background job's end, a lane's news (the assistant calling the user).
+//   Whichever runtime runs the session says it, checking the record as each turn starts; what it's
+//   saying ends as the session closes. Outside a call nothing is said.
+//
+// The commands:
 //
 // - `voice.listen`, a shell command, starts when push-to-talk goes down (`piccosta voice start`).
 //   It records from the microphone itself, from when it starts until its stdin closes, which
@@ -7,28 +25,23 @@
 //   as UTF-8 lines, each a finished piece of the transcript in order, as soon as it has them (a
 //   streaming recognizer while the key is held, a batch one like whisper.cpp after), then exits,
 //   within LISTEN_FINISH_SECONDS of its stdin closing. The lines joined by spaces are the user's
-//   message, delivered to the session the way `piccosta tell` delivers one.
-// - `voice.speak`, a shell command, starts once for each spoken turn. piccosta writes it UTF-8
+//   message, delivered to the session in the call the way `piccosta tell` delivers one (queued in
+//   its file when nobody runs it, for the next run to answer).
+// - `voice.speak`, a shell command, starts once for each turn said. piccosta writes it UTF-8
 //   lines, each a piece of the answer that ends at a sentence or a paragraph, the moment the model
 //   has written it, and closes its stdin when the turn ends. It says each line as it comes (Piper
 //   reads its stdin this way) and exits after the last. Turns are said one after another, never
 //   over each other.
-// - `voice.quick`, optional: a fast model (provider/id) that answers first, from the end of the
-//   conversation, while the session's model does the work. Its lines go to the speak command
-//   first, then the session's answer's, which wait their turn. It's spoken only: the session never
-//   sees its words, so its transcript and its prompt cache are as they'd be without it; what it
-//   cost is counted in the session's statistics.
-//
-// A message is spoken when the user said it: `piccosta voice` marks its inbox record spoken, and
-// the mark goes with it into the session's user message, where the model never sees it. The answer
-// to it is spoken; any other message the user sends, a steer typed while one is said among them,
-// ends that speech and is answered silently.
+// - `voice.quick`, optional: a fast model (provider/id) that answers each of the user's messages
+//   first, from the end of the conversation, while the session's model does the work. Its lines go
+//   to the speak command first, then the session's answer's, which wait their turn. It's spoken
+//   only: the session never sees its words, so its transcript and its prompt cache are as they'd
+//   be without it; what it cost is counted in the session's statistics.
 
 use crate::agent::{AgentConfig, Event, EventSink};
 use crate::message::{AgentMessage, Message, SystemMessage, TextOrBlocks, Usage, UserMessage};
 use crate::model::{Model, ProviderConfig};
 use crate::provider::{Request, StreamEvent};
-use crate::tools::web::github::process_start_time;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -41,11 +54,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 // In the agent dir: the record (pid and start time) of the hold that's listening, the lock that
-// lets one `voice start` or `voice stop` at a time touch it, and the record of the terminal UI
-// whose focused session spoken words go to.
+// lets one `voice start` or `voice stop` at a time touch it, and the call's record.
 const HOLD_FILE: &str = "voice.pid";
 const LOCK_FILE: &str = "voice.lock";
-const FOCUS_FILE: &str = "voice-focus.json";
+const CALL_FILE: &str = "call.json";
 // Where a hold's errors and the listen command's stderr go, in the agent dir.
 const LOG_FILE: &str = "voice.log";
 // How long a hold listens when no `voice stop` comes (a missed key release), unless
@@ -69,6 +81,10 @@ const SPEAK_EXIT_SECONDS: u64 = 300;
 const QUICK_SECONDS: u64 = 30;
 const DRAIN_SECONDS: u64 = 300;
 const STOP_SECONDS: u64 = 5;
+// How often listening and speaking look at the call's record to see that their call is still on: a
+// spoken line is a sentence, a couple of seconds, so half a second ends speech within the line
+// being said, and reading a small file twice a second costs nothing.
+const CALL_POLL: Duration = Duration::from_millis(500);
 // How many turns can wait to be said, and how many pieces of one turn's answer: a few turns is
 // more than anyone asks while one is said, and four thousand streamed pieces is several thousand
 // tokens, minutes of speech. Past either, what doesn't fit is dropped, never waited for.
@@ -117,31 +133,80 @@ fn text_setting(settings: &crate::config::Settings, key: &str) -> Option<String>
 
 // --- Process records ---
 
-// Write a record of process `pid` to `path`: its start time, so a later reader can tell it from a
-// process that has since been given the same pid, and the session it's about, if any. It's written
-// beside the old one and renamed over it, so a reader finds one or the other, never half of one.
-fn write_record(path: &Path, pid: u32, session: Option<&Path>) -> std::io::Result<()> {
+// Write `record` to `path`, beside the old one and renamed over it, so a reader finds one or the
+// other, never half of one.
+fn write_record(path: &Path, record: Value) -> std::io::Result<()> {
     let written = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&written, json!({ "pid": pid, "started": process_start_time(pid), "session": session }).to_string())?;
+    std::fs::write(&written, record.to_string())?;
     std::fs::rename(written, path)
 }
 
-// The record at `path` as (pid, session), when the process that wrote it is still running.
-fn live_record(path: &Path) -> Option<(u32, Option<PathBuf>)> {
+// The hold's record at `path`: its pid, when the process that wrote it is still running. The
+// record holds its boot and start time too (proc.rs recorded_start), to tell it from a process
+// given the same pid since.
+fn live_record(path: &Path) -> Option<u32> {
     let record: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let pid = u32::try_from(record.get("pid")?.as_u64()?).ok()?;
-    let started = record.get("started")?.as_str()?;
-    (process_start_time(pid).as_deref() == Some(started)).then(|| (pid, record.get("session").and_then(Value::as_str).map(PathBuf::from)))
+    let started = crate::proc::recorded_start(record.get("started")?.as_str()?)?;
+    crate::proc::Process::started(pid as i32, started).map(|_| pid)
 }
 
-// A running terminal UI's focused session (None when it's one kept in memory), where push-to-talk
-// sends what it hears. Each UI writes it when its focus moves to another session; the last one
-// written wins, and one whose UI has closed is passed over (live_record).
-pub fn focus(agent_dir: &Path, session: Option<&Path>) {
-    static WRITTEN: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
-    let mut written = WRITTEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if written.as_ref().map(Option::as_deref) != Some(session) && write_record(&agent_dir.join(FOCUS_FILE), std::process::id(), session).is_ok() {
-        *written = Some(session.map(Path::to_path_buf));
+// The call the user is on: its session's file and its id, or None when there's no call. A read that
+// fails for any reason but the file being gone (too many open files, say) is an error, not a hangup.
+fn reading(agent_dir: &Path) -> std::io::Result<Option<(PathBuf, String)>> {
+    let text = match std::fs::read_to_string(agent_dir.join(CALL_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        read => read?,
+    };
+    // The record is replaced whole (write_record), so one that doesn't parse isn't a call.
+    let record: Value = serde_json::from_str(&text).unwrap_or_default();
+    Ok(record["session"].as_str().zip(record["id"].as_str()).map(|(file, id)| (PathBuf::from(file), id.to_string())))
+}
+
+fn current(agent_dir: &Path) -> Option<(PathBuf, String)> {
+    reading(agent_dir).ok().flatten()
+}
+
+// Whether the call with id `id` is known to be over: no call, or another one. A failed read says
+// nothing, so speech and listening go on until a read says so.
+fn over(agent_dir: &Path, id: &str) -> bool {
+    reading(agent_dir).is_ok_and(|call| call.is_none_or(|(_, now)| now != id))
+}
+
+// The file of the session the user is on a call with, if they're on one.
+pub fn call(agent_dir: &Path) -> Option<PathBuf> {
+    current(agent_dir).map(|(file, _)| file)
+}
+
+// Done once the call with id `id` is over, looked for every CALL_POLL.
+async fn ended(agent_dir: &Path, id: &str) {
+    while !over(agent_dir, id) {
+        tokio::time::sleep(CALL_POLL).await;
+    }
+}
+
+// Call the session in `file`, under a new id, which ends any other call; None hangs up.
+pub fn set_call(agent_dir: &Path, file: Option<&Path>) -> std::io::Result<()> {
+    match file {
+        Some(file) => write_record(&agent_dir.join(CALL_FILE), json!({ "session": file, "id": uuid::Uuid::now_v7().to_string() })),
+        None => std::fs::remove_file(agent_dir.join(CALL_FILE)).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }),
+    }
+}
+
+// Hang up if the call is with the session in `file`, which is closing.
+pub fn hang_up(agent_dir: &Path, file: &Path) {
+    if call(agent_dir).as_deref() == Some(file) {
+        let _ = set_call(agent_dir, None);
+    }
+}
+
+// The session `wanted` names for `piccosta call`: the assistant's for none or "assistant", the file
+// for a path, else the session whose id starts with it or whose name it is.
+fn session_named(agent_dir: &Path, wanted: Option<&str>) -> Result<PathBuf, String> {
+    match wanted {
+        None | Some("assistant") => crate::manager::session_file(agent_dir).ok_or_else(|| "no assistant yet: start it with `piccosta assistant`".into()),
+        Some(path) if path.contains('/') || path.ends_with(".jsonl") => std::path::absolute(path).map_err(|error| error.to_string()),
+        Some(wanted) => crate::host::all_sessions(agent_dir, usize::MAX).into_iter().find(|summary| summary.id.starts_with(wanted) || summary.title == wanted).map(|summary| summary.path).ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)")),
     }
 }
 
@@ -155,16 +220,20 @@ fn lock(agent_dir: &Path) -> Result<std::fs::File, String> {
 
 // --- Push-to-talk ---
 
-// `piccosta voice start [assistant]`, `piccosta voice stop`, and `voice hold <session file>`, the
-// process start leaves listening. Output: an error to print, or Ok when it's done.
+// `piccosta call [assistant | <session>]`, `piccosta hangup`, `piccosta voice start`, `piccosta
+// voice stop`, and `voice hold <call id>`, the process start leaves listening. Output: an
+// error to print, or Ok when it's done.
 pub async fn run(arguments: &[String]) -> Result<(), String> {
     let agent_dir = crate::config::agent_dir();
     let hold_file = agent_dir.join(HOLD_FILE);
     match arguments.first().map(String::as_str) {
+        Some("call") => set_call(&agent_dir, Some(&session_named(&agent_dir, arguments.get(1).map(String::as_str))?)).map_err(|error| error.to_string()),
+        Some("hangup") => set_call(&agent_dir, None).map_err(|error| error.to_string()),
         Some("start") => {
-            let settings = crate::config::Settings::load(&agent_dir, &std::env::current_dir().unwrap_or_default());
+            // Off a call, push-to-talk is someone else's button.
+            let Some((target, id)) = current(&agent_dir) else { return Ok(()) };
+            let settings = crate::config::Settings::load(&agent_dir, std::env::current_dir().ok().as_deref());
             text_setting(&settings, "voice.listen").ok_or("no listen command: set voice.listen in settings")?;
-            let target = target(&agent_dir, arguments.get(1).map(String::as_str) == Some("assistant")).ok_or("nowhere to send it: open a session in the terminal UI, or start the assistant")?;
             let _lock = lock(&agent_dir)?;
             // A hold still listening (its release was missed) ends first, and sends what it heard.
             stop(&hold_file);
@@ -174,9 +243,9 @@ pub async fn run(arguments: &[String]) -> Result<(), String> {
             let exe = std::env::current_exe().map_err(|error| error.to_string())?;
             let log = log().map_err(|error| error.to_string())?;
             let mut hold = std::process::Command::new(exe);
-            hold.arg("voice").arg("hold").arg(&target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+            hold.arg("voice").arg("hold").arg(&id).arg(&target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
             let hold = std::os::unix::process::CommandExt::process_group(&mut hold, 0).spawn().map_err(|error| format!("couldn't start listening: {error}"))?;
-            write_record(&hold_file, hold.id(), None).map_err(|error| error.to_string())
+            write_record(&hold_file, json!({ "pid": hold.id(), "started": crate::proc::start(hold.id() as i32).map(|start| format!("{} {start}", crate::proc::boot_id())) })).map_err(|error| error.to_string())
         }
         Some("stop") => {
             let _lock = lock(&agent_dir)?;
@@ -184,29 +253,23 @@ pub async fn run(arguments: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("hold") => {
-            let listened = hold(&agent_dir, Path::new(arguments.get(1).ok_or("voice hold needs a session file")?)).await;
+            let (Some(id), Some(target)) = (arguments.get(1), arguments.get(2)) else { return Err("voice hold needs a call id and its session file".into()) };
+            let listened = hold(&agent_dir, id, Path::new(target)).await;
             // However it ended, its record goes, unless a newer start has written its own.
             let _lock = lock(&agent_dir)?;
-            if live_record(&hold_file).is_some_and(|(pid, _)| pid == std::process::id()) {
+            if live_record(&hold_file) == Some(std::process::id()) {
                 let _ = std::fs::remove_file(&hold_file);
             }
             listened
         }
-        _ => Err("usage: piccosta voice start [assistant] | piccosta voice stop".into()),
+        _ => Err("usage: piccosta voice start | piccosta voice stop".into()),
     }
-}
-
-// Where spoken words go: the session focused in a running terminal UI, else the assistant's (and
-// always the assistant's when `assistant_only`).
-fn target(agent_dir: &Path, assistant_only: bool) -> Option<PathBuf> {
-    let focused = live_record(&agent_dir.join(FOCUS_FILE)).filter(|_| !assistant_only).and_then(|(_, session)| session);
-    focused.or_else(|| crate::manager::session_file(agent_dir))
 }
 
 // End the hold that's listening, if its record names one still running: SIGTERM, which it answers
 // by closing the listen command's stdin. The caller holds the lock.
 fn stop(hold_file: &Path) {
-    if let Some((pid, _)) = live_record(hold_file) {
+    if let Some(pid) = live_record(hold_file) {
         // SAFETY: kill() only sends a signal.
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
@@ -214,9 +277,10 @@ fn stop(hold_file: &Path) {
 }
 
 // Listen until SIGTERM (`voice stop`) or the time limit, then deliver what was heard to the session
-// in `target`.
-async fn hold(agent_dir: &Path, target: &Path) -> Result<(), String> {
-    let settings = crate::config::Settings::load(agent_dir, &std::env::current_dir().unwrap_or_default());
+// in the call with id `id` (its session's file, `target`), if that call is still on. One that ends
+// first ends the listening.
+async fn hold(agent_dir: &Path, id: &str, target: &Path) -> Result<(), String> {
+    let settings = crate::config::Settings::load(agent_dir, std::env::current_dir().ok().as_deref());
     let listen = text_setting(&settings, "voice.listen").ok_or("no listen command: set voice.listen in settings")?;
     let limit = settings.get("voice.maxSeconds").and_then(Value::as_u64).unwrap_or(MAX_HOLD_SECONDS);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
@@ -227,10 +291,15 @@ async fn hold(agent_dir: &Path, target: &Path) -> Result<(), String> {
     // While the key is down the lines are read as they come, so a recognizer that streams is never
     // held up by a full pipe. One that ends by itself has nothing more to say.
     let time_up = tokio::time::sleep(Duration::from_secs(limit));
-    tokio::pin!(time_up);
+    let call_ended = ended(agent_dir, id);
+    tokio::pin!(time_up, call_ended);
     loop {
         tokio::select! {
             _ = terminate.recv() => break,
+            () = &mut call_ended => {
+                kill_group(&mut listener).await;
+                return Ok(());
+            }
             () = &mut time_up => {
                 eprintln!("piccosta voice: no stop after {limit} s (voice.maxSeconds); stopped listening");
                 break;
@@ -256,10 +325,12 @@ async fn hold(agent_dir: &Path, target: &Path) -> Result<(), String> {
         kill_group(&mut listener).await;
     }
     let words = heard.iter().map(|line| line.trim()).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
-    if words.is_empty() {
+    if words.is_empty() || over(agent_dir, id) {
         return Ok(());
     }
-    crate::manager::deliver(target, &words, true).map_err(|error| format!("{}: {error}", target.display()))
+    // The assistant hears from the user with the time, as `piccosta tell` sends it.
+    let text = if crate::manager::session_file(agent_dir).as_deref() == Some(target) { crate::manager::from_user(&words) } else { words };
+    crate::runtime::send(target, &text, None).map(|_| ())
 }
 
 // --- Speaking ---
@@ -274,10 +345,15 @@ struct Quick {
     cwd: PathBuf,
 }
 
-// A spoken turn, as the speech worker gets it: the speak command, the words it answers, what the
-// quick model reads, and the session's answer as it streams.
+// A turn to say, as the speech worker gets it: the speak command, the words it answers, what the
+// quick model reads (no quick model for a turn the user didn't start), and the session's answer as
+// it streams.
 struct Turn {
     speak: String,
+    // Cancelled as its session closes (jobs.rs shutdown), which ends it said or waiting.
+    closed: CancellationToken,
+    // The id of the call it's said in, whose end ends it too.
+    call: String,
     session_id: String,
     words: String,
     transcript: String,
@@ -292,7 +368,7 @@ enum Job {
 }
 
 // The speech worker, one a process, which says turns one after another on a thread of its own (an
-// agent runs on whatever runtime its frontend has). Started with the first spoken turn; `stop`
+// agent runs on whatever runtime its frontend has). Started with the first turn said; `stop`
 // ends it, and `thread` is its thread with a receiver that closes as that thread returns.
 struct Worker {
     jobs: mpsc::Sender<Job>,
@@ -367,11 +443,12 @@ pub fn spent_changes() -> watch::Receiver<Spent> {
     SPENT.subscribe()
 }
 
-// A session's events, with its spoken turns spoken. Input: the settings, the agent's config (for
-// the quick model), the session, and where the events go on to. Output: the sink to give the
-// agent, which is `emit` itself when `voice.speak` isn't set.
+// A session's events, with its answers said while the user is on a call with it. Input: the
+// settings, the agent's config (for the quick model), the session, and where the events go on to.
+// Output: the sink to give the agent, which is `emit` itself when `voice.speak` isn't set.
 pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, session: &crate::session::Session, mut emit: EventSink) -> EventSink {
     let Some(speak) = text_setting(settings, "voice.speak") else { return emit };
+    let closed = config.tool_shared.jobs.closed.clone();
     let quick = text_setting(settings, "voice.quick").and_then(|name| config.registry.resolve(&name).ok().cloned()).map(|model| Quick {
         config: config.registry.provider_config(&model.provider).cloned(),
         model,
@@ -379,19 +456,25 @@ pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, sessio
         transport: config.transport.clone(),
         cwd: config.cwd.clone(),
     });
-    let session_id = session.id().to_string();
+    let (session_id, file, agent_dir) = (session.id().to_string(), session.file().map(Path::to_path_buf), crate::config::agent_dir());
     let mut transcript = String::new();
     session.context().messages.iter().for_each(|message| remember(&mut transcript, message));
-    // The spoken turn under way: where the session's answer goes, a piece at a time. Each message
-    // the user sends ends the one before's; its own is spoken only when they said it.
+    // The turn being said: where the session's answer goes, a piece at a time. Each message from
+    // the user ends the one before's and starts its own, while the call is with this session; a
+    // job's end or a lane's news starts one when none is under way.
     let mut turn: Option<mpsc::Sender<String>> = None;
     Box::new(move |event: &Event| {
         match event {
-            Event::MessageStart { message: AgentMessage::User(user) } => {
-                turn = user.spoken.then(|| mpsc::channel(ANSWER_QUEUE)).and_then(|(sender, answer)| {
-                    let spoken = Turn { speak: speak.clone(), session_id: session_id.clone(), words: user.content.text(), transcript: transcript.clone(), quick: quick.clone(), answer };
-                    worker().jobs.try_send(Job::Turn(Box::new(spoken))).map(|()| sender).inspect_err(|_| note("too many turns waiting to be said; this one isn't")).ok()
-                });
+            Event::MessageStart { message: message @ (AgentMessage::User(_) | AgentMessage::Custom(_)) } => {
+                let user = matches!(message, AgentMessage::User(_));
+                if user || turn.is_none() {
+                    let on_call = current(&agent_dir).filter(|(called, _)| Some(called) == file.as_ref());
+                    turn = on_call.map(|(_, call)| (call, mpsc::channel(ANSWER_QUEUE))).and_then(|(call, (sender, answer))| {
+                        let words = if let AgentMessage::User(said) = message { said.content.text() } else { String::new() };
+                        let said = Turn { speak: speak.clone(), closed: closed.clone(), call, session_id: session_id.clone(), words, transcript: transcript.clone(), quick: quick.clone().filter(|_| user), answer };
+                        worker().jobs.try_send(Job::Turn(Box::new(said))).map(|()| sender).inspect_err(|_| note("too many turns waiting to be said; this one isn't")).ok()
+                    });
+                }
             }
             Event::MessageUpdate { assistant_message_event, .. } => {
                 if assistant_message_event.get("type").and_then(Value::as_str) == Some("text_delta")
@@ -430,16 +513,22 @@ fn remember(transcript: &mut String, message: &AgentMessage) {
 
 // Say one turn: start the speak command, give it the quick answer when there's a quick model, then
 // the session's answer, which has waited meanwhile; close its stdin and give it its time to finish.
-// A speak command that stops taking lines, or a worker told to stop, ends the turn at once: the
-// command and everything it started are killed, and the rest of the answer is let go.
+// A speak command that stops taking lines, a worker told to stop, the session closing or the call
+// ending ends the turn at once: the command and everything it started are killed, and the rest of
+// the answer is let go. A turn whose session closed or whose call ended while it waited isn't
+// started.
 async fn play(mut turn: Turn, stop: &CancellationToken) {
+    let agent_dir = crate::config::agent_dir();
+    if turn.closed.is_cancelled() || over(&agent_dir, &turn.call) {
+        return;
+    }
     let mut command = shell(&turn.speak);
     command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(log().map_or(Stdio::null(), Stdio::from));
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return note(&format!("couldn't run voice.speak: {error}")),
     };
-    let group = child.id();
+    let (group, closed, call) = (child.id(), turn.closed.clone(), turn.call.clone());
     let cut = stop.child_token();
     let mut speaker = Speaker { stdin: child.stdin.take(), pending: String::new(), cut: cut.clone() };
     let said = async {
@@ -459,7 +548,7 @@ async fn play(mut turn: Turn, stop: &CancellationToken) {
             false
         }
     };
-    let finished = tokio::select! { exited = said => exited, () = cut.cancelled() => false };
+    let finished = tokio::select! { exited = said => exited, () = cut.cancelled() => false, () = closed.cancelled() => false, () = ended(&agent_dir, &call) => false };
     if !finished {
         kill_group(&mut child).await;
     } else if let Some(group) = group {
@@ -508,7 +597,7 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
     let credential = crate::auth::credential_for(&quick.model.provider, quick.config.as_ref(), &quick.credentials).await.map_err(|error| note(&format!("voice.quick: {error}"))).ok()?;
     let messages = [
         Message::System(SystemMessage { content: TextOrBlocks::Text(QUICK_PROMPT.into()), sections: None, tools_added: None, tools_removed: None, timestamp: 0 }),
-        Message::User(UserMessage { content: TextOrBlocks::Text(format!("The conversation so far, its end:\n\n{}The user just said: {}", turn.transcript, turn.words)), timestamp: crate::clock::now_ms(), spoken: false }),
+        Message::User(UserMessage { content: TextOrBlocks::Text(format!("The conversation so far, its end:\n\n{}The user just said: {}", turn.transcript, turn.words)), timestamp: crate::clock::now_ms() }),
     ];
     let session_id = uuid::Uuid::now_v7().to_string();
     let (sender, mut events) = mpsc::unbounded_channel();

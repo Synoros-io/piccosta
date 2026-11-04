@@ -1,10 +1,12 @@
 // How busy the machine is, so a model can be told when it's overused. An agent that knows the
-// load is high, memory or swap is nearly gone, or /tmp or its disk is nearly full can hold off
-// on starting more and look at what's running, instead of adding to it. Nothing is stopped or
+// load is high, memory is nearly gone or swap is filling, or $TMPDIR or its disk is nearly full
+// can hold off on starting more and look at what's running, instead of adding to it. Nothing is stopped or
 // slowed: the note is all this does, and the run carries on whatever the load. Linux only (it
-// reads /proc); elsewhere it finds nothing.
+// reads /proc); elsewhere it finds nothing. Each threshold below is the default for a `machine.*`
+// setting of the same name (machine.loadPerCore, ...), for a machine whose normal looks different.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // The 1-minute load average per core past which work queues for CPU: above 1.0 something is
@@ -13,41 +15,70 @@ const LOAD_PER_CORE: f64 = 1.5;
 // Memory available (MemAvailable) under a tenth of the total: the kernel is about to reclaim
 // hard or swap.
 const MEMORY_AVAILABLE_FRACTION: f64 = 0.10;
-// More than half the swap in use: the machine has been short of memory for a while.
+// More than half the swap in use: the machine has been short of memory for a while. That alone
+// isn't a note: zram setups sit at high swap use as their normal, so it counts only while memory
+// is low or swap is still growing.
 const SWAP_USED_FRACTION: f64 = 0.50;
-// /tmp or the working directory's filesystem more than 90% full.
+// Swap counts as growing once it's up by a twentieth of its size within the last REPEAT: more than
+// the drift of a steady machine, the start of one running short.
+const SWAP_GROWTH_FRACTION: f64 = 0.05;
+// $TMPDIR or the working directory's filesystem more than 90% full.
 const DISK_USED_FRACTION: f64 = 0.90;
 // While the machine stays overused, a session hears it again after this long.
 const REPEAT: Duration = Duration::from_secs(600);
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+// Swap use (kB) over the last REPEAT, each with when it was read, to tell growing swap from
+// steady. One for the process: every session reads the same machine.
+static SWAP_SEEN: Mutex<Vec<(Instant, f64)>> = Mutex::new(Vec::new());
+// How often a swap reading is kept for the growth window: twenty in REPEAT's ten minutes.
+const SWAP_SAMPLE_EVERY: Duration = Duration::from_secs(30);
+
 // Each overused resource, in words ("load 18.4 on 12 cores"); empty when all is well.
 fn strain(cwd: &Path) -> Vec<String> {
+    let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(cwd));
+    let setting = |name: &str, default: f64| settings.get(&format!("machine.{name}")).and_then(serde_json::Value::as_f64).unwrap_or(default);
     let mut found = Vec::new();
     let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
     let load: Option<f64> = std::fs::read_to_string("/proc/loadavg").ok().and_then(|text| text.split_whitespace().next()?.parse().ok());
-    if let Some(load) = load.filter(|load| *load > LOAD_PER_CORE * cores as f64) {
+    if let Some(load) = load.filter(|load| *load > setting("loadPerCore", LOAD_PER_CORE) * cores as f64) {
         found.push(format!("load {load:.1} on {cores} cores"));
     }
     // /proc/meminfo's values are in kB.
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let kilobytes = |key: &str| meminfo.lines().find_map(|line| line.strip_prefix(key)?.split_whitespace().next()?.parse::<f64>().ok());
     let gigabytes = |kb: f64| kb * 1024.0 / BYTES_PER_GB;
+    let mut memory_low = false;
     if let (Some(total), Some(available)) = (kilobytes("MemTotal:"), kilobytes("MemAvailable:"))
-        && available < MEMORY_AVAILABLE_FRACTION * total
+        && available < setting("memoryAvailableFraction", MEMORY_AVAILABLE_FRACTION) * total
     {
+        memory_low = true;
         found.push(format!("memory {:.1} GB free of {:.0}", gigabytes(available), gigabytes(total)));
     }
     if let (Some(total), Some(free)) = (kilobytes("SwapTotal:"), kilobytes("SwapFree:"))
         && total > 0.0
-        && total - free > SWAP_USED_FRACTION * total
     {
-        found.push(format!("swap {:.0}% used", 100.0 * (total - free) / total));
+        // Growth is measured from the lowest use read in the last REPEAT, older readings dropped
+        // first, so a rise has to be recent to count and one across the window's edge still does.
+        let used = total - free;
+        let growing = SWAP_SEEN.lock().is_ok_and(|mut seen| {
+            seen.retain(|(at, _)| at.elapsed() <= REPEAT);
+            let lowest = seen.iter().map(|(_, kb)| *kb).fold(used, f64::min);
+            // At most one sample per SWAP_SAMPLE_EVERY, so the window holds a bounded few.
+            if seen.last().is_none_or(|(at, _)| at.elapsed() >= SWAP_SAMPLE_EVERY) {
+                seen.push((Instant::now(), used));
+            }
+            used - lowest > setting("swapGrowthFraction", SWAP_GROWTH_FRACTION) * total
+        });
+        if used > setting("swapUsedFraction", SWAP_USED_FRACTION) * total && (growing || memory_low) {
+            found.push(format!("swap {:.0}% used{}", 100.0 * used / total, if growing { " and growing" } else { "" }));
+        }
     }
     let mut seen_devices = Vec::new();
-    for (name, path) in [("/tmp", Path::new("/tmp")), ("the working directory's disk", cwd)] {
+    let temp = std::env::temp_dir();
+    for (name, path) in [(temp.display().to_string(), temp.as_path()), ("the working directory's disk".to_string(), cwd)] {
         let Some((device, used, total)) = disk(path) else { continue };
-        if !seen_devices.contains(&device) && used > DISK_USED_FRACTION * total {
+        if !seen_devices.contains(&device) && used > setting("diskUsedFraction", DISK_USED_FRACTION) * total {
             found.push(format!("{name} {:.0}% full ({:.1} GB left)", 100.0 * used / total, (total - used) / BYTES_PER_GB));
         }
         seen_devices.push(device);

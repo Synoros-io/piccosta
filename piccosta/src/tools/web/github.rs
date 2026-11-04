@@ -360,41 +360,12 @@ async fn gh(clones: &Clones, args: &[&str], timeout: Duration) -> Option<String>
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-// This process's owner record for its runtime directory: pid, boot id and the process's start
-// time, so a later process can tell a reused pid from a live owner.
-pub(crate) fn process_start_time(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_name = &stat[stat.rfind(')')? + 2..];
-    // Field 22 of stat is the start time; after the name, the state is field 3.
-    after_name.split_whitespace().nth(19).map(str::to_string)
-}
-
-fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat[stat.rfind(')')? + 2..].chars().next()
-}
-
-fn boot_id() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|id| id.trim().to_string())
-}
-
 // Whether a runtime directory's owner is provably gone (github-extract.ts cloneRuntimeOwnerIsDead):
-// a different boot, or the pid gone, a zombie, or started at a different time.
-fn owner_is_dead(owner: &Value, current_boot: Option<&str>) -> bool {
-    let (Some(pid), Some(boot), Some(start), Some(current_boot)) =
-        (owner.get("pid").and_then(Value::as_u64), owner.get("bootId").and_then(Value::as_str), owner.get("startTime").and_then(Value::as_str), current_boot)
-    else {
-        return false;
-    };
-    if boot != current_boot {
-        return true;
-    }
-    match (process_state(pid as u32), process_start_time(pid as u32)) {
-        (None, _) => true,
-        (Some('Z' | 'X'), _) => true,
-        (_, Some(now)) => now != start,
-        _ => false,
-    }
+// another boot's, or its pid gone, a zombie, or started at another time. The owner record is the
+// pid, boot id and start time of the process that made the directory (runtime_dir).
+fn owner_is_dead(owner: &Value) -> bool {
+    let (Some(pid), Some(boot), Some(start)) = (owner["pid"].as_u64(), owner["bootId"].as_str(), owner["startTime"].as_str()) else { return false };
+    crate::proc::recorded_start(&format!("{boot} {start}")).and_then(|start| crate::proc::Process::started(pid as i32, start)).is_none()
 }
 
 // The clones this process made, one per repo and ref.
@@ -466,14 +437,14 @@ impl Clones {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
         let pid = std::process::id();
-        let owner = json!({"version": OWNER_VERSION, "pid": pid, "platform": "linux", "bootId": boot_id(), "startTime": process_start_time(pid)});
+        let start = crate::proc::start(pid as i32).map(|start| start.to_string());
+        let owner = json!({"version": OWNER_VERSION, "pid": pid, "platform": "linux", "bootId": crate::proc::boot_id(), "startTime": start});
         std::fs::write(path.join(OWNER_FILE), owner.to_string()).ok()?;
         *runtime = Some(path.clone());
         Some(path)
     }
 
     fn sweep_stale(&self, parent: &Path) {
-        let current_boot = boot_id();
         let Ok(entries) = std::fs::read_dir(parent) else { return };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -481,7 +452,7 @@ impl Clones {
                 continue;
             }
             let owner = std::fs::read_to_string(entry.path().join(OWNER_FILE)).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok());
-            if owner.is_some_and(|owner| owner_is_dead(&owner, current_boot.as_deref())) {
+            if owner.is_some_and(|owner| owner_is_dead(&owner)) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }

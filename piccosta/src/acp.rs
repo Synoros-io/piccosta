@@ -25,18 +25,17 @@
 // and every open one is finished before a prompt is answered; model, thinking and mode all go in
 // configOptions, load's answer included; nothing but protocol lines on stdout.
 
-use crate::agent::{Event, EventSink, Gate, Handle};
-use crate::host::{Command, Done, Host};
+use crate::agent::{Agent, Event, EventSink, Gate, Handle};
+use crate::host::Host;
+use crate::runtime::{Command, Done};
 use crate::message::{AgentMessage, Content, StopReason, TextOrBlocks};
 use crate::model::Model;
 use crate::rpc::write_line;
 use crate::session::Session;
 use serde_json::{json, Map, Value};
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -55,8 +54,6 @@ const TOOL_OUTPUT_CHARS: usize = 8000;
 // The largest file a prompt's link is read in for, and the largest an edit's before/after is
 // shown for; past that the model gets the path, the client the plain output.
 const FILE_MAX_BYTES: u64 = 1024 * 1024;
-// Tools that only read, which no mode asks about.
-const READ_ONLY: [&str; 4] = ["read", "web_search", "fetch_content", "get_search_content"];
 // JSON-RPC error codes (ACP v1 ErrorCode).
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -80,12 +77,22 @@ const MODES: [(Mode, &str, &str, &str); 3] = [
     (Mode::Auto, "auto", "Auto", "Run every tool without asking"),
 ];
 
-fn needs_approval(mode: Mode, tool: &str) -> bool {
-    match mode {
+// A session's approval mode and the tools the user said "always" for, which its gate reads.
+type Approvals = Arc<Mutex<(Mode, HashSet<String>)>>;
+
+// Whether a call to `tool` waits for the user's yes: the mode asks about it, or the tool has a
+// question for the user (Tool::approval), and they haven't said "always" for it (for that question,
+// when it has one).
+fn asks(approvals: &Approvals, tool: &str, question: Option<&str>) -> bool {
+    let (mode, always) = &*approvals.lock().unwrap();
+    let asked = match mode {
+        _ if question.is_some() => true,
         Mode::Auto => false,
-        Mode::Edits => !READ_ONLY.contains(&tool) && !matches!(tool, "edit" | "write"),
-        Mode::Ask => !READ_ONLY.contains(&tool),
-    }
+        // Tools that only read no mode asks about.
+        Mode::Edits => !crate::tools::read_only(tool) && !matches!(tool, "edit" | "write"),
+        Mode::Ask => !crate::tools::read_only(tool),
+    };
+    asked && !always.contains(question.unwrap_or(tool))
 }
 
 // The user's answer to a permission request.
@@ -101,17 +108,18 @@ enum Input {
     // From a session's task, keyed by its session id and which start of it this was.
     Event(String, u64, Box<Event>),
     Done(String, u64, Box<Done>),
-    // A tool call waiting for the user's yes, with the tool's own question if it has one.
-    Ask { session: String, serial: u64, call_id: String, question: Option<&'static str>, reply: oneshot::Sender<Answer> },
+    // A tool call waiting for the user's yes: the model's call it is or was made in (a script's
+    // calls are made in the script's), the call asked about, and its tool's own question if it has
+    // one.
+    Ask { session: String, serial: u64, call_id: String, name: String, arguments: Map<String, Value>, question: Option<&'static str>, reply: oneshot::Sender<Answer> },
     // A cancelled prompt's time to stop is up; the number is which prompt of the session it was.
     CancelDeadline(String, u64, u64),
 }
 
-// A tool call announced and not finished: its name, arguments, the file it works on, and (for edit
-// and write) that file's text before it ran, None when there was no such file.
+// A tool call announced and not finished: its name, the file it works on, and (for edit and write)
+// that file's text before it ran, None when there was no such file.
 struct OpenCall {
     name: String,
-    arguments: Map<String, Value>,
     path: Option<PathBuf>,
     before: Option<Option<String>>,
     // A shell command's output already written to its client terminal.
@@ -132,14 +140,12 @@ struct Live {
     serial: u64,
     host: Arc<Host>,
     shared: Arc<crate::tools::ToolShared>,
-    handle: Handle,
     runs: Arc<Mutex<Runs>>,
     commands: UnboundedSender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Agent>,
     model: Model,
     thinking: String,
-    mode: Rc<Cell<Mode>>,
-    always: Rc<RefCell<HashSet<String>>>,
+    approvals: Approvals,
     // One per command sent to the task, oldest first: the prompt request it answers, if it is one.
     owed: VecDeque<Option<Value>>,
     // Commands whose events are no longer part of a client prompt, through a cancelled deadline.
@@ -158,12 +164,26 @@ struct Live {
     // The context the last response filled and the session's cost so far, for usage_update
     // (ACP's `used` is tokens in context now, its `cost` the whole session's).
     used: u64,
-    cost: f64,
+    cost: crate::provider::responses::Tally,
 }
 
-// Tell the client how full the context is and what the session has cost.
+// Tell the client how full the context is, what the session has cost and how much of its plan is used.
 fn usage_update(session: &str, live: &Live) {
-    update(session, json!({"sessionUpdate": "usage_update", "used": live.used, "size": live.model.context_window, "cost": {"amount": live.cost, "currency": "USD"}}));
+    // A plan's usage costs no money, so it goes without a cost. When some responses' cost isn't
+    // known, `amount` leaves them out and _meta.costUnknown says so.
+    let mut usage = json!({"sessionUpdate": "usage_update", "used": live.used, "size": live.model.context_window});
+    if live.cost.total > 0.0 {
+        usage["cost"] = json!({"amount": live.cost.total, "currency": "USD"});
+    }
+    if live.cost.unknown() {
+        usage["_meta"]["costUnknown"] = json!(true);
+    }
+    // What the session's plan has used, in its own windows (scale::plan_usage).
+    let plan = crate::scale::plan_usage(&live.host.agent_dir, &live.model.provider);
+    if !plan.is_null() {
+        usage["_meta"]["planUsage"] = plan;
+    }
+    update(session, usage);
 }
 
 struct Acp {
@@ -222,6 +242,7 @@ pub async fn run(args: crate::cli::Args) -> Result<ExitCode, String> {
 }
 
 async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
+    crate::scale::watch();
     let (inputs, mut received) = unbounded_channel();
     // stdin on a plain thread, as rpc mode reads it.
     let lines = inputs.clone();
@@ -247,20 +268,17 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             Some(Input::Line(line)) => acp.line(&line).await,
             Some(Input::Event(session, serial, event)) if acp.current(&session, serial) => acp.event(&session, *event),
             Some(Input::Done(session, serial, done)) if acp.current(&session, serial) => acp.done(&session, *done),
-            Some(Input::Ask { session, serial, call_id, question, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, question, reply),
+            Some(Input::Ask { session, serial, call_id, name, arguments, question, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, &name, &arguments, question, reply),
             Some(Input::CancelDeadline(session, serial, prompt)) if acp.current(&session, serial) => acp.cancel_deadline(&session, prompt),
             Some(Input::Closed) | None => break 0,
             _ => {}
         }
     };
-    let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| {
-        live.handle.abort();
-        live.task
-    }).collect();
+    // Each runtime ends as its commands' channel goes.
+    let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| live.task).collect();
     let _ = tokio::time::timeout(STOP_WAIT, futures_util::future::join_all(tasks)).await;
     crate::voice::shutdown(false).await;
     crate::provider::claude::shutdown().await;
-    crate::tools::bash::kill_all_running();
     Ok(ExitCode::from(code))
 }
 
@@ -332,8 +350,17 @@ impl Acp {
             "session/new" => {
                 let host = self.host(params)?;
                 let session = host.session(None, false, true).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
-                let (model, thinking) = host.launch(&self.args).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
+                let (model, thinking, note) = host.launch(&self.args).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
+                if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+                    return Ok(self.later(listing, method, params, id));
+                }
                 let id = self.start(host.clone(), session, model.as_deref(), thinking.as_deref())?;
+                // A kind with none of its models served: the user hears which model it runs on, as a
+                // notice where the client takes them, else as the agent's words.
+                if let Some(note) = note.map(|note| crate::scale::fell_back(&note, &format!("{}/{}", self.sessions[&id].model.provider, self.sessions[&id].model.id))) {
+                    let shown = if self.notices { json!({"sessionUpdate": "notice", "severity": "warning", "title": "Model fallback", "description": note}) } else { json!({"sessionUpdate": "agent_message_chunk", "content": text_block(&note)}) };
+                    self.after.push((id.clone(), shown));
+                }
                 let state = self.state(&id).await;
                 self.after.push((id.clone(), commands()));
                 self.session_notices(params, &id, &host);
@@ -345,6 +372,9 @@ impl Acp {
                 let session = Session::open(&file, &host.cwd).map_err(|error| Failure(INTERNAL_ERROR, error.to_string(), None))?;
                 if Path::new(&session.header().cwd) != host.cwd {
                     return Err(invalid("cwd does not match the session"));
+                }
+                if let Some(listing) = host.listing(Some(&session), None).filter(|_| !self.sessions.contains_key(&session_id)) {
+                    return Ok(self.later(listing, method, params, id));
                 }
                 replay(&session_id, &session, &host.cwd, self.terminals);
                 if !self.sessions.contains_key(&session_id) {
@@ -361,8 +391,7 @@ impl Acp {
                 } else if let Some(dir) = &self.args.session_dir {
                     crate::host::sessions_in(Path::new(dir), None, usize::MAX)
                 } else {
-                    std::fs::read_dir(crate::config::agent_dir().join("sessions")).into_iter().flatten().flatten()
-                        .flat_map(|entry| crate::host::sessions_in(&entry.path(), None, usize::MAX)).collect()
+                    crate::host::all_sessions(&crate::config::agent_dir(), usize::MAX)
                 };
                 listed.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
                 let sessions: Vec<Value> = listed
@@ -377,7 +406,9 @@ impl Acp {
             "session/close" => {
                 self.asks.retain(|_, (session, ..)| session != &session_id);
                 if let Some(mut live) = self.sessions.remove(&session_id) {
-                    live.handle.abort();
+                    // The runtime's own close (runtime.rs), so it ends as any close does: its call
+                    // hung up, its jobs and what they left killed.
+                    let _ = live.commands.send(Command::Close(None));
                     drop(live.commands);
                     if tokio::time::timeout(STOP_WAIT, &mut live.task).await.is_err() {
                         live.task.abort();
@@ -405,7 +436,7 @@ impl Acp {
                 let (name, argument) = trimmed.strip_prefix('/').map(|line| line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()))).unwrap_or(("", ""));
                 let command = match name {
                     "compact" => Command::Compact(Some(argument.to_string()).filter(|text| !text.is_empty())),
-                    _ => Command::Prompt(crate::prompt::command_prompt(&text).unwrap_or_else(|| text.clone()), images, false),
+                    _ => Command::Prompt(crate::prompt::command_prompt(&text).unwrap_or_else(|| text.clone()), images),
                 };
                 if !live.titled {
                     live.titled = true;
@@ -440,6 +471,18 @@ impl Acp {
         }
     }
 
+    // A request opening a session on a model whose list is still coming: this loop is asked it
+    // again once the lists are in, and serves the other sessions meanwhile. Output: None, since
+    // it's answered then.
+    fn later(&self, listing: futures_util::future::BoxFuture<'static, ()>, method: &str, params: &Value, id: Value) -> Option<Value> {
+        let (inputs, again) = (self.inputs.clone(), json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string());
+        tokio::task::spawn_local(async move {
+            listing.await;
+            let _ = inputs.send(Input::Line(again));
+        });
+        None
+    }
+
     fn notification(&mut self, method: &str, params: &Value) {
         // Cancel: stop the run, and answer the prompt when it has stopped, or after CANCEL_WAIT if
         // it hasn't.
@@ -453,7 +496,7 @@ impl Acp {
                 let mut runs = live.runs.lock().unwrap();
                 runs.cancelled_through = runs.sent;
             }
-            live.handle.interrupt(&live.shared.jobs);
+            let _ = live.commands.send(Command::Stop(None));
             let (inputs, session, serial, prompt) = (self.inputs.clone(), session.to_string(), live.serial, live.prompts);
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(CANCEL_WAIT).await;
@@ -479,25 +522,26 @@ impl Acp {
         let _ = reply.send(answer);
     }
 
-    // Ask the client about a tool call it already shows. A tool's own question heads the card, and
-    // its "always" says it covers that question for the rest of the session.
-    fn ask(&mut self, session: String, call_id: String, question: Option<&'static str>, reply: oneshot::Sender<Answer>) {
-        let Some(call) = self.sessions.get(&session).and_then(|live| live.open.get(&call_id)) else {
-            let _ = reply.send(Answer::No);
+    // A permission request for a call, on the card of the model's call it's made in. With that call
+    // over (a script that moved to the background), nobody is asked and the reply goes unanswered.
+    // A tool's own question heads the card, and its "always" says it covers that question for the
+    // rest of the session.
+    fn ask(&mut self, session: String, call_id: String, name: &str, arguments: &Map<String, Value>, question: Option<&'static str>, reply: oneshot::Sender<Answer>) {
+        if !self.sessions.get(&session).is_some_and(|live| live.open.contains_key(&call_id)) {
             return;
-        };
+        }
         let id = self.next_request;
         self.next_request += 1;
         let (always, title) = match question {
-            Some(question) => (format!("Allow every {} call that asks this, until the session closes", call.name), format!("{question} ({})", title(&call.name, &call.arguments))),
-            None => (format!("Always allow {}", call.name), title(&call.name, &call.arguments)),
+            Some(question) => (format!("Allow every {name} call that asks this, until the session closes"), format!("{question} ({})", title(name, arguments))),
+            None => (format!("Always allow {name}"), title(name, arguments)),
         };
         let options = json!([
             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
             {"optionId": "allow-always", "name": always, "kind": "allow_always"},
             {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
         ]);
-        let tool_call = json!({"toolCallId": call_id, "title": title, "kind": kind(&call.name)});
+        let tool_call = json!({"toolCallId": call_id, "title": title, "kind": kind(name)});
         write_line(&json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {"sessionId": session, "toolCall": tool_call, "options": options}}));
         self.asks.insert(id, (session, call_id, reply));
     }
@@ -523,7 +567,7 @@ impl Acp {
             Event::MessageEnd { message: AgentMessage::Assistant(assistant), .. } => {
                 let usage = &assistant.usage;
                 let used = usage.input + usage.output + usage.cache_read + usage.cache_write;
-                live.cost += usage.cost.total;
+                live.cost.add(usage, &assistant.provider);
                 if used > 0 {
                     live.used = used;
                     usage_update(session, live);
@@ -540,7 +584,7 @@ impl Acp {
                         _ => None,
                     }
                 });
-                let waits = needs_approval(live.mode.get(), &tool_name) && !live.always.borrow().contains(&tool_name);
+                let waits = asks(&live.approvals, &tool_name, None);
                 let mut call = json!({
                     "sessionUpdate": "tool_call", "toolCallId": tool_call_id, "title": title(&tool_name, &args), "name": tool_name,
                     "kind": kind(&tool_name), "status": if waits { "pending" } else { "in_progress" }, "rawInput": Value::Object(args.clone())
@@ -559,7 +603,7 @@ impl Acp {
                     call["content"] = json!([{"type": "terminal", "terminalId": tool_call_id}]);
                 }
                 update(session, call);
-                live.open.insert(tool_call_id, OpenCall { name: tool_name, arguments: args, path, before, shown: String::new() });
+                live.open.insert(tool_call_id, OpenCall { name: tool_name, path, before, shown: String::new() });
             }
             Event::ToolExecutionUpdate { tool_call_id, partial_result, .. } if live.open.contains_key(&tool_call_id) => {
                 let text = output_text(&partial_result);
@@ -707,22 +751,26 @@ impl Acp {
         let (mut agent, shared) = host.open(session, model, thinking, emit, true).map_err(|error| Failure(INTERNAL_ERROR, error, None))?;
         agent.session.persist_now().map_err(|error| Failure(INTERNAL_ERROR, format!("could not write the session: {error}"), None))?;
         let first_mode = if self.args.yolo { Mode::Auto } else { Mode::Ask };
-        let (mode, always) = (Rc::new(Cell::new(first_mode)), Rc::new(RefCell::new(HashSet::new())));
-        agent.set_gate(gate(self.inputs.clone(), id.clone(), serial, mode.clone(), always.clone()));
+        let approvals = Arc::new(Mutex::new((first_mode, HashSet::new())));
+        agent.set_gate(gate(self.inputs.clone(), id.clone(), serial, approvals.clone()));
         let titled = crate::host::name(&agent.session).is_some() || agent.session.context().messages.iter().any(|message| matches!(message, AgentMessage::User(_)));
-        let cost = agent.session.context().messages.iter().filter_map(|message| if let AgentMessage::Assistant(assistant) = message { Some(assistant.usage.cost.total) } else { None }).sum();
+        let mut cost = crate::provider::responses::Tally::default();
+        for message in agent.session.context().messages {
+            if let AgentMessage::Assistant(assistant) = message {
+                cost.add(&assistant.usage, &assistant.provider);
+            }
+        }
         let used = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
-        let (handle, live_model, live_thinking) = (agent.handle(), agent.model().clone(), agent.thinking_level().to_string());
-        runs.lock().unwrap().handle = handle.clone();
-        let (commands, receiver) = unbounded_channel();
+        let (live_model, live_thinking) = (agent.model().clone(), agent.thinking_level().to_string());
+        runs.lock().unwrap().handle = agent.handle();
         let reports = (self.inputs.clone(), id.clone());
         let finishes = runs.clone();
-        let task = host.clone().spawn(agent, shared.clone(), false, receiver, move |done| {
+        let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
             finishes.lock().unwrap().finished += 1;
             let _ = reports.0.send(Input::Done(reports.1.clone(), serial, Box::new(done)));
         });
         let live = Live {
-            serial, host, shared, handle, runs, commands, task, model: live_model, thinking: live_thinking, mode, always, owed: VecDeque::new(), muted: 0, prompt: None, cancelled: false,
+            serial, host, shared, runs, commands, task, model: live_model, thinking: live_thinking, approvals, owed: VecDeque::new(), muted: 0, prompt: None, cancelled: false,
             prompts: 0, stop: None, error: None, message: 0, open: HashMap::new(), titled, used, cost,
         };
         self.sessions.insert(id.clone(), live);
@@ -732,9 +780,8 @@ impl Acp {
     fn set_mode(&mut self, session: &str, value: &str) -> Result<(), Failure> {
         let live = self.sessions.get(session).ok_or_else(|| unknown_session(session))?;
         let (mode, ..) = MODES.iter().find(|(_, id, ..)| *id == value).ok_or_else(|| invalid(format!("no mode {value}")))?;
-        live.mode.set(*mode);
         // Choosing a mode starts its asking afresh: an earlier "always allow" doesn't outlive it.
-        live.always.borrow_mut().clear();
+        *live.approvals.lock().unwrap() = (*mode, HashSet::new());
         Ok(())
     }
 
@@ -794,7 +841,8 @@ impl Acp {
         if !models.iter().any(|model| format!("{}/{}", model.provider, model.id) == current) {
             models.insert(0, live.model.clone());
         }
-        let mode = MODES.iter().find(|(mode, ..)| *mode == live.mode.get()).map_or("ask", |(_, id, ..)| *id);
+        let asking = live.approvals.lock().unwrap().0;
+        let mode = MODES.iter().find(|(mode, ..)| *mode == asking).map_or("ask", |(_, id, ..)| *id);
         let modes: Vec<Value> = MODES.iter().map(|(_, id, name, description)| json!({"id": id, "name": name, "description": description})).collect();
         let mode_options: Vec<Value> = MODES.iter().map(|(_, id, name, description)| json!({"value": id, "name": name, "description": description})).collect();
         let model_options: Vec<Value> = models.iter().map(|model| json!({"value": format!("{}/{}", model.provider, model.id), "name": model.name})).collect();
@@ -811,23 +859,23 @@ impl Acp {
 // The gate a session's tool calls pass: through at once when the mode doesn't ask about the tool
 // or the user said "always" for it, else after the client's yes. A call with a question for the
 // user (Tool::approval) is asked in every mode, and its "always" holds for that question only.
-fn gate(inputs: UnboundedSender<Input>, session: String, serial: u64, mode: Rc<Cell<Mode>>, always: Rc<RefCell<HashSet<String>>>) -> Gate {
-    Rc::new(move |call_id: String, name: String, _arguments: Map<String, Value>, question: Option<&'static str>| {
-        let (inputs, session, mode, always) = (inputs.clone(), session.clone(), mode.clone(), always.clone());
+fn gate(inputs: UnboundedSender<Input>, session: String, serial: u64, approvals: Approvals) -> Gate {
+    Arc::new(move |call_id: String, name: String, arguments: Map<String, Value>, question: Option<&'static str>| {
+        let (inputs, session, approvals) = (inputs.clone(), session.clone(), approvals.clone());
         Box::pin(async move {
-            let key = question.map_or_else(|| name.clone(), str::to_string);
-            if (question.is_none() && !needs_approval(mode.get(), &name)) || always.borrow().contains(&key) {
+            if !asks(&approvals, &name, question) {
                 return Ok(());
             }
             let (reply, answer) = oneshot::channel();
-            let _ = inputs.send(Input::Ask { session, serial, call_id, question, reply });
+            let _ = inputs.send(Input::Ask { session, serial, call_id, name: name.clone(), arguments, question, reply });
             match answer.await {
                 Ok(Answer::Always) => {
-                    always.borrow_mut().insert(key);
+                    approvals.lock().unwrap().1.insert(question.map_or(name, str::to_string));
                     Ok(())
                 }
                 Ok(Answer::Once) => Ok(()),
-                _ => Err(format!("The user declined this {name} call.")),
+                Ok(Answer::No) => Err(format!("The user declined this {name} call.")),
+                Err(_) => Err(format!("This {name} call needs the user's yes, and nobody could be asked: the call it was made in has ended (a script in the background).")),
             }
         })
     })

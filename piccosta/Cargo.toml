@@ -1,7 +1,8 @@
 [package]
 name = "piccosta"
-version = "0.10.2"
+version = "0.12.1"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "One agent harness for every model you use"
 
@@ -16,6 +17,7 @@ base64.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
 libc.workspace = true
+socket2.workspace = true
 unicode-normalization.workspace = true
 image.workspace = true
 regex.workspace = true
@@ -28,6 +30,7 @@ htmd.workspace = true
 pdf_oxide.workspace = true
 encoding_rs.workspace = true
 url.workspace = true
+hyper-util.workspace = true
 sha2.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
@@ -39,3 +42,5 @@ ratex-types.workspace = true
 ratex-render.workspace = true
 term-maths.workspace = true
 zbus.workspace = true
+monty.workspace = true
+monty-types.workspace = true

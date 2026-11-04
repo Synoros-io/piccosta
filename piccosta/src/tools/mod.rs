@@ -22,6 +22,7 @@ pub mod paths;
 pub mod read;
 pub mod readonly;
 pub mod reaper;
+pub mod script;
 pub mod subagent;
 pub mod truncate;
 pub mod validate;
@@ -65,6 +66,11 @@ pub trait Tool: Send + Sync {
     }
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[]
+    }
+    // Whether rpc and ACP run it without asking the user: it only reads, or (the script) each call
+    // it makes is asked about on its own.
+    fn read_only(&self) -> bool {
+        false
     }
     // Repair argument shapes models are known to send, before validation (pi's prepareArguments).
     fn prepare_arguments(&self, arguments: Map<String, Value>) -> Map<String, Value> {
@@ -142,16 +148,30 @@ pub struct ToolContext {
     pub thinking_level: String,
     // Whether the current model takes images; read says so beside an image when it doesn't.
     pub model_accepts_images: bool,
+    // What an image read or fetched is fitted to: the model's own limits, or Anthropic's.
+    pub image_limits: image::Limits,
     // Set when the user aborts the turn.
     pub cancel: CancellationToken,
     pub updates: Option<mpsc::UnboundedSender<ToolUpdate>>,
+    // A script's calls: its commands never move to the background, the script moves as a whole.
+    pub stay_in_foreground: bool,
+    // The session's approval gate (rpc's, ACP's) and the id of the model's call this is for, so the
+    // calls a script makes are asked about as the model's own are.
+    pub gate: Option<(String, crate::agent::Gate)>,
     pub shared: Arc<ToolShared>,
 }
 
-// The built-in tools, in the order pi lists them, then the web tools and the computer.
+// Whether the built-in tool called `name` only reads (Tool::read_only); no other tool does.
+pub fn read_only(name: &str) -> bool {
+    builtin().iter().any(|tool| tool.name() == name && tool.read_only())
+}
+
+// The built-in tools, in the order pi lists them, then the web tools, the computer and the script
+// tool (with no functions until script::bind gives it the session's list).
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(read::ReadTool), Arc::new(bash::BashTool), Arc::new(edit::EditTool), Arc::new(write::WriteTool)];
     tools.extend(web::tools());
     tools.push(Arc::new(computer::ComputerTool));
+    tools.push(Arc::new(script::ScriptTool::default()));
     tools
 }

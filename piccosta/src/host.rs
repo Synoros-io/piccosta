@@ -12,7 +12,6 @@ use indexmap::IndexMap;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 // The pi release piccosta is based on and speaks the protocols of (session files, json and rpc
 // mode).
@@ -37,20 +36,6 @@ pub struct Host {
     pub append_prompt: Option<String>,
     // --yolo: no approvals, whatever the frontend asks for.
     pub yolo: bool,
-}
-
-// What a live session's task is asked to do, one at a time.
-pub enum Command {
-    // The text, its images, and whether the user said it.
-    Prompt(String, Vec<crate::message::Content>, bool),
-    Model(String),
-    Thinking(String),
-    Name(String),
-    Compact(Option<String>),
-    AutoCompaction(bool),
-    AutoRetry(bool),
-    // Work with other models from the next prompt on (none: alone again).
-    Team(Team),
 }
 
 // The models a session works with besides its own (provider/id, in the order they speak after
@@ -143,15 +128,6 @@ fn exchange_over(session: &Session, done_counts: bool) -> bool {
     done_counts && last_line.is_some_and(|line| line.eq_ignore_ascii_case(DONE_LINE))
 }
 
-// What the task reports after each command (and after a turn a background job started, marked
-// `notice`): how it went, and the model and thinking level the session has now.
-pub struct Done {
-    pub result: Result<(), String>,
-    pub notice: bool,
-    pub model: Model,
-    pub thinking: String,
-}
-
 // A session file as a list shows it.
 #[derive(Clone)]
 pub struct SessionSummary {
@@ -172,7 +148,7 @@ impl Host {
     // The host for a directory other than the process's own (an ACP client names one per session).
     pub fn at(cwd: PathBuf) -> Host {
         let agent_dir = config::agent_dir();
-        let settings = config::Settings::load(&agent_dir, &cwd);
+        let settings = config::Settings::load(&agent_dir, Some(&cwd));
         let session_dir = session::default_session_dir(&agent_dir, &cwd);
         Host { cwd, agent_dir, settings, session_dir, context_files: true, tools: true, tool_names: None, exclude_tools: Vec::new(), append_prompt: None, yolo: false }
     }
@@ -265,11 +241,7 @@ impl Host {
             return Ok(self.cwd.join(wanted));
         }
         let matches = |summary: &SessionSummary| summary.id.starts_with(wanted) || summary.title == wanted;
-        let everywhere = || {
-            let folders = std::fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten();
-            folders.flat_map(|folder| sessions_in(&folder.path(), None, usize::MAX))
-        };
-        let found = self.sessions(usize::MAX).into_iter().find(matches).or_else(|| everywhere().find(matches));
+        let found = self.sessions(usize::MAX).into_iter().find(matches).or_else(|| all_sessions(&self.agent_dir, usize::MAX).into_iter().find(matches));
         found.map(|summary| summary.path).ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
     }
 
@@ -279,9 +251,11 @@ impl Host {
     // searching (say) runs on the scale's search models; a manager keeps them all, and so does a
     // subagent, which has no one to hand them to. --tools naming one keeps it. A session started
     // for a kind of work (a subagent's job among them) gets exactly the tools its kind lists, owned
-    // or not, else all of them; and none that write when it's read-only, since edit and write run
-    // here, outside its commands' sandbox (work). --exclude-tools still takes any away.
-    fn tool_list(&self, session: &Session) -> Vec<Arc<dyn tools::Tool>> {
+    // or not, else all of them; and none that write when it's read-only, since edit, write and the
+    // computer (whose open starts any program) run outside its commands' sandbox (work); a script
+    // only calls what's left, so it can't reach them either. --exclude-tools still takes any away.
+    // Last, the model's script mode decides which of what's left it gets directly (tools/script.rs).
+    fn tool_list(&self, session: &Session, model: &Model) -> Vec<Arc<dyn tools::Tool>> {
         let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
         let (work_tools, work_read_only) = self.work(session);
         if !self.tools {
@@ -303,8 +277,9 @@ impl Host {
             Some(names) => names.iter().any(|name| name == tool.name()) && (self.tool_names.is_none() || named(tool)),
             None => (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool),
         };
-        let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write");
-        list.into_iter().filter(|tool| wanted(tool) && !writes(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect()
+        let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write" | "computer");
+        let list = list.into_iter().filter(|tool| wanted(tool) && !writes(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect();
+        tools::script::bind(list, &self.settings, &format!("{}/{}", model.provider, model.id))
     }
 
     // The kind of work a session was started for (the sessions tool's `use`, manager.rs work): its
@@ -329,30 +304,51 @@ impl Host {
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(&self.settings, role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
-        let tool_list = self.tool_list(session);
+        let tool_list = self.tool_list(session, model);
         Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: &tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
+    }
+
+    // The model a session (None: a new one) opens on: the one asked for, else the one it last used,
+    // else the default, else the first a connected account serves.
+    fn wanted(&self, session: Option<&Session>, model: Option<&str>, registry: &ModelRegistry) -> Option<String> {
+        model
+            .map(str::to_string)
+            .or_else(|| session.and_then(|session| session.context().model).map(|(provider, id)| format!("{provider}/{id}")))
+            .or_else(|| self.settings.default_model())
+            .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)))
+    }
+
+    // What to await before opening a session on a model, when the model it would open on isn't
+    // listed yet and the lists piccosta started fetching are still coming (model::listing). open
+    // never waits itself; its callers await this outside their input dispatch, then open.
+    pub fn listing(&self, session: Option<&Session>, model: Option<&str>) -> Option<futures_util::future::BoxFuture<'static, ()>> {
+        let registry = self.registry().ok()?;
+        let wanted = self.wanted(session, model, &registry)?;
+        registry.resolve(&wanted).is_err().then(|| crate::model::listing(&self.agent_dir))?
     }
 
     // A session ready to run. Input: the model and thinking level asked for, if any (else what
     // the session last used, else the level that model was last set to, else the settings'
     // defaults), where events go, and whether a run
-    // waits for background jobs before it ends (print and json mode). Output: the agent and the
-    // tools' shared state (background jobs, web results), which the caller shuts down at the end.
+    // waits for background jobs before it ends (print and json mode). The session is claimed first
+    // and read again (runtime.rs claim), and everything after is made from it as it is then.
+    // Output: the agent and the tools' shared state (background jobs, web results), which the
+    // caller shuts down at the end.
     pub fn open(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, emit: EventSink, hold_for_jobs: bool) -> Result<(Agent, Arc<ToolShared>), String> {
-        session.claim()?;
+        let claim = crate::runtime::claim(&mut session)?;
         let registry = self.registry()?;
         let resumed = session.context();
-        let wanted = model
-            .map(str::to_string)
-            .or_else(|| resumed.model.as_ref().map(|(provider, id)| format!("{provider}/{id}")))
-            .or_else(|| self.settings.default_model());
-        let wanted = wanted.ok_or_else(|| format!("no model; pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
-        // A session whose model has left the catalog opens on the default model rather than not at
-        // all (pi's "Could not restore model"); a model asked for by name still has to exist.
-        let model = match (registry.resolve(&wanted), model, self.settings.default_model()) {
-            (Ok(found), ..) => found.clone(),
-            (Err(_), None, Some(default)) if default != wanted => registry.resolve(&default)?.clone(),
-            (Err(error), ..) => return Err(error),
+        let wanted = self.wanted(Some(&session), model, &registry);
+        let wanted = wanted.ok_or_else(|| format!("no model: no connected account serves one; log in to one, or pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
+        // A session whose model is no longer offered opens on the default model, and with that gone
+        // too, on the first model a connected account serves, rather than not at all (the status
+        // line shows which). A model asked for by name still has to exist.
+        let fallback = || self.settings.default_model().and_then(|default| registry.resolve(&default).ok()).or(registry.models().first());
+        let model = match (registry.resolve(&wanted), model) {
+            (Ok(found), _) => found.clone(),
+            (Err(error), Some(_)) if crate::model::listing(&self.agent_dir).is_some() => return Err(format!("{error} (the model lists are still being fetched; try again in a moment)")),
+            (Err(error), Some(_)) => return Err(error),
+            (Err(error), None) => fallback().ok_or(error)?.clone(),
         };
         let has_thinking = resumed.messages.iter().any(|message| matches!(message, AgentMessage::Assistant(_)));
         // The level asked for, else the one this model was last set to by hand (in any session, so
@@ -373,17 +369,18 @@ impl Host {
         let (notice_sender, notices) = tokio::sync::mpsc::unbounded_channel();
         let credentials = auth::CredentialPaths::from_environment(&self.agent_dir);
         let mut tool_shared = ToolShared::new(&self.settings, &self.agent_dir, notice_sender, &registry, credentials.clone());
-        if role.is_some() {
+        // A manager's commands get its own shorter default, unless the environment sets one.
+        if role.is_some() && std::env::var_os(crate::tools::jobs::SOFT_LIMIT_ENV).is_none() {
             tool_shared.jobs.soft_limit = crate::manager::SOFT_LIMIT;
         }
         tool_shared.read_only |= self.work(&session).1;
-        let tools = self.tool_list(&session);
         tool_shared.visual = crate::manager::work(&session).as_deref() == Some("visual");
         let tool_shared = Arc::new(tool_shared);
         // A reopened session's stored web results, so its responseIds still page.
         tool_shared.web.store.restore(session.path_to_leaf());
         let compaction = self.settings.compaction(&model.provider, &model.id);
         let manager_home = role.map(|role| crate::manager::home_for(&self.agent_dir, role, &cwd));
+        let tools = self.tool_list(&session, &model);
         let config = AgentConfig {
             model,
             registry,
@@ -401,6 +398,7 @@ impl Host {
             gate: None,
             hold_for_jobs,
             manager_home,
+            claim,
         };
         let emit = crate::voice::speaking(&self.settings, &config, &session, emit);
         let agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
@@ -410,14 +408,15 @@ impl Host {
 
 impl Host {
     // The model and level a command line asks for: --model and --thinking as given, else what the
-    // scale picks for --use (its level unless --thinking says otherwise).
-    pub fn launch(&self, args: &crate::cli::Args) -> Result<(Option<String>, Option<String>), String> {
+    // scale picks for --use (its level unless --thinking says otherwise), and a line for the user
+    // when --use found none of its models served and leaves the model to the session's default.
+    pub fn launch(&self, args: &crate::cli::Args) -> Result<crate::scale::Pick, String> {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
-                let (model, level) = crate::scale::pick(&self.agent_dir, name)?;
-                Ok((Some(model), args.thinking.clone().or(level)))
+                let (model, level, note) = crate::scale::pick(&self.agent_dir, name)?;
+                Ok((model, args.thinking.clone().or(level), note))
             }
-            (model, _) => Ok((model, args.thinking.clone())),
+            (model, _) => Ok((model, args.thinking.clone(), None)),
         }
     }
 
@@ -426,81 +425,15 @@ impl Host {
         config::remembered_thinking_level(&self.agent_dir, &format!("{}/{}", model.provider, model.id))
     }
 
-    // A live session's task: its commands one at a time, and (with `wake`) a background job's
-    // finish message as a turn of its own when it comes while the session is idle; without, it
-    // waits for the next prompt (rpc mode: T3 Code stops a pi that starts a run unasked). Steering and aborts don't wait
-    // in this line; they go through the agent's handle while a prompt runs. The task ends when
-    // the commands' sender is dropped, after stopping the session's jobs and web state. Runs on a
-    // LocalSet: the agent's future isn't Send (rustc can't prove it through the providers'
-    // higher-ranked lifetimes).
-    pub fn spawn(self: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: bool, mut commands: UnboundedReceiver<Command>, mut done: impl FnMut(Done) + 'static) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn_local(async move {
-            let mut team = team(&agent.session);
-            let mut spent = crate::voice::spent_changes();
-            loop {
-                let (result, notice) = tokio::select! {
-                    command = commands.recv() => match command {
-                        Some(command) if !commands.is_closed() => (self.obey(&mut agent, command, &mut team).await, false),
-                        _ => break,
-                    },
-                    Some(notice) = agent.notice(), if wake => {
-                        if tools::jobs::stopped_by_user(&notice) {
-                            agent.hold_notice(notice);
-                            continue;
-                        }
-                        (agent.take_notice(notice).await, true)
-                    }
-                    // A quick answer's cost (voice.rs), counted when it comes, the session idle.
-                    Ok(()) = spent.changed() => {
-                        if let Err(error) = agent.record_spent() {
-                            crate::voice::note(&error);
-                        }
-                        continue;
-                    }
-                };
-                done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
-            }
-            // The session is closed: a Claude query waiting for its next message goes too.
-            let _ = agent.record_spent();
-            crate::provider::claude::close(agent.session.id());
-            shared.jobs.shutdown("quit");
-            shared.web.shutdown();
-        })
-    }
-
-    // Carry out one command. `team` is the models the session works with.
-    async fn obey(&self, agent: &mut Agent, command: Command, team: &mut Team) -> Result<(), String> {
-        let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
-        match command {
-            Command::Prompt(text, images, spoken) => self.answer(agent, team, &text, images, spoken).await,
-            Command::Team(asked) => {
-                *team = record_team(&self.registry()?, &mut agent.session, &asked)?;
-                Ok(())
-            }
-            Command::Compact(instructions) => agent.compact(instructions.as_deref()).await,
-            Command::Thinking(level) => written(agent.set_thinking_level(&level)),
-            Command::Name(name) => written(agent.set_name(&name)),
-            Command::AutoCompaction(enabled) => {
-                agent.set_auto_compaction(enabled);
-                Ok(())
-            }
-            Command::AutoRetry(enabled) => {
-                agent.set_auto_retry(enabled);
-                Ok(())
-            }
-            Command::Model(name) => self.switch_model(agent, &name),
-        }
-    }
-
     // Put the session on another model (provider/id). It brings the level it was last set to;
     // one never set keeps the session's.
-    fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
+    pub fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         let model = self.registry()?.resolve(name)?.clone();
-        let sections = self.sections(&model, &agent.session)?;
+        let (sections, tools) = (self.sections(&model, &agent.session)?, self.tool_list(&agent.session, &model));
         let compaction = self.settings.compaction(&model.provider, &model.id);
         let level = self.remembered_thinking_level(&model).unwrap_or_else(|| agent.thinking_level().to_string());
-        written(agent.set_model(model, sections, compaction))?;
+        written(agent.set_model(model, sections, tools, compaction))?;
         written(agent.set_thinking_level(&level))
     }
 
@@ -509,7 +442,10 @@ impl Host {
     // turns until one ends its reply with the done line, or the round limit. Each turn is the
     // speaker's model on the session for one run, opened by its note; the session model takes it
     // back for the user's next message. A failed or stopped turn ends the exchange.
-    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>, spoken: bool) -> Result<(), String> {
+    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>) -> Result<(), String> {
+        if text.is_empty() && images.is_empty() && agent.session.queued().is_empty() {
+            return Ok(());
+        }
         let lead = format!("{}/{}", agent.model().provider, agent.model().id);
         let speakers: Vec<String> = std::iter::once(lead.clone()).chain(team.models.iter().filter(|model| **model != lead).cloned()).collect();
         let rounds = self.settings.get("pairRounds").and_then(Value::as_u64).unwrap_or(PAIR_ROUNDS).max(1);
@@ -521,7 +457,7 @@ impl Host {
         if turns > 1 {
             agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
-        agent.prompt_with_images(text, images, spoken).await?;
+        agent.prompt_with_images(text, images).await?;
         let mut result = Ok(());
         for turn in 1..turns {
             if agent.aborted() || exchange_over(&agent.session, team.pair && turn > 1) {
@@ -545,6 +481,16 @@ impl Host {
 
 // Session files in one directory, optionally restricted to their recorded cwd. A closed
 // session may have been renamed, so its header supplies both the id and the directory it ran in.
+// Every session on this computer, newest first: each project folder's newest `limit`, then the
+// newest `limit` of those.
+pub fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<SessionSummary> {
+    let folders = std::fs::read_dir(agent_dir.join("sessions")).into_iter().flatten().flatten();
+    let mut found: Vec<SessionSummary> = folders.flat_map(|folder| sessions_in(&folder.path(), None, limit)).collect();
+    found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+    found.truncate(limit);
+    found
+}
+
 pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries

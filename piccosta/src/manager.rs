@@ -31,20 +31,17 @@
 // pintask.rs), and the newest LEDGER_VIEW_CHARS of the ledger. Everything else is on disk, word
 // for word, and `ledger search` brings it back.
 //
-// A session another piccosta runs can't be written to from here, so messages for it go to its
-// inbox, `<session file>.inbox`: JSON lines under an advisory lock, which the piccosta running it
-// takes in (the TUI every couple of seconds, print mode after each prompt, this service every
-// second).
+// Messages for it, and for the sessions it manages, go through their runtimes (runtime.rs send).
 
-use crate::host::{Command, Host};
-use crate::message::{AgentMessage, Content};
+use crate::host::Host;
+use crate::message::{AgentMessage, Content, StopReason};
+use crate::runtime::{Command, Sent};
 use crate::tools::{Tool, ToolContext, ToolFuture, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,12 +74,29 @@ const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold fro
 // a subagent above all, goes to the background so the manager stays free for the user. The usual
 // limit is a minute.
 pub const SOFT_LIMIT: Duration = Duration::from_secs(3);
-const QUOTA_ASK: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.";
-const QUOTA_FREE: &str = "Models on claude-bridge/* and openai-codex/* run on the user's own Claude and ChatGPT plans, as piccosta is meant to; the user has let you use them as you judge best, so watch `sessions usage`.";
 
-// The model and thinking level the manager runs on unless `manager.model`/`manager.thinking`
-// say otherwise: a model that writes few tokens and holds 1M of context, at a medium level.
-const DEFAULT_MODEL: &str = "claude-bridge/claude-opus-5-5";
+// What a manager is told about the providers the user wants asked about (`manager.askFirst`, a
+// list of providers; unset, auth::ACCOUNTS' ask_first ones, the Claude and ChatGPT plans): ask
+// before spending them on its own, or use them as it judges best.
+fn quota(settings: &crate::config::Settings, ask: bool) -> String {
+    let default = || crate::auth::ACCOUNTS.iter().filter(|account| account.ask_first).map(|account| account.provider.to_string()).collect();
+    let listed: Option<Vec<String>> = settings.get("manager.askFirst").and_then(|list| serde_json::from_value(list.clone()).ok());
+    let paid = listed.unwrap_or_else(default);
+    if paid.is_empty() {
+        return "The user has let you use every model as you judge best, so watch `sessions usage`.".into();
+    }
+    let models = paid.iter().map(|provider| format!("{provider}/*")).collect::<Vec<_>>().join(" and ");
+    let plans = paid.iter().map(|provider| crate::auth::account(provider).map_or(provider.as_str(), |account| account.plan_name)).collect::<Vec<_>>().join(" and ");
+    if ask {
+        format!("Models on {models} run on the user's own {plans} plans: that's how piccosta is meant to be used, and there's nothing about it to check. What they use counts against the plans' limits, so before you start or message one on such a model on your own, ask; when the user asked for the work or named the model, that is their go-ahead.")
+    } else {
+        format!("Models on {models} run on the user's own {plans} plans, as piccosta is meant to; the user has let you use them as you judge best, so watch `sessions usage`.")
+    }
+}
+
+// What the manager runs on unless `manager.model`/`manager.thinking` say otherwise: the scale's
+// kind for managing a main lane (critical), first at its level, else at a medium one.
+const MANAGER_KIND: &str = "critical";
 const DEFAULT_THINKING: &str = "medium";
 // The command `notify` runs with the message as its last argument, unless `manager.notifyCommand`
 // names another (a list of words).
@@ -97,7 +111,8 @@ const LEDGER_VIEW_CHARS: usize = 16_000;
 const MEMORY_CHARS: usize = 8_000;
 // The ledger file's size past which its older half moves to the archive.
 const LEDGER_ROLL_BYTES: u64 = 256 * 1024;
-// How often the service looks at its inbox and schedules, and at its managers' lanes.
+// How often the service looks at the schedules, and a manager at its lanes; and how many looks go
+// between looks for quiet ones.
 const POLL: Duration = Duration::from_secs(1);
 const LANE_SCAN_SECONDS: u64 = 60;
 // How long a lane can go without a new entry before its manager hears about it, unless
@@ -105,7 +120,7 @@ const LANE_SCAN_SECONDS: u64 = 60;
 // isn't nagged, short enough that a stalled or forgotten one is noticed within the hour. A lane
 // still quiet after a reminder gets the next one after twice the wait, so one left alone costs a
 // few reminders a day, not one an hour.
-const INACTIVE_MINUTES: u64 = 30;
+pub const INACTIVE_MINUTES: u64 = 30;
 // How many sessions `sessions list` shows, how many messages `read` gives by default, and how
 // many characters of each it keeps.
 const LIST_LIMIT: usize = 40;
@@ -116,11 +131,6 @@ const READ_CHARS: usize = 3_000;
 const NEWS_CHARS: usize = 800;
 // The sessions a manager started, one file path a line in its home: the ones it may delete.
 const STARTED_FILE: &str = "started";
-// How long a lane's file has to stay still after a finished turn before the manager hears of it:
-// a pair's next turn, or a run's last writes, start within that.
-const TURN_SETTLE_SECONDS: u64 = 5;
-// How much of a session file's end is read for its last message: room for a long answer.
-const TAIL_BYTES: u64 = 1024 * 1024;
 // How much `ledger search` returns.
 const SEARCH_CHARS: usize = 12_000;
 const DAY_MS: i64 = 86_400_000;
@@ -133,7 +143,7 @@ pub enum Role {
     Project,
 }
 
-// Whether this piccosta was started by an agent's command: bash sets PI_SESSION_ID for everything
+// Whether this piccosta was started by an agent's command: bash sets PICCOSTA_SESSION_ID for everything
 // a command starts, and piccosta's own launches (a manager's lane runs, the service, a terminal
 // the user opens) don't have it, so a human's piccosta under another piccosta is still the user's.
 // A command that unsets it on purpose is an escape, which this doesn't claim to stop.
@@ -254,40 +264,6 @@ pub fn make(agent_dir: &Path, session: &mut crate::session::Session, role: Role)
     fs::write(home.join("session"), file)
 }
 
-// --- Inboxes ---
-
-fn inbox_path(session_file: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.inbox", session_file.display()))
-}
-
-// Leave a message for whoever runs the session in `session_file`, `spoken` when the user said it.
-pub fn deliver(session_file: &Path, text: &str, spoken: bool) -> std::io::Result<()> {
-    if let Some(dir) = session_file.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(inbox_path(session_file))?;
-    file.lock()?;
-    writeln!(file, "{}", json!({ "text": text, "spoken": spoken }))
-}
-
-// Whether messages are waiting in this session's inbox.
-pub fn waiting(session_file: &Path) -> bool {
-    inbox_path(session_file).metadata().is_ok_and(|meta| meta.len() > 0)
-}
-
-// Take every message waiting for this session, oldest first, each with whether it was spoken, and
-// empty its inbox.
-pub fn take_inbox(session_file: &Path) -> Vec<(String, bool)> {
-    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(inbox_path(session_file)) else { return Vec::new() };
-    if file.lock().is_err() {
-        return Vec::new();
-    }
-    let lines: Vec<String> = std::io::BufReader::new(&file).lines().map_while(Result::ok).collect();
-    let _ = file.set_len(0);
-    let records = lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok());
-    records.filter_map(|record| Some((record.get("text")?.as_str()?.to_string(), record.get("spoken").and_then(Value::as_bool).unwrap_or(false)))).collect()
-}
-
 // --- The ledger ---
 
 fn now_text() -> String {
@@ -402,15 +378,13 @@ struct Lane {
     // The file's last change (epoch seconds) when its reminders started, and how many it's had.
     quiet_since: u64,
     reminders: u32,
-    // The process of its run going now, when `sessions` started one.
+    // The run `sessions` started in it, by its identity as it started (runtime.rs Run), until it's
+    // heard to end. Not `run`, which held a bare pid before (0.11.4 and older).
     #[serde(default)]
-    run: Option<u32>,
-    // The time stamp of the last turn end the manager heard about, and the file's last change
-    // when it was last looked at for one.
+    launched: Option<crate::runtime::Run>,
+    // The time stamp of the last turn end the manager heard about.
     #[serde(default)]
     reported: String,
-    #[serde(default)]
-    looked: u64,
 }
 
 fn load_lanes(home: &Path) -> Vec<Lane> {
@@ -427,12 +401,13 @@ fn changed(file: &Path) -> Option<u64> {
 }
 
 // Start answering for a lane, or carry on with one already listed; `run` is the process of a run
-// just started in it.
-fn take_lane(home: &Path, file: &Path, title: &str, run: Option<u32>) {
+// just started in it, and `heard` the time stamp of its last turn before the manager's message,
+// which a new lane's news starts after.
+fn take_lane(home: &Path, file: &Path, title: &str, run: Option<crate::runtime::Run>, heard: String) {
     let mut lanes = load_lanes(home);
     match lanes.iter_mut().find(|lane| lane.file == file) {
-        Some(lane) => lane.run = run.or(lane.run),
-        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, run, reported: String::new(), looked: 0 }),
+        Some(lane) => lane.launched = run.or(lane.launched.take()),
+        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, launched: run, reported: heard }),
     }
     save_lanes(home, &lanes);
 }
@@ -448,59 +423,14 @@ fn session_id(file: &Path) -> String {
     file.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit('_').next()).unwrap_or_default().to_string()
 }
 
-// Whether a lane's run is still going: its process is there and is that session's run (a pid can
-// pass to another process once the run is gone, and a zombie has no command line).
-fn running(pid: u32, file: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|line| line.split(|byte| *byte == 0).any(|argument| argument == file.as_os_str().as_bytes()))
-}
-
-// Run a message in a session in a piccosta of its own (print mode), apart from whoever starts it:
-// in a session and process group of its own, so it carries on when the manager, its terminal or
-// its service stops (the service's unit has KillMode=process for this). What it prints goes to
-// `log`. Output: its process id.
-fn launch(file: &Path, cwd: &Path, message: &str, log: &Path) -> std::io::Result<u32> {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
-    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
-    fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
-    let output = fs::File::create(log)?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("-p").arg("--session").arg(file).arg(message).current_dir(cwd);
-    // A lane's run is the manager's, not a command's, even when an agent's `sessions message`
-    // starts it (which wakes a project manager's lane, or the manager itself).
-    command.env_remove(crate::tools::subagent::SESSION_ENV);
-    command.stdin(std::process::Stdio::null()).stdout(output.try_clone()?).stderr(output);
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    // Waited for, so it isn't left a zombie while this piccosta runs; if this one ends first, init
-    // takes it over.
-    std::thread::spawn(move || child.wait());
-    Ok(pid)
-}
-
-// The model's last finished turn in a session file (one that didn't end on tool calls): its time
-// stamp and its text. Read from the file's end, so a long session costs no more than a short one.
+// The model's last finished turn in a session file (one that didn't end on tool calls): its entry's
+// time stamp and its text.
 fn last_turn(file: &Path) -> Option<(String, String)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut handle = fs::File::open(file).ok()?;
-    let length = handle.metadata().ok()?.len();
-    handle.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES))).ok()?;
-    let mut tail = Vec::new();
-    handle.read_to_end(&mut tail).ok()?;
-    let tail = String::from_utf8_lossy(&tail);
-    let last = tail.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|entry| entry["type"] == "message")?;
-    let message = &last["message"];
-    let finished = message["role"] == "assistant" && message["stopReason"] != "toolUse";
-    let text: String = message["content"].as_array()?.iter().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
-    finished.then(|| (last["timestamp"].as_str().unwrap_or_default().to_string(), text))
+    let session = crate::session::Session::read(file).ok()?;
+    let last = session.entries().iter().rev().find(|entry| matches!(entry, crate::session::SessionEntry::Message { .. }))?;
+    let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = last else { return None };
+    let text: Vec<&str> = reply.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
+    (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n")))
 }
 
 // The last `NEWS_CHARS` characters of a text.
@@ -509,21 +439,81 @@ fn ending(text: &str) -> String {
     characters[characters.len().saturating_sub(NEWS_CHARS)..].iter().collect()
 }
 
-// What a manager hears about its lanes, as messages for it: each turn a lane finished (once its
-// file has been still for TURN_SETTLE_SECONDS, so a pair's next turn or the last writes can land),
-// with what it said and whether its run is still going; a run that ended without finishing a
-// turn, with the end of what it printed; a lane someone else closed; and, when `remind`, each lane
-// quiet for its wait (the setting's minutes, doubled for each reminder since it last changed). A
-// lane whose file is gone, or that was closed, leaves the list.
-fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
-    let mut lanes = load_lanes(home);
-    if lanes.is_empty() {
-        return Vec::new();
+// News of a lane's last finished turn, when the manager hasn't heard it yet; `still`, that its run
+// goes on (a background job, or a partner's turn). `ended` says its run ended, and whether it said
+// so: a run of the manager's that ended without a word or a new turn gets news too, with the end of
+// what it printed.
+fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> Option<String> {
+    let (id, title) = (session_id(&lane.file), lane.title.clone());
+    let news = match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
+        Some((stamp, said)) => {
+            lane.reported = stamp;
+            let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
+            Some(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)))
+        }
+        None if ended == Some(false) && lane.launched.is_some() => {
+            let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
+            let pid = lane.launched.as_ref().map_or(0, |run| run.pid);
+            Some(format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {pid}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), ending(&printed)))
+        }
+        None => None,
+    };
+    if ended.is_some() {
+        lane.launched = None;
     }
+    news
+}
+
+// A manager's lanes, watched while its session runs (its runtime starts this): each turn a lane
+// finishes, as it ends (a subscription to the lane's runtime, made whenever one runs it); a turn
+// that ended while nobody listened, read from its file as the subscription starts, or when it's
+// first looked at with nothing running it; a run it started that ended without finishing a turn;
+// a lane someone else closed; and
+// every LANE_SCAN_SECONDS, each lane quiet for its wait (the setting's minutes, doubled for each
+// reminder since it last changed). A lane whose file is gone, or that was closed, leaves the list.
+// The news goes to the manager's runtime, as messages.
+pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, wait_minutes: u64) {
+    let (heard_sender, mut heard) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, Value)>();
+    let mut listening = std::collections::HashSet::new();
+    let mut tick = tokio::time::interval(POLL);
+    let mut ticks = 0u64;
+    loop {
+        let news = tokio::select! {
+            _ = tick.tick() => {
+                ticks += 1;
+                look(&home, &mut listening, &heard_sender, ticks, wait_minutes)
+            }
+            Some((file, said)) = heard.recv() => {
+                let mut lanes = load_lanes(&home);
+                let Some(lane) = lanes.iter_mut().find(|lane| lane.file == file) else { continue };
+                // The subscription's first line, then a line a turn, then its end.
+                let news = match (said.get("turn_end"), said["ok"] == true) {
+                    (Some(turn), _) => catch_up(&home, lane, turn["jobs"].as_u64().unwrap_or(0) > 0, None),
+                    (None, true) => catch_up(&home, lane, false, None),
+                    (None, false) => {
+                        listening.remove(&file);
+                        catch_up(&home, lane, false, Some(said["end"] == true))
+                    }
+                };
+                save_lanes(&home, &lanes);
+                news.into_iter().collect()
+            }
+        };
+        let Some(manager) = manager.upgrade() else { return };
+        for text in news {
+            let _ = manager.send(Command::Message(text));
+        }
+    }
+}
+
+// One look at a manager's lanes (watch). Output: the news.
+fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: &tokio::sync::mpsc::UnboundedSender<(PathBuf, Value)>, ticks: u64, wait_minutes: u64) -> Vec<String> {
+    let mut lanes = load_lanes(home);
+    let (remind, first) = (ticks.is_multiple_of(LANE_SCAN_SECONDS), ticks == 1);
     let now = (crate::clock::now_ms() / 1000) as u64;
     let agent_dir = crate::config::agent_dir();
-    let mut reminders = Vec::new();
-    let mut save = remind;
+    let mut news = Vec::new();
+    let mut save = remind || first;
     lanes.retain_mut(|lane| {
         let Some(last) = changed(&lane.file) else {
             save = true;
@@ -532,28 +522,23 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
         let (id, title) = (session_id(&lane.file), lane.title.clone());
         if crate::session::is_closed(&agent_dir, &lane.file) {
             save = true;
-            reminders.push(format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text()));
+            news.push(format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text()));
             return false;
         }
-        let run_ended = lane.run.is_some_and(|pid| !running(pid, &lane.file));
-        if (last != lane.looked && now.saturating_sub(last) >= TURN_SETTLE_SECONDS) || run_ended {
-            lane.looked = last;
-            save = true;
-            match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
-                Some((stamp, said)) => {
-                    lane.reported = stamp;
-                    let still = if lane.run.is_some() && !run_ended { " Its run is still going (a background job, or a partner's turn)." } else { "" };
-                    reminders.push(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)));
-                }
-                None if run_ended => {
-                    let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
-                    reminders.push(format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), lane.run.unwrap_or_default(), ending(&printed)));
-                }
-                None => {}
+        if !listening.contains(&lane.file) {
+            if crate::runtime::running(&lane.file) {
+                listening.insert(lane.file.clone());
+                let (file, heard) = (lane.file.clone(), heard.clone());
+                tokio::task::spawn_local(async move {
+                    let said_so = crate::runtime::subscribe(&file, |line| drop(heard.send((file.clone(), line)))).await;
+                    let _ = heard.send((file, json!({"end": said_so})));
+                });
+            } else if first || lane.launched.as_ref().is_some_and(crate::runtime::ended) {
+                // What ended while nobody listened: as this manager starts, and a run it started
+                // that ended before it could be heard (it never started, say).
+                save = true;
+                news.extend(catch_up(home, lane, false, Some(first)));
             }
-        }
-        if run_ended {
-            lane.run = None;
         }
         if !remind {
             return true;
@@ -564,30 +549,15 @@ fn lane_news(home: &Path, wait_minutes: u64, remind: bool) -> Vec<String> {
         let quiet_minutes = now.saturating_sub(last) / 60;
         if quiet_minutes >= wait_minutes << lane.reminders.min(16) {
             lane.reminders += 1;
-            let running = if crate::session::held_elsewhere(&lane.file) { "it's still running" } else { "nothing is running it" };
-            reminders.push(format!("[{}, a quiet lane] Session {} \"{}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text(), session_id(&lane.file), lane.title));
+            let running = if listening.contains(&lane.file) { "it's still running" } else { "nothing is running it" };
+            news.push(format!("[{}, a quiet lane] Session {id} \"{title}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text()));
         }
         true
     });
     if save {
         save_lanes(home, &lanes);
     }
-    reminders
-}
-
-// The headless piccostas (print mode) that have `file` open: a lane's background run.
-fn headless_runs(file: &Path) -> Vec<i32> {
-    let Ok(entries) = fs::read_dir("/proc") else { return Vec::new() };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            let arguments = fs::read(entry.path().join("cmdline")).ok()?;
-            let printing = arguments.split(|byte| *byte == 0).any(|argument| argument == b"-p");
-            let holds = fs::read_dir(entry.path().join("fd")).ok()?.flatten().any(|fd| fs::read_link(fd.path()).ok().as_deref() == Some(file));
-            (printing && holds).then_some(pid)
-        })
-        .collect()
+    news
 }
 
 // --- Schedules ---
@@ -673,20 +643,28 @@ fn string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     arguments.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty())
 }
 
-// Every session on this computer, newest first.
-fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<crate::host::SessionSummary> {
-    let folders = fs::read_dir(agent_dir.join("sessions")).into_iter().flatten().flatten();
-    let mut found: Vec<crate::host::SessionSummary> = folders.flat_map(|folder| crate::host::sessions_in(&folder.path(), None, limit)).collect();
-    found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
-    found.truncate(limit);
-    found
+
+// The one session an id, the start of one, or a name picks. An exact id wins; otherwise more than
+// one match is refused with the candidates named, since stopping or closing the wrong session (two
+// made in the same minute share their first characters) can't be undone.
+fn find(agent_dir: &Path, wanted: &str) -> Result<crate::host::SessionSummary, String> {
+    let mut found: Vec<_> = crate::host::all_sessions(agent_dir, usize::MAX).into_iter().filter(|summary| summary.id.starts_with(wanted) || summary.title == wanted).collect();
+    if let Some(exact) = found.iter().position(|summary| summary.id == wanted) {
+        return Ok(found.swap_remove(exact));
+    }
+    match found.len() {
+        0 => Err(format!("No session matches \"{wanted}\" (an id, the start of one, or a name)")),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!("\"{wanted}\" matches {} sessions; give more of the id: {}", found.len(), found.iter().map(|summary| format!("{} \"{}\"", summary.id, summary.title)).collect::<Vec<_>>().join(", "))),
+    }
 }
 
-fn find(agent_dir: &Path, wanted: &str) -> Result<crate::host::SessionSummary, String> {
-    all_sessions(agent_dir, usize::MAX)
-        .into_iter()
-        .find(|summary| summary.id.starts_with(wanted) || summary.title == wanted)
-        .ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
+// Stop or close a session's runtime (runtime.rs end), off this thread, since it answers once its
+// turn has stopped.
+async fn end(home: &Path, file: &Path, what: &'static str) -> Option<Result<(), String>> {
+    let ours = load_lanes(home).into_iter().find(|lane| lane.file == file).and_then(|lane| lane.launched);
+    let file = file.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::runtime::end(&file, what, ours.as_ref())).await.ok().flatten()
 }
 
 fn ago(modified: std::time::SystemTime) -> String {
@@ -728,10 +706,10 @@ pub struct SessionsTool {
 
 impl SessionsTool {
     fn list(&self) -> String {
-        let lines: Vec<String> = all_sessions(&self.agent_dir, LIST_LIMIT)
+        let lines: Vec<String> = crate::host::all_sessions(&self.agent_dir, LIST_LIMIT)
             .iter()
             .map(|summary| {
-                let running = if crate::session::held_elsewhere(&summary.path) { " · running" } else if summary.closed { " · closed" } else { "" };
+                let running = if crate::runtime::running(&summary.path) { " · running" } else if summary.closed { " · closed" } else { "" };
                 let session = crate::session::Session::open(&summary.path, &summary.cwd).ok();
                 let kind = match session.as_ref().and_then(role) {
                     Some(Role::Assistant) => " · the assistant (you)",
@@ -752,35 +730,40 @@ impl SessionsTool {
         let session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
         let messages: Vec<String> = session.context().messages.iter().filter_map(message_line).collect();
         let shown = &messages[messages.len().saturating_sub(count)..];
-        let running = if crate::session::held_elsewhere(&summary.path) { "running now" } else { "not running" };
+        let running = if crate::runtime::running(&summary.path) { "running now" } else { "not running" };
         Ok(format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n")))
     }
 
-    // Send a message to a session: into its inbox when another piccosta runs it (that one takes it
-    // in after its current step), else in a run of its own (launch). Either way it's one of this
-    // manager's lanes from then on. Output: what happened, for the reply.
-    fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
-        if crate::session::held_elsewhere(file) {
-            take_lane(&self.home, file, title, None);
-            deliver(file, message, false).map_err(|error| error.to_string())?;
-            return Ok("It's open in another piccosta, which takes the message in after its current step; read the session later to see what came of it.".into());
-        }
-        let pid = launch(file, cwd, message, &run_log(&self.home, file)).map_err(|error| format!("Couldn't start its run: {error}"))?;
-        take_lane(&self.home, file, title, Some(pid));
-        Ok(format!("Its run started (pid {pid}) in a process of its own; when its turn ends you get a message with what it said."))
+    // Send a message to a session (runtime.rs send): to whatever runs it, which reads it at its next
+    // step, else in a run of its own. Either way it's one of this manager's lanes from then on.
+    // Sent off this thread, which may be a terminal UI's, since a stopped runtime holds a send up
+    // by its wait. Output: what happened, for the reply.
+    async fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
+        let heard = last_turn(file).map(|(stamp, _)| stamp).unwrap_or_default();
+        let (to, cwd, message, log) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file));
+        let sent = tokio::task::spawn_blocking(move || crate::runtime::send(&to, &message, Some((&cwd, &log)))).await.map_err(|error| error.to_string())?;
+        let (said, run) = match sent.map_err(|error| format!("Couldn't send it: {error}"))? {
+            Sent::Started(run) => (format!("Its run started (pid {}) in a process of its own; when its turn ends you get a message with what it said.", run.pid), Some(run)),
+            Sent::Delivered => ("It's running, and reads it at its next step; when its turn ends you get a message with what it said.".to_string(), None),
+            Sent::Unconfirmed => ("It was sent, not confirmed: the piccosta running it didn't answer in time (stopped, or stuck), or its connection ended without an answer. It isn't sent again. Read the session later, or stop it (`sessions stop`).".to_string(), None),
+            Sent::Queued => ("It's a manager's session, so the message waits in it for the service or a terminal UI to open it; read the session later to see what came of it.".to_string(), None),
+        };
+        take_lane(&self.home, file, title, run, heard);
+        Ok(said)
     }
 
     // Write a session's model, level, partners and name into its file before anything runs it, so
     // it opens the same in a run, the terminal UI or an editor. `use` picks from the model scale
-    // unless a model is named. Input: a session nobody is running. Output: its model, when set.
-    fn configure(&self, session: &mut crate::session::Session, arguments: &Map<String, Value>) -> Result<Option<String>, String> {
+    // unless a model is named. Input: a session nobody is running. Output: its model, when set, and
+    // a line saying so when `use` found none of the kind's models served (it runs on the default).
+    fn configure(&self, session: &mut crate::session::Session, arguments: &Map<String, Value>) -> Result<(Option<String>, Option<String>), String> {
         use crate::session::SessionEntry;
         let registry = crate::model::ModelRegistry::load(&self.agent_dir.join("models.json"))?;
         let written = |result: std::io::Result<String>| result.map(drop).map_err(|error| error.to_string());
-        let (model, scale_level) = match (string(arguments, "model"), string(arguments, "use")) {
-            (Some(model), _) => (Some(model.to_string()), None),
-            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind).map(|(model, level)| (Some(model), level))?,
-            (None, None) => (None, None),
+        let (model, scale_level, note) = match (string(arguments, "model"), string(arguments, "use")) {
+            (Some(model), _) => (Some(model.to_string()), None, None),
+            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind)?,
+            (None, None) => (None, None, None),
         };
         // The kind is kept in the session, so it runs with that kind's tools and readOnly.
         if let Some(kind) = string(arguments, "use") {
@@ -802,7 +785,7 @@ impl SessionsTool {
         if let Some(name) = string(arguments, "name") {
             written(session.append(SessionEntry::SessionInfo { base: session.next_base(), name: Some(name.to_string()) }))?;
         }
-        Ok(chosen)
+        Ok((chosen, note))
     }
 
     // The directories that have sessions, the latest used first: how many, when last used, and
@@ -825,20 +808,30 @@ impl SessionsTool {
     // What the sessions of the last day and week cost, by provider, from their own records.
     fn usage(&self) -> String {
         let now = crate::clock::now_ms();
-        let mut totals: std::collections::BTreeMap<String, (f64, f64)> = std::collections::BTreeMap::new();
-        for summary in all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
+        type Tallies = std::collections::BTreeMap<String, (crate::provider::responses::Tally, crate::provider::responses::Tally)>;
+        // The day's and the week's, by provider; each session's tallied alone first, so a turn
+        // settles only its own session's pending ones.
+        let mut totals = Tallies::new();
+        for summary in crate::host::all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
             let Ok(session) = crate::session::Session::open(&summary.path, &summary.cwd) else { continue };
+            let mut tallies = Tallies::new();
             for message in session.context().messages {
                 if let AgentMessage::Assistant(assistant) = message {
-                    let total = totals.entry(assistant.provider.clone()).or_default();
-                    total.1 += assistant.usage.cost.total;
+                    let (day, week) = tallies.entry(assistant.provider.clone()).or_default();
+                    week.add(&assistant.usage, &assistant.provider);
                     if now - assistant.timestamp < DAY_MS {
-                        total.0 += assistant.usage.cost.total;
+                        day.add(&assistant.usage, &assistant.provider);
                     }
                 }
             }
+            for (provider, (day, week)) in tallies {
+                let total = totals.entry(provider).or_default();
+                total.0.merge(day);
+                total.1.merge(week);
+            }
         }
-        let mut lines: Vec<String> = totals.iter().map(|(provider, (day, week))| format!("{provider}: ${day:.2} in the last day, ${week:.2} in the last week (catalog prices; plans bill by quota, not these)")).collect();
+        let spent = totals.iter().filter(|(_, (_, week))| week.total > 0.0 || week.unknown());
+        let mut lines: Vec<String> = spent.map(|(provider, (day, week))| format!("{provider}: {} in the last day, {} in the last week (the model's prices, or Claude Code's reckoning, for keys billed by the token; plans bill by quota, below)", day.dollars(2), week.dollars(2))).collect();
         if lines.is_empty() {
             lines.push("Nothing spent this week.".into());
         }
@@ -892,20 +885,20 @@ impl Tool for SessionsTool {
                     let folder = crate::session::default_session_dir(&self.agent_dir, &dir);
                     let mut session = crate::session::Session::create(&dir, Some(&folder));
                     session.persist_now().map_err(|error| error.to_string())?;
-                    let model = self.configure(&mut session, &arguments)?;
+                    let (model, note) = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
                     // Kept, so this manager may delete it later: a manager deletes only what it made.
                     let _ = fs::OpenOptions::new().create(true).append(true).open(self.home.join(STARTED_FILE)).and_then(|mut list| writeln!(list, "{}", file.display()));
                     let (id, name) = (session_id(&file), crate::host::title(&session));
                     drop(session);
-                    let started = format!("Made session {id}, a session in {}{}.", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")));
+                    let started = format!("Made session {id}, a session in {}{}.{}", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")), note.map_or(String::new(), |note| format!(" {note}.")));
                     match string(&arguments, "message") {
                         Some(message) => {
                             let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
-                            text(format!("{started} {}", self.run(&file, &dir, message, &title)?))
+                            text(format!("{started} {}", self.run(&file, &dir, message, &title).await?))
                         }
                         None => {
-                            take_lane(&self.home, &file, &name, None);
+                            take_lane(&self.home, &file, &name, None, String::new());
                             text(format!("{started} It has no message, so it waits: the user can open it in piccosta, where it's listed under its project, or you can message it."))
                         }
                     }
@@ -913,62 +906,56 @@ impl Tool for SessionsTool {
                 "message" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
                     let changes = ["use", "model", "thinking", "pair", "trio", "name"].iter().any(|key| arguments.contains_key(*key));
-                    if changes && !crate::session::held_elsewhere(&summary.path) {
-                        let mut session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
-                        self.configure(&mut session, &arguments)?;
-                    }
-                    text(self.run(&summary.path, &summary.cwd, need("message")?, &summary.title)?)
+                    // Changes go in only while nothing runs it, before the message starts a run.
+                    let configured = if changes { crate::runtime::when_idle(&summary.path, |session| self.configure(session, &arguments))? } else { None };
+                    let note = configured.transpose()?.and_then(|(_, note)| note).map(|note| format!("{note}. "));
+                    text(format!("{}{}", note.unwrap_or_default(), self.run(&summary.path, &summary.cwd, need("message")?, &summary.title).await?))
                 }
-                // Stop a lane's run: the headless piccosta (print mode) holding its session, which
-                // stops its own commands as it goes. A session open in someone's terminal or editor
-                // isn't stopped from here; it gets a message instead.
+                // Stop a lane's run, as Esc does: what it's running moves to the background and its
+                // turn stops; a run of its own then ends, and everything it started with it. One
+                // open in a terminal or editor stays open there.
                 "stop" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
-                    let runs = headless_runs(&summary.path);
-                    if runs.is_empty() {
-                        return text(if crate::session::held_elsewhere(&summary.path) { format!("\"{}\" is open in a terminal or editor, not a background run; send it a message instead.", summary.title) } else { format!("\"{}\" isn't running.", summary.title) });
-                    }
-                    for pid in &runs {
-                        // SAFETY: kill() takes plain integers; a pid already gone fails with ESRCH.
-                        unsafe { libc::kill(*pid, libc::SIGTERM) };
-                    }
-                    text(format!("Stopped \"{}\" (pid {}).", summary.title, runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")))
+                    let stopped = match end(&self.home, &summary.path, "stop").await {
+                        None => "isn't running".to_string(),
+                        Some(Err(why)) => why,
+                        Some(Ok(())) if crate::runtime::running(&summary.path) => "its turn stopped; it's open in a terminal or editor, which keeps it".to_string(),
+                        Some(Ok(())) => "its run stopped, with everything it was running".to_string(),
+                    };
+                    text(format!("\"{}\": {stopped}.", summary.title))
                 }
-                // Close a session: it's done. Its background run stops, it's marked closed for
-                // everyone (it leaves the sidebar), and it's no longer a lane.
+                // Close a session: it's done. Whatever runs it stops and ends, with its jobs; it's
+                // marked closed for everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
-                    let runs = headless_runs(&summary.path);
-                    for pid in &runs {
-                        // SAFETY: kill() takes plain integers; a pid already gone fails with ESRCH.
-                        unsafe { libc::kill(*pid, libc::SIGTERM) };
-                    }
+                    let stopped = match end(&self.home, &summary.path, "close").await {
+                        None => String::new(),
+                        Some(Err(why)) => format!("; {why}"),
+                        Some(Ok(())) => ", and its run ended, with everything it was running".to_string(),
+                    };
                     crate::session::set_closed(&self.agent_dir, &summary.path, true);
                     let mut lanes = load_lanes(&self.home);
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
-                    let stopped = if runs.is_empty() { String::new() } else { format!(", and its run (pid {}) stopped", runs.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")) };
                     text(format!("Closed \"{}\"{stopped}. A message to it opens it again.", summary.title))
                 }
-                // Delete a session this manager started: to the trash, with the Claude bridge's record
-                // and its inbox. A session still running is left alone.
+                // Delete a session this manager started: to the trash, with the Claude bridge's
+                // record. A session still running is left alone.
                 "delete" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
                     let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default();
                     if !started.lines().any(|line| Path::new(line) == summary.path) {
                         return Err(format!("\"{}\" wasn't started by you, and you delete only sessions you started; close it instead (`sessions close`).", summary.title));
                     }
-                    if crate::session::held_elsewhere(&summary.path) {
+                    if crate::runtime::running(&summary.path) {
                         return Err(format!("\"{}\" is running; stop it (`sessions stop`) or close it first, then delete it.", summary.title));
                     }
+                    // The lane goes only once its session is in the trash, so a failed delete keeps it.
+                    crate::tui::commands::trash_session(&summary.path)?;
                     let mut lanes = load_lanes(&self.home);
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
-                    text(match crate::tui::commands::trash_session(&summary.path) {
-                        Some(true) => format!("Moved \"{}\" to the trash.", summary.title),
-                        Some(false) => format!("Deleted \"{}\".", summary.title),
-                        None => return Err(format!("Could not delete {}.", summary.path.display())),
-                    })
+                    text(format!("Moved \"{}\" to the trash.", summary.title))
                 }
                 other => Err(format!("No action \"{other}\": list, projects, read, start, message, stop, close, delete or usage")),
             }
@@ -1088,46 +1075,22 @@ pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> Str
             "\n- Its sessions are yours to watch and direct. The assistant, the user's lead director, may message you too; answer it as you would the user.\n- For real work, start sessions with a second model (`sessions start` with `trio` to have it check each answer, `pair` to have the two work it through together); ask the user before you start them. Manage the reviewing and the builds yourself, and leave long, large arms of work and plans to subsessions.".to_string(),
         ),
     };
-    let scale = crate::scale::uses(&crate::config::agent_dir()).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, entry.models.join(", then "))).collect::<Vec<_>>().join("\n");
+    let agent_dir = crate::config::agent_dir();
+    let scale = crate::scale::uses(&agent_dir).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, crate::scale::available(&agent_dir, entry).join(", then "))).collect::<Vec<_>>().join("\n");
     let home = home_for(&crate::config::agent_dir(), role, cwd);
     let memory = fs::read_to_string(home.join("memory.md")).unwrap_or_default();
     let memory = if role != Role::Assistant { String::new() } else if memory.trim().is_empty() { "\n\nYour memory: nothing yet.".into() } else { format!("\n\nYour memory:\n{}", memory.trim_end()) };
-    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", if ask { QUOTA_ASK } else { QUOTA_FREE })
+    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", &quota(settings, ask))
         .replace("{ledger}", &home.join("ledger.md").display().to_string())
         .replace("{scope}", if role == Role::Assistant { "across the projects" } else { "in the project" })
         .replace("{memory_line}", &if role == Role::Assistant { ASSISTANT_MEMORY.replace("{path}", &home.join("memory.md").display().to_string()) } else { String::new() })
         .replace("{memory}", &memory)
 }
 
-// Wake a manager that isn't the one running here: a message into its session, through its inbox
-// when a piccosta runs it, else a run of its own (launch). Its answer stays in its session.
-fn wake(home: &Path, file: &Path, cwd: &Path, text: &str) {
-    if crate::session::held_elsewhere(file) {
-        let _ = deliver(file, text, false);
-        return;
-    }
-    let _ = launch(file, cwd, text, &home.join("runs").join("manager.log"));
-}
-
-// What's waiting for the project managers: their schedules that are due, and messages left in the
-// inbox of one nobody is running (it was closed when they came), each as (its home, session file,
-// directory, message).
-fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
-    let homes = fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten();
-    let mut work = Vec::new();
-    for home in homes.map(|entry| entry.path()) {
-        let Some(file) = pointer(&home) else { continue };
-        let mut messages: Vec<String> = due_schedules(&home).into_iter().map(|schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text)).collect();
-        if !crate::session::held_elsewhere(&file) {
-            messages.extend(take_inbox(&file).into_iter().map(|(text, _)| text));
-        }
-        if messages.is_empty() {
-            continue;
-        }
-        let Some(cwd) = crate::session::Session::open(&file, &home).ok().map(|session| PathBuf::from(&session.header().cwd)) else { continue };
-        work.push((home, file, cwd, messages.join("\n\n")));
-    }
-    work
+// A message from the user to a manager, saying so with the time, as the manager's prompt says its
+// messages do.
+pub fn from_user(text: &str) -> String {
+    format!("[{}, from the user]\n{text}", now_text())
 }
 
 // --- The service ---
@@ -1136,32 +1099,64 @@ fn project_work(agent_dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf, String)> {
 // starting it again after it fails (a missing login would otherwise restart it in a tight loop).
 const UNIT: &str = "piccosta-assistant.service";
 const RESTART_SECONDS: u32 = 30;
+// The environment the unit carries over from the terminal that wrote it: the paths piccosta and the
+// tools it runs find their files by, where set. Never a key: keys go in ENV_FILE, which the user
+// writes and the unit only names.
+const UNIT_PATHS: [&str; 5] = ["PATH", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PICCOSTA_AGENT_DIR"];
+const ENV_FILE: &str = "assistant.env";
+
+// A value as one quoted word of a unit file (systemd.syntax(7)): backslashes, quotes and newlines
+// escaped, and % doubled, since systemd reads %x as a specifier.
+fn unit_word(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('%', "%%"))
+}
+
+// The EnvironmentFile= line for `path`, its leading - making the file optional. systemd takes that
+// path as written, unquoted, expanding only specifiers (so % is doubled), after cutting the line at
+// a line break, trimming its end and joining a line that ends in a backslash to the next
+// (load-fragment.c config_parse_unit_env_file, systemd 260), and then glob-expanding it. A path that
+// can't survive that (a control character, a trailing space or backslash, a glob character) has no
+// line, and the comment says so.
+fn env_file_line(path: &str) -> Option<String> {
+    let whole = !path.contains(char::is_control) && !path.contains(['*', '?', '[']) && !path.ends_with(char::is_whitespace) && !path.ends_with('\\');
+    whole.then(|| format!("EnvironmentFile=-{}\n", path.replace('%', "%%")))
+}
+
+// The unit's text. Input: this binary and the agent dir. ExecStart expands $ only in arguments, not
+// in the command (systemd-analyze verify, systemd 260). The comment names the keys file with Rust's
+// escapes, quoted, so no character of it can end the comment's line.
+fn unit_text(exe: &str, agent_dir: &Path) -> String {
+    let environment: String = UNIT_PATHS.iter().filter_map(|name| Some(format!("Environment={}\n", unit_word(&format!("{name}={}", std::env::var(name).ok()?))))).collect();
+    let env_file = agent_dir.join(ENV_FILE).display().to_string();
+    let (line, unread) = env_file_line(&env_file).map_or((String::new(), " (its name can't be written in a unit, so it isn't read)"), |line| (line, ""));
+    format!(
+        "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n# Keys the assistant needs that the terminal has only in its environment (OPENCODE_API_KEY, say) go in \"{}\"{unread}, one NAME=value a line, readable by you alone (chmod 600); none are written here.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={} assistant\n{environment}{line}Restart=on-failure\nRestartSec={RESTART_SECONDS}\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
+        env_file.escape_debug(),
+        unit_word(exe)
+    )
+}
 
 // With `manager.autostart: true` in settings, make sure the assistant is running, from the terminal
 // UI, so it needn't be set up by hand. Off unless asked for: it's a background service, on a login
-// the user may not have. Where systemd runs the user's session, piccosta writes its unit (this
-// binary, the PATH it was started with, so `claude` and the rest are found) and enables it, so it
+// the user may not have. Where systemd runs the user's session, piccosta writes its unit (unit_text:
+// this binary, and the PATH and paths it was started with, so `claude` and the rest are found) and enables it, so it
 // starts at login and comes back if it fails; elsewhere it starts as a detached process of its
 // own. With PICCOSTA_AGENT_DIR set (a second agent dir, a test) it's off, since the unit serves the
 // default one, and so it is for a terminal UI an agent's command started (a test driving it).
 // Output: what it did, for a notice, or None when it's off or already running.
 pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     let agent_dir = crate::config::agent_dir();
-    if session_file(&agent_dir).is_some_and(|file| crate::session::held_elsewhere(&file)) {
+    if session_file(&agent_dir).is_some_and(|file| crate::runtime::running(&file)) {
         return None;
     }
     if settings.get("manager.autostart").and_then(Value::as_bool) != Some(true) || own_agent_dir() || started_by_agent() {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
-    let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
+    let exe = crate::proc::exe().ok()?.to_string_lossy().into_owned();
     let systemctl = |words: &[&str]| std::process::Command::new("systemctl").arg("--user").args(words).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success());
     let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     if systemctl(&["show-environment"]) {
-        let unit = format!(
-            "# Written by piccosta, which keeps it up to date; with `manager.autostart` off in its settings, `systemctl --user disable --now piccosta-assistant` stops it.\n[Unit]\nDescription=piccosta assistant\n\n[Service]\nExecStart={exe} assistant\nEnvironment=PATH={}\nRestart=on-failure\nRestartSec={RESTART_SECONDS}\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let unit = unit_text(&exe, &agent_dir);
         let path = config.join("systemd/user").join(UNIT);
         if fs::read_to_string(&path).ok().as_deref() != Some(unit.as_str()) {
             fs::create_dir_all(path.parent()?).ok()?;
@@ -1170,29 +1165,20 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
         }
         return Some(if systemctl(&["enable", "--now", UNIT]) { format!("Started the assistant ({UNIT})") } else { format!("Couldn't start {UNIT}; `systemctl --user status {UNIT}` says why") });
     }
-    use std::os::unix::process::CommandExt;
     let _ = fs::create_dir_all(home(&agent_dir));
     let log = fs::File::create(home(&agent_dir).join("assistant.log")).ok();
     let mut command = std::process::Command::new(exe);
     command.arg("assistant").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
     command.stderr(log.map_or(std::process::Stdio::null(), std::process::Stdio::from));
-    // SAFETY: setsid() is async-signal-safe and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    Some(match command.spawn() {
+    Some(match crate::proc::own_session(&mut command).spawn() {
         Ok(_) => "Started the assistant".into(),
         Err(error) => format!("Couldn't start the assistant: {error}"),
     })
 }
 
-// `piccosta assistant`: run the assistant until SIGTERM. Messages come from its inbox (the TUI, or
-// `piccosta tell`), from the sessions it starts (their ends, as job messages), and from its
-// schedules; each goes in with the time and where it came from. It also fires the project
-// managers' schedules.
+// `piccosta assistant`: run the assistant until SIGTERM. Messages come through its runtime (the
+// TUI, `piccosta tell`), from its lanes as their turns end, and from its schedules; each goes in
+// with the time and where it came from. It also fires the project managers' schedules.
 pub async fn run(args: crate::cli::Args) -> Result<std::process::ExitCode, String> {
     tokio::task::LocalSet::new().run_until(serve(args)).await
 }
@@ -1215,20 +1201,21 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     session.persist_now().map_err(|error| error.to_string())?;
     let file = session.file().ok_or("the manager needs a session file")?.to_path_buf();
     fs::write(home.join("session"), file.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
-    let (model, thinking) = host.launch(&args)?;
-    let model = model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| DEFAULT_MODEL.into());
-    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| DEFAULT_THINKING.into());
-    let busy = Arc::new(AtomicBool::new(false));
-    let marks = busy.clone();
-    let emit: crate::agent::EventSink = Box::new(move |event: &crate::agent::Event| match event {
-        crate::agent::Event::AgentStart => marks.store(true, Ordering::SeqCst),
-        crate::agent::Event::AgentSettled { .. } => marks.store(false, Ordering::SeqCst),
-        _ => {}
-    });
-    let (agent, shared) = host.open(session, Some(&model), Some(&thinking), emit, false)?;
-    let handle = agent.handle();
-    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let task = host.clone().spawn(agent, shared.clone(), true, receiver, |done| {
+    // Its notes (a kind with no model served) go to the assistant's log.
+    let (model, thinking, note) = host.launch(&args)?;
+    let (model, level, note) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
+        Some(model) => (Some(model), None, note),
+        None => crate::scale::pick(&agent_dir, MANAGER_KIND)?,
+    };
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).or(level).unwrap_or_else(|| DEFAULT_THINKING.into());
+    if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+        listing.await;
+    }
+    let (agent, shared) = host.open(session, model.as_deref(), Some(&thinking), Box::new(|_| {}), false)?;
+    let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared, true, false, |done| {
         if let Err(error) = done.result {
             eprintln!("piccosta manager: {error}");
         }
@@ -1240,46 +1227,31 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
     let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
     let mut poll = tokio::time::interval(POLL);
-    let wait_minutes = host.settings.get("manager.inactiveMinutes").and_then(Value::as_u64).unwrap_or(INACTIVE_MINUTES);
-    let mut ticks = 0u64;
+    let scheduled = |schedule: Schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text);
     loop {
         tokio::select! {
             _ = term.recv() => break,
             _ = interrupt.recv() => break,
             _ = hangup.recv() => break,
+            // The schedules that are due: the assistant's, and the project managers', which go to
+            // them wherever they run, or wait in their sessions.
             _ = poll.tick() => {
-                let mut incoming: Vec<(String, bool)> = take_inbox(&file).into_iter().map(|(text, spoken)| (format!("[{}, from the user]\n{text}", now_text()), spoken)).collect();
-                incoming.extend(due_schedules(&home).into_iter().map(|schedule| (format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text), false)));
-                // The managers' lanes: runs that ended, every second, and quiet lanes, every
-                // minute. The assistant's come here, a project manager's go to it.
-                ticks += 1;
-                let remind = ticks.is_multiple_of(LANE_SCAN_SECONDS);
-                incoming.extend(lane_news(&home, wait_minutes, remind).into_iter().map(|news| (news, false)));
+                for schedule in due_schedules(&home) {
+                    let _ = commands.send(Command::Message(scheduled(schedule)));
+                }
                 for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-                    let news = lane_news(&project_home, wait_minutes, remind);
-                    if let (false, Some(manager)) = (news.is_empty(), pointer(&project_home)) {
-                        let cwd = crate::session::Session::open(&manager, &project_home).ok().map(|session| PathBuf::from(&session.header().cwd)).unwrap_or_default();
-                        wake(&project_home, &manager, &cwd, &news.join("\n\n"));
-                    }
-                }
-                for (project_home, file, cwd, message) in project_work(&agent_dir) {
-                    wake(&project_home, &file, &cwd, &message);
-                }
-                for (message, spoken) in incoming {
-                    if busy.load(Ordering::SeqCst) {
-                        handle.steer(message, spoken);
-                    } else {
-                        busy.store(true, Ordering::SeqCst);
-                        let _ = commands.send(Command::Prompt(message, Vec::new(), spoken));
+                    let Some(manager) = pointer(&project_home) else { continue };
+                    for schedule in due_schedules(&project_home) {
+                        if let Err(error) = crate::runtime::send(&manager, &scheduled(schedule), None) {
+                            eprintln!("piccosta manager: {error}");
+                        }
                     }
                 }
             }
         }
     }
-    handle.abort();
     drop(commands);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    shared.jobs.shutdown("SIGTERM");
     crate::voice::shutdown(false).await;
     crate::provider::claude::shutdown().await;
     Ok(std::process::ExitCode::SUCCESS)

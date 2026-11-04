@@ -12,8 +12,9 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// The folder in a project that holds its own settings (pi's CONFIG_DIR_NAME).
-pub const PROJECT_CONFIG_DIR: &str = ".pi";
+// The folder in a project that holds its own settings. pi's own `.pi/` is never read: its
+// settings are pi's, and a repo that also uses pi would hand them to piccosta.
+pub const PROJECT_CONFIG_DIR: &str = ".piccosta";
 
 // Defaults from settings-defaults.ts, used when neither settings file sets the key.
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
@@ -42,7 +43,7 @@ pub fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local/share"))
 }
 
-// Settings from the agent dir's settings.json, with a project's .pi/settings.json merged over it.
+// Settings from the agent dir's settings.json, with a project's .piccosta/settings.json merged over it.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
     merged: Map<String, Value>,
@@ -63,9 +64,10 @@ fn deep_merge(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
     }
 }
 
-// One settings file. Output: its object (empty when the file is missing), or an error message
-// when it exists but isn't a JSON object.
-fn read_settings_file(path: &Path) -> Result<Map<String, Value>, String> {
+// One JSON file (settings, a login). Output: its object (empty when the file is missing), or an
+// error message when it exists but isn't a JSON object: a login file that's there but doesn't
+// read is a failure, not a missing login.
+pub(crate) fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
@@ -81,8 +83,7 @@ fn read_settings_file(path: &Path) -> Result<Map<String, Value>, String> {
 // The thinking level `model` (provider/id) was last set to, from the agent dir's settings.json. Read
 // fresh each time: another session, or another piccosta (Zed's, T3 Code's), may have set it since.
 pub fn remembered_thinking_level(agent_dir: &Path, model: &str) -> Option<String> {
-    let settings = read_settings_file(&agent_dir.join("settings.json")).ok()?;
-    settings.get(MODEL_THINKING_LEVELS)?.get(model)?.as_str().map(str::to_string)
+    Settings::load(agent_dir, None).get(MODEL_THINKING_LEVELS)?.get(model)?.as_str().map(str::to_string)
 }
 
 // Change the agent dir's settings.json: `edit` gets its object, and the file is written back only
@@ -92,7 +93,7 @@ pub fn remembered_thinking_level(agent_dir: &Path, model: &str) -> Option<String
 fn edit_settings(agent_dir: &Path, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
     let path = agent_dir.join("settings.json");
     let failed = |error: &dyn std::fmt::Display| format!("could not save {}: {error}", path.display());
-    let mut settings = read_settings_file(&path)?;
+    let mut settings = read_json_object(&path)?;
     let before = settings.clone();
     edit(&mut settings);
     if settings == before {
@@ -127,11 +128,15 @@ pub fn remember_model(agent_dir: &Path, provider: &str, model_id: &str) -> Resul
 }
 
 impl Settings {
-    // Load both scopes. Input: the agent dir and the working directory.
-    pub fn load(agent_dir: &Path, cwd: &Path) -> Settings {
+    // The agent dir's settings.json, and the project's in `cwd` merged over it. Without a cwd it's
+    // the install's alone, for what belongs to the user rather than a project, and is the same for
+    // every project one process serves: the model lists, the Claude bridge, the client name, the
+    // models' thinking levels.
+    pub fn load(agent_dir: &Path, cwd: Option<&Path>) -> Settings {
         let mut settings = Settings::default();
-        for path in [agent_dir.join("settings.json"), cwd.join(PROJECT_CONFIG_DIR).join("settings.json")] {
-            match read_settings_file(&path) {
+        let project = cwd.map(|cwd| cwd.join(PROJECT_CONFIG_DIR).join("settings.json"));
+        for path in std::iter::once(agent_dir.join("settings.json")).chain(project) {
+            match read_json_object(&path) {
                 Ok(object) => deep_merge(&mut settings.merged, &object),
                 Err(error) => settings.load_errors.push(error),
             }
@@ -268,6 +273,7 @@ impl Settings {
             allow_ranges: strings("web.ssrf.allowRanges"),
             domain_allow: strings("web.fetchContent.domainPolicy.allow"),
             domain_deny: strings("web.fetchContent.domainPolicy.deny"),
+            max_response_size_mb: self.get_u64("web.fetch.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_MAX_RESPONSE_MB),
             pdf_max_size_mb: self.get_u64("web.pdf.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_SIZE_MB),
             pdf_max_pages: self.get_u64("web.pdf.maxPages").filter(|pages| *pages > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_PAGES) as usize,
             github_clone_enabled: self.get_bool("web.githubClone.enabled").unwrap_or(true),
@@ -279,8 +285,9 @@ impl Settings {
 }
 
 // pi-web-access's defaults: extract.ts:32 (timeout), web-tool-core.ts:291-293 (inline content),
-// pdf-extract.ts:67-70 (PDF size and pages).
+// extract.ts:1339 (any response but a PDF, `?? 5`), pdf-extract.ts:67-70 (PDF size and pages).
 const DEFAULT_WEB_FETCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WEB_MAX_RESPONSE_MB: u64 = 5;
 const DEFAULT_WEB_INLINE_CONTENT_CHARS: u64 = 30_000;
 const MIN_WEB_INLINE_CONTENT_CHARS: u64 = 1_000;
 const MAX_WEB_INLINE_CONTENT_CHARS: u64 = 200_000;
@@ -306,6 +313,8 @@ pub struct WebSettings {
     pub allow_ranges: Vec<String>,
     pub domain_allow: Vec<String>,
     pub domain_deny: Vec<String>,
+    // `web.fetch.maxSizeMB`: the largest response fetched that isn't a PDF.
+    pub max_response_size_mb: u64,
     pub pdf_max_size_mb: u64,
     pub pdf_max_pages: usize,
     // `web.githubClone.*`: GitHub repo URLs as shallow clones.

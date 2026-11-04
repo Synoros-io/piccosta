@@ -7,6 +7,9 @@ members = ["piccosta", "lfm"]
 
 [workspace.package]
 edition = "2024"
+# The oldest Rust that builds it: Monty (the script tool) and the ruff parser crates it uses ask
+# for 1.96, the newest of any dependency's rust-version.
+rust-version = "1.96"
 # FSL-1.1-ALv2 (Synoros), with the notices of the MIT projects piccosta is based on, all in
 # LICENSE.md; a file based on one says so in its header.
 license = "FSL-1.1-ALv2 AND MIT"
@@ -19,7 +22,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 # Session ids are UUIDv7 (time-ordered) and entry ids come from random v4 UUIDs, as in pi.
 uuid = { version = "1", features = ["v4", "v7"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal", "net"] }
 # rustls with the system's certificate store; no OpenSSL to link against.
 reqwest = { version = "0.13", features = ["json", "stream"] }
 base64 = "0.22"
@@ -28,6 +31,8 @@ futures-util = "0.3"
 tokio-util = "0.7"
 # setsid, kill and access for the shell tools; already in the tree through tokio.
 libc = "0.2"
+# A session socket's connect that never waits (runtime.rs); already in the tree through tokio.
+socket2 = "0.6"
 # NFKC for edit's fuzzy matching, as JavaScript's String.normalize does it.
 unicode-normalization = "0.1"
 # Decoding, resizing and re-encoding images for read; pi uses this same crate through WebAssembly.
@@ -54,6 +59,9 @@ encoding_rs = "0.8"
 sha2 = "0.11"
 # WHATWG URL parsing, as JavaScript's URL does it; already in the tree through reqwest.
 url = "2"
+# The proxy rules reqwest reads from the environment (its own matcher), for Codex's websocket;
+# already in the tree through reqwest, with this feature.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 # The terminal UI: ratatui draws and diffs the screen, crossterm talks to the terminal (its
 # event stream feeds the async loop), pulldown-cmark reads the models' Markdown (with $..$ math).
 ratatui = "0.30"
@@ -67,6 +75,10 @@ ratex-layout = "0.1.15"
 ratex-types = "0.1.15"
 ratex-render = { version = "0.1.15", features = ["embed-fonts"] }
 term-maths = "1"
+# The script tool's Python: Monty, pydantic's sandboxed interpreter in Rust (MIT). A script reaches
+# nothing outside it except the tool functions piccosta hands it.
+monty = "1.4"
+monty-types = "1.4"
 # The computer tool's accessibility tree: AT-SPI is D-Bus, and zbus speaks it in pure Rust on
 # tokio, without libdbus.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
@@ -117,6 +129,11 @@ opt-level = 3
 [profile.release]
 incremental = true
 codegen-units = 16
+
+# This branch built beside a release build of main in the same target directory
+# (target/experimental/), so neither replaces the other.
+[profile.experimental]
+inherits = "release"
 
 [profile.dist]
 inherits = "release"

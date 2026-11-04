@@ -136,7 +136,7 @@ async fn search_searxng(base_url: &str, query: &str, options: &SearchOptions<'_>
     if let Some(range) = options.recency {
         url.query_pairs_mut().append_pair("time_range", range);
     }
-    let client = reqwest::Client::builder().timeout(SEARCH_TIMEOUT).build().map_err(|error| error.to_string())?;
+    let client = crate::provider::http_client().timeout(SEARCH_TIMEOUT).build().map_err(|error| error.to_string())?;
     let response = client.get(url).header(ACCEPT, "application/json").send().await.map_err(|error| net::error_text(&error))?;
     let status = response.status().as_u16();
     if !response.status().is_success() {

@@ -17,21 +17,24 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
+// "~" and "~/..." under home; any other path as written.
+pub fn expand_home(raw: &str) -> PathBuf {
+    match raw.strip_prefix('~') {
+        Some("") => home_dir(),
+        Some(rest) if rest.starts_with('/') => home_dir().join(&rest[1..]),
+        _ => PathBuf::from(raw),
+    }
+}
+
 // Input: a path as the model wrote it. Output: the path with odd spaces made plain, a leading
 // "@" dropped (models copy @file mentions), "~" expanded and a file:// URL turned into its path.
 pub fn normalize(raw: &str) -> PathBuf {
     let spaced: String = raw.chars().map(|c| if is_unicode_space(c) { ' ' } else { c }).collect();
     let path = spaced.strip_prefix('@').unwrap_or(&spaced);
-    if path == "~" {
-        return home_dir();
+    match path.strip_prefix("file://") {
+        Some(rest) => PathBuf::from(percent_decode(rest.strip_prefix("localhost").unwrap_or(rest))),
+        None => expand_home(path),
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home_dir().join(rest);
-    }
-    if let Some(rest) = path.strip_prefix("file://") {
-        return PathBuf::from(percent_decode(rest.strip_prefix("localhost").unwrap_or(rest)));
-    }
-    PathBuf::from(path)
 }
 
 // %XX escapes in a file URL's path, as fileURLToPath undoes them. Bytes that don't form valid
@@ -137,6 +140,20 @@ pub fn access(path: &Path, mode: libc::c_int) -> io::Result<()> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
     // SAFETY: access() only reads the NUL-terminated path we just built.
     if unsafe { libc::access(c_path.as_ptr(), mode) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+// A FIFO, device or socket can block an open, a read or a write until something at the other end
+// acts, which may be never, and no abort reaches a call stuck there. So read, write and edit refuse
+// them, checked by type before they open the path; a missing path or a directory goes on to the
+// tool's own error.
+pub fn refuse_special(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::metadata(path).map(|metadata| metadata.file_type()) {
+        Ok(kind) if kind.is_fifo() || kind.is_socket() || kind.is_block_device() || kind.is_char_device() => {
+            Err(format!("{} is a FIFO, device or socket, not a regular file; use bash for it", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 // The key the mutation queue and editfix's snapshots use for a file: its real path, so "./a",

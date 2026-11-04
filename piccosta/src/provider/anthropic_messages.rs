@@ -34,12 +34,7 @@ fn input_block(block: &Content) -> Option<Value> {
 fn build_body(request: &Request<'_>) -> Value {
     let model = request.model;
     let resolved = transcript::resolve_transcript(request.messages, false);
-    let normalize = |id: &str, _: &AssistantMessage| {
-        id.chars()
-            .map(|character| if character.is_ascii_alphanumeric() || character == '_' || character == '-' { character } else { '_' })
-            .take(TOOL_ID_LIMIT)
-            .collect()
-    };
+    let normalize = |id: &str, _: &AssistantMessage| transform::safe_id(id, TOOL_ID_LIMIT);
     let messages = transform::transform_messages(&resolved, model, &normalize);
     let mut system = Vec::new();
     let mut turns: Vec<Value> = Vec::new();
@@ -287,21 +282,16 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         let _ = events.send(event);
     };
     let mut building = Building::default();
-    let result = tokio::select! {
-        result = async {
-            let body = build_body(request);
-            let extra = vec![("x-api-key", request.credential.key.clone()), ("anthropic-version", ANTHROPIC_VERSION.into())];
-            let response = super::post_openai(request.model, format!("{}/v1/messages", request.model.base_url.trim_end_matches('/')), request.credential, request.session_id, extra, &body).await?;
-            send(StreamEvent::Start);
-            super::sse::read_events(response, BODY_IDLE_TIMEOUT, "Anthropic", |event| handle(event, &mut output, &mut building, request.model, &mut send)).await?;
-            if !building.stopped || output.stop_reason == StopReason::Pending { return Err("Anthropic stream ended without a stop reason".into()); }
-            Ok(())
-        } => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
-    if let Err(error) = result {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(error);
-    }
+    let result = super::abortable(request, async {
+        let body = build_body(request);
+        let extra = vec![("x-api-key", request.credential.key.clone()), ("anthropic-version", ANTHROPIC_VERSION.into())];
+        let response = super::post_openai(request.model, format!("{}/v1/messages", request.model.base_url.trim_end_matches('/')), request.credential, request.session_id, extra, &body).await?;
+        send(StreamEvent::Start);
+        super::sse::read_events(response, BODY_IDLE_TIMEOUT, "Anthropic", |event| handle(event, &mut output, &mut building, request.model, &mut send)).await?;
+        if !building.stopped || output.stop_reason == StopReason::Pending { return Err("Anthropic stream ended without a stop reason".into()); }
+        Ok(())
+    })
+    .await;
+    super::settle(request, &mut output, result);
     output
 }

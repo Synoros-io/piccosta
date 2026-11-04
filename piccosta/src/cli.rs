@@ -195,8 +195,11 @@ Usage:
   piccosta t3 [dir]      T3 Code, with piccosta as its Pi provider
   piccosta assistant     The user's assistant service (the terminal UI starts it with manager.autostart)
   piccosta tell <text>   A message for the assistant
-  piccosta voice start [assistant]  Push-to-talk down: voice.listen hears it for the focused
-                         session (or the assistant), and its answer goes to voice.speak
+  piccosta call [assistant | <id or name>]
+                         Be on a call with a session (the assistant when none is named):
+                         push-to-talk talks to it, and voice.speak says every answer it gives
+  piccosta hangup        End the call (closing that session ends it too)
+  piccosta voice start   Push-to-talk down: voice.listen hears it for the call; off one, nothing
   piccosta voice stop    Push-to-talk up: what was heard is sent
 
 Options:

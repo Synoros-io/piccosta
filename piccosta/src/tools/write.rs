@@ -39,11 +39,11 @@ impl Tool for WriteTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Create or overwrite files")
+        Some("create a file, or replace one whole")
     }
 
     fn prompt_guidelines(&self) -> &'static [&'static str] {
-        &["Use write only for new files or complete rewrites."]
+        &["Change part of a file with edit; write is for new files and whole rewrites"]
     }
 
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
@@ -63,6 +63,7 @@ impl Tool for WriteTool {
             if let Some(message) = aborted() {
                 return Err(message);
             }
+            paths::refuse_special(&absolute)?;
             tokio::fs::write(&absolute, arguments.content.as_bytes())
                 .await
                 .map_err(|error| paths::fs_error(&error, "open", Some(&absolute)))?;

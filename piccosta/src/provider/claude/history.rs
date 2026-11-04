@@ -44,7 +44,6 @@ const TOOL_ID_MAX: usize = 64;
 // with a hash of the whole path after it (cc-session-io paths.ts).
 const PROJECT_DIR_MAX: usize = 200;
 // The record fields cc-session-io writes for a session it creates.
-const RECORD_VERSION: &str = "2.1.83";
 const SLUG_ADJECTIVES: &str = "ancient bold bright calm clever cool crimson daring eager fast fierce gentle golden happy hidden iron keen lively mighty nimble pale proud quick rapid sharp silent smooth steady swift vivid warm wild";
 const SLUG_NOUNS: &str = "arrow badge beacon blade brook castle cedar cloud comet crest dawn drift eagle ember falcon flame forge gale grove harbor hawk jade kettle lance maple marsh needle oak pearl pine ridge river rune sage shade spark stone thorn tower wave";
 // The kept records' sidecar next to pi's session file (pi lists only *.jsonl, so it's left alone).
@@ -57,18 +56,6 @@ pub const SIDECAR_SUFFIX: &str = ".claude-bridge";
 pub const SHAPE_PARTS: [&str; 6] = ["systemPrompt", "tools", "cliModel", "effort", "maxTokens", "cwd"];
 
 pub type Shape = Map<String, Value>;
-
-// What a live query holds: its shape, one print per message of pi's it holds, and the tool calls
-// it is parked on (None while a turn streams or after the last one).
-pub struct Held {
-    pub shape: Shape,
-    pub prints: Vec<String>,
-    pub pending: Option<Vec<String>>,
-    // Its turn is over, stopped mid-answer (pi's abort) or answered, and it waits, as Claude Code
-    // does at its prompt, for the next message, which goes into this same query (mod.rs, interrupt
-    // and hold).
-    pub waiting: bool,
-}
 
 // --- Fingerprints ---
 
@@ -136,7 +123,7 @@ pub fn shape(system_prompt: &str, tools: &[ToolDefinition], cli_model: &str, eff
 // plus results for exactly the calls the query is parked on, or plus user messages for a query
 // that waits, which are then delivered; otherwise Err with the first reason found, and the call
 // rewrites.
-pub fn decide(live: Option<&Held>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
+pub fn decide(live: Option<&super::State>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
     let live = live.ok_or("no live query for this session")?;
     let changed: Vec<&str> = SHAPE_PARTS.into_iter().filter(|part| shape.get(*part) != live.shape.get(*part)).collect();
     if !changed.is_empty() {
@@ -458,6 +445,9 @@ pub struct Records {
     cwd: String,
     model: String,
     slug: String,
+    // The checkout's branch as Claude Code records it (`git rev-parse --abbrev-ref HEAD`), read once
+    // for the record set; None outside a git repo.
+    git_branch: Option<String>,
     last_uuid: Option<String>,
     next_ms: i64,
     pub records: Vec<Value>,
@@ -481,6 +471,8 @@ impl Records {
             cwd: cwd.to_string(),
             model: model.to_string(),
             slug: format!("{}-{}-{}", pick(&adjectives, first), pick(&adjectives, second), pick(&nouns, third)),
+            git_branch: std::process::Command::new("git").arg("-C").arg(cwd).args(["rev-parse", "--abbrev-ref", "HEAD"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+                .filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|branch| !branch.is_empty()),
             last_uuid: None,
             next_ms: clock::now_ms(),
             records: Vec::new(),
@@ -488,14 +480,15 @@ impl Records {
     }
 
     // The fields every record starts with, in cc-session-io's order; the new record joins the chain.
+    // The Claude Code version and the branch are left out when they aren't known, never made up.
     fn base(&mut self, kind: &str) -> Map<String, Value> {
         let uuid = Uuid::new_v4().to_string();
-        let record = json!({"type": kind, "uuid": uuid, "parentUuid": self.last_uuid, "sessionId": self.session_id,
+        let Value::Object(record) = json!({"type": kind, "uuid": uuid, "parentUuid": self.last_uuid, "sessionId": self.session_id,
             "timestamp": clock::iso_from_ms(self.next_ms), "isSidechain": false, "cwd": self.cwd, "userType": "external",
-            "version": RECORD_VERSION, "gitBranch": "HEAD", "slug": self.slug, "entrypoint": "cli"});
+            "version": super::version(), "gitBranch": self.git_branch, "slug": self.slug, "entrypoint": "cli"}) else { return Map::new() };
         self.next_ms += 1;
         self.last_uuid = Some(uuid);
-        record.as_object().cloned().unwrap_or_default()
+        record.into_iter().filter(|(key, value)| !(value.is_null() && ["version", "gitBranch"].contains(&key.as_str()))).collect()
     }
 
     fn user(&mut self, content: Value) {

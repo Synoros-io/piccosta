@@ -48,19 +48,27 @@ struct Compat {
 
 fn compat_of(model: &Model) -> Compat {
     let opencode = is_opencode(model);
+    // DeepSeek's own API (pi's detection), and DeepSeek's models behind opencode (pi's catalog).
+    let deepseek = model.provider == "deepseek" || model.base_url.contains("deepseek.com") || (opencode && model.id.starts_with("deepseek"));
     let flag = |key: &str, detected: bool| model.compat.as_ref().and_then(|compat| compat.get(key)).and_then(Value::as_bool).unwrap_or(detected);
     Compat {
         supports_store: flag("supportsStore", !opencode),
         supports_developer_role: flag("supportsDeveloperRole", !opencode),
         supports_reasoning_effort: flag("supportsReasoningEffort", true),
-        max_tokens_field: model.compat_str("maxTokensField").unwrap_or("max_completion_tokens").to_string(),
-        requires_reasoning_content_on_assistant_messages: flag("requiresReasoningContentOnAssistantMessages", false),
-        thinking_format: model.compat_str("thinkingFormat").unwrap_or("openai").to_string(),
-        // OpenAI compatibility alone doesn't mean strict JSON-schema tools.
-        supports_strict_mode: flag("supportsStrictMode", false),
+        max_tokens_field: model.compat_str("maxTokensField").unwrap_or(if opencode { "max_tokens" } else { "max_completion_tokens" }).to_string(),
+        requires_reasoning_content_on_assistant_messages: flag("requiresReasoningContentOnAssistantMessages", deepseek),
+        thinking_format: model.compat_str("thinkingFormat").unwrap_or(if deepseek { "deepseek" } else { "openai" }).to_string(),
+        // OpenAI compatibility alone doesn't mean strict JSON-schema tools; opencode's gateway takes them.
+        supports_strict_mode: flag("supportsStrictMode", opencode),
         supports_mid_conversation_system: flag("supportsMidConvoSystemMessages", false),
         supports_mid_conversation_tool_additions: flag("supportsMidConvoToolAdditions", false),
     }
+}
+
+// The field thinking streamed as `reasoning` goes back in: opencode's gateway streams `reasoning`
+// but takes it back only as `reasoning_content`; a model's compat reasoningReplayField names another.
+fn reasoning_replay_field(model: &Model) -> &str {
+    model.compat_str("reasoningReplayField").unwrap_or(if is_opencode(model) { "reasoning_content" } else { "reasoning" })
 }
 
 fn tool_support(compat: &Compat) -> ToolSupport {
@@ -225,10 +233,9 @@ fn convert_assistant(model: &Model, assistant: &AssistantMessage, compat: &Compa
         message.insert("content".into(), text.into());
     }
     if let Some((_, signature)) = thinking.first() {
-        // The field the thinking streamed in; opencode-go streams `reasoning` but takes it back as
-        // `reasoning_content`.
+        // The field the thinking streamed in, or the one `reasoning` goes back as.
         let field = match *signature {
-            Some("reasoning") if model.provider == "opencode-go" => Some("reasoning_content"),
+            Some("reasoning") => Some(reasoning_replay_field(model)),
             Some(field) if REASONING_FIELDS.contains(&field) => Some(field),
             _ => None,
         };
@@ -394,9 +401,8 @@ fn handle_chunk(chunk: &Value, model: &Model, output: &mut AssistantMessage, bui
 
     // Reasoning before content: some proxies put both in one delta, and thinking comes first.
     if let Some((field, piece)) = REASONING_FIELDS.iter().find_map(|field| delta.get(*field).and_then(Value::as_str).filter(|text| !text.is_empty()).map(|text| (*field, text))) {
-        let signature = if model.provider == "opencode-go" && field == "reasoning" { "reasoning_content" } else { field };
         let index = *building.thinking.get_or_insert_with(|| {
-            output.content.push(Content::Thinking { thinking: String::new(), thinking_signature: Some(signature.to_string()), redacted: None });
+            output.content.push(Content::Thinking { thinking: String::new(), thinking_signature: Some(field.to_string()), redacted: None });
             let index = output.content.len() - 1;
             send(StreamEvent::ThinkingStart { index });
             index
@@ -501,24 +507,17 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         partial_arguments: Default::default(),
         has_finish_reason: false,
     };
-    let result = tokio::select! {
-        result = run(request, &mut output, &mut building, &mut send) => result,
-        () = request.cancel.cancelled() => Err("Request was aborted".to_string()),
-    };
+    let result = super::abortable(request, run(request, &mut output, &mut building, &mut send)).await;
     if result.is_ok() {
         finish_blocks(&mut output, &mut building, &mut send);
     }
-    let failure = match result {
-        Err(message) => Some(message),
-        Ok(()) if output.stop_reason == StopReason::Aborted => Some("Request was aborted".to_string()),
-        Ok(()) if output.stop_reason == StopReason::Error => Some(output.error_message.clone().unwrap_or_else(|| "Provider returned an error stop reason".into())),
-        Ok(()) if !building.has_finish_reason || output.stop_reason == StopReason::Pending => Some("Stream ended without finish_reason".to_string()),
-        Ok(()) => None,
-    };
-    if let Some(message) = failure {
-        output.stop_reason = if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
-        output.error_message = Some(message);
-    }
+    let ended = result.and_then(|()| match output.stop_reason {
+        StopReason::Aborted => Err("Request was aborted".to_string()),
+        StopReason::Error => Err(output.error_message.clone().unwrap_or_else(|| "Provider returned an error stop reason".into())),
+        _ if !building.has_finish_reason || output.stop_reason == StopReason::Pending => Err("Stream ended without finish_reason".to_string()),
+        _ => Ok(()),
+    });
+    super::settle(request, &mut output, ended);
     output
 }
 

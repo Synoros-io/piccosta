@@ -3,10 +3,12 @@
 // this way (T3 Code's pi provider) drives piccosta. A response is {id, type: "response", command,
 // success, data | error}, without an id when the command had none; events are json mode's. One
 // session is served at a time; new_session, switch_session, fork and clone replace it. piccosta
-// has no extensions, so it never sends extension_ui_request and ignores extension_ui_response.
+// has no extensions: it sends extension_ui_request only to ask approval (confirm) and to tell the
+// user something (notify), and reads extension_ui_response only for its confirms.
 
-use crate::agent::{Event, EventSink, Gate, Handle};
-use crate::host::{Command, Done, Host};
+use crate::agent::{Agent, Event, EventSink, Gate, Handle};
+use crate::host::Host;
+use crate::runtime::{Command, Done};
 use crate::message::{AgentMessage, Content};
 use crate::model::Model;
 use crate::session::{Session, SessionEntry};
@@ -25,10 +27,9 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 // (mcpExtensionSource.ts:317-334 in pingdotgg/t3code). piccosta runs no JavaScript extensions, so
 // rpc mode asks for approval itself, the same way: for every tool but the read-only ones (and
 // edit and write under auto-accept-edits), an extension_ui_request confirm titled "Allow <tool>?"
-// with the arguments as JSON, cut to APPROVAL_ARGUMENT_CHARS. piccosta's web tools only read, so
-// they join the list, as they're in ACP's.
+// with the arguments as JSON, cut to APPROVAL_ARGUMENT_CHARS. The read-only ones are the tools
+// whose read_only() says so, the same as ACP's.
 const RUNTIME_MODE_ENV: &str = "T3_PI_RUNTIME_MODE";
-const APPROVAL_FREE: [&str; 8] = ["read", "grep", "find", "ls", "tool_search", "web_search", "fetch_content", "get_search_content"];
 const APPROVAL_ARGUMENT_CHARS: usize = 4000;
 const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 
@@ -49,7 +50,7 @@ struct Live {
     // Its tools' shared state: a steering message moves the running commands to the background.
     shared: Arc<crate::tools::ToolShared>,
     commands: UnboundedSender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<Agent>>,
     id: String,
     file: Option<PathBuf>,
     // With no file (--no-session, which T3 Code uses for titles and other generated text): the
@@ -95,6 +96,7 @@ pub async fn run(args: crate::cli::Args) -> Result<ExitCode, String> {
 async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     let host = Arc::new(Host::for_args(&args));
     host.show_settings_errors();
+    crate::scale::watch();
     let (inputs, mut received) = unbounded_channel();
     // stdin on a plain thread, as print mode reads it (main.rs read_piped_stdin says why).
     let lines = inputs.clone();
@@ -108,8 +110,17 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         let _ = lines.send(Input::Closed);
     });
     let session = host.opening(&args)?;
-    let (model, thinking) = host.launch(&args)?;
+    let (model, thinking, note) = host.launch(&args)?;
+    if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
+        listing.await;
+    }
     let live = start(&host, &inputs, 0, session, model.as_deref(), thinking.as_deref())?;
+    // A kind with none of its models served: the frontend shows which model it runs on, as pi's
+    // notify (an extension_ui_request no response answers).
+    if let Some(note) = note {
+        let note = crate::scale::fell_back(&note, &format!("{}/{}", live.model.provider, live.model.id));
+        write_line(&json!({"type": "extension_ui_request", "id": uuid::Uuid::new_v4().to_string(), "method": "notify", "message": note, "notifyType": "warning"}));
+    }
     let mut rpc = Rpc { host, inputs, live, generations: 1, steering_mode: "one-at-a-time".into(), follow_up_mode: "one-at-a-time".into(), asks: HashMap::new(), persist: !args.no_session };
     if let Some(name) = args.name.clone().filter(|name| !name.trim().is_empty()) {
         rpc.live.name = Some(name.clone());
@@ -133,12 +144,12 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         }
     };
     let live = rpc.live;
-    live.handle.abort();
     drop(live.commands);
-    let _ = tokio::time::timeout(STOP_WAIT, live.task).await;
+    if let Some(task) = live.task {
+        let _ = tokio::time::timeout(STOP_WAIT, task).await;
+    }
     crate::voice::shutdown(false).await;
     crate::provider::claude::shutdown().await;
-    crate::tools::bash::kill_all_running();
     Ok(ExitCode::from(code))
 }
 
@@ -155,31 +166,15 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     // other processes before the first prompt.
     agent.session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
     agent.set_gate(approval_gate(inputs, host.yolo));
-    let (commands, receiver) = unbounded_channel();
     let reports = inputs.clone();
-    let mut live = Live {
-        generation,
-        handle: agent.handle(),
-        shared: shared.clone(),
-        commands,
-        task: tokio::task::spawn_local(async {}),
-        id: agent.session.id().to_string(),
-        file: agent.session.file().map(PathBuf::from),
-        memory: agent.session.file().is_none().then(|| agent.session.clone()),
-        name: crate::host::name(&agent.session),
-        model: agent.model().clone(),
-        thinking: agent.thinking_level().to_string(),
-        auto_compaction: agent.auto_compaction(),
-        streaming: false,
-        compacting: false,
-        owed: VecDeque::new(),
-        compaction: None,
-        aborts: Vec::new(),
-    };
-    live.task = host.clone().spawn(agent, shared, false, receiver, move |done| {
+    let (handle, id, file, name) = (agent.handle(), agent.session.id().to_string(), agent.session.file().map(PathBuf::from), crate::host::name(&agent.session));
+    let (memory, model, thinking, auto_compaction) = (agent.session.file().is_none().then(|| agent.session.clone()), agent.model().clone(), agent.thinking_level().to_string(), agent.auto_compaction());
+    let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
         let _ = reports.send(Input::Done(generation, Box::new(done)));
     });
-    Ok(live)
+    let task = Some(task);
+    let (streaming, compacting, owed, compaction, aborts) = (false, false, VecDeque::new(), None, Vec::new());
+    Ok(Live { generation, handle, shared, commands, task, id, file, memory, name, model, thinking, auto_compaction, streaming, compacting, owed, compaction, aborts })
 }
 
 // The approval gate T3 Code's runtime mode asks for. It lets everything through in full access,
@@ -189,10 +184,10 @@ fn approval_gate(inputs: &UnboundedSender<Input>, yolo: bool) -> Gate {
     let mode = std::env::var(RUNTIME_MODE_ENV).ok().filter(|mode| mode != "full-access" && !yolo);
     let edits_free = mode.as_deref() == Some("auto-accept-edits");
     let inputs = inputs.clone();
-    std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>, question: Option<&'static str>| {
+    std::sync::Arc::new(move |_call_id: String, name: String, arguments: Map<String, Value>, question: Option<&'static str>| {
         let (inputs, asks) = (inputs.clone(), mode.is_some());
         Box::pin(async move {
-            let free = !asks || APPROVAL_FREE.contains(&name.as_str()) || (edits_free && matches!(name.as_str(), "edit" | "write"));
+            let free = !asks || crate::tools::read_only(&name) || (edits_free && matches!(name.as_str(), "edit" | "write"));
             if free && question.is_none() {
                 return Ok(());
             }
@@ -281,7 +276,7 @@ impl Rpc {
                 if live.streaming {
                     match command.get("streamingBehavior").and_then(Value::as_str) {
                         Some("steer") => {
-                            live.handle.steer(message, false);
+                            live.handle.steer(message);
                             live.shared.jobs.detach_all();
                         }
                         Some("followUp") => live.handle.follow_up(message),
@@ -294,17 +289,17 @@ impl Rpc {
                 // The response goes before the run's first event, as pi's preflight answers.
                 respond(id, "prompt", Ok(Some(json!({"disposition": "started"}))));
                 live.streaming = true;
-                self.send(Command::Prompt(message, images, false), None);
+                self.send(Command::Prompt(message, images), None);
                 return Ok(Reply::Later);
             }
             "steer" | "follow_up" => {
                 let message = text("message");
-                if kind == "steer" { live.handle.steer(message, false) } else { live.handle.follow_up(message) }
+                if kind == "steer" { live.handle.steer(message) } else { live.handle.follow_up(message) }
                 self.announce_queue();
                 Some(json!({"disposition": "queued"}))
             }
             "abort" | "abort_retry" => {
-                live.handle.interrupt(&live.shared.jobs);
+                let _ = live.commands.send(Command::Stop(None));
                 if live.streaming && kind == "abort" {
                     live.aborts.push(id);
                     return Ok(Reply::Later);
@@ -570,11 +565,11 @@ impl Rpc {
     // thinking level over (new, fork, clone); a switched-to session runs with its own. If the new
     // one can't start, the old file is served again.
     async fn replace(&mut self, session: impl FnOnce(&Rpc) -> Result<Session, String>, keep_model: bool) -> Result<(), String> {
-        self.live.handle.abort();
         let (closed, _) = unbounded_channel();
         drop(std::mem::replace(&mut self.live.commands, closed));
-        let task = std::mem::replace(&mut self.live.task, tokio::task::spawn_local(async {}));
-        let _ = tokio::time::timeout(STOP_WAIT, task).await;
+        if let Some(task) = self.live.task.take() {
+            let _ = tokio::time::timeout(STOP_WAIT, task).await;
+        }
         for (id, name) in std::mem::take(&mut self.live.owed).into_iter().flatten() {
             respond(id, name, Err("the session was replaced".into()));
         }
@@ -587,7 +582,13 @@ impl Rpc {
         let (model, thinking) = if keep_model { (Some(model.as_str()), Some(thinking.as_str())) } else { (None, None) };
         let generation = self.generations;
         self.generations += 1;
-        let started = session(self).and_then(|session| start(&self.host, &self.inputs, generation, session, model, thinking));
+        // A switched-to session's model may still be being listed; there's no session to serve
+        // meanwhile, so what comes in waits its turn.
+        let session = session(self);
+        if let Some(listing) = session.as_ref().ok().and_then(|session| self.host.listing(Some(session), model)) {
+            listing.await;
+        }
+        let started = session.and_then(|session| start(&self.host, &self.inputs, generation, session, model, thinking));
         match started {
             Ok(live) => {
                 live.handle.set_steering_mode(&self.steering_mode);
@@ -655,6 +656,7 @@ impl Rpc {
         stats.insert("contextUsage".into(), if window > 0 { context_usage(&session, window) } else { Value::Null });
         stats.insert("sessionFile".into(), json!(self.live.file));
         stats.insert("sessionId".into(), json!(self.live.id));
+        stats.insert("planUsage".into(), crate::scale::plan_usage(&self.host.agent_dir, &self.live.model.provider));
         Ok(Value::Object(stats))
     }
 }
@@ -665,19 +667,26 @@ impl Rpc {
 pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
     let (mut users, mut assistants, mut calls, mut results, mut messages) = (0, 0, 0, 0, 0);
     let mut totals = [0u64; 5];
-    let mut cost = 0.0;
-    let mut add = |usage: &crate::message::Usage| {
+    let mut cost = crate::provider::responses::Tally::default();
+    // A plan's tokens count, its cost doesn't (the Tally knows which are a plan's).
+    let mut add = |usage: &crate::message::Usage, provider: &str| {
         for (total, part) in totals.iter_mut().zip([usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens]) {
             *total += part;
         }
-        cost += usage.cost.total;
+        cost.add(usage, provider);
     };
+    // A compaction's or branch summary's usage names no provider: it was made with the session's
+    // model at the time, which the latest model change says.
+    let mut provider = String::new();
     for entry in session.entries() {
+        if let SessionEntry::ModelChange { provider: changed, .. } = entry {
+            provider = changed.clone();
+        }
         let SessionEntry::Message { message, .. } = entry else {
             let value = entry_json(entry);
             let usage = value.get("usage").filter(|_| matches!(entry, SessionEntry::Usage { .. } | SessionEntry::Compaction { .. } | SessionEntry::BranchSummary { .. }));
             if let Some(usage) = usage.and_then(|usage| serde_json::from_value(usage.clone()).ok()) {
-                add(&usage);
+                add(&usage, value.get("provider").and_then(Value::as_str).unwrap_or(&provider));
             }
             continue;
         };
@@ -687,13 +696,13 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
             AgentMessage::ToolResult(result) => {
                 results += 1;
                 if let Some(usage) = &result.usage {
-                    add(usage);
+                    add(usage, "");
                 }
             }
             AgentMessage::Assistant(assistant) => {
                 assistants += 1;
                 calls += assistant.content.iter().filter(|block| matches!(block, Content::ToolCall { .. })).count();
-                add(&assistant.usage);
+                add(&assistant.usage, &assistant.provider);
             }
             _ => {}
         }
@@ -706,9 +715,14 @@ pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
         "toolResults": results,
         "totalMessages": messages,
         "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write, "total": total},
-        "cost": cost,
+        "cost": cost.total,
     });
-    stats.as_object().cloned().unwrap_or_default()
+    let mut stats = stats.as_object().cloned().unwrap_or_default();
+    // Beyond pi's fields: some responses' cost isn't known, so `cost` leaves them out.
+    if cost.unknown() {
+        stats.insert("costUnknown".into(), true.into());
+    }
+    stats
 }
 
 // pi's ContextUsage (agent-session.ts getContextUsage): the projected context's size, or null

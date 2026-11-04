@@ -8,7 +8,7 @@
 // last is the one that comes back.
 //
 // /restart also leaves a handover for the image it execs: the background jobs still running, by
-// session, and the reaper. It's named by the process id, which the exec keeps, so only that
+// session, and the watcher (tools/reaper.rs). It's named by the process id, which the exec keeps, so only that
 // image reads it, and it reads it once.
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ pub struct State {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Handover {
-    // The reaper's pipe descriptor and pid (tools/reaper.rs).
+    // The watcher's pipe descriptor and pid (tools/reaper.rs).
     pub reaper: Option<(i32, u32)>,
     pub sessions: Vec<(PathBuf, Vec<crate::tools::jobs::HandedJob>)>,
 }
