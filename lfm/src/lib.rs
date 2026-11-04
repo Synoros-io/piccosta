@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod codec;
 pub mod model;
+mod normalize;
 pub mod quant;
 pub mod tensor;
 pub mod tokenizer;

@@ -924,7 +924,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let effort = effort(model, request.thinking_level);
     let thinking_off = request.thinking_level == "off";
     let cwd = request.cwd.to_string_lossy().into_owned();
-    let (key, one_shot) = (request.session_id.unwrap_or("(none)").to_string(), !request.cache);
+    let (key, one_shot) = (request.session_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), !request.cache);
     if !one_shot {
         history::attach(&key, request.session_file);
         lock(&REWRITES).remove(&key);
@@ -1090,6 +1090,9 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         debug("start: context ends at an assistant message, opening with the continue note");
     }
     let mut args = base_args(start.thinking_off, start.effort);
+    if start.one_shot {
+        args.push("--no-session-persistence".into());
+    }
     args.extend(written.iter().map(|id| format!("--resume={id}")));
     args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--model", start.cli_model,
         "--disable-slash-commands"].map(String::from));

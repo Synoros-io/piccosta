@@ -792,7 +792,7 @@ impl Model {
     // The speech frames of `text`, in the voice `system` asks for (such as the card's "Perform TTS in American
     // English using a female voice."), at most `max_frames` of them.
     pub fn speak(&self, text: &str, system: &str, max_frames: usize, sampler: &mut Sampler) -> Result<Vec<Vec<u32>>> {
-        let prompt = self.prompt(system, Part::Text(text.to_string()), true);
+        let prompt = self.prompt(system, Part::Text(crate::normalize::english(text).into_owned()), true);
         Ok(self.generate(self.embed(&prompt, &[])?, true, &[self.tokens.mixed_start], max_frames, sampler)?.1)
     }
 

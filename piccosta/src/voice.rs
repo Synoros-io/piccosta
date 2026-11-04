@@ -44,14 +44,14 @@
 
 use crate::agent::{AgentConfig, Event, EventSink};
 use crate::message::{AgentMessage, Message, SystemMessage, TextOrBlocks, Usage, UserMessage};
-use crate::model::{Model, ProviderConfig};
+use crate::model::ModelRegistry;
 use crate::provider::{Request, StreamEvent};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -394,8 +394,7 @@ async fn hold(agent_dir: &Path, id: &str, target: &Path) -> Result<(), String> {
 // The quick model and what it takes to call it, carried onto the speech worker.
 #[derive(Clone)]
 struct Quick {
-    model: Model,
-    config: Option<ProviderConfig>,
+    name: String,
     credentials: crate::auth::CredentialPaths,
     transport: String,
     cwd: PathBuf,
@@ -415,6 +414,7 @@ struct Turn {
     transcript: String,
     quick: Option<Quick>,
     answer: mpsc::Receiver<String>,
+    started: Instant,
 }
 
 enum Job {
@@ -505,9 +505,8 @@ pub fn spent_changes() -> watch::Receiver<Spent> {
 pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, session: &crate::session::Session, mut emit: EventSink) -> EventSink {
     let Some(speak) = text_setting(settings, "voice.speak") else { return emit };
     let closed = config.tool_shared.jobs.closed.clone();
-    let quick = text_setting(settings, "voice.quick").and_then(|name| config.registry.resolve(&name).ok().cloned()).map(|model| Quick {
-        config: config.registry.provider_config(&model.provider).cloned(),
-        model,
+    let quick = text_setting(settings, "voice.quick").map(|name| Quick {
+        name,
         credentials: config.credentials.clone(),
         transport: config.transport.clone(),
         cwd: config.cwd.clone(),
@@ -527,7 +526,7 @@ pub fn speaking(settings: &crate::config::Settings, config: &AgentConfig, sessio
                     let on_call = current(&agent_dir).filter(|(called, _)| Some(called) == file.as_ref());
                     turn = on_call.map(|(_, call)| (call, mpsc::channel(ANSWER_QUEUE))).and_then(|(call, (sender, answer))| {
                         let words = if let AgentMessage::User(said) = message { said.content.text() } else { String::new() };
-                        let said = Turn { speak: speak.clone(), closed: closed.clone(), call, session_id: session_id.clone(), words, transcript: transcript.clone(), quick: quick.clone().filter(|_| user), answer };
+                        let said = Turn { speak: speak.clone(), closed: closed.clone(), call, session_id: session_id.clone(), words, transcript: transcript.clone(), quick: quick.clone().filter(|_| user), answer, started: Instant::now() };
                         worker().jobs.try_send(Job::Turn(Box::new(said))).map(|()| sender).inspect_err(|_| note("too many turns waiting to be said; this one isn't")).ok()
                     });
                 }
@@ -586,7 +585,7 @@ async fn play(mut turn: Turn, stop: &CancellationToken) {
     };
     let (group, closed, call) = (child.id(), turn.closed.clone(), turn.call.clone());
     let cut = stop.child_token();
-    let mut speaker = Speaker { stdin: child.stdin.take(), pending: String::new(), cut: cut.clone() };
+    let mut speaker = Speaker { stdin: child.stdin.take(), pending: String::new(), cut: cut.clone(), started: turn.started, source: "voice.quick", first: true, session_id: turn.session_id.clone() };
     let said = async {
         if let Some(quick) = &turn.quick {
             if tokio::time::timeout(Duration::from_secs(QUICK_SECONDS), quick_answer(quick, &turn, &mut speaker)).await.is_err() {
@@ -594,6 +593,8 @@ async fn play(mut turn: Turn, stop: &CancellationToken) {
             }
             speaker.add("", true).await;
         }
+        speaker.source = "session";
+        speaker.first = true;
         while let Some(delta) = turn.answer.recv().await {
             speaker.add(&delta, false).await;
         }
@@ -622,6 +623,10 @@ struct Speaker {
     stdin: Option<ChildStdin>,
     pending: String,
     cut: CancellationToken,
+    started: Instant,
+    source: &'static str,
+    first: bool,
+    session_id: String,
 }
 
 impl Speaker {
@@ -635,44 +640,70 @@ impl Speaker {
         let boundary = pending.char_indices().zip(pending.chars().skip(1)).filter(|((_, character), next)| *character == '\n' || (".!?".contains(*character) && next.is_whitespace()));
         let Some(end) = (if finished { Some(pending.len()) } else { boundary.map(|((index, character), _)| index + character.len_utf8()).last() }) else { return };
         let piece = self.pending.drain(..end).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-        if let (false, Some(stdin)) = (piece.is_empty(), &mut self.stdin)
-            && !matches!(tokio::time::timeout(Duration::from_secs(SPEAK_WRITE_SECONDS), stdin.write_all(format!("{piece}\n").as_bytes())).await, Ok(Ok(())))
-        {
-            note("voice.speak stopped taking lines; it's killed and the rest of this turn isn't said");
-            self.stdin = None;
-            self.cut.cancel();
+        if let (false, Some(stdin)) = (piece.is_empty(), &mut self.stdin) {
+            if matches!(tokio::time::timeout(Duration::from_secs(SPEAK_WRITE_SECONDS), stdin.write_all(format!("{piece}\n").as_bytes())).await, Ok(Ok(()))) {
+                if self.first {
+                    note(&format!("{} first line to voice.speak in {:.3} s (session {})", self.source, self.started.elapsed().as_secs_f64(), self.session_id));
+                    self.first = false;
+                }
+            } else {
+                note("voice.speak stopped taking lines; it's killed and the rest of this turn isn't said");
+                self.stdin = None;
+                self.cut.cancel();
+            }
         }
     }
 }
 
 // Ask the quick model for its answer to the turn's words, with the conversation's end, and give the
 // speaker its text as it streams (or all at once, from a provider that didn't stream it). Uncached,
-// under a session id of its own, and never written anywhere; what it cost goes to SPENT, for the
+// with no saved session (a fresh routing id for HTTP), what it cost goes to SPENT, for the
 // session's statistics. A model that fails says nothing.
 async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Option<()> {
-    let credential = crate::auth::credential_for(&quick.model.provider, quick.config.as_ref(), &quick.credentials).await.map_err(|error| note(&format!("voice.quick: {error}"))).ok()?;
+    // Lists arrive in the background. A failed lookup at session creation mustn't disable every
+    // later turn; read the current list here, waiting for startup only if this model is missing.
+    let path = crate::config::agent_dir().join("models.json");
+    let resolve = || {
+        let registry = ModelRegistry::load(&path)?;
+        let model = registry.resolve(&quick.name)?.clone();
+        let config = registry.provider_config(&model.provider).cloned();
+        Ok::<_, String>((model, config))
+    };
+    let mut resolved = resolve();
+    if resolved.is_err() && let Some(listing) = crate::model::listing(&crate::config::agent_dir()) {
+        listing.await;
+        resolved = resolve();
+    }
+    let (model, config) = resolved.map_err(|error| note(&format!("voice.quick {} unavailable: {error}", quick.name))).ok()?;
+    note(&format!("voice.quick trying {} (session {})", quick.name, turn.session_id));
+    let credential = crate::auth::credential_for(&model.provider, config.as_ref(), &quick.credentials).await.map_err(|error| note(&format!("voice.quick: {error}"))).ok()?;
     let messages = [
         Message::System(SystemMessage { content: TextOrBlocks::Text(QUICK_PROMPT.into()), sections: None, tools_added: None, tools_removed: None, timestamp: 0 }),
         Message::User(UserMessage { content: TextOrBlocks::Text(format!("The conversation so far, its end:\n\n{}The user just said: {}", turn.transcript, turn.words)), timestamp: crate::clock::now_ms() }),
     ];
     let session_id = uuid::Uuid::now_v7().to_string();
     let (sender, mut events) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let _cancel = cancel.clone().drop_guard();
     let request = Request {
-        model: &quick.model,
+        model: &model,
         messages: &messages,
         credential: &credential,
-        session_id: Some(&session_id),
+        session_id: (model.provider != crate::provider::claude::PROVIDER).then_some(session_id.as_str()),
         cache: false,
         transport: &quick.transport,
-        thinking_level: crate::provider::clamp_thinking_level(&quick.model, "off"),
+        thinking_level: crate::provider::clamp_thinking_level(&model, "off"),
         session_file: None,
         cwd: &quick.cwd,
-        cancel: CancellationToken::new(),
+        cancel,
     };
     let mut streamed = false;
     let read = async {
         while let Some(event) = events.recv().await {
             if let StreamEvent::TextDelta { delta, .. } = event {
+                if !streamed {
+                    note(&format!("voice.quick first text in {:.3} s (session {})", turn.started.elapsed().as_secs_f64(), turn.session_id));
+                }
                 streamed = true;
                 speaker.add(&delta, false).await;
             }
@@ -680,7 +711,11 @@ async fn quick_answer(quick: &Quick, turn: &Turn, speaker: &mut Speaker) -> Opti
     };
     let (reply, ()) = tokio::join!(crate::provider::stream(request, sender), read);
     if !streamed {
-        speaker.add(&TextOrBlocks::Blocks(reply.content.clone()).text(), false).await;
+        let text = TextOrBlocks::Blocks(reply.content.clone()).text();
+        if text.trim().is_empty() {
+            note("voice.quick returned no speech");
+        }
+        speaker.add(&text, false).await;
     }
     if let Some(error) = &reply.error_message {
         note(&format!("voice.quick: {error}"));

@@ -2091,17 +2091,11 @@ impl App {
             frame.render_widget(border, editor);
             let visible = usize::from(text_area.height);
             let first = (cursor.0 + 1).saturating_sub(visible);
+            // An empty box says nothing, except the two keys that matter while a turn runs.
             if self.slots[slot_index].draft.text.is_empty() {
-                let view = &self.slots[slot_index];
-                let hint = match (view.busy(), view.live.is_some(), view.elsewhere) {
-                    (true, ..) => "queue a message (read after the current step) · ^x^s sends now · ↑ takes it back · esc stops",
-                    (false, false, true) => "another piccosta is running this session; it's shown here as it goes",
-                    (false, false, false) => "an earlier session: type to carry on with it",
-                    (false, true, _) if view.team.pair => "ask anything · the two models answer each other until one is done, then you · /pair off works alone",
-                    (false, true, _) if !view.team.models.is_empty() => "ask anything · the other model checks each answer, then you · /trio off works alone",
-                    (false, true, _) => "ask anything · / for commands · /pair or /trio <model> to work with a second model",
-                };
-                frame.render_widget(Paragraph::new(hint).style(Style::new().fg(theme::DIM)), text_area);
+                if self.slots[slot_index].busy() {
+                    frame.render_widget(Paragraph::new("esc stops · ^x^s sends now").style(Style::new().fg(theme::DIM)), text_area);
+                }
             } else {
                 let shown: Vec<Line> = editor_rows.iter().skip(first).take(visible).map(|row| Line::from(row.clone())).collect();
                 frame.render_widget(Paragraph::new(shown), text_area);
