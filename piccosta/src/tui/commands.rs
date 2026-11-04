@@ -94,15 +94,26 @@ impl App {
     pub(super) fn command(&mut self, line: &str) -> bool {
         let (name, argument) = line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()));
         match name {
-            // /clear <name> names the session being left, as Claude Code's does.
-            // /clear <name> names the session being left, as Claude Code's does.
+            // /clear starts this tab over, as Claude Code's does: a new session in the same directory
+            // takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
+            // /clear <name> names the one left first. A running turn stops first (esc).
             "clear" => {
-                if !argument.is_empty() {
-                    self.focused().title = argument.to_string();
-                    self.tell(Command::Name(argument.to_string()));
-                }
-                if let Some(slot) = self.new_session() {
+                let left = self.panes[self.focus].slot;
+                if self.slots[left].busy() {
+                    self.notice = Some("A turn is running; esc stops it, then /clear.".into());
+                } else if let Some(slot) = {
+                    if !argument.is_empty() {
+                        self.focused().title = argument.to_string();
+                        self.tell(Command::Name(argument.to_string()));
+                    }
+                    self.new_session().filter(|&slot| slot != left)
+                } {
                     self.show(slot);
+                    if self.close(left)
+                        && let Some(path) = self.slots[left].path.take()
+                    {
+                        crate::session::set_closed(&self.host.agent_dir, &path, true);
+                    }
                 }
             }
             // /new <dir> starts the session in that directory; /new alone offers this one and the

@@ -180,6 +180,7 @@ impl Host {
     }
 
     // The models whose provider has a credential (pi's getAvailableSnapshot), in the registry's order.
+    // A kept list still serves through a failed login check, but never through an explicit logout.
     pub async fn usable_models(&self) -> Result<Vec<Model>, String> {
         let registry = self.registry()?;
         let paths = auth::CredentialPaths::from_environment(&self.agent_dir);
@@ -187,7 +188,11 @@ impl Host {
         let mut models = Vec::new();
         for model in registry.models() {
             if !usable.contains_key(&model.provider) {
-                let found = auth::credential_for(&model.provider, registry.provider_config(&model.provider), &paths).await.is_ok();
+                let config = registry.provider_config(&model.provider);
+                let found = match auth::credential_for(&model.provider, config, &paths).await {
+                    Ok(_) => true,
+                    Err(error) => !error.starts_with(auth::NO_CREDENTIAL) && !crate::model::listed(&self.agent_dir, &model.provider, config).is_empty(),
+                };
                 usable.insert(model.provider.clone(), found);
             }
             if usable[&model.provider] {

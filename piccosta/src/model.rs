@@ -85,6 +85,11 @@ pub fn listing(agent_dir: &Path) -> Option<futures_util::future::BoxFuture<'stat
 }
 static LISTING_WAITED_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Whether a list is kept for `provider`.
+pub fn kept(agent_dir: &Path, provider: &str) -> bool {
+    list_copy(agent_dir, provider).is_file()
+}
+
 fn list_copy(agent_dir: &Path, provider: &str) -> PathBuf {
     agent_dir.join(LISTS_DIR).join(format!("{provider}.json"))
 }
@@ -347,6 +352,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
                 let _ = fs::remove_file(&copy);
                 lines.push(Ok(format!("{provider}: not connected")));
             }
+            Err(error) if !copy.is_file() => lines.push(Err(format!("{provider}: not connected; couldn't fetch the list ({error})"))),
             Err(error) => lines.push(Err(format!("{provider}: couldn't fetch the list ({error}); kept the last one"))),
             // Written whole under a name of its own, then moved into place, so a load never reads
             // half of one and two refreshes at once don't write into the same file.
@@ -368,7 +374,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
 
 // The models of a provider's kept list as load reads them, the ones on its home only (a copy kept
 // before that was checked may hold others); none when there's no copy or it doesn't read as models.
-fn listed(agent_dir: &Path, provider: &str, config: Option<&ProviderConfig>) -> Vec<Map<String, Value>> {
+pub(crate) fn listed(agent_dir: &Path, provider: &str, config: Option<&ProviderConfig>) -> Vec<Map<String, Value>> {
     let models: Vec<Value> = fs::read_to_string(list_copy(agent_dir, provider)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
     home(provider, config).and_then(|home| checked(provider, models.into_iter(), home)).and_then(|(models, _)| as_models(provider, &models)).unwrap_or_default()
 }

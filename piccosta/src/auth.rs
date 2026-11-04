@@ -86,7 +86,7 @@ pub fn account(provider: &str) -> Option<&'static Account> {
 
 // Claude Code's login, from the bridge's own once-per-process `claude auth status` (bounded by its
 // deadline, the child killed and reaped). Output: how it's logged in, or why Claude can't run: not
-// installed or explicitly logged out (no login), or no answer (a failure, which keeps the list).
+// found or no answer (a failure, which keeps the list), or explicitly logged out (no login).
 async fn claude_login() -> Result<Credential, String> {
     let settings = &*crate::provider::claude::SETTINGS;
     let provider = crate::provider::claude::PROVIDER;
@@ -94,7 +94,10 @@ async fn claude_login() -> Result<Credential, String> {
     let Some(status) = status else {
         return Err(match installed(&settings.claude) {
             true => format!("Claude Code ({}) didn't say whether it's logged in", settings.claude),
-            false => format!("{NO_CREDENTIAL} \"{provider}\": Claude Code ({}) isn't installed", settings.claude),
+            // Gone with a list kept is an update in progress (npm reinstalls it) or a move: the list
+            // stays. Gone with none is someone without Claude Code, who sees nothing about it.
+            false if !crate::model::kept(&crate::config::agent_dir(), provider) => format!("{NO_CREDENTIAL} \"{provider}\": Claude Code ({}) isn't installed", settings.claude),
+            false => format!("Claude Code ({}) wasn't found just now; it may be updating or have moved", settings.claude),
         });
     };
     // Only an explicit false is a logout; an answer without it ({}, an error) is a failure.
