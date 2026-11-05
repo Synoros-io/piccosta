@@ -102,7 +102,7 @@ enum Input {
     Event(String, u64, Box<Event>),
     Done(String, u64, Box<Done>),
     // A tool call waiting for the user's yes.
-    Ask { session: String, serial: u64, call_id: String, reply: oneshot::Sender<Answer> },
+    Ask { session: String, serial: u64, call_id: String, question: Option<String>, reply: oneshot::Sender<Answer> },
     // A cancelled prompt's time to stop is up; the number is which prompt of the session it was.
     CancelDeadline(String, u64, u64),
 }
@@ -260,7 +260,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             Some(Input::Line(line)) => acp.line(&line).await,
             Some(Input::Event(session, serial, event)) if acp.current(&session, serial) => acp.event(&session, *event),
             Some(Input::Done(session, serial, done)) if acp.current(&session, serial) => acp.done(&session, *done),
-            Some(Input::Ask { session, serial, call_id, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, reply),
+            Some(Input::Ask { session, serial, call_id, question, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, question, reply),
             Some(Input::CancelDeadline(session, serial, prompt)) if acp.current(&session, serial) => acp.cancel_deadline(&session, prompt),
             Some(Input::Closed) | None => break 0,
             _ => {}
@@ -511,19 +511,19 @@ impl Acp {
     }
 
     // Ask the client about a tool call it already shows.
-    fn ask(&mut self, session: String, call_id: String, reply: oneshot::Sender<Answer>) {
+    fn ask(&mut self, session: String, call_id: String, question: Option<String>, reply: oneshot::Sender<Answer>) {
         let Some(call) = self.sessions.get(&session).and_then(|live| live.open.get(&call_id)) else {
             let _ = reply.send(Answer::No);
             return;
         };
         let id = self.next_request;
         self.next_request += 1;
-        let options = json!([
+        let mut options = json!([
             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
-            {"optionId": "allow-always", "name": format!("Always allow {}", call.name), "kind": "allow_always"},
             {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
         ]);
-        let tool_call = json!({"toolCallId": call_id, "title": title(&call.name, &call.arguments), "kind": kind(&call.name)});
+        if question.is_none() { options.as_array_mut().unwrap().insert(1, json!({"optionId": "allow-always", "name": format!("Always allow {}", call.name), "kind": "allow_always"})); }
+        let tool_call = json!({"toolCallId": call_id, "title": question.unwrap_or_else(|| title(&call.name, &call.arguments)), "kind": kind(&call.name)});
         write_line(&json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {"sessionId": session, "toolCall": tool_call, "options": options}}));
         self.asks.insert(id, (session, call_id, reply));
     }
@@ -841,16 +841,15 @@ impl Acp {
 // The gate a session's tool calls pass: through at once when the mode doesn't ask about the tool
 // or the user said "always" for it, else after the client's yes.
 fn gate(inputs: UnboundedSender<Input>, session: String, serial: u64, mode: Rc<Cell<Mode>>, always: Rc<RefCell<HashSet<String>>>) -> Gate {
-    Rc::new(move |call_id: String, name: String, _arguments: Map<String, Value>| {
+    Rc::new(move |call_id: String, name: String, _arguments: Map<String, Value>, question: Option<String>, read_only: bool| {
         let (inputs, session, mode, always) = (inputs.clone(), session.clone(), mode.clone(), always.clone());
         Box::pin(async move {
-            if !needs_approval(mode.get(), &name) || always.borrow().contains(&name) {
-                return Ok(());
-            }
+            if question.is_none() && (read_only || !needs_approval(mode.get(), &name) || always.borrow().contains(&name)) { return Ok(()); }
+            let required = question.is_some();
             let (reply, answer) = oneshot::channel();
-            let _ = inputs.send(Input::Ask { session, serial, call_id, reply });
+            let _ = inputs.send(Input::Ask { session, serial, call_id, question, reply });
             match answer.await {
-                Ok(Answer::Always) => {
+                Ok(Answer::Always) if !required => {
                     always.borrow_mut().insert(name);
                     Ok(())
                 }

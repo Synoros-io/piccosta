@@ -131,7 +131,7 @@ fn base64_len(bytes: usize) -> usize {
     bytes.div_ceil(3) * 4
 }
 
-fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
+pub(super) fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let rgba = image.to_rgba8();
     image::codecs::png::PngEncoder::new(&mut out)
@@ -150,7 +150,7 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
 }
 
 // Decode with the file's EXIF orientation applied, so a phone photo isn't sideways.
-fn decode(bytes: &[u8]) -> Option<DynamicImage> {
+pub(super) fn decode(bytes: &[u8]) -> Option<DynamicImage> {
     let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut decoder = reader.into_decoder().ok()?;
     let orientation = decoder.orientation().ok();
@@ -161,24 +161,52 @@ fn decode(bytes: &[u8]) -> Option<DynamicImage> {
     Some(image)
 }
 
+// A plugin may supply compressed images, not just screenshots. Four default-sized 2000x2000
+// frames is the source-pixel ceiling; 64 MB bounds its RGBA8 decode before any normalization.
+pub(super) const MAX_PLUGIN_RESPONSE_PIXELS: u64 = 4 * 2000 * 2000;
+const MAX_PLUGIN_DECODE_BYTES: u64 = MAX_PLUGIN_RESPONSE_PIXELS * 4;
+
+// Validate dimensions and decoder allocation before decoding. Always normalize plugin bytes,
+// then fit that PNG to the provider: a small JPEG can become a much larger PNG.
+pub(super) fn prepare_plugin(bytes: &[u8], limits: Limits, pixels_left: &mut u64) -> Result<Prepared, String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| format!("bad image: {e}"))?;
+    let mut budget = image::Limits::default();
+    budget.max_alloc = Some(MAX_PLUGIN_DECODE_BYTES);
+    reader.limits(budget);
+    let mut decoder = reader.into_decoder().map_err(|e| format!("bad image: {e}"))?;
+    let (width, height) = decoder.dimensions();
+    *pixels_left = pixels_left.checked_sub(u64::from(width) * u64::from(height))
+        .ok_or_else(|| format!("bad image: response decoded-pixel budget exceeded ({width}x{height}, {pixels_left} pixels left)"))?;
+    let orientation = decoder.orientation().ok();
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|e| format!("bad image: could not decode: {e}"))?;
+    if let Some(orientation) = orientation { image.apply_orientation(orientation); }
+    // No original bytes to forward: fit the decoded frame first, then encode a clean PNG (or
+    // JPEG when PNG won't fit). Encoding the full source first needlessly expands large JPEGs.
+    prepare_decoded(&[], "image/png", limits, image)
+}
+
 // Input: an image file's bytes, its sniffed type and the limits to fit. Output: the image as it goes to the model,
 // or the note that replaces it when it can't be made small enough (image-process.ts:75-110).
 // BMP isn't an inline type anywhere, so it's always re-encoded. An image already within both
 // limits goes out as it was.
 pub fn prepare(bytes: &[u8], mime_type: &str, limits: Limits) -> Result<Prepared, String> {
-    let Limits { max_width, max_height, max_bytes, jpeg_quality } = limits;
-    let mut hints = Vec::new();
-    let converted_from = (mime_type == "image/bmp").then_some(mime_type);
     let image = decode(bytes).ok_or_else(|| {
-        if converted_from.is_some() {
+        if mime_type == "image/bmp" {
             "[Image omitted: could not be converted to a supported inline image format.]".to_string()
         } else {
             "[Image omitted: could not be resized below the inline image size limit.]".to_string()
         }
     })?;
+    prepare_decoded(bytes, mime_type, limits, image)
+}
+
+fn prepare_decoded(bytes: &[u8], mime_type: &str, limits: Limits, image: DynamicImage) -> Result<Prepared, String> {
+    let Limits { max_width, max_height, max_bytes, jpeg_quality } = limits;
+    let mut hints = Vec::new();
+    let converted_from = (mime_type == "image/bmp").then_some(mime_type);
     let (width, height) = (image.width(), image.height());
 
-    if converted_from.is_none() && width <= max_width && height <= max_height && base64_len(bytes.len()) < max_bytes {
+    if !bytes.is_empty() && converted_from.is_none() && width <= max_width && height <= max_height && base64_len(bytes.len()) < max_bytes {
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         return Ok(Prepared { data, mime_type: mime_type.to_string(), hints, width, height });
     }

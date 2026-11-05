@@ -4,7 +4,7 @@ use crate::model_add::{Addition, Probe, APIS};
 
 impl App {
     fn model_input(&mut self, title: &'static str, initial: String, masked: bool, apply: fn(&mut App, String)) {
-        self.picker = Some(Picker { title, items: Vec::new(), filter: initial, selected: 0, apply, delete: None, confirming: false, free: None, text: true, masked });
+        self.picker = Some(Picker { title: title.to_string(), answer: None, items: Vec::new(), filter: initial, selected: 0, apply, delete: None, confirming: false, free: None, text: true, masked });
     }
 
     pub(super) fn add_model(&mut self) {

@@ -223,17 +223,23 @@ impl Host {
     // as in pi), a fork of one (--fork), one named (--session, --resume), this directory's latest
     // (-c), or a new one. `--resume` with no name is the TUI's picker, so it opens a new one here.
     pub fn opening(&self, args: &crate::cli::Args) -> Result<Session, String> {
-        if args.no_session {
-            return Ok(Session::create(&self.cwd, None));
-        }
-        if let Some(source) = &args.fork {
+        let mut session = if args.no_session {
+            Session::create(&self.cwd, None)
+        } else if let Some(source) = &args.fork {
             let source = Session::open(&self.find_session(source)?, &self.cwd).map_err(|error| error.to_string())?;
             let leaf = source.leaf_id().map(str::to_string);
-            return source.branch(leaf.as_deref(), &self.session_dir).map_err(|error| error.to_string());
+            source.branch(leaf.as_deref(), &self.session_dir).map_err(|error| error.to_string())?
+        } else {
+            let named = args.session.iter().chain(args.resume.iter().filter(|name| !name.is_empty())).next();
+            let path = named.map(|name| self.find_session(name)).transpose()?;
+            self.session(path.as_deref(), args.continue_recent, true)?
+        };
+        // The kind must be recorded before tools and prompt are built, in every frontend.
+        let child = std::env::var(tools::subagent::CHILD_ENV).ok().filter(|_| session.entries().is_empty());
+        if let Some(kind) = args.use_scale.as_ref().or(child.as_ref()) {
+            crate::manager::set_work(&mut session, kind).map_err(|error| error.to_string())?;
         }
-        let named = args.session.iter().chain(args.resume.iter().filter(|name| !name.is_empty())).next();
-        let path = named.map(|name| self.find_session(name)).transpose()?;
-        self.session(path.as_deref(), args.continue_recent, true)
+        Ok(session)
     }
 
     // A session named on the command line. One that looks like a path (it has a `/` or ends in
@@ -258,11 +264,11 @@ impl Host {
     // for a kind of work (a subagent's job among them) gets exactly the tools its kind lists, owned
     // or not, else all of them; and none that write when it's read-only, since edit and write run
     // here, outside its commands' sandbox (work). --exclude-tools still takes any away.
-    fn tool_list(&self, session: &Session) -> Vec<Arc<dyn tools::Tool>> {
+    fn tool_list(&self, session: &Session, plugins: Option<Vec<Arc<dyn tools::Tool>>>) -> Result<Vec<Arc<dyn tools::Tool>>, String> {
         let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
         let (work_tools, work_read_only) = self.work(session);
         if !self.tools {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut list = tools::builtin();
         let subagents = std::env::var_os(tools::subagent::CHILD_ENV).is_none().then(|| tools::subagent::SubagentTool::load(&self.agent_dir)).flatten();
@@ -274,6 +280,14 @@ impl Host {
         if let Some(role) = role {
             list.extend(crate::manager::tools(&self.agent_dir, &self.settings, role, cwd));
         }
+        let Some(plugins) = plugins else { return Ok(list) };
+        list.extend(plugins);
+        for name in self.tool_names.iter().flatten().chain(&self.exclude_tools) {
+            if !list.iter().any(|tool| tool.name() == name) {
+                let known: Vec<_> = list.iter().map(|tool| tool.name()).collect();
+                return Err(format!("Unknown tool \"{name}\". Tools available in this session: {}", known.join(", ")));
+            }
+        }
         let named = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_some_and(|names| names.iter().any(|name| name == tool.name()));
         let wanted = |tool: &Arc<dyn tools::Tool>| match &work_tools {
             // A kind's list, narrowed further by an explicit --tools.
@@ -281,7 +295,7 @@ impl Host {
             None => (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool),
         };
         let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write");
-        list.into_iter().filter(|tool| wanted(tool) && !writes(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect()
+        Ok(list.into_iter().filter(|tool| wanted(tool) && !writes(tool) && !self.exclude_tools.iter().any(|name| name == tool.name())).collect())
     }
 
     // The kind of work a session was started for (the sessions tool's `use`, manager.rs work): its
@@ -297,7 +311,7 @@ impl Host {
     // The prompt sections for a model (its constitution can differ by model), with a manager's
     // part when the session is one. The instructions the session holds stand in when a context
     // file can't be read (prompt::sections).
-    pub fn sections(&self, model: &Model, session: &Session) -> Result<IndexMap<String, String>, String> {
+    pub fn sections(&self, model: &Model, session: &Session, tool_list: &[Arc<dyn tools::Tool>]) -> Result<IndexMap<String, String>, String> {
         let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
         let messages = crate::message::to_model_messages(&session.context().messages);
         let held_context = crate::provider::transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
@@ -306,8 +320,7 @@ impl Host {
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(&self.settings, role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
-        let tool_list = self.tool_list(session);
-        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: &tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
+        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
     }
 
     // The model a session (None: a new one) opens on: the one asked for, else the one it last used,
@@ -366,7 +379,10 @@ impl Host {
         if role.is_some() {
             crate::manager::users_only()?;
         }
-        let sections = self.sections(&model, &session)?;
+        let base = self.tool_list(&session, None)?;
+        let pending_plugins = self.tools.then(|| tools::plugin::discover(&self.agent_dir, &cwd, crate::manager::work(&session), self.work(&session).1, base.clone())).flatten().map(tools::plugin::Discovery);
+        let tool_list = if pending_plugins.is_some() { base } else { self.tool_list(&session, Some(Vec::new()))? };
+        let sections = self.sections(&model, &session, &tool_list)?;
 
         let (notice_sender, notices) = tokio::sync::mpsc::unbounded_channel();
         let credentials = auth::CredentialPaths::from_environment(&self.agent_dir);
@@ -386,7 +402,7 @@ impl Host {
             registry,
             credentials,
             thinking_level,
-            tools: self.tool_list(&session),
+            tools: tool_list,
             tool_shared: tool_shared.clone(),
             cwd,
             sections,
@@ -400,8 +416,21 @@ impl Host {
             manager_home,
             claim,
         };
-        let agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
+        let mut agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
+        agent.pending_plugins = pending_plugins;
         Ok((agent, tool_shared))
+    }
+
+    // The runtime waits here, not input dispatch. The installed paths were snapshotted at open;
+    // after this one finalization, model switches reuse the same tools and prompt sections.
+    pub async fn ready(&self, agent: &mut Agent) -> Result<(), String> {
+        if let Some(mut pending) = agent.pending_plugins.take() {
+            let plugins = (&mut pending.0).await.map_err(|e| format!("Plugin discovery: {e}"))?;
+            let tools = self.tool_list(&agent.session, Some(plugins))?;
+            let sections = self.sections(agent.model(), &agent.session, &tools)?;
+            agent.install_tools(tools, sections);
+        }
+        Ok(())
     }
 }
 
@@ -430,7 +459,7 @@ impl Host {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
         let registry = self.registry()?;
         let model = registry.resolve(name)?.clone();
-        let sections = self.sections(&model, &agent.session)?;
+        let sections = self.sections(&model, &agent.session, agent.tools())?;
         let compaction = self.settings.compaction(&model.provider, &model.id);
         let level = self.remembered_thinking_level(&model).unwrap_or_else(|| agent.thinking_level().to_string());
         written(agent.set_model(model, registry, sections, compaction))?;

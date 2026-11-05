@@ -240,7 +240,7 @@ pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Resu
     let pipe = Arc::new(Receiver::from_owned_fd(super::reaper::inherited(handed.pipe))?);
     let kill = CancellationToken::new();
     let job = shared.jobs.adopt(&handed, kill.clone())?;
-    shared.jobs.shells().push(Shell { pid: handed.pid, own: handed.own, kill_at: None, pipe: pipe.clone(), handed: false });
+    shared.jobs.shells().push(Shell { pid: handed.pid, own: handed.own, plugin: None, kill_at: None, pipe: pipe.clone(), handed: false });
     let (event_sender, events) = mpsc::unbounded_channel();
     tokio::spawn(watch(shared.clone(), pipe, handed.pid, kill, None, event_sender));
     let tail = Tail::from_log(&job.log_path);
@@ -478,7 +478,7 @@ async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String
         return Err(format!("Working directory does not exist: {}\nCannot execute bash commands.", context.cwd.display()));
     }
     let (pid, pipe) = spawn(&command, context)?;
-    shared.jobs.shells().push(Shell { pid, own: arguments.own, kill_at: None, pipe: pipe.clone(), handed: false });
+    shared.jobs.shells().push(Shell { pid, own: arguments.own, plugin: None, kill_at: None, pipe: pipe.clone(), handed: false });
     super::reaper::track(pid, true);
     let started = Instant::now();
     let kill = CancellationToken::new();

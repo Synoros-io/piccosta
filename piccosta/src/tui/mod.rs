@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use render::{Block as Part, Flags, Rows, ToolView};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,6 +87,8 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    // A tool's per-call question. Dropping its answer (Esc, quit) refuses it.
+    Ask(String, tokio::sync::oneshot::Sender<bool>),
     ModelProbe(u64, Result<(crate::model_add::Addition, crate::model_add::Probe), String>),
     // What a scan's runtimes said (asker): each one's status, None when nothing runs it; and
     // whether it was a look for agents.
@@ -345,6 +347,7 @@ struct App {
     last_click: Option<(Instant, Position, u8)>,
     quit: bool,
     picker: Option<Picker>,
+    questions: VecDeque<Picker>,
     model_add: Option<crate::model_add::Addition>,
     model_flow: u64,
     model_probe: Option<tokio::task::AbortHandle>,
@@ -375,7 +378,7 @@ fn id_of(path: &Path) -> String {
 
 // A list to choose from, filtered by what's typed.
 struct Picker {
-    title: &'static str,
+    title: String,
     items: Vec<String>,
     filter: String,
     selected: usize,
@@ -386,6 +389,7 @@ struct Picker {
     // In a picker of directories, the directory typed paths start from: what's typed can then be
     // the choice itself (a path, or anything when no item matches).
     free: Option<PathBuf>,
+    answer: Option<tokio::sync::oneshot::Sender<bool>>,
     text: bool,
     masked: bool,
 }
@@ -494,6 +498,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         last_click: None,
         quit: false,
         picker: None,
+        questions: VecDeque::new(),
         model_add: None,
         model_flow: 0,
         model_probe: None,
@@ -556,6 +561,14 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         // Everything else already waiting goes in before the next frame.
         while let Ok((slot, update)) = app.updates.try_recv() {
             app.update(slot, update);
+        }
+        // Cancelled calls no longer need an answer. Questions wait behind an open picker, not
+        // over it, and default to No so an unrelated Enter never grants desktop access.
+        if app.picker.as_ref().is_some_and(|picker| picker.answer.as_ref().is_some_and(|answer| answer.is_closed())) { app.picker = None; }
+        if app.picker.is_none() {
+            while let Some(question) = app.questions.pop_front() {
+                if question.answer.as_ref().is_some_and(|answer| !answer.is_closed()) { app.picker = Some(question); break; }
+            }
         }
         // A /restart waiting for turns to end goes ahead once none is running.
         if app.restart_waiting && !app.slots.iter().any(Slot::busy) {
@@ -995,7 +1008,17 @@ impl App {
             let _ = sender.send((slot, Update::Event(Box::new(event.clone()))));
         });
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
-        let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
+        let (mut agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, false)?;
+        let questions = self.sender.clone();
+        agent.set_gate(std::rc::Rc::new(move |_: String, name: String, _: serde_json::Map<String, Value>, question: Option<String>, _: bool| {
+            let questions = questions.clone();
+            Box::pin(async move {
+                let Some(question) = question else { return Ok(()) };
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = questions.send((slot, Update::Ask(format!("{name}: {question}"), reply)));
+                if answer.await == Ok(true) { Ok(()) } else { Err(format!("The user declined this {name} call.")) }
+            })
+        }));
         let view = &mut self.slots[slot];
         view.opened = true;
         view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
@@ -1272,7 +1295,7 @@ impl App {
 
     // Choose from a list; an argument that matches one item picks it at once.
     fn pick(&mut self, title: &'static str, items: Vec<String>, filter: &str, apply: fn(&mut App, String)) {
-        let picker = Picker { title, items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, text: false, masked: false };
+        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None, text: false, masked: false };
         let shown = picker.shown();
         if !filter.is_empty() && (shown.len() == 1 || shown.iter().any(|item| item.as_str() == filter)) {
             let choice = shown.iter().find(|item| item.as_str() == filter).unwrap_or(&shown[0]).to_string();
@@ -1553,6 +1576,9 @@ impl App {
         let visible = self.panes.iter().any(|pane| pane.slot == slot);
         let view = &mut self.slots[slot];
         match update {
+            Update::Ask(question, answer) => {
+                self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items: vec!["No".into(), "Yes".into()], filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), text: false, masked: false });
+            }
             Update::Report(text) => self.report(text),
             Update::ModelProbe(flow, result) => self.probed_model(flow, result),
             Update::Scanned(statuses, agents) => self.scanned(statuses, agents),
@@ -1898,11 +1924,10 @@ impl App {
                 picker.selected = 0;
             }
             KeyCode::Enter => {
-                let (choice, apply) = (picker.chosen(), picker.apply);
+                let (choice, apply, answer) = (picker.chosen(), picker.apply, picker.answer.take());
                 self.picker = None;
-                if let Some(choice) = choice {
-                    apply(self, choice);
-                }
+                if let Some(answer) = answer { let _ = answer.send(choice.as_deref() == Some("Yes")); }
+                else if let Some(choice) = choice { apply(self, choice); }
             }
             _ => {}
         }
@@ -2216,17 +2241,21 @@ impl App {
         let Some(picker) = &self.picker else { return };
         let shown = picker.shown();
         let width = area.width.min(PICKER_MAX_WIDTH);
-        let height = (shown.len() as u16 + 3).min(area.height.saturating_sub(4)).max(4);
+        // A question is the reason for permission, not a heading that can be clipped by the
+        // session's name. Wrap all of it above the choices, which still start on No.
+        let mut lines = if picker.answer.is_some() { render::report(&picker.title, width.saturating_sub(2), &mut self.tex) } else { Vec::new() };
+        let question_rows = lines.len() as u16;
+        let height = (question_rows + shown.len() as u16 + 3).min(area.height.saturating_sub(4)).max(4);
         let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + area.height / 5, width, height };
         frame.render_widget(Clear, rect);
-        let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else { picker.title };
+        let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else if picker.answer.is_some() { "allow this call? enter chooses · esc refuses" } else { &picker.title };
         let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::ACCENT)).title(format!(" {title} "));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let selected = picker.selected.min(shown.len().saturating_sub(1));
-        let visible = usize::from(inner.height.saturating_sub(1));
+        let visible = usize::from(inner.height.saturating_sub(question_rows + 1));
         let first = (selected + 1).saturating_sub(visible);
-        let mut lines = vec![Line::from(vec![Span::styled("› ", Style::new().fg(theme::ACCENT)), Span::raw(if picker.masked { "•".repeat(picker.filter.chars().count()) } else { picker.filter.clone() })])];
+        lines.push(Line::from(vec![Span::styled("› ", Style::new().fg(theme::ACCENT)), Span::raw(if picker.masked { "•".repeat(picker.filter.chars().count()) } else { picker.filter.clone() })]));
         for (index, item) in shown.iter().enumerate().skip(first).take(visible) {
             let style = match (index == selected, picker.confirming) {
                 (true, true) => Style::new().fg(theme::REMOVED).add_modifier(Modifier::BOLD),

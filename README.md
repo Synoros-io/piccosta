@@ -97,6 +97,16 @@ The model hands a task to a kind of work on the scale (critical, general, review
 - **Pages** come back as Markdown, read with Readability. PDFs come back as text. GitHub URLs become shallow clones the model can read.
 - **Long results** are stored, so the model can page through them later instead of fetching again.
 
+### Plugins
+
+Executables in `<agent dir>/plugins/` describe their tools once when a session opens. Calls share
+one process per plugin per session; failures name the plugin and leave the session running.
+`plugins.callTimeoutSeconds` sets the call deadline (120 seconds by default, capped at 3600).
+Linux uses watcher-owned cgroups when the user's systemd cgroup is delegated, otherwise a child
+subreaper; without either delegation or usable pidfd signalling, plugins refuse to start.
+Windows retains the plugin's Job Object. On macOS, containment is **process-group only**:
+helpers that call `setsid` can outlive the session; a notice says so on the first plugin start.
+
 ### Editors and scripts
 
 - **Print mode.** `piccosta -p` answers and exits, and reads stdin too. `--mode json` prints one event per line. Failures exit non-zero.

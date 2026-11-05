@@ -40,7 +40,13 @@ pub fn start(pid: i32) -> Option<u64> { Process::open(pid).filter(|p| p.signal(0
 pub fn boot_id() -> String { "windows-filetime".into() }
 pub fn children() -> Vec<i32> { Vec::new() }
 
-struct Job { handle: OwnedHandle, process: Process }
+#[derive(Clone)]
+pub struct JobHandle(Arc<OwnedHandle>);
+impl JobHandle {
+    pub fn kill(&self) { unsafe { TerminateJobObject(self.0.as_raw_handle(), STOP_EXIT_CODE); } }
+}
+pub fn job(pid: u32) -> Option<JobHandle> { JOBS.lock().unwrap().get(&pid).map(|job| job.handle.clone()) }
+struct Job { handle: JobHandle, process: Process }
 static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn own_session(command: &mut std::process::Command) -> &mut std::process::Command {
@@ -77,14 +83,14 @@ pub fn attach(pid: u32) -> std::io::Result<()> {
             more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
         }
         if !resumed { return Err(std::io::Error::other("command has no suspended thread")); }
-        JOBS.lock().unwrap().insert(pid, Job { handle, process: process.clone() });
+        JOBS.lock().unwrap().insert(pid, Job { handle: JobHandle(Arc::new(handle)), process: process.clone() });
         Ok(())
     })();
     if result.is_err() { process.signal(KILL); }
     result
 }
 pub fn signal_group(pid: u32, _signal: i32) {
-    if let Some(job) = JOBS.lock().unwrap().get(&pid) { unsafe { TerminateJobObject(job.handle.as_raw_handle(), STOP_EXIT_CODE); } }
+    if let Some(job) = JOBS.lock().unwrap().get(&pid) { job.handle.kill(); }
 }
 // The job alone; on Windows signal_group already touches nothing but the job.
 pub fn kill_group(pid: u32, signal: i32) { signal_group(pid, signal) }

@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["piccosta"]
+members = ["piccosta", "plugins/computer"]
 
 [workspace.package]
 edition = "2024"

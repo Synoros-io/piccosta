@@ -1,0 +1,17 @@
+[package]
+name = "piccosta-computer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Piccosta's optional Linux computer-use plugin"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+piccosta = { path = "../../piccosta" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+libc.workspace = true
+uuid.workspace = true
+# AT-SPI is D-Bus; zbus speaks it in pure Rust (MIT), on tokio's existing runtime.
+zbus = { version = "5", default-features = false, features = ["tokio"] }

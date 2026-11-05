@@ -93,12 +93,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     let json = args.mode.as_deref() == Some("json");
     let host = std::sync::Arc::new(piccosta::host::Host::for_args(&args));
     host.show_settings_errors();
-    let mut session = host.opening(&args)?;
-    // A subagent's new session records its job as its kind, whose tools and readOnly it then runs
-    // with, now and whenever it's reopened.
-    if let Some(job) = std::env::var(piccosta::tools::subagent::CHILD_ENV).ok().filter(|_| session.entries().is_empty()) {
-        piccosta::manager::set_work(&mut session, &job).map_err(|error| format!("could not write the session: {error}"))?;
-    }
+    let session = host.opening(&args)?;
     let emit: piccosta::agent::EventSink = if json {
         Box::new(|event: &Event| write_line(&serde_json::to_string(event).unwrap_or_default()))
     } else {
@@ -218,8 +213,14 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(piccosta::tools::plugin_host::HOST_ENV).is_some() { piccosta::tools::plugin_host::run(); }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn run() -> ExitCode {
     // Started as the watcher by another piccosta (tools/reaper.rs): watch for it to go, and nothing else.
     if std::env::var_os(piccosta::tools::reaper::REAPER_ENV).is_some() {
         piccosta::tools::reaper::run();

@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::Write;
+#[cfg(not(target_os = "linux"))]
+use std::io::BufRead;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -29,12 +31,80 @@ pub const REAPER_ENV: &str = "PICCOSTA_REAPER";
 static PIPE: Mutex<Option<Option<(File, u32)>>> = Mutex::new(None);
 
 // Tell the watcher a shell's group started (`running`) or ended. Starts the watcher the first time.
-pub fn track(pid: u32, running: bool) {
+pub fn track(pid: u32, running: bool) { record(pid, crate::proc::start(pid as i32), running, false); }
+pub fn track_plugin(pid: u32, start: Option<u64>, running: bool) { record(pid, start, running, true); }
+
+#[cfg(target_os = "linux")]
+pub fn track_cgroup(path: &std::path::Path, file: &File, running: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut pipe = PIPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (stdin, _) = pipe.get_or_insert_with(start).as_mut().ok_or_else(|| std::io::Error::other("plugin watcher could not start"))?;
+    let id = file.metadata()?.ino();
+    let line = format!("{}{id} {}\n", if running { 'c' } else { 'd' }, serde_json::to_string(path)?);
+    let mut data = libc::iovec { iov_base: line.as_ptr().cast_mut().cast(), iov_len: line.len() };
+    // SCM_RIGHTS transfers the original open cgroup.kill, not a path the watcher must reopen.
+    let mut control = [0usize; CONTROL_WORDS];
+    // SAFETY: aligned control storage, one valid descriptor, and a live message buffer.
+    unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &mut data;
+        message.msg_iovlen = 1;
+        if running {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = std::mem::size_of_val(&control) as _;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<i32>() as _) as _;
+            std::ptr::write(libc::CMSG_DATA(header).cast::<i32>(), file.as_raw_fd());
+        }
+        let count = libc::sendmsg(stdin.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
+        if count < 0 { return Err(std::io::Error::last_os_error()); }
+        stdin.write_all(&line.as_bytes()[count as usize..])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const CONTROL_WORDS: usize = (unsafe { libc::CMSG_SPACE(size_of::<i32>() as _) } as usize).div_ceil(size_of::<usize>());
+
+// Read through recvmsg, not buffered stdin: buffering could discard SCM_RIGHTS. Each record is
+// short and local; one byte at a time keeps descriptor ownership attached to its exact line.
+#[cfg(target_os = "linux")]
+fn records() -> impl Iterator<Item = (String, Option<File>)> {
+    std::iter::from_fn(|| {
+        let (mut bytes, mut file) = (Vec::new(), None);
+        loop {
+            let mut byte = 0u8;
+            let mut control = [0usize; CONTROL_WORDS];
+            let mut data = libc::iovec { iov_base: (&mut byte as *mut u8).cast(), iov_len: 1 };
+            // SAFETY: live data/aligned control buffers. SCM_RIGHTS gives us an owned descriptor.
+            unsafe {
+                let mut message: libc::msghdr = std::mem::zeroed();
+                message.msg_iov = &mut data;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen = std::mem::size_of_val(&control) as _;
+                let count = libc::recvmsg(0, &mut message, libc::MSG_CMSG_CLOEXEC);
+                if count < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+                if count <= 0 { return None; }
+                let header = libc::CMSG_FIRSTHDR(&message);
+                if !header.is_null() && (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                    file = Some(File::from_raw_fd(std::ptr::read(libc::CMSG_DATA(header).cast::<i32>())));
+                }
+            }
+            if byte == b'\n' { return Some((String::from_utf8_lossy(&bytes).into_owned(), file)); }
+            bytes.push(byte);
+        }
+    })
+}
+
+fn record(pid: u32, identity: Option<u64>, running: bool, plugin: bool) {
     let mut pipe = PIPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((stdin, _)) = pipe.get_or_insert_with(start) {
         // A group joins with its leader's start time (proc::group_held), taken while it runs.
-        let start = if running { crate::proc::start(pid as i32).map_or(String::new(), |start| format!(" {start}")) } else { String::new() };
-        let _ = writeln!(stdin, "{}{pid}{start}", if running { '+' } else { '-' });
+        let start = if running { identity.map_or(String::new(), |start| format!(" {start}")) } else { String::new() };
+        let _ = stdin.write_all(format!("{}{pid}{start}\n", if !running { '-' } else if plugin { 'p' } else { '+' }).as_bytes());
     }
 }
 
@@ -71,28 +141,62 @@ pub fn inherited(fd: i32) -> OwnedFd {
 // Start the watcher: this binary again, with the pipe as its stdin and nothing else open.
 fn start() -> Option<(File, u32)> {
     let mut command = Command::new(crate::proc::exe().ok()?);
-    command.env(REAPER_ENV, "1").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = crate::proc::own_session(&mut command).spawn().ok()?;
-    Some((File::from(OwnedFd::from(child.stdin.take()?)), child.id()))
+    command.env(REAPER_ENV, "1").stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        let (writer, reader) = std::os::unix::net::UnixStream::pair().ok()?;
+        command.stdin(Stdio::from(OwnedFd::from(reader)));
+        let child = crate::proc::own_session(&mut command).spawn().ok()?;
+        Some((File::from(OwnedFd::from(writer)), child.id()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        command.stdin(Stdio::piped());
+        let mut child = crate::proc::own_session(&mut command).spawn().ok()?;
+        Some((File::from(OwnedFd::from(child.stdin.take()?)), child.id()))
+    }
 }
 
 // The watcher's whole life: keep the list until the pipe closes, then stop what's on it, SIGTERM
 // first, then SIGKILL after bash's stop grace (subagents write their last messages then).
 pub fn run() {
-    let mut groups: HashMap<u32, Option<u64>> = HashMap::new();
-    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+    let mut groups: HashMap<u32, (Option<u64>, bool)> = HashMap::new();
+    #[cfg(target_os = "linux")]
+    let mut cgroups: HashMap<u64, (std::path::PathBuf, File)> = HashMap::new();
+    #[cfg(target_os = "linux")]
+    let lines = records();
+    #[cfg(not(target_os = "linux"))]
+    let lines = std::io::stdin().lock().lines().map_while(Result::ok).map(|line| (line, None::<File>));
+    for (line, _file) in lines {
         let (sign, rest) = line.split_at(line.len().min(1));
+        #[cfg(target_os = "linux")]
+        if sign == "c" || sign == "d" {
+            if let Some((id, path)) = rest.split_once(' ') && let Ok(id) = id.parse::<u64>() {
+                if sign == "c" {
+                    if let (Some(file), Ok(path)) = (_file, serde_json::from_str(path)) { cgroups.insert(id, (path, file)); }
+                } else { cgroups.remove(&id); }
+            }
+            continue;
+        }
         let mut fields = rest.split_whitespace();
         if let Some(Ok(pid)) = fields.next().map(str::parse::<u32>) {
-            if sign == "+" { groups.insert(pid, fields.next().and_then(|start| start.parse().ok())) } else { groups.remove(&pid) };
+            if sign == "+" || sign == "p" { groups.insert(pid, (fields.next().and_then(|start| start.parse().ok()), sign == "p")) } else { groups.remove(&pid) };
         }
     }
-    if groups.is_empty() {
-        return;
-    }
+    // A supervisor may have died first. Its cgroup still belongs to us, not to that pid.
+    #[cfg(target_os = "linux")]
+    for (_, file) in cgroups.values() { super::plugin_host::kill_cgroup(file); }
+    #[cfg(target_os = "linux")]
+    let empty = groups.is_empty() && cgroups.is_empty();
+    #[cfg(not(target_os = "linux"))]
+    let empty = groups.is_empty();
+    if empty { return; }
     // Each group only while it's still the one registered (proc::group_held).
-    let signal_all = |signal| groups.iter().filter(|&(&group, &start)| crate::proc::group_held(group, start)).for_each(|(&group, _)| crate::proc::kill_group(group, signal));
+    for (&pid, &(start, plugin)) in &groups { if plugin { super::plugin_host::kill(pid, start); } }
+    let signal_all = |signal| groups.iter().filter(|&(&group, &(start, plugin))| !plugin && crate::proc::group_held(group, start)).for_each(|(&group, _)| crate::proc::kill_group(group, signal));
     signal_all(libc::SIGTERM);
     std::thread::sleep(super::bash::SUBAGENT_STOP_GRACE);
     signal_all(libc::SIGKILL);
+    #[cfg(target_os = "linux")]
+    for (_, (path, file)) in cgroups { super::plugin_host::remove_cgroup(&path, &file); }
 }

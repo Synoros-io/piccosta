@@ -150,8 +150,9 @@ pub type EventSink = Box<dyn FnMut(&Event) + Send>;
 
 // Asked before each tool call runs, with the tool's name and arguments: Ok to run it, or the
 // reason it was refused, which becomes the call's error result. A frontend that asks the user
-// sets one (rpc mode for T3 Code's approvals); without one every call runs.
-pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>>;
+// sets one (rpc mode for T3 Code's approvals). A tool's own question always needs a yes;
+// without a frontend it is refused. The last flag is the tool's read-only declaration.
+pub type Gate = std::rc::Rc<dyn Fn(String, String, Map<String, Value>, Option<String>, bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>>;
 
 // A session's controls for whoever drives it while it runs: abort the current run, and queue
 // messages for it. Steering goes in after the current turn's tool calls, a follow-up when the
@@ -288,6 +289,7 @@ pub struct AgentConfig {
 
 pub struct Agent {
     pub session: Session,
+    pub(crate) pending_plugins: Option<tools::plugin::Discovery>,
     config: AgentConfig,
     emit: EventSink,
     // Cancelled when the user aborts; each run gets a fresh one, which the handle then holds.
@@ -353,7 +355,7 @@ impl Agent {
         let config = AgentConfig { thinking_level: level, ..config };
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
-        Ok(Agent { session, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0), machine_noted: None })
+        Ok(Agent { session, pending_plugins: None, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0), machine_noted: None })
     }
 
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
@@ -382,6 +384,12 @@ impl Agent {
     fn fresh_cancel(&mut self) {
         self.cancel = CancellationToken::new();
         self.handle.lock().cancel = self.cancel.clone();
+    }
+
+    pub(crate) fn tools(&self) -> &[Arc<dyn Tool>] { &self.config.tools }
+    pub(crate) fn install_tools(&mut self, tools: Vec<Arc<dyn Tool>>, sections: IndexMap<String, String>) {
+        self.config.tools = tools;
+        self.config.sections = sections;
     }
 
     pub fn model(&self) -> &Model {
@@ -1311,8 +1319,12 @@ impl Agent {
             // abort.
             let checked = match (checked, self.config.gate.clone()) {
                 (Ok((tool, validated)), Some(gate)) => tokio::select! {
-                    allowed = gate(id.clone(), name.clone(), validated.clone()) => allowed.map(|()| (tool, validated)),
+                    allowed = gate(id.clone(), name.clone(), validated.clone(), tool.approval(&validated), tool.read_only()) => allowed.map(|()| (tool, validated)),
                     () = self.cancel.cancelled() => Err("Operation aborted".to_string()),
+                },
+                (Ok((tool, validated)), None) => match tool.approval(&validated) {
+                    Some(question) => Err(format!("{question} No user approval is available here; the call was refused.")),
+                    None => Ok((tool, validated)),
                 },
                 (checked, _) => checked,
             };

@@ -170,13 +170,7 @@ pub fn parse(arguments: &[String]) -> Args {
         args.thinking = args.thinking.take().or(Some(level.to_string()));
         args.model = Some(model.to_string());
     }
-    // A tool name that isn't one is a typo, not a request for no tools.
-    let known: Vec<&str> = crate::tools::builtin().iter().map(|tool| tool.name()).chain([crate::tools::subagent::NAME]).collect();
-    for name in args.tools.iter().flatten().chain(&args.exclude_tools) {
-        if !known.contains(&name.as_str()) {
-            args.errors.push(format!("Unknown tool \"{name}\". Tools: {}", known.join(", ")));
-        }
-    }
+    // Tool names are checked when the session opens, after its plugins have been described.
     if let Some(mode) = &args.mode
         && !MODES.contains(&mode.as_str())
     {

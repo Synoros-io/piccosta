@@ -178,6 +178,7 @@ struct RunningJob {
 pub struct Shell {
     pub pid: u32,
     pub own: bool,
+    pub plugin: Option<super::plugin_host::Owner>,
     pub kill_at: Option<Instant>,
     pub pipe: Arc<crate::proc::Receiver>,
     pub handed: bool,
@@ -297,6 +298,10 @@ impl Jobs {
     // its watcher can race.
     pub fn kill_group(&self, pid: u32) {
         let mut shells = self.shells();
+        if let Some(owner) = shells.iter().find(|shell| shell.pid == pid).and_then(|shell| shell.plugin.as_ref()) {
+            owner.kill();
+            return;
+        }
         match shells.iter_mut().find(|shell| shell.pid == pid && shell.own) {
             Some(shell) if shell.kill_at.is_some() => {}
             Some(shell) => {
@@ -329,8 +334,10 @@ impl Jobs {
     pub fn shutdown(&self, reason: &str) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.kill_all(&format!("session shutdown ({reason})"), true);
-        let left: Vec<u32> = self.shells().iter().filter(|shell| !shell.handed).map(|shell| shell.pid).collect();
-        left.into_iter().for_each(|pid| self.kill_group(pid));
+        let left: Vec<_> = self.shells().iter().filter(|shell| !shell.handed).map(|shell| (shell.pid, shell.plugin.clone())).collect();
+        for (pid, plugin) in left {
+            if let Some(owner) = plugin { owner.kill(); } else { self.kill_group(pid); }
+        }
         for path in self.spill_files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..) {
             let _ = std::fs::remove_file(path);
         }

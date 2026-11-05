@@ -491,6 +491,28 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         let handle = agent.handle();
         let mut team = crate::host::team(&agent.session);
         let mut queue: VecDeque<Command> = VecDeque::new();
+        let mut preparing = Box::pin(host.ready(&mut agent));
+        let ready = loop {
+            tokio::select! {
+                result = &mut preparing => break result,
+                command = next(&mut commands, &mut claim) => match command {
+                    Some(Command::Close(answer)) => {
+                        if let Some(answer) = answer { let _ = answer.send(()); }
+                        break Err("Session closed during plugin discovery".into());
+                    }
+                    Some(command) => queue.push_back(command),
+                    None => break Err("Session closed during plugin discovery".into()),
+                }
+            }
+        };
+        drop(preparing);
+        if let Err(error) = ready {
+            done(Done { result: Err(error), notice: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+            if let Some(watcher) = watcher { watcher.abort(); }
+            shared.jobs.shutdown("plugin discovery ended");
+            shared.web.shutdown();
+            return agent;
+        }
         // What the last runner left queued is taken at once.
         if wake && !agent.session.queued().is_empty() {
             queue.push_back(Command::Message(String::new()));

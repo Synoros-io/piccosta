@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 // The folder in a project that holds its own settings. pi's own `.pi/` is never read: its
 // settings are pi's, and a repo that also uses pi would hand them to piccosta.
 pub const PROJECT_CONFIG_DIR: &str = ".piccosta";
+pub const AGENT_DIR_ENV: &str = "PICCOSTA_AGENT_DIR";
 
 // Defaults from settings-defaults.ts, used when neither settings file sets the key.
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
@@ -32,7 +33,7 @@ const MODEL_THINKING_LEVELS: &str = "modelThinkingLevels";
 // The agent dir: PICCOSTA_AGENT_DIR, else piccosta/agent under data_home (XDG on Unix,
 // roaming AppData on Windows). The environment overrides keep existing installations movable.
 pub fn agent_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PICCOSTA_AGENT_DIR") {
+    if let Some(dir) = std::env::var_os(AGENT_DIR_ENV) {
         return PathBuf::from(dir);
     }
     data_home().join("piccosta").join("agent")

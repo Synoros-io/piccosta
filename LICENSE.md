@@ -112,6 +112,8 @@ piccosta is based on these projects, released under the MIT License:
 - pi-web-access: Copyright (c) 2025 Nico Bailon
 - pi-claude-bridge (https://github.com/elidickinson/pi-claude-bridge): Copyright (c) 2026 Eli Dickinson
 - cc-session-io: Copyright (c) 2024
+- anthropic-quickstarts (https://github.com/anthropics/anthropic-quickstarts): Copyright (c) 2023 Anthropic
+- computer-use-linux and agent-workspace-linux (https://github.com/agent-sh): Copyright (c) 2026 Avi Fenesh
 
 For each of them:
 

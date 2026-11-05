@@ -18,6 +18,8 @@ pub mod mutation;
 pub mod output;
 pub mod pathhint;
 pub mod paths;
+pub mod plugin;
+pub mod plugin_host;
 pub mod read;
 #[cfg(target_os = "linux")]
 pub mod readonly;
@@ -77,10 +79,10 @@ pub struct ToolUpdate {
 }
 
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
     // One line for the system prompt's tool list, and guidelines for its guideline list.
-    fn prompt_snippet(&self) -> Option<&'static str> {
+    fn prompt_snippet(&self) -> Option<&str> {
         None
     }
     fn prompt_guidelines(&self) -> &'static [&'static str] {
@@ -90,6 +92,9 @@ pub trait Tool: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    // A question that always needs this call's yes, even in auto mode. Without a frontend the
+    // call is refused, rather than silently touching something the user hasn't allowed.
+    fn approval(&self, _arguments: &Map<String, Value>) -> Option<String> { None }
     // Repair argument shapes models are known to send, before validation (pi's prepareArguments).
     fn prepare_arguments(&self, arguments: Map<String, Value>) -> Map<String, Value> {
         arguments
@@ -115,6 +120,8 @@ pub struct ToolShared {
     // Whether bash runs in the read-only sandbox: a session for a read-only kind, a read-only job's
     // subagent among them (host.rs).
     pub read_only: bool,
+    // plugins.callTimeoutSeconds; positive seconds capped at plugin::MAX_CALL_WAIT.
+    pub plugin_call_wait: std::time::Duration,
 }
 
 impl ToolShared {
@@ -139,6 +146,7 @@ impl ToolShared {
             bin_dir: agent_dir.join("bin"),
             web: web::WebShared::new(settings.web(), agent_dir, registry, credentials),
             read_only: false,
+            plugin_call_wait: settings.get("plugins.callTimeoutSeconds").and_then(Value::as_u64).filter(|seconds| *seconds > 0).map(std::time::Duration::from_secs).unwrap_or(plugin::CALL_WAIT).min(plugin::MAX_CALL_WAIT),
         }
     }
 }

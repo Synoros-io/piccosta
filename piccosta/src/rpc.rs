@@ -163,11 +163,7 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     // On disk at once: the loop answers get_entries from the file, and T3 Code passes the path to
     // other processes before the first prompt.
     agent.session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
-    if !host.yolo
-        && let Some(gate) = approval_gate(inputs)
-    {
-        agent.set_gate(gate);
-    }
+    agent.set_gate(approval_gate(inputs, host.yolo));
     let reports = inputs.clone();
     let (handle, id, file, name) = (agent.handle(), agent.session.id().to_string(), agent.session.file().map(PathBuf::from), crate::host::name(&agent.session));
     let (memory, model, thinking, auto_compaction) = (agent.session.file().is_none().then(|| agent.session.clone()), agent.model().clone(), agent.thinking_level().to_string(), agent.auto_compaction());
@@ -179,30 +175,26 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     Ok(Live { generation, handle, shared, commands, task, id, file, memory, name, model, thinking, auto_compaction, streaming, compacting, owed, compaction, aborts })
 }
 
-// The approval gate T3 Code's runtime mode asks for, or None in full access (or outside T3 Code).
-fn approval_gate(inputs: &UnboundedSender<Input>) -> Option<Gate> {
-    let mode = std::env::var(RUNTIME_MODE_ENV).ok()?;
-    if mode == "full-access" {
-        return None;
-    }
-    let edits_free = mode == "auto-accept-edits";
+// Ordinary tools follow T3 Code's mode. A plugin's own question still needs this call's yes.
+fn approval_gate(inputs: &UnboundedSender<Input>, yolo: bool) -> Gate {
+    let mode = std::env::var(RUNTIME_MODE_ENV).ok();
+    let full = yolo || mode.as_deref().is_none_or(|mode| mode == "full-access");
+    let edits_free = mode.as_deref() == Some("auto-accept-edits");
     let inputs = inputs.clone();
-    Some(std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>| {
+    std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>, question: Option<String>, read_only: bool| {
         let inputs = inputs.clone();
         Box::pin(async move {
-            if crate::tools::read_only(&name) || (edits_free && matches!(name.as_str(), "edit" | "write")) {
-                return Ok(());
-            }
+            if question.is_none() && (full || read_only || (edits_free && matches!(name.as_str(), "edit" | "write"))) { return Ok(()); }
             let arguments = Value::Object(arguments).to_string();
             let message: String = arguments.chars().take(APPROVAL_ARGUMENT_CHARS).collect();
             let (reply, answer) = tokio::sync::oneshot::channel();
-            let _ = inputs.send(Input::Ask { title: format!("Allow {name}?"), message, reply });
+            let _ = inputs.send(Input::Ask { title: question.unwrap_or_else(|| format!("Allow {name}?")), message, reply });
             match answer.await {
                 Ok(true) => Ok(()),
                 _ => Err(format!("{name} was declined in T3 Code.")),
             }
         })
-    }))
+    })
 }
 
 pub(crate) fn write_line(value: &Value) {
