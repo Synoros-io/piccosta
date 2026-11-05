@@ -78,9 +78,7 @@ pub fn parent_death(command: &mut tokio::process::Command) {
         let parent = std::process::id();
         // SAFETY: raw system calls only in the forked child.
         unsafe { command.pre_exec(move || {
-            // SIGTERM, not SIGKILL: Claude Code flushes its native journal on it, which the
-            // bridge's checkpoint recovers from after a crash.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             if libc::getppid() as u32 != parent { return Err(std::io::Error::other("piccosta ended")); }
             Ok(())
         }); }

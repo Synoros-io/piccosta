@@ -38,8 +38,8 @@ fn context(message: &AssistantMessage) -> u64 {
 // the custom entry's data (written, read, before, cause, detail), or None when the turn read at
 // least half of the context before it, wrote little, or has no turn before. The cause is what
 // changed the request's prefix: a compaction since the turn before, another model, a new system
-// message; on the Claude bridge, a gap past the cache TTL, else the new query it started, with
-// why; else it's unknown.
+// message; on the Claude bridge, a gap longer than a query waits for its next message (the cache
+// had lapsed), else the new query it started, with why; else it's unknown.
 pub fn check(session: &Session, id: &str, bridge: Option<String>) -> Option<Value> {
     let entry = session.entry(id)?;
     let SessionEntry::Message { message: AgentMessage::Assistant(current), .. } = entry else { return None };
@@ -73,7 +73,7 @@ pub fn check(session: &Session, id: &str, bridge: Option<String>) -> Option<Valu
         ("model change", None)
     } else if prompt_changed {
         ("prompt change", None)
-    } else if bridged && gap_ms > crate::provider::claude::cache_ttl().as_millis() as i64 {
+    } else if bridged && gap_ms > crate::provider::claude::hold_time().as_millis() as i64 {
         ("cache expired", Some(format!("idle {} min", gap_ms / 60_000)))
     } else {
         (if bridge.is_some() { "query restart" } else { "unknown" }, bridge)

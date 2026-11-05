@@ -21,13 +21,13 @@ It stores no credentials of its own: it uses each account's existing login, and 
 - **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn, and falls back to plain HTTP streaming when it can't be used.
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
-- **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats.
+- **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats (see [Your own models](#your-own-models)).
 - **New models show up on their own.** piccosta offers what each connected account serves: Codex's own list for your ChatGPT login, the models Claude Code offers your Claude login, opencode-go's `/models`, and `<baseUrl>/models` for a `models.json` provider that names no models. The lists are fetched as piccosta starts and with `/models refresh`; one that can't be fetched keeps the last one, and an account you aren't logged in to offers nothing. What you set for a model goes over what its provider reports, in `models.json`'s `providers.<provider>.modelOverrides.<id>` (pi's format), e.g. `{"contextWindow": 200000, "maxTokens": 8000, "input": ["text"], "thinkingLevelMap": {"medium": "medium"}}`; an object such as `thinkingLevelMap` or `compat` changes only the keys you name. `"serviceTier": "priority"` asks a Codex model for its fast mode (about twice as fast, counted higher against your plan).
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
 ### Model scale
 
-Sliding scale : critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
+Every kind of work has its models: critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
 - piccosta records how much of your Claude, Codex and opencode Go plans is used: as the plans report it with each response, and by asking each one, as its own tools do, when piccosta starts, every 5 minutes (`usage.refreshSeconds` in settings) and after a turn ends. The pane header shows the session's plan (`· 5h 19% · 7d 66%`), and `/usage` every plan with when each window resets. Once one passes 80% of a window (`lowUsagePercent` in `scale.json`), the scale's next picks prefer another plan's model. A session already running stays on its model.
 - The defaults ship with piccosta. Your changes go in one file, `scale.json` in piccosta's folder: `/scale edit` writes all of it there and opens it in your editor, and `/scale <kind> <model[:level]> …` sets one kind's models. A kind you change keeps the rest of its defaults; `"off": true` turns one off.
 - `/scale` shows it all with the plans' usage. `--use <kind>` starts a session on its pick, on the command line, in `/new` and in Ctrl+N's box.
@@ -227,6 +227,28 @@ Zed's model, thinking and mode pickers work. Its Ask, Edits and Auto modes decid
 
 Add `--yolo` to skip permissions.
 
+## Your own models
+
+Any endpoint that speaks OpenAI's chat completions (or the Responses API, Anthropic Messages or Google's generateContent) is added in `models.json` in the agent dir (see Settings below for where that is; create the file if it isn't there):
+
+```json
+{
+  "providers": {
+    "myserver": {
+      "baseUrl": "https://your-host/v1",
+      "api": "openai-completions",
+      "apiKey": "$MYSERVER_API_KEY"
+    }
+  }
+}
+```
+
+- `api`: `openai-completions` for `/v1/chat/completions`; `openai-responses`, `anthropic-messages` or `google-generative-ai` for the others.
+- `apiKey`: the key itself, `$VAR` to read it from the environment, or `!command` to use a command's output (a password manager, say). Leave it out for a local server that takes no key.
+- Without a `models` list, piccosta offers everything `<baseUrl>/models` lists. To name them yourself, or for a server with no `/models`: `"models": [{"id": "my-model", "contextWindow": 128000, "maxTokens": 8192}]`.
+
+The models show up as `myserver/<id>`: pick one with `/model`, or `piccosta -m myserver/my-model`. `/models refresh` fetches the lists again.
+
 ## Settings
 
 piccosta keeps its files in `$PICCOSTA_AGENT_DIR` when it's set, else `$XDG_DATA_HOME/piccosta/agent`, else `~/.local/share/piccosta/agent` on Linux and macOS (XDG layout), or `%APPDATA%/piccosta/agent` on Windows: `settings.json`, `models.json`, `scale.json`, sessions, and the fetched model lists (`models/`). `HOME` remains an override; Windows otherwise uses `USERPROFILE`. Existing `CODEX_HOME` and Claude config overrides still apply.
@@ -243,12 +265,6 @@ A project's `.piccosta/settings.json` is merged over them, except the model list
 - `models.freshSeconds`: a list fetched more recently than this isn't fetched again at start (900);
 - `models.timeoutSeconds`: how long one list may take (10);
 - `models.codexClientVersion`: the Codex version piccosta asks Codex's list as, since the list leaves out models newer than that. Without it, piccosta asks as the Codex CLI last did, else as `codex --version` says.
-
-`claudeBridge.holdSeconds` in the agent dir's settings (overridden by `CLAUDE_BRIDGE_HOLD_SECONDS`)
-keeps a session's Claude Code process waiting after a turn: 300 seconds by default, 0 to end it
-after every turn. Restarted requests are byte-identical; holding saves only startup, measured at
-449 ms to the first token. Assistant and manager sessions hold until closed or piccosta exits,
-regardless of this setting. Closing a session, quitting and `/restart` end held processes.
 
 `web.fetch.maxSizeMB` is the largest page the web tools fetch, a PDF aside (5).
 

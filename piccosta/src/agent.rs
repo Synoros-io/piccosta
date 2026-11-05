@@ -596,10 +596,9 @@ impl Agent {
             if let Some(system) = self.prompt_update() {
                 starting.insert(0, AgentMessage::System(system));
             }
-            let outcome = self.run(std::mem::take(&mut starting)).await;
-            // Saving a response or tool result can fail too. The query still has to end.
-            provider::claude::end_run(&self.session, outcome.is_ok()).await;
-            let outcome = outcome?;
+            let outcome = self.run(std::mem::take(&mut starting)).await?;
+            // The end of a run, which a Claude query still parked on tool calls doesn't outlive.
+            provider::claude::end_run(self.session.id());
             crate::scale::after_turn();
             if outcome.aborted {
                 aborted = true;
@@ -743,7 +742,6 @@ impl Agent {
             if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
                 (self.emit)(&Event::TurnEnd { message: AgentMessage::Assistant(assistant.clone()), tool_results: Vec::new() });
                 let will_retry = self.will_retry(&assistant);
-                provider::claude::end_run(&self.session, false).await;
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry });
                 let aborted = assistant.stop_reason == StopReason::Aborted;
                 let retry = will_retry.then(|| FailedResponse {
@@ -792,7 +790,6 @@ impl Agent {
                 let text = format!("piccosta stopped the run: the same call was made {} times in a row ({}).", self.repeated_call.1, crate::tools::jobs::command_preview(&self.repeated_call.0));
                 let note = CustomMessage { custom_type: LOOP_NOTE_TYPE.into(), content: TextOrBlocks::Text(text), display: true, details: None, timestamp: clock::now_ms() };
                 self.add_message(AgentMessage::Custom(note), &mut new_messages)?;
-                provider::claude::end_run(&self.session, false).await;
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
                 return Ok(RunOutcome { aborted: false, retry: None, last_assistant: Some((assistant, entry_id)) });
             }
@@ -802,7 +799,6 @@ impl Agent {
             // go into the next one.
             let steering = if aborted { Vec::new() } else { self.steering() };
             if aborted || (!has_calls && steering.is_empty()) {
-                provider::claude::end_run(&self.session, !aborted).await;
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
                 return Ok(RunOutcome { aborted, retry: None, last_assistant: Some((assistant, entry_id)) });
             }

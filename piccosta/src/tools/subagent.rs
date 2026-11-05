@@ -157,14 +157,16 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent knows only the task you give it, so include the paths, what you already know and what you want back.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. When the user names a model for the task, pass it as model (provider/id), with thinking if they named a level; otherwise leave both out. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent knows only the task you give it, so include the paths, what you already know and what you want back.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",
                 "required": ["agent", "task"],
                 "properties": {
                     "agent": {"type": "string", "enum": names, "description": "The job"},
-                    "task": {"type": "string", "description": "The task, with everything the subagent needs to do it"}
+                    "task": {"type": "string", "description": "The task, with everything the subagent needs to do it"},
+                    "model": {"type": "string", "description": "provider/id, only when the user named the model; else the job's own"},
+                    "thinking": {"type": "string", "enum": crate::provider::THINKING_LEVELS, "description": "The level, only with a model the user named"}
                 }
             }),
             constrained_sampling: Some(json!({"type": "json_schema", "strict": "prefer"})),
@@ -183,7 +185,16 @@ impl Tool for SubagentTool {
                 let names: Vec<&str> = self.jobs.iter().map(|job| job.name.as_str()).collect();
                 return Err(format!("No subagent job \"{name}\". Jobs: {}", names.join(", ")));
             };
-            let models = self.available(job, context).await?;
+            // The model the user named for this task, else the job's own.
+            let models = match arguments.get("model").and_then(Value::as_str).filter(|model| !model.is_empty()) {
+                Some(named) => {
+                    let registry = ModelRegistry::load(&self.agent_dir.join("models.json"))?;
+                    let model = registry.resolve(named).map_err(|_| format!("No connected account serves the model \"{named}\"; /model lists the ones that are"))?;
+                    let level = arguments.get("thinking").and_then(Value::as_str).map_or(String::new(), |level| format!(":{level}"));
+                    (vec![format!("{}/{}{level}", model.provider, model.id)], Vec::new())
+                }
+                None => self.available(job, context).await?,
+            };
             // Straight to the background: a subagent runs for minutes, and the session stays free
             // to answer meanwhile; its answer comes back as the job's message.
             super::bash::run_in_background(self.command(job, task, models, context)?, context).await

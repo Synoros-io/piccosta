@@ -8,9 +8,11 @@
 // Code's tools/call requests.
 //
 // One live query per pi session. A turn that ends on tool calls parks the query: Claude Code waits
-// inside tools/call. An answer holds it until the next turn or idle expiry; an interrupt closes
-// it, keeping its records to resume with the same cached prefix (history.rs). A one-off summary
-// (compaction's) is a query of its own that ends with its turn.
+// inside tools/call. A turn that ends with an answer leaves it waiting for the next message, for
+// as long as its prompt cache lives. The next call either delivers exactly those results (or that
+// message) to it, or discards it and starts a new one from a session file holding exactly pi's
+// context (history.rs says how). A one-off summary (compaction's) is a query of its own that ends
+// with its turn.
 //
 // Based on piccosta's TypeScript bridge, itself built on pi-claude-bridge (MIT, Eli Dickinson,
 // see LICENSE.md), without the Agent SDK: the parts of its control protocol the
@@ -33,10 +35,13 @@
 //                                  CLAUDE_CONFIG_DIR, and where their session files go); one with no
 //                                  account record keeps the account's email out of the prompt, and
 //                                  then needs CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
-//   CLAUDE_BRIDGE_HOLD_SECONDS, holdSeconds   idle hold (300 s); 0 closes after each turn;
-//                                  assistants and managers hold until their session closes
 //   CLAUDE_BRIDGE_KEEP_SESSIONS, keepSessions   off: don't keep Claude Code's records between
 //                                  queries (history.rs)
+//   CLAUDE_BRIDGE_HOLD_SECONDS, holdSeconds     how long a query whose turn is over waits for the
+//                                  next message (default the login's cache life, hold_time; 0 ends
+//                                  it with each turn)
+//   CLAUDE_BRIDGE_HOLD_MAX, holdMax         how many such queries may wait at once in this piccosta
+//                                  process (default HOLD_MAX); past it the longest idle one closes
 //   CLAUDE_BRIDGE_STRICT_MCP, strictMcp     off: let Claude Code load MCP servers from
 //                                  ~/.claude.json and .mcp.json
 //   CLAUDE_BRIDGE_ONE_M, oneM; CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE, longContextExtraUsage;
@@ -45,7 +50,7 @@
 //   CLAUDE_BRIDGE_NO_THINKING_OFF, noThinkingOff   models that can't turn thinking off
 //   CLAUDE_BRIDGE_DEBUG_PATH, debugPath     append a debug log here
 //   CLAUDE_BRIDGE_RECORD_STREAM, recordStream   append every line Claude Code writes here
-// The plan (Max opens 1M on opus-4-6) and whether the login is an API key (the cache TTL) come
+// The plan (Max opens 1M on opus-4-6) and whether the login is an API key (the hold time) come
 // from Claude Code itself: `claude auth status --json`, asked once per process (AUTH), given
 // PROBE_DEADLINE like `claude --version`.
 
@@ -81,6 +86,8 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
 // store, read in the binary; 2.1.316 against a stand-in API: a 51,341-character result arrives whole).
 // Past the ceiling the model gets a 2,000-character preview and a path to the rest.
 const MCP_RESULT_MAX_CHARS: u64 = 500_000;
+// The file a resumed query reads pi's prompt from, in the session's own dir (deleted with it).
+const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
 // The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan by
 // 2026-11-02; a newer model serves 200K until it's measured and added to `claudeBridge.oneM`). An
 // unentitled [1m] fails every turn, so the default is the bare id at 200K.
@@ -119,13 +126,21 @@ const CHILD_ENV: [(&str, &str); 10] = [("ENABLE_CLAUDEAI_MCP_SERVERS", "0"), ("D
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"), ("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off"), ("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1"),
     ("ENABLE_TOOL_SEARCH", "false"), ("MAX_MCP_OUTPUT_TOKENS", "250000"), ("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", "1000000"),
     ("CLAUDE_CODE_MAX_RETRIES", "0"), ("DISABLE_GROWTHBOOK", "1")];
+// Claude Code resuming a transcript that ends at a user record (tool results, maybe a message
+// after them) takes that turn as owed and answers it at once, with the results and any message in
+// one user turn. Without these it writes "No response requested." as the model's reply there,
+// which the model then reads as its own and copies. Its own default age limit for that (an hour)
+// is lifted, since a resumed history can be days old; the continue note is what it adds when the
+// turn ends at tool results alone. Found in Claude Code 2.1.316's resume code, and checked against
+// a stand-in model: one request, no notice.
+const RESUME_ENV: [(&str, &str); 3] = [("CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "1"), ("CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS", "315360000000"), ("CLAUDE_CODE_RESUME_PROMPT", history::CONTINUE_NOTE)];
 // What a parent Claude Code session sets for the processes under it (what `env` showed inside a
 // Claude Code Bash call, 2026-10-15, plus the two 2.1.312 sets on 2026-10-29). Left in, the child
 // would act as part of that session. NODE_OPTIONS and DEBUG go too, as the SDK removed them.
-const PARENT_ENV: [&str; 19] = ["CLAUDECODE", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_CHILD_SESSION",
+const PARENT_ENV: [&str; 18] = ["CLAUDECODE", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
     "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_PID", "CLAUDE_PLUGIN_DATA", "CODEX_COMPANION_SESSION_ID",
-    "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "NODE_OPTIONS", "DEBUG"];
+    "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS", "NODE_OPTIONS", "DEBUG"];
 // The settings file every provider child gets: no auto-memory, no CLAUDE.md or AGENTS.md (pi
 // owns context files), no git status block (a git change would rewrite it and bust the cache), no
 // hooks (they cost seconds and tokens per query, and an opened repo's would run untrusted).
@@ -139,20 +154,24 @@ const FALLBACK_SETTLE: Duration = Duration::from_millis(100);
 // Closing a child: stdin ends, then SIGTERM after 2 s, then SIGKILL after 5 more (the SDK's close).
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const TERM_GRACE: Duration = Duration::from_secs(5);
-// Restarted requests are byte-identical; holding saves only startup (+449 ms to the first token,
-// measured 2026-11-04). Keep it while the user replies, not after minutes away.
-const DEFAULT_HOLD_SECONDS: u64 = 300;
 // The longest shutdown waits for the queries' tasks to close their children that way.
 const SHUTDOWN_WAIT: Duration = CLOSE_GRACE.saturating_add(TERM_GRACE).saturating_add(CLOSE_GRACE);
-// The cache monitor's expiry window. Claude Code 2.1.316 asks for a
+// How long a query that answered stays open for the next message: the life of the prompt cache it
+// wrote, past which a new query costs no more than this one would. Claude Code 2.1.316 asks for a
 // 1 h cache on a subscription (ttl "1h", reason "subscriber", read in the binary) and 5 min with
 // an API key; every cache write in 30 h of real claude-bridge sessions (2026-11-02) was a 1 h one.
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const API_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-// The last Claude Code release the bridge was checked against: CHILD_ENV and
+// How many answered queries may wait at once. Each is an idle Claude Code process of about 200 MB
+// RSS (2.1.316, measured 2026-11-02), so four is under 1 GB: enough to keep the caches of the few
+// sessions one person switches between warm, small enough not to matter on an ordinary laptop. A
+// machine with more to spare raises it. Counted in this piccosta process only: another piccosta's
+// waiting queries are its own.
+const HOLD_MAX: usize = 4;
+// The last Claude Code release the bridge was checked against: CHILD_ENV, RESUME_ENV and
 // MCP_RESULT_MAX_CHARS were read in this binary. A newer one gets a notice, since any of them
 // could have been renamed.
-const VERIFIED_VERSION: &str = "2.1.318";
+const VERIFIED_VERSION: &str = "2.1.316";
 // How much of a child's stderr is kept for a failure message: its last lines, where a refused
 // option or a failed login is reported, without carrying a long log into the session.
 const STDERR_TAIL: usize = 4096;
@@ -173,7 +192,9 @@ pub struct Settings {
     pub claude: String,
     pub config_dir: Option<PathBuf>,
     keep: bool,
-    hold: Duration,
+    // None: the login's cache life (hold_time).
+    hold: Option<Duration>,
+    hold_max: usize,
     strict_mcp: bool,
     one_m: Vec<String>,
     no_thinking_off: Vec<String>,
@@ -206,11 +227,15 @@ pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
     });
     let list = |name: &str, key: &str, default: &[&str]| setting(name, key)
         .map_or_else(|| default.iter().map(|id| id.to_string()).collect(), |ids| ids.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect());
+    // No room for a waiting query is the same as no wait: each query ends with its turn.
+    let hold_max = setting("HOLD_MAX", "holdMax").and_then(|count| count.parse().ok()).unwrap_or(HOLD_MAX);
+    let hold = setting("HOLD_SECONDS", "holdSeconds").and_then(|seconds| seconds.parse().ok()).map(Duration::from_secs);
     Settings {
         claude: setting("CLAUDE_PATH", "claudePath").unwrap_or_else(|| "claude".into()),
         config_dir: setting("CONFIG_DIR", "configDir").map(PathBuf::from),
         keep: setting("KEEP_SESSIONS", "keepSessions").is_none_or(|keep| is_on(&keep)),
-        hold: Duration::from_secs(setting("HOLD_SECONDS", "holdSeconds").and_then(|seconds| seconds.parse().ok()).unwrap_or(DEFAULT_HOLD_SECONDS)),
+        hold: if hold_max == 0 { Some(Duration::ZERO) } else { hold },
+        hold_max,
         strict_mcp: setting("STRICT_MCP", "strictMcp").is_none_or(|strict| is_on(&strict)),
         one_m: list("ONE_M", "oneM", &MEASURED_ONE_M),
         no_thinking_off: list("NO_THINKING_OFF", "noThinkingOff", &NO_THINKING_OFF),
@@ -315,9 +340,11 @@ pub fn debug(line: &str) {
     }
 }
 
-// The life of the cache Claude Code asks for: 5 minutes on an API key, an hour on a subscription.
-pub fn cache_ttl() -> Duration {
-    if AUTH.as_ref().is_some_and(|auth| auth["authMethod"] == "api_key") { API_KEY_CACHE_TTL } else { CACHE_TTL }
+// How long an answered query waits for the next message, also for the cache monitor: a miss after
+// a longer gap is one the cache had already lapsed for. Unset, it's the life of the cache Claude
+// Code asks for: 5 minutes on an API key, an hour on a subscription.
+pub fn hold_time() -> Duration {
+    SETTINGS.hold.unwrap_or_else(|| if AUTH.as_ref().is_some_and(|auth| auth["authMethod"] == "api_key") { API_KEY_CACHE_TTL } else { CACHE_TTL })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -397,8 +424,14 @@ async fn ask_alone(subtype: &str) -> Result<Value, String> {
     answer.map_err(|_| format!("Claude Code didn't answer {subtype}"))?.ok_or_else(|| format!("Claude Code ended before answering {subtype}"))
 }
 
-// Ask Claude Code how much of the plan is used (get_usage, no model request).
+// Ask Claude Code how much of the plan is used (get_usage, a query that asks no model): through a
+// waiting query when there is one, whose answer is noted when it comes (Query::line), else through a
+// Claude Code started for it (1.3 s, 2026-11-03).
 pub async fn ask_usage() -> Result<(), String> {
+    let waiting = lock(&LIVE).values().find(|live| lock(&live.state).waiting).map(|live| live.commands.clone());
+    if let Some(commands) = waiting {
+        return commands.send(Command::Usage).map_err(|_| "the waiting query ended".to_string());
+    }
     note_usage(&ask_alone("get_usage").await?["response"]["response"]);
     Ok(())
 }
@@ -472,9 +505,8 @@ fn effort(model: &Model, level: &str) -> Option<String> {
 
 struct Child {
     process: tokio::process::Child,
+    #[cfg(not(target_os = "linux"))]
     pid: u32,
-    // Its start time, so its group is signalled only while it's still its own (proc::group_held).
-    start: Option<u64>,
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
     // The last STDERR_TAIL bytes of its stderr, and the task keeping them, stopped by stderr_tail or
@@ -483,7 +515,7 @@ struct Child {
     stderr_reader: Option<tokio::task::JoinHandle<()>>,
 }
 
-fn spawn(args: &[String], cwd: &str) -> Result<Child, String> {
+fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String> {
     version();
     let mut command = tokio::process::Command::from(claude_command());
     command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -491,18 +523,20 @@ fn spawn(args: &[String], cwd: &str) -> Result<Child, String> {
         command.env_remove(name);
     }
     command.envs(CHILD_ENV);
+    if resumes_turn {
+        command.envs(RESUME_ENV);
+    }
     debug(&format!("spawn: {} {}", SETTINGS.claude, args.join(" ")));
     start(command)
 }
 
-// Start a claude. Dropping its Child kills it. If piccosta itself dies, SIGTERM lets Claude
-// Code flush its buffered native journal, which the pre-query checkpoint points at for recovery.
-// Its own group is also watched by the reaper, which escalates if SIGTERM can't reach a wedged
-// child. Normal shutdown gives every query its bounded close before the spawning thread ends.
+// Start a claude. It ends when its Child is dropped (kill_on_drop), and with this piccosta
+// however that ends: the kernel sends it SIGKILL as the thread that started it ends (bash.rs spawn
+// says when that is), which is after every query has had its chance to close it (shutdown).
 fn start(mut command: tokio::process::Command) -> Result<Child, String> {
-    crate::proc::group(&mut command);
     crate::proc::parent_death(&mut command);
     let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
+    #[cfg(not(target_os = "linux"))]
     let pid = {
         let pid = process.id().ok_or("Claude Code exited before assignment")?;
         crate::proc::attach(pid).map_err(|error| format!("Claude Code job: {error}"))?;
@@ -523,18 +557,22 @@ fn start(mut command: tokio::process::Command) -> Result<Child, String> {
             }
         })
     });
-    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), stderr, stderr_reader, pid, start: crate::proc::start(pid as i32) })
+    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), stderr, stderr_reader,
+        #[cfg(not(target_os = "linux"))]
+        pid,
+    })
 }
 
 // However a child ends, its stderr reader goes when it's dropped (kill_on_drop stops one still
 // running then).
 impl Drop for Child {
     fn drop(&mut self) {
-        if crate::proc::group_held(self.pid, self.start) {
-            crate::proc::kill_group(self.pid, crate::proc::KILL);
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::proc::signal_group(self.pid, crate::proc::KILL);
+            crate::proc::release(self.pid);
+            crate::tools::reaper::track(self.pid, false);
         }
-        crate::proc::release(self.pid);
-        crate::tools::reaper::track(self.pid, false);
         if let Some(reader) = &self.stderr_reader {
             reader.abort();
         }
@@ -612,6 +650,9 @@ pub async fn shutdown() {
         tokio::time::sleep(SHUTDOWN_POLL).await;
     }
 }
+
+// How a waiting query's get_usage request id begins, so its answer is told from the session's own.
+const USAGE_REQUEST: &str = "usage-";
 
 fn request_id() -> String {
     Uuid::new_v4().simple().to_string()[..13].to_string()
@@ -770,6 +811,11 @@ struct State {
     shape: Shape,
     prints: Vec<String>,
     pending: Option<Vec<String>>,
+    // Its turn is over, stopped mid-answer (pi's abort) or answered, and it waits, as Claude Code
+    // does at its prompt, for the next message, which goes into this same query (interrupt, hold),
+    // since when (for the cap on waiting queries).
+    waiting: bool,
+    idle_since: Instant,
     kept_base: (Vec<String>, Vec<String>),
 }
 
@@ -781,9 +827,12 @@ struct Live {
 
 enum Command {
     // The call's tool results (id, MCP result) and its stream.
-    Deliver(Vec<(String, Value)>, Option<Vec<Value>>, Turn),
+    Deliver(Vec<(String, Value)>, Turn),
+    // The next message for a waiting query, and its stream.
+    Prompt(Vec<Value>, Turn),
     Discard(String),
-    EndRun(Option<Duration>, oneshot::Sender<()>),
+    // Ask Claude Code for the plan's usage (ask_usage).
+    Usage,
 }
 
 // One provider call's stream: where its events go, the message it ends with, and its abort.
@@ -823,21 +872,47 @@ fn discard(key: &str, reason: &str) {
     }
 }
 
-// A clean answer may wait for the next run. Errors and unfinished tool calls close; managers
-// already carry their role in the session, and hold for the lifetime of their runtime.
-pub async fn end_run(session: &crate::session::Session, keep: bool) {
-    let commands = lock(&LIVE).get(session.id()).map(|live| live.commands.clone());
-    if let Some(commands) = commands {
-        let hold = if !keep { Some(Duration::ZERO) } else if crate::manager::role(session).is_some() { None } else { Some(SETTINGS.hold) };
-        let (done, ended) = oneshot::channel();
-        let _ = commands.send(Command::EndRun(hold, done));
-        let _ = ended.await;
+// The end of one of pi's runs. A query still live here is parked on calls pi won't answer (a tool
+// ended the run), and would hold its child forever; the next call, if any, rewrites. A waiting
+// query (it answered, or was stopped mid-answer) stays: the next message goes into it, and it ends
+// when its cache would have lapsed, its session closes (close) or piccosta exits (shutdown).
+pub fn end_run(session_id: &str) {
+    end_query(session_id, "pi's run ended with the query still live", true);
+}
+
+// A pi session closed, deleted or replaced: its query, waiting or not, ends now rather than when
+// its cache lapses.
+pub fn close(session_id: &str) {
+    end_query(session_id, "the session was closed", false);
+}
+
+// Let go of the session's query, unless it waits and `keep_waiting` says to leave it.
+fn end_query(session_id: &str, reason: &str, keep_waiting: bool) {
+    let mut all = lock(&LIVE);
+    if keep_waiting && all.get(session_id).is_some_and(|live| lock(&live.state).waiting) {
+        return;
+    }
+    if let Some(live) = all.remove(session_id) {
+        let_go(live, reason);
     }
 }
 
-pub fn close(session_id: &str) {
-    discard(session_id, "the session was closed");
-    history::detach(session_id);
+// Keep the waiting queries within CLAUDE_BRIDGE_HOLD_MAX, `key`'s own query counted as one of
+// them: a new query is about to start for it, or its query just started waiting. The longest idle
+// of the others close first.
+fn make_room(key: &str) {
+    let mut all = lock(&LIVE);
+    let mut waiting: Vec<(Instant, String)> = all.iter().filter(|(other, _)| *other != key).filter_map(|(other, live)| {
+        let state = lock(&live.state);
+        state.waiting.then(|| (state.idle_since, other.clone()))
+    }).collect();
+    waiting.sort();
+    let over = (waiting.len() + 1).saturating_sub(SETTINGS.hold_max);
+    for (_, other) in waiting.into_iter().take(over) {
+        if let Some(live) = all.remove(&other) {
+            let_go(live, &format!("more than {} queries waiting (claudeBridge.holdMax)", SETTINGS.hold_max));
+        }
+    }
 }
 
 // --- One provider call ---
@@ -858,7 +933,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let cwd = request.cwd.to_string_lossy().into_owned();
     let (key, one_shot) = (request.session_id.unwrap_or("(none)").to_string(), !request.cache);
     if !one_shot {
-        history::attach(&key, request.session_file, &messages);
+        history::attach(&key, request.session_file);
         lock(&REWRITES).remove(&key);
     }
     let shape = history::shape(&system_prompt, &tools, &cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
@@ -925,8 +1000,8 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
     out
 }
 
-// Hand tool results or a new user turn to the held query when the sync check allows it. Output:
-// Ok once sent (the next turn streams into `turn`), else the rewrite reason and the turn back; the
+// Hand this call's tool results to the parked query when the sync check allows it. Output: Ok once
+// they're sent (the next turn streams into `turn`), else the rewrite reason and the turn back; the
 // live query, if any, is discarded then.
 fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
     let mut live = lock(&LIVE);
@@ -944,29 +1019,37 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fo
         }
     };
     let Some(entry) = live.get(key) else { return Err(("no live query for this session".into(), turn)) };
+    // A waiting query takes the user messages that came after its turn as its next message; a
+    // parked one, the results of the calls it's parked on.
     let mut state = lock(&entry.state);
-    let results = messages[start..].iter().filter_map(|message| match message {
-        Message::ToolResult(result) => {
-            let mut content: Vec<Value> = result.content.iter().filter_map(|block| match block {
-                Content::Text { text, .. } if !text.is_empty() => Some(json!({"type": "text", "text": text})),
-                Content::Image { data, mime_type } if !data.is_empty() && !mime_type.is_empty() => Some(json!({"type": "image", "data": data, "mimeType": mime_type})),
-                _ => None,
-            }).collect();
-            if content.is_empty() {
-                content.push(json!({"type": "text", "text": if result.is_error { history::EMPTY_ERROR_RESULT } else { "" }}));
+    let command = if state.waiting {
+        let content = messages[start..].iter().filter_map(|message| match message {
+            Message::User(user) => Some(history::anthropic_blocks(&user.content.clone().into_blocks())),
+            _ => None,
+        }).flatten().collect();
+        debug(&format!("sync: the waiting query takes the next message (session {key}, {} messages)", prints.len()));
+        Command::Prompt(content, turn)
+    } else {
+        let results = messages[start..].iter().filter_map(|message| match message {
+            Message::ToolResult(result) => {
+                let mut content: Vec<Value> = result.content.iter().filter_map(|block| match block {
+                    Content::Text { text, .. } if !text.is_empty() => Some(json!({"type": "text", "text": text})),
+                    Content::Image { data, mime_type } if !data.is_empty() && !mime_type.is_empty() => Some(json!({"type": "image", "data": data, "mimeType": mime_type})),
+                    _ => None,
+                }).collect();
+                if content.is_empty() {
+                    content.push(json!({"type": "text", "text": if result.is_error { history::EMPTY_ERROR_RESULT } else { "" }}));
+                }
+                Some((result.tool_call_id.clone(), json!({"content": content, "isError": result.is_error})))
             }
-            Some((result.tool_call_id.clone(), json!({"content": content, "isError": result.is_error})))
-        }
-        _ => None,
-    }).collect();
-    let prompt = state.pending.is_none().then(|| messages[start..].iter().flat_map(|message| match message {
-        Message::User(user) => history::anthropic_blocks(&user.content.clone().into_blocks()),
-        _ => Vec::new(),
-    }).collect());
-    debug(&format!("sync: deliver to the held query (session {key}, {} messages)", prints.len()));
-    (state.prints, state.pending, state.kept_base) = (prints.to_vec(), None, kept_base(messages));
+            _ => None,
+        }).collect();
+        debug(&format!("sync: deliver to the parked query (session {key}, {} messages)", prints.len()));
+        Command::Deliver(results, turn)
+    };
+    (state.prints, state.pending, state.waiting, state.kept_base) = (prints.to_vec(), None, false, kept_base(messages));
     drop(state);
-    let Err(mpsc::error::SendError(Command::Deliver(_, _, turn))) = entry.commands.send(Command::Deliver(results, prompt, turn)) else { return Ok(()) };
+    let Err(mpsc::error::SendError(Command::Prompt(_, turn) | Command::Deliver(_, turn))) = entry.commands.send(command) else { return Ok(()) };
     live.remove(key);
     Err(("the query is gone".into(), turn))
 }
@@ -983,16 +1066,21 @@ struct Start<'a> {
     prints: &'a [String],
     shape: &'a Shape,
     cwd: &'a str,
-    // A summary keeps no records and takes no tools.
+    // A summary's: it ends with its turn, keeps no records, takes no tools and leaves the waiting
+    // queries alone.
     one_shot: bool,
 }
 
 // Start a query holding exactly pi's context: the history in a fresh session file it resumes, the
-// trailing user turn as its opening prompt. A history ending at tool results or an interrupt
-// gets an invisible terminal boundary (history::write_session), so initialize always goes first.
+// trailing user turn as its opening prompt; or, when the turn starts at tool results, all of it in
+// the history, for Claude Code to answer on resume.
 fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     let visible: Vec<Message> = start.messages.iter().filter(history::visible).cloned().collect();
-    let (history_end, prompt, continued) = history::split(start.key, &visible);
+    let (history_end, prompt, continued) = history::split(&visible);
+    // A context whose last turn starts at tool results goes into the history whole, and Claude Code
+    // answers it on resume (RESUME_ENV), rather than ending the history at the results.
+    let resumes_turn = history_end > 0 && matches!(visible[history_end - 1], Message::ToolResult(_));
+    let history_end = if resumes_turn { visible.len() } else { history_end };
     let project_path = history::real_or(start.cwd);
     let written = if history_end > 0 {
         let history = &visible[..history_end];
@@ -1003,17 +1091,13 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     } else {
         None
     };
-    if continued {
+    if resumes_turn {
+        debug("start: the turn starts at tool results; Claude Code answers it on resume");
+    } else if continued {
         debug("start: context ends at an assistant message, opening with the continue note");
     }
     let mut args = base_args(start.thinking_off, start.effort);
-    let cc_session = written.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-    args.push(if written.is_some() { format!("--resume={cc_session}") } else { format!("--session-id={cc_session}") });
-    let base = kept_base(&visible);
-    if !start.one_shot {
-        history::checkpoint(start.key, &cc_session, &project_path, start.shape, &base.0, &base.1)
-            .map_err(|error| format!("Could not checkpoint Claude Code's active session: {error}"))?;
-    }
+    args.extend(written.iter().map(|id| format!("--resume={id}")));
     args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--model", start.cli_model,
         "--disable-slash-commands"].map(String::from));
     if SETTINGS.strict_mcp || start.one_shot {
@@ -1024,18 +1108,37 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         args.extend(["--thinking-display", "summarized"].map(String::from));
     }
     args.extend(["--settings", PROVIDER_SETTINGS].map(String::from));
-    let child = spawn(&args, start.cwd).inspect_err(|_| {
+    // A turn Claude Code answers on resume runs before the initialize request's prompt applies, so
+    // without this it goes out with Claude Code's own system prompt: none of pi's, no AGENTS.md, a
+    // prompt cache miss on everything, and the model told it may answer "No response requested."
+    // (2.1.316 against a stand-in API). It goes in a file, since a prompt of 128 KiB or more can't
+    // be one argument (Linux's MAX_ARG_STRLEN).
+    if let Some(id) = written.as_ref().filter(|_| resumes_turn) {
+        let dir = history::session_path(id, &project_path).with_extension("");
+        let file = dir.join(SYSTEM_PROMPT_FILE);
+        if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, start.system_prompt)) {
+            history::delete_session(id, &project_path);
+            return Err(format!("Could not write the prompt for Claude Code: {error}"));
+        }
+        args.extend(["--system-prompt-file".to_string(), file.to_string_lossy().into_owned()]);
+    }
+    if !start.one_shot {
+        make_room(start.key);
+    }
+    let child = spawn(&args, start.cwd, resumes_turn).inspect_err(|_| {
         if let Some(id) = &written {
             history::delete_session(id, &project_path);
         }
     })?;
-    let opening = vec![initialize(start.system_prompt, start.tools),
-        json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null})];
-    let state = Arc::new(Mutex::new(State { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None, kept_base: base }));
+    let mut opening = vec![initialize(start.system_prompt, start.tools)];
+    if !resumes_turn {
+        opening.push(json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null}));
+    }
+    let state = Arc::new(Mutex::new(State { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None, waiting: false,
+        idle_since: Instant::now(), kept_base: kept_base(&visible) }));
     let (commands, inbox) = mpsc::unbounded_channel();
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
     let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
-    query.cc_session = Some(cc_session);
     query.one_shot = start.one_shot;
     query.turn = Some(turn);
     lock(&LIVE).insert(start.key.to_string(), Live { id, state, commands });
@@ -1057,10 +1160,10 @@ enum Wake {
     Line(Option<String>),
     Command(Option<Command>),
     Idle,
-    Expire,
     Settle,
     Lost,
     Abort,
+    Lapsed,
 }
 
 // Everything a query's task holds. Per turn: the message being built (`out`) with, per content
@@ -1105,15 +1208,17 @@ struct Query {
     queued: HashMap<String, Value>,
     settle_at: Option<Instant>,
     last_activity: Instant,
-    hold_until: Option<Instant>,
     rejection: Option<Value>,
     failure: Option<String>,
     result_seen: bool,
     closed: bool,
     one_shot: bool,
-    // Ignore the stopped stream while Claude Code flushes its records and ends.
+    // An interrupt was sent and its turn hasn't ended yet; and the next message, held back until it
+    // has, so nothing more of the stopped answer goes into the next one's turn.
     interrupting: bool,
-    ended: Option<oneshot::Sender<()>>,
+    next_prompt: Option<Vec<Value>>,
+    // When a waiting query's prompt cache lapses and it ends.
+    hold_until: Option<Instant>,
     // Claude Code's running total of what this query cost (total_cost_usd, in dollars) at its last
     // result, and at this turn's, if it had one.
     cost_seen: f64,
@@ -1131,7 +1236,7 @@ impl Query {
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
-            settle_at: None, last_activity: Instant::now(), hold_until: None, rejection: None, failure: None, result_seen: false, closed: false, one_shot: false, interrupting: false, ended: None, cost_seen: 0.0, result_cost: None, pending_turns: 0 }
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, one_shot: false, interrupting: false, next_prompt: None, hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0 }
     }
 
     async fn run(mut self, opening: Vec<Value>) {
@@ -1148,47 +1253,26 @@ impl Query {
                 line = self.child.lines.next_line() => Wake::Line(line.ok().flatten()),
                 command = self.inbox.recv() => Wake::Command(command),
                 () = sleep_until(self.last_activity + BODY_IDLE_TIMEOUT), if streaming => Wake::Idle,
-                () = sleep_until(self.hold_until.unwrap_or(far)), if self.hold_until.is_some() => Wake::Expire,
                 () = sleep_until(self.settle_at.unwrap_or(far)), if self.settle_at.is_some() => Wake::Settle,
                 () = sleep_until(lost.unwrap_or(far)), if lost.is_some() => Wake::Lost,
-                () = cancel.cancelled(), if streaming && !self.interrupting => Wake::Abort,
+                () = cancel.cancelled(), if streaming => Wake::Abort,
+                () = sleep_until(self.hold_until.unwrap_or(far)), if self.hold_until.is_some() => Wake::Lapsed,
             };
             match wake {
                 Wake::Line(Some(line)) => self.line(&line).await,
                 Wake::Line(None) => break,
-                Wake::Command(Some(Command::Deliver(results, prompt, turn))) => self.deliver(results, prompt, turn).await,
+                Wake::Command(Some(Command::Deliver(results, turn))) => self.deliver(results, turn).await,
+                Wake::Command(Some(Command::Prompt(content, turn))) => self.prompt(content, turn).await,
                 Wake::Command(Some(Command::Discard(reason))) => self.discard(&reason).await,
-                Wake::Command(Some(Command::EndRun(hold, done))) => {
-                    if self.result_seen && self.turn.is_none() && hold != Some(Duration::ZERO) {
-                        self.hold_until = hold.and_then(|hold| Instant::now().checked_add(hold));
-                        let _ = done.send(());
-                    } else {
-                        self.ended = Some(done);
-                        self.discard("pi's run ended with the query still live").await;
-                    }
-                }
+                Wake::Command(Some(Command::Usage)) => self.child.send(&json!({"type": "control_request", "request_id": format!("{USAGE_REQUEST}{}", request_id()), "request": {"subtype": "get_usage"}})).await,
                 Wake::Command(None) => self.discard("the bridge let go of it").await,
                 Wake::Idle => self.idle().await,
-                Wake::Expire => {
-                    debug(&format!("hold expired: session {}", self.key));
-                    break;
-                }
                 Wake::Settle => self.end_turn_on_tool_use(),
                 Wake::Lost => self.check_lost().await,
                 Wake::Abort => self.interrupt().await,
-            }
-            if self.result_seen {
-                if self.interrupting || self.one_shot || self.failure.is_some() {
-                    break;
-                }
-                if self.turn.is_some() {
-                    self.keep_records();
-                    lock(&self.state).prints.push(fingerprint(&Message::Assistant(self.out.clone())));
-                    self.reply();
-                }
+                Wake::Lapsed => self.discard("its prompt cache has lapsed").await,
             }
         }
-        self.forget();
         self.finish().await;
         QUERIES.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1339,33 +1423,60 @@ impl Query {
         self.child.send(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"mcp_response": rpc}}})).await;
     }
 
-    // An interrupt's records include completed blocks and Claude Code's interrupt note, which pi
-    // doesn't show. Let Claude Code flush them before replying, so the next call can resume the
-    // same bytes even when it arrives at once or piccosta restarts.
+    // pi's abort: stop the answer and keep the query, as Claude Code does on Esc. pi gets the
+    // stopped answer (and drops it from its context); Claude Code ends the turn and waits, and the
+    // user's next message goes into this query (decide), so the next request is the last one's
+    // context, unchanged, plus that message, and the prompt cache holds. Starting a new query here
+    // instead rebuilt the whole conversation and wrote all of it to the cache again.
     async fn interrupt(&mut self) {
-        debug(&format!("interrupt: saving the stopped turn for session {}", self.key));
-        (self.settle_at, self.interrupting) = (None, true);
-        self.out.stop_reason = StopReason::Aborted;
-        self.out.error_message.get_or_insert_with(|| "Operation aborted".to_string());
+        debug(&format!("interrupt: session {}", self.key));
+        // A summary stopped is over, as nothing comes after it. And a message still held back
+        // behind an earlier interrupt never reached Claude Code, which would then hold less than pi
+        // (pi keeps the message). Either way the query ends, and a next turn rewrites.
+        if self.one_shot || self.next_prompt.is_some() {
+            self.end_open(StopReason::Aborted, "Operation aborted");
+            return self.discard(if self.one_shot { "the summary was stopped" } else { "stopped before its message went in" }).await;
+        }
+        // It waits from now, not from the stopped turn's result, which can come after the next
+        // message has already started a turn. And it's marked waiting before pi gets the stopped
+        // answer: pi's run then ends at once, and end_run lets go of a query that isn't waiting.
+        (self.settle_at, self.interrupting, self.hold_until) = (None, true, Some(Instant::now() + hold_time()));
+        {
+            let mut state = lock(&self.state);
+            state.pending = None;
+            state.waiting = true;
+            state.idle_since = Instant::now();
+        }
+        make_room(&self.key);
+        if let Some(turn) = self.turn.take() {
+            self.out.stop_reason = StopReason::Aborted;
+            self.out.error_message.get_or_insert_with(|| "Operation aborted".to_string());
+            self.hand_pending(turn);
+        }
         self.child.send(&json!({"type": "control_request", "request_id": request_id(), "request": {"subtype": "interrupt"}})).await;
     }
 
-    async fn deliver(&mut self, results: Vec<(String, Value)>, prompt: Option<Vec<Value>>, turn: Turn) {
-        self.hold_until = None;
+    // The next message for a waiting query, as a new turn of it. Its stream opens now; the message
+    // goes in once a stopped answer before it has ended (send_next).
+    async fn prompt(&mut self, content: Vec<Value>, turn: Turn) {
+        (self.turn, self.hold_until, self.next_prompt) = (Some(turn), None, Some(content));
+        self.reset_turn();
+        self.last_activity = Instant::now();
+        self.send_next().await;
+    }
+
+    async fn send_next(&mut self) {
+        if !self.interrupting
+            && let Some(content) = self.next_prompt.take()
+        {
+            self.child.send(&json!({"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": null})).await;
+        }
+    }
+
+    async fn deliver(&mut self, results: Vec<(String, Value)>, turn: Turn) {
         self.turn = Some(turn);
         self.reset_turn();
         self.last_activity = Instant::now();
-        // A crash after a tool result must not replay the earlier part of this same query.
-        if let Some(id) = &self.cc_session {
-            let state = lock(&self.state);
-            if let Err(error) = history::checkpoint(&self.key, id, &self.project_path, &self.shape, &state.kept_base.0, &state.kept_base.1) {
-                self.failure = Some(format!("Could not checkpoint Claude Code's active session: {error}"));
-                return;
-            }
-        }
-        if let Some(prompt) = prompt {
-            self.child.send(&json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null})).await;
-        }
         for (id, result) in results {
             match self.parked.remove(&id) {
                 Some(call) => self.answer(call.request_id, call.rpc_id, Ok(result)).await,
@@ -1385,11 +1496,16 @@ impl Query {
         self.last_activity = Instant::now();
         match message["type"].as_str().unwrap_or_default() {
             "control_request" => self.control(&message).await,
+            // A usage answer, or its failure, which is no fault of the session's.
+            "control_response" if message["response"]["request_id"].as_str().is_some_and(|id| id.starts_with(USAGE_REQUEST)) => note_usage(&message["response"]["response"]),
             "control_response" if message["response"]["subtype"] == "error" => {
                 self.failure = Some(format!("Claude Code refused the session: {}", message["response"]["error"].as_str().unwrap_or("no reason given")));
             }
             "control_response" | "control_cancel_request" | "keep_alive" | "transcript_mirror" => {}
-            _ => self.message(&message),
+            _ => {
+                self.message(&message);
+                self.send_next().await;
+            }
         }
     }
 
@@ -1458,15 +1574,19 @@ impl Query {
         } else if matches!(kind, "stream_event" | "user" | "result") {
             self.flush_settle();
         }
+        // The stopped turn's end, after an interrupt: the query stays, waiting for the next message
+        // (or already taking it).
         if kind == "result" && self.interrupting {
-            self.result_seen = true;
-            self.add_unstreamed_usage(&message["usage"]);
-            self.result_cost = message["total_cost_usd"].as_f64();
-            self.child.stdin = None;
+            self.interrupting = false;
             return;
         }
         if kind == "result" {
             self.result_seen = true;
+            // A turn that answered leaves the query waiting (hold, below). Anything else ends the
+            // input, and Claude Code exits once the last turn is done.
+            if error.is_some() || !self.holds() {
+                self.child.stdin = None;
+            }
             if let Some(mut error) = error {
                 if let Some(info) = self.rejection.take() {
                     error = describe_rate_limit(&info, &error);
@@ -1515,21 +1635,45 @@ impl Query {
             }
             _ => {}
         }
+        if kind == "result" && self.child.stdin.is_some() {
+            self.hold();
+        }
     }
 
-    // Keep the records before replying: a clean answer, a stopped stream's invisible tail, or a
-    // parked tool call whose real results will be appended by the next run.
+    // Whether the turn ending now leaves the query waiting: holding is on, and pi's turn ended with
+    // an answer, not on tool calls it was handed.
+    fn holds(&self) -> bool {
+        !hold_time().is_zero() && !self.one_shot && self.turn.is_some() && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)
+            && lock(&self.state).pending.is_none()
+    }
+
+    // A turn that answered: its records are kept for a later rewrite, the query waits for the next
+    // message (decide) until its prompt cache lapses, and pi gets the answer. The next turn then
+    // goes out as Claude Code's own continuation, the bytes the cache already holds.
+    fn hold(&mut self) {
+        self.keep_records();
+        {
+            let mut state = lock(&self.state);
+            state.prints.push(fingerprint(&Message::Assistant(self.out.clone())));
+            state.waiting = true;
+            state.idle_since = Instant::now();
+        }
+        make_room(&self.key);
+        self.hold_until = Some(Instant::now() + hold_time());
+        debug(&format!("sync: waiting for the next message for {} s (session {})", hold_time().as_secs(), self.key));
+        self.reply();
+    }
+
+    // Keep this query's records, its final answer included, when it ended cleanly with one.
     fn keep_records(&self) {
-        let (pending, (mut prints, mut roles)) = {
+        let (parked, (mut prints, mut roles)) = {
             let state = lock(&self.state);
-            (state.pending.clone().unwrap_or_default(), state.kept_base.clone())
+            (state.pending.is_some(), state.kept_base.clone())
         };
-        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !self.one_shot && (!pending.is_empty() || matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length | StopReason::Aborted))) {
-            if self.out.stop_reason != StopReason::Aborted {
-                prints.push(fingerprint(&Message::Assistant(self.out.clone())));
-                roles.push("assistant".into());
-            }
-            history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles, &pending);
+        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !parked && !self.one_shot && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)) {
+            prints.push(fingerprint(&Message::Assistant(self.out.clone())));
+            roles.push("assistant".into());
+            history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles);
         }
     }
 
@@ -1817,17 +1961,11 @@ impl Query {
             self.keep_records();
             self.reply();
         }
-        if self.closed && self.ended.is_some() {
-            self.keep_records();
-        }
         let ids: HashSet<&String> = self.written.iter().chain(&self.cc_session).collect();
         for id in ids {
             history::delete_session(id, &self.project_path);
         }
         debug(&format!("query done: session {} closed={} failure={:?}", self.key, self.closed, self.failure));
         self.forget();
-        if let Some(done) = self.ended.take() {
-            let _ = done.send(());
-        }
     }
 }
