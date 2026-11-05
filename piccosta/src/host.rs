@@ -428,11 +428,12 @@ impl Host {
     // one never set keeps the session's.
     pub fn switch_model(&self, agent: &mut Agent, name: &str) -> Result<(), String> {
         let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
-        let model = self.registry()?.resolve(name)?.clone();
+        let registry = self.registry()?;
+        let model = registry.resolve(name)?.clone();
         let sections = self.sections(&model, &agent.session)?;
         let compaction = self.settings.compaction(&model.provider, &model.id);
         let level = self.remembered_thinking_level(&model).unwrap_or_else(|| agent.thinking_level().to_string());
-        written(agent.set_model(model, sections, compaction))?;
+        written(agent.set_model(model, registry, sections, compaction))?;
         written(agent.set_thinking_level(&level))
     }
 

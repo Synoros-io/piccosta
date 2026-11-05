@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 40] = [
+const COMMANDS: [(&str, &str); 42] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -55,6 +55,8 @@ const COMMANDS: [(&str, &str); 40] = [
     ("/rewind", "go back to before one of your prompts, in a copy, with that prompt in the editor"),
     ("/rename, /name <name>", "name this session"),
     ("/model [name]", "switch the model; new sessions start on it too"),
+    ("/models add", "add a model endpoint without writing JSON"),
+    ("/models remove", "remove a configured provider by name"),
     ("/models refresh", "fetch each account's model list again now"),
     ("/pair [model|off]", "work with a second model as a pair: the two answer each other in turn until one says it's done, then you speak"),
     ("/trio [model|off]", "work with a second model as a trio: it checks each answer once, then you speak"),
@@ -235,7 +237,16 @@ impl App {
             "fork" | "branch" => self.fork(None, argument.to_string(), String::new()),
             "rewind" => self.rewind(),
             // The lists come in the background; their report lands when they have.
-            "models" => {
+            "models" if argument == "add" => self.add_model(),
+            "models" if argument.starts_with("remove ") => {
+                let name = argument.trim_start_matches("remove ").trim().to_string();
+                let (agent_dir, sender) = (self.host.agent_dir.clone(), self.sender.clone());
+                tokio::spawn(async move {
+                    let result = crate::model_add::remove(&agent_dir, &name).await.unwrap_or_else(|error| error);
+                    let _ = sender.send((0, Update::Report(result)));
+                });
+            }
+            "models" if argument.is_empty() || argument == "refresh" => {
                 let (agent_dir, sender) = (self.host.agent_dir.clone(), self.sender.clone());
                 tokio::spawn(async move {
                     let lines = crate::model::refresh_models(agent_dir, true).await;
@@ -243,6 +254,7 @@ impl App {
                 });
                 self.notice = Some("Fetching each account's model list…".into());
             }
+            "models" => self.notice = Some("/models add, /models remove <name>, or /models refresh".into()),
             // Both pickers start on what the session runs now, so a stray enter changes nothing (a
             // level picked is saved for the model).
             "model" => {

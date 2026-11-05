@@ -38,6 +38,8 @@ const CODEX_JWT_CLAIM: &str = "https://api.openai.com/auth";
 const REFRESH_MARGIN_MS: i64 = 15 * 60 * 1000;
 // How long a refresh may take before it's abandoned (resolve.ts: 15 s, regardless of the caller).
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+// Default to the token refresh's 15 s budget, but let a password manager's unlock take longer.
+const DEFAULT_KEY_COMMAND_TIMEOUT: Duration = REFRESH_TIMEOUT;
 // The auth.json lock, compatible with pi's proper-lockfile: a directory named <file>.lock,
 // considered abandoned when its mtime is older than 30 s, waited for with backoff from 10 ms
 // doubling to 1 s, up to 30 s in all (auth-storage.ts:118-198).
@@ -108,7 +110,7 @@ async fn claude_login() -> Result<Credential, String> {
         return Err(format!("Claude Code ({}) didn't say whether it's logged in: {status}", settings.claude));
     }
     let method = status["authMethod"].as_str().map_or(String::new(), |method| format!(" ({method})"));
-    Ok(Credential { key: "not-used".into(), account_id: None, source: format!("Claude Code's own login{method}") })
+    Ok(Credential { key: "not-used".into(), account_id: None, origin: None, source: format!("Claude Code's own login{method}") })
 }
 
 // Whether a command name or path is a file that exists: a path as given, a bare name on PATH.
@@ -124,8 +126,22 @@ fn installed(command: &str) -> bool {
 pub struct Credential {
     pub key: String,
     pub account_id: Option<String>,
+    // Pasted keys belong to the origin they were added for, not to a reusable provider name.
+    pub origin: Option<url::Origin>,
     // Where it came from, for `piccosta auth status` and error messages.
     pub source: String,
+}
+
+impl Credential {
+    // Check the actual destination too: a model override can differ from its provider's base URL.
+    pub fn check_origin(&self, destination: &str) -> Result<(), String> {
+        if let Some(origin) = &self.origin
+            && url::Url::parse(destination).ok().is_none_or(|url| url.origin() != *origin)
+        {
+            return Err(format!("refused stored key: request origin differs from {}", origin.ascii_serialization()));
+        }
+        Ok(())
+    }
 }
 
 // Where the credential files live. Each path comes from the environment, with the default noted.
@@ -165,28 +181,62 @@ fn codex_account_id(access_token: &str) -> Option<String> {
     jwt_claims(access_token)?.get(CODEX_JWT_CLAIM)?.get("chatgpt_account_id")?.as_str().filter(|id| !id.is_empty()).map(str::to_string)
 }
 
-// Run a models.json `!command` and take its output as the key. Input: the command after the `!`.
-// Output: stdout, trimmed, or an error with the command's stderr. It runs through sh so the
-// variable expansions in piccosta's default models.json work as they do in pi.
+// Drop also runs on cancellation. Child's kill_on_drop handles the direct child; the group/job
+// catches helpers too, but pipe collection must stop even if one escapes into another session.
+struct KeyCommand { pid: u32, start: Option<u64> }
+impl Drop for KeyCommand {
+    fn drop(&mut self) {
+        if crate::proc::group_held(self.pid, self.start) {
+            crate::proc::kill_group(self.pid, crate::proc::KILL);
+        }
+        crate::proc::release(self.pid);
+    }
+}
+
+// Run a models.json `!command` through sh, as pi does. Output: trimmed stdout, never stderr
+// (password managers may put secrets there), with a deadline on both the process and its pipes.
 async fn run_key_command(command: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|error| format!("could not run apiKey command: {error}"))?;
-    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || key.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("apiKey command failed: {}", stderr.trim()));
+    use std::process::Stdio;
+    let mut command_line = tokio::process::Command::new("sh");
+    command_line.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    crate::proc::group(&mut command_line);
+    let mut child = command_line.spawn().map_err(|error| format!("could not run apiKey command: {error}"))?;
+    let pid = child.id().ok_or("apiKey command has no process")?;
+    if let Err(error) = crate::proc::attach(pid) {
+        let _ = child.kill().await;
+        return Err(format!("could not supervise apiKey command: {error}"));
+    }
+    let guard = KeyCommand { pid, start: crate::proc::start(pid as i32) };
+    let timeout = crate::config::Settings::load(&crate::config::agent_dir(), None).get("auth.commandTimeoutSeconds").and_then(Value::as_u64).filter(|seconds| *seconds > 0).map(Duration::from_secs).unwrap_or(DEFAULT_KEY_COMMAND_TIMEOUT);
+    let mut stdout = child.stdout.take().ok_or("apiKey command has no stdout")?;
+    let mut output = Vec::new();
+    let result = tokio::time::timeout(timeout, async {
+        use tokio::io::AsyncReadExt;
+        tokio::try_join!(child.wait(), stdout.read_to_end(&mut output))
+    }).await;
+    // Never wait for a helper's inherited pipe after the deadline. Reap only our direct child.
+    drop(stdout);
+    drop(guard);
+    let status = match result {
+        Ok(result) => result.map_err(|error| error.to_string())?.0,
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(format!("apiKey command timed out after {} s", timeout.as_secs()));
+        }
+    };
+    let key = String::from_utf8_lossy(&output).trim().to_string();
+    if !status.success() || key.is_empty() {
+        return Err("apiKey command failed or returned no key".into());
     }
     Ok(key)
 }
 
 // A models.json apiKey value made into a key. Input: the configured value. Output: the key, from
 // the environment for `$VAR`, from a command for `!command`, otherwise the value itself.
-async fn resolve_configured_key(value: &str) -> Result<String, String> {
+pub(crate) async fn resolve_configured_key(value: &str) -> Result<String, String> {
+    if value == "@stored" {
+        return Err("the provider's stored key is missing; add the provider again".into());
+    }
     if let Some(command) = value.strip_prefix('!') {
         return run_key_command(command).await;
     }
@@ -226,8 +276,15 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
             Some("oauth") if owner == Some(&Owner::CodexCli) => return fresh_codex_login(&login_file).await,
             Some("api_key") => {
                 if let Some(key) = stored.get("key").and_then(Value::as_str) {
-                    let key = resolve_configured_key(key).await?;
-                    return Ok(Credential { key, account_id: None, source: format!("{}", login_file.display()) });
+                    let origin = match stored.get("origin") {
+                        Some(origin) => Some(url::Url::parse(origin.as_str().ok_or("stored key has an invalid origin")?).map_err(|_| "stored key has an invalid origin")?.origin()),
+                        None if config.and_then(|config| config.api_key.as_deref()) == Some("@stored") => return Err("stored key has no origin; remove and add the provider again".into()),
+                        None => None,
+                    };
+                    let key = if stored["literal"] == true { key.to_string() } else { resolve_configured_key(key).await? };
+                    let credential = Credential { key, account_id: None, origin, source: format!("{}", login_file.display()) };
+                    credential.check_origin(config.and_then(|config| config.base_url.as_deref()).unwrap_or_default())?;
+                    return Ok(credential);
                 }
             }
             _ => {}
@@ -254,6 +311,7 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
             return Ok(Credential {
                 key: access.to_string(),
                 account_id,
+                origin: None,
                 source: format!("the Codex CLI's token in {} (refreshed only when the Codex CLI runs)", codex_file.display()),
             });
         }
@@ -261,7 +319,7 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
     if owner == Some(&Owner::Opencode) {
         let opencode_file = paths.opencode_dir.join("auth.json");
         if let Some(key) = read_json_object(&opencode_file)?.get(provider).and_then(|entry| entry.get("key")).and_then(Value::as_str) {
-            return Ok(Credential { key: key.to_string(), account_id: None, source: format!("{}", opencode_file.display()) });
+            return Ok(Credential { key: key.to_string(), account_id: None, origin: None, source: format!("{}", opencode_file.display()) });
         }
     }
 
@@ -269,19 +327,19 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
     if let Some(value) = config.and_then(|config| config.api_key.as_deref()) {
         let key = resolve_configured_key(value).await?;
         let account_id = if owner == Some(&Owner::CodexCli) { codex_account_id(&key) } else { None };
-        return Ok(Credential { key, account_id, source: "models.json apiKey".to_string() });
+        return Ok(Credential { key, account_id, origin: None, source: "models.json apiKey".to_string() });
     }
 
     // 4. The environment.
     if let Some(variable) = account.and_then(|account| account.env_key)
         && let Ok(key) = std::env::var(variable) {
-            return Ok(Credential { key, account_id: None, source: format!("${variable}") });
+            return Ok(Credential { key, account_id: None, origin: None, source: format!("${variable}") });
         }
 
     // 5. None: a server of the user's own in models.json (a local one) with no apiKey wants no key,
     // and is asked with no Authorization header.
     if account.is_none() && config.is_some_and(|config| config.base_url.is_some()) {
-        return Ok(Credential { key: String::new(), account_id: None, source: NO_KEY_NEEDED.to_string() });
+        return Ok(Credential { key: String::new(), account_id: None, origin: None, source: NO_KEY_NEEDED.to_string() });
     }
 
     let variable = account.and_then(|account| account.env_key).map_or(String::new(), |variable| format!(", or set ${variable}"));
@@ -306,14 +364,14 @@ async fn fresh_codex_login(login_file: &Path) -> Result<Credential, String> {
     let source = format!("{}", login_file.display());
     let (access, _, expires, account_id) = read_login().ok_or_else(|| format!("the Codex login in {source} is incomplete"))?;
     if expires - clock::now_ms() > REFRESH_MARGIN_MS {
-        return Ok(Credential { account_id: account_id.or_else(|| codex_account_id(&access)), key: access, source });
+        return Ok(Credential { account_id: account_id.or_else(|| codex_account_id(&access)), key: access, origin: None, source });
     }
 
     let lock = FileLock::acquire(login_file).await.map_err(|error| format!("could not lock {source}: {error}"))?;
     let (access, refresh, expires, account_id) = read_login().ok_or_else(|| format!("the Codex login in {source} is incomplete"))?;
     if expires - clock::now_ms() > REFRESH_MARGIN_MS {
         drop(lock);
-        return Ok(Credential { account_id: account_id.or_else(|| codex_account_id(&access)), key: access, source });
+        return Ok(Credential { account_id: account_id.or_else(|| codex_account_id(&access)), key: access, origin: None, source });
     }
 
     let stored = read_json_object(login_file)?;
@@ -335,7 +393,7 @@ async fn fresh_codex_login(login_file: &Path) -> Result<Credential, String> {
     stored.insert("openai-codex".into(), Value::Object(entry));
     write_private_json(login_file, &Value::Object(stored)).map_err(|error| format!("could not save {source}: {error}"))?;
     drop(lock);
-    Ok(Credential { key: refreshed.access, account_id: Some(account_id), source })
+    Ok(Credential { key: refreshed.access, account_id: Some(account_id), origin: None, source })
 }
 
 struct RefreshedToken {
@@ -413,14 +471,14 @@ pub fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
 
 // A lock on a file, held while the value exists. It's a directory next to the file, the way pi's
 // proper-lockfile does it, so a TS pi and this binary sharing a login dir respect each other.
-struct FileLock {
+pub(crate) struct FileLock {
     lock_dir: PathBuf,
 }
 
 impl FileLock {
     // Take the lock. Waits with backoff while someone else holds it; takes over a lock whose
     // directory is older than LOCK_STALE, since its owner died without removing it.
-    async fn acquire(file: &Path) -> io::Result<FileLock> {
+    pub(crate) async fn acquire(file: &Path) -> io::Result<FileLock> {
         let lock_dir = PathBuf::from(format!("{}.lock", file.display()));
         if let Some(dir) = file.parent() {
             fs::create_dir_all(dir)?;

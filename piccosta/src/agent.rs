@@ -403,12 +403,14 @@ impl Agent {
     // nothing: a model change lets the prompt be brought up to date, which rewrites the cache, and a
     // frontend that sets the model it's already on after each run left a model change after every
     // answer in real sessions (2026-11-01).
-    pub fn set_model(&mut self, model: Model, sections: IndexMap<String, String>, compaction: CompactionSettings) -> std::io::Result<()> {
+    pub fn set_model(&mut self, model: Model, registry: ModelRegistry, sections: IndexMap<String, String>, compaction: CompactionSettings) -> std::io::Result<()> {
         if (&model.provider, &model.id) != (&self.config.model.provider, &self.config.model.id) {
             let base = self.session.next_base();
             self.session.append(SessionEntry::ModelChange { base, provider: model.provider.clone(), model_id: model.id.clone() })?;
         }
         self.config.model = model;
+        // A provider added since this session opened must bring its credential settings too.
+        self.config.registry = registry;
         self.config.sections = sections;
         // The new model's compaction numbers, with the session's on/off kept (/autocompact).
         self.config.compaction = CompactionSettings { enabled: self.config.compaction.enabled, ..compaction };

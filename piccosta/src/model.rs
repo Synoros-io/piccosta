@@ -43,6 +43,19 @@ const CODEX_COMPAT: &str = r#"{"supportsMidConvoSystemMessages": true, "supports
 const LISTS_FRESH_S: u64 = 15 * 60;
 const LIST_TIMEOUT_S: u64 = 10;
 
+// Refresh and addition use the same deadline and origin-only redirect policy.
+pub(crate) fn list_client(settings: &crate::config::Settings) -> reqwest::ClientBuilder {
+    crate::provider::http_client().timeout(list_seconds(settings, "models.timeoutSeconds", LIST_TIMEOUT_S))
+}
+
+// OpenAI and Messages put their list in data; Google puts it in models and prefixes the names.
+pub(crate) fn model_list(body: &Value) -> Option<&Vec<Value>> {
+    body["data"].as_array().or_else(|| body["models"].as_array())
+}
+pub(crate) fn listed_id(raw: &Value) -> Option<&str> {
+    raw["id"].as_str().or_else(|| raw["name"].as_str().map(|name| name.trim_start_matches("models/"))).filter(|id| !id.is_empty())
+}
+
 // A `models.*` setting in seconds, else its default.
 fn list_seconds(settings: &crate::config::Settings, key: &str, default: u64) -> Duration {
     Duration::from_secs(settings.get(key).and_then(Value::as_u64).unwrap_or(default))
@@ -180,8 +193,24 @@ fn claude_model(raw: &Value) -> Value {
 
 // One model of a configured provider's OpenAI-style list, with pi's defaults for what it doesn't say.
 fn listed_model(raw: &Value, config: &ProviderConfig) -> Option<Value> {
-    Some(json!({"id": raw["id"], "name": raw["id"], "api": config.api.as_deref().unwrap_or("openai-completions"), "baseUrl": config.base_url, "input": ["text"],
+    let id = listed_id(raw)?;
+    Some(json!({"id": id, "name": id, "api": config.api.as_deref().unwrap_or("openai-completions"), "baseUrl": config.base_url, "input": ["text"],
         "contextWindow": DEFAULT_CONTEXT_WINDOW, "maxTokens": DEFAULT_MAX_TOKENS}))
+}
+
+// The add flow already fetched these ids; keep them just as refresh_models keeps a fetched list.
+pub(crate) fn keep_added_list(agent_dir: &Path, provider: &str, ids: &[String], config: &ProviderConfig) -> Result<(), String> {
+    let (models, _) = checked(provider, ids.iter().filter_map(|id| listed_model(&json!({"id": id}), config)), home(provider, Some(config))?)?;
+    keep_list(&list_copy(agent_dir, provider), &models).map_err(|error| error.to_string())
+}
+
+// One private partial per writer, renamed whole; neither add nor refresh can expose half a list.
+fn keep_list(copy: &Path, models: &[Value]) -> std::io::Result<()> {
+    crate::platform::private_dir(copy.parent().ok_or_else(|| std::io::Error::other("model list has no directory"))?)?;
+    let partial = copy.with_extension(format!("json.{}.partial", uuid::Uuid::new_v4().simple()));
+    let result = crate::auth::write_private_json(&partial, &json!(models)).and_then(|()| fs::rename(&partial, copy));
+    if result.is_err() { let _ = fs::remove_file(&partial); }
+    result
 }
 
 // One provider's list as its account serves it now, checked as load will read it. Output: its
@@ -216,12 +245,20 @@ async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&Pr
         _ => {
             let config = config.ok_or("no settings in models.json")?.clone();
             let credential = Some(credential?);
-            (format!("{}/models", config.base_url.as_deref().ok_or("no baseUrl")?.trim_end_matches('/')), credential, "/data", Box::new(move |raw: &Value| listed_model(raw, &config)))
+            let base = config.base_url.as_deref().ok_or("no baseUrl")?.trim_end_matches('/');
+            let route = if config.api.as_deref() == Some("anthropic-messages") { "/v1/models" } else { "/models" };
+            (format!("{base}{route}"), credential, "/data", Box::new(move |raw: &Value| listed_model(raw, &config)))
         }
     };
     // Authorized as inference is: the key, then the provider's own headers from models.json.
     let mut request = client.get(&url);
     if let Some(credential) = credential.filter(|credential| !credential.key.is_empty()) {
+        credential.check_origin(&url)?;
+        match config.and_then(|config| config.api.as_deref()) {
+            Some("anthropic-messages") => request = request.header("x-api-key", &credential.key).header("anthropic-version", crate::provider::anthropic_messages::ANTHROPIC_VERSION),
+            Some("google-generative-ai") => request = request.header("x-goog-api-key", &credential.key),
+            _ => {},
+        }
         request = request.bearer_auth(credential.key);
         if let Some(account) = credential.account_id {
             request = request.header("chatgpt-account-id", account);
@@ -231,7 +268,7 @@ async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&Pr
         request = request.header(name, value);
     }
     let body = async { request.send().await?.error_for_status()?.json::<Value>().await }.await.map_err(crate::provider::http_error)?;
-    let list = body.pointer(pointer).and_then(Value::as_array).ok_or_else(|| format!("the answer has no list at {pointer}"))?;
+    let list = if owner.is_none() { model_list(&body) } else { body.pointer(pointer).and_then(Value::as_array) }.ok_or_else(|| format!("the answer has no list at {pointer}"))?;
     checked(provider, list.iter().filter_map(convert), home(provider, config)?)
 }
 
@@ -320,7 +357,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
     let paths = crate::auth::CredentialPaths::from_environment(&agent_dir);
     let settings = crate::config::Settings::load(&agent_dir, None);
     let lists_fresh = list_seconds(&settings, "models.freshSeconds", LISTS_FRESH_S);
-    let client = match crate::provider::http_client().timeout(list_seconds(&settings, "models.timeoutSeconds", LIST_TIMEOUT_S)).build() {
+    let client = match list_client(&settings).build() {
         Ok(client) => client,
         Err(error) => return vec![Err(format!("couldn't fetch the model lists: {error}"))],
     };
@@ -358,14 +395,7 @@ pub async fn refresh_models(agent_dir: PathBuf, force: bool) -> Vec<Result<Strin
             // half of one and two refreshes at once don't write into the same file.
             Ok((models, notes)) => {
                 lines.extend(notes.into_iter().map(|note| Err(format!("{provider}: {note}"))));
-                let partial = copy.with_extension(format!("json.{}.partial", uuid::Uuid::new_v4().simple()));
-                lines.push(match fs::write(&partial, Value::Array(models.clone()).to_string()).and_then(|()| fs::rename(&partial, &copy)) {
-                    Ok(()) => Ok(format!("{provider}: {} models", models.len())),
-                    Err(error) => {
-                        let _ = fs::remove_file(&partial);
-                        Err(format!("{provider}: couldn't keep the list ({error})"))
-                    }
-                });
+                lines.push(keep_list(&copy, &models).map(|()| format!("{provider}: {} models", models.len())).map_err(|error| format!("{provider}: couldn't keep the list ({error})")));
             }
         }
     }

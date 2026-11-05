@@ -190,6 +190,7 @@ pub fn http_error(error: reqwest::Error) -> String {
 // success, else the status and the server's message (status first, as the openai SDK writes it,
 // so retry rules can see a 5xx).
 pub async fn post_openai(model: &Model, url: String, credential: &Credential, session_id: Option<&str>, extra: Vec<(&str, String)>, body: &Value) -> Result<reqwest::Response, String> {
+    credential.check_origin(&url)?;
     let opencode = is_opencode(model);
     let mut http = http_client()
         .build()
@@ -281,6 +282,11 @@ pub fn new_output(model: &Model, api: &str) -> AssistantMessage {
 // Aborted when cancelled) and the reason in error_message, as pi records it.
 pub async fn stream(request: Request<'_>, events: mpsc::UnboundedSender<StreamEvent>) -> AssistantMessage {
     let started = std::time::Instant::now();
+    if let Err(error) = request.credential.check_origin(&request.model.base_url) {
+        let mut output = new_output(request.model, &request.model.api);
+        settle(&request, &mut output, Err(error));
+        return output;
+    }
     let mut message = match request.model.api.as_str() {
         "openai-codex-responses" => codex::stream(&request, &events).await,
         "openai-responses" => openai_responses::stream(&request, &events).await,

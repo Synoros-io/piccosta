@@ -7,6 +7,7 @@ mod clip;
 pub(crate) mod commands;
 mod render;
 mod state;
+mod model_add;
 mod tex;
 
 use crate::agent::{Event, Handle};
@@ -86,6 +87,7 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    ModelProbe(u64, Result<(crate::model_add::Addition, crate::model_add::Probe), String>),
     // What a scan's runtimes said (asker): each one's status, None when nothing runs it; and
     // whether it was a look for agents.
     Scanned(BTreeMap<PathBuf, Option<Value>>, bool),
@@ -341,6 +343,9 @@ struct App {
     last_click: Option<(Instant, Position, u8)>,
     quit: bool,
     picker: Option<Picker>,
+    model_add: Option<crate::model_add::Addition>,
+    model_flow: u64,
+    model_probe: Option<tokio::task::AbortHandle>,
     // The prompts /rewind offered: each one's parent entry and its text.
     rewind: Vec<(Option<String>, String)>,
     history: Vec<String>,
@@ -379,12 +384,17 @@ struct Picker {
     // In a picker of directories, the directory typed paths start from: what's typed can then be
     // the choice itself (a path, or anything when no item matches).
     free: Option<PathBuf>,
+    text: bool,
+    masked: bool,
 }
 
 impl Picker {
     // The item picked, or, in a free picker, what's typed when nothing matches. A free picker
     // matches on what's typed up to its first space; the rest (flags) goes along with the item.
     fn chosen(&self) -> Option<String> {
+        if self.text {
+            return Some(self.filter.trim().to_string());
+        }
         let shown = self.shown();
         let typed = self.filter.trim();
         if self.free.is_some() && shown.is_empty() {
@@ -482,6 +492,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         last_click: None,
         quit: false,
         picker: None,
+        model_add: None,
+        model_flow: 0,
+        model_probe: None,
         rewind: Vec::new(),
         history: Vec::new(),
         sidebar_rows: Vec::new(),
@@ -1076,6 +1089,8 @@ impl App {
 
     // Text pasted into the picker's filter or the editor, with line ends and tabs evened out.
     fn paste_text(&mut self, text: &str) {
+        // An early/repeated key paste must not reach an ordinary picker or the draft.
+        if self.model_probe.is_some() || self.model_add.is_some() && self.picker.as_ref().is_some_and(|picker| !picker.text) { return; }
         let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', TAB_SPACES);
         if let Some(picker) = &mut self.picker {
             picker.filter.push_str(&text);
@@ -1252,7 +1267,7 @@ impl App {
 
     // Choose from a list; an argument that matches one item picks it at once.
     fn pick(&mut self, title: &'static str, items: Vec<String>, filter: &str, apply: fn(&mut App, String)) {
-        let picker = Picker { title, items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None };
+        let picker = Picker { title, items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, text: false, masked: false };
         let shown = picker.shown();
         if !filter.is_empty() && (shown.len() == 1 || shown.iter().any(|item| item.as_str() == filter)) {
             let choice = shown.iter().find(|item| item.as_str() == filter).unwrap_or(&shown[0]).to_string();
@@ -1530,6 +1545,7 @@ impl App {
         let view = &mut self.slots[slot];
         match update {
             Update::Report(text) => self.report(text),
+            Update::ModelProbe(flow, result) => self.probed_model(flow, result),
             Update::Scanned(statuses, agents) => self.scanned(statuses, agents),
             Update::Sent(sent, text) => self.sent(slot, sent, text),
             Update::Done(done) => {
@@ -1827,6 +1843,15 @@ impl App {
     }
 
     fn picker_key(&mut self, key: KeyEvent) {
+        // While probing, even Enter stays here. Only Esc can close it; pastes are dropped too.
+        if self.model_probe.is_some() && key.code != KeyCode::Esc { return; }
+        if self.model_add.is_some() && self.picker.as_ref().is_some_and(|picker| !picker.text)
+            && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) { return; }
+        if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.paste(false);
+            return;
+        }
         let Some(picker) = &mut self.picker else { return };
         if picker.confirming {
             match key.code {
@@ -1846,7 +1871,13 @@ impl App {
         match key.code {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && picker.delete.is_some() => picker.confirming = true,
             KeyCode::Delete if picker.delete.is_some() => picker.confirming = true,
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.picker = None;
+                self.model_add = None;
+                if let Some(probe) = self.model_probe.take() { probe.abort(); }
+                self.model_flow += 1;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => picker.filter.clear(),
             KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Down => picker.selected += 1,
             KeyCode::Backspace => {
@@ -2186,7 +2217,7 @@ impl App {
         let selected = picker.selected.min(shown.len().saturating_sub(1));
         let visible = usize::from(inner.height.saturating_sub(1));
         let first = (selected + 1).saturating_sub(visible);
-        let mut lines = vec![Line::from(vec![Span::styled("› ", Style::new().fg(theme::ACCENT)), Span::raw(picker.filter.clone())])];
+        let mut lines = vec![Line::from(vec![Span::styled("› ", Style::new().fg(theme::ACCENT)), Span::raw(if picker.masked { "•".repeat(picker.filter.chars().count()) } else { picker.filter.clone() })])];
         for (index, item) in shown.iter().enumerate().skip(first).take(visible) {
             let style = match (index == selected, picker.confirming) {
                 (true, true) => Style::new().fg(theme::REMOVED).add_modifier(Modifier::BOLD),

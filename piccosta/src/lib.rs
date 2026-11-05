@@ -17,6 +17,7 @@ pub mod manager;
 pub mod json_number;
 pub mod message;
 pub mod model;
+pub mod model_add;
 pub mod pintask;
 pub mod proc;
 pub mod platform;

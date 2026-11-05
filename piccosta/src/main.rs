@@ -229,6 +229,13 @@ async fn main() -> ExitCode {
     // kept that reads waits for them, and says what went wrong. The terminal UI shows that too.
     // --help and --version need none.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // Model setup needs no account login or startup refresh, and must never become a prompt.
+    if arguments.first().is_some_and(|arg| arg == "models") {
+        return match piccosta::model_add::cli(&arguments[1..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { eprintln!("piccosta: {error}"); ExitCode::FAILURE }
+        };
+    }
     let args = cli::parse(&arguments);
     let agent_dir = config::agent_dir();
     if !(args.help || args.version) {

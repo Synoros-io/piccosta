@@ -160,6 +160,7 @@ pub fn request_body(model_id: &str, query: &str, options: &SearchOptions<'_>) ->
 // openai_responses.rs). Output: the response, or the transport error.
 async fn send(target: &Target, credential: &Credential, session_id: &str, body: &Value) -> Result<reqwest::Response, String> {
     let model = &target.model;
+    credential.check_origin(&model.base_url)?;
     let client = provider::http_client().timeout(SEARCH_TIMEOUT).build().map_err(|error| error.to_string())?;
     let mut http = if model.api == CODEX_API {
         let account_id = credential.account_id.as_deref().ok_or("Failed to extract accountId from token")?;

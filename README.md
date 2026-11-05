@@ -21,7 +21,7 @@ It stores no credentials of its own: it uses each account's existing login, and 
 - **GPT through your Codex login**, over the Responses API. Its websocket sends only what's new each turn, and falls back to plain HTTP streaming when it can't be used.
 - **The opencode-go models**, through four request formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google's generateContent. Thinking carries across turns, Gemini's signed thoughts included.
 - More will be added with time. It is strictly against antigravity's TOS, so I can't release a version doing that.
-- **Your own models** go in `models.json`, in pi's format: any endpoint that speaks one of those four formats (see [Your own models](#your-own-models)).
+- **Your own models:** `/models add` or `piccosta models add <url>` adds an endpoint without writing JSON (see [Your own models](#your-own-models)).
 - **New models show up on their own.** piccosta offers what each connected account serves: Codex's own list for your ChatGPT login, the models Claude Code offers your Claude login, opencode-go's `/models`, and `<baseUrl>/models` for a `models.json` provider that names no models. The lists are fetched as piccosta starts and with `/models refresh`; one that can't be fetched keeps the last one, and an account you aren't logged in to offers nothing. What you set for a model goes over what its provider reports, in `models.json`'s `providers.<provider>.modelOverrides.<id>` (pi's format), e.g. `{"contextWindow": 200000, "maxTokens": 8000, "input": ["text"], "thinkingLevelMap": {"medium": "medium"}}`; an object such as `thinkingLevelMap` or `compat` changes only the keys you name. `"serviceTier": "priority"` asks a Codex model for its fast mode (about twice as fast, counted higher against your plan).
 - **One thinking scale for all of them**, from `off` to `max`, mapped to what each model actually takes. A level a model doesn't take runs as its nearest, and piccosta says so.
 
@@ -229,7 +229,19 @@ Add `--yolo` to skip permissions.
 
 ## Your own models
 
-Any endpoint that speaks OpenAI's chat completions (or the Responses API, Anthropic Messages or Google's generateContent) is added in `models.json` in the agent dir (see Settings below for where that is; create the file if it isn't there):
+Use `/models add` in the terminal UI, or:
+
+```sh
+piccosta models add <base-url> --name myserver
+piccosta models add <base-url> --name myserver --key-env MYSERVER_API_KEY
+# Or pipe a key from your password manager:
+your-key-command | piccosta models add <base-url> --key-stdin
+piccosta models remove myserver
+```
+
+The guided UI probes the URL (also `/v1/models`), asks for a key only when needed, proposes a name, and shows the models before saving. Paste a key in its hidden input, or choose an environment variable or command. The CLI also takes `--key-command CMD` and `--api` for one of the four formats below. Without a model list, it asks for a model id. A pasted or piped key goes only in the private credential store (`login/auth.json`, mode 0600), bound to that URL's origin; requests elsewhere are refused. `models.json` refers to it with `"apiKey": "@stored"`. Other providers and overrides are kept. New models are pickable at once; an already running session's prompt and tools stay unchanged. `/models remove <name>` removes a provider in the UI too.
+
+The JSON reference, in `models.json` in the agent dir (see Settings below):
 
 ```json
 {
@@ -244,7 +256,7 @@ Any endpoint that speaks OpenAI's chat completions (or the Responses API, Anthro
 ```
 
 - `api`: `openai-completions` for `/v1/chat/completions`; `openai-responses`, `anthropic-messages` or `google-generative-ai` for the others.
-- `apiKey`: the key itself, `$VAR` to read it from the environment, or `!command` to use a command's output (a password manager, say). Leave it out for a local server that takes no key.
+- `apiKey`: `@stored` for a key added to the credential store, `$VAR` to read it from the environment, or `!command` to use a command's output (a password manager, say). Literal keys still work, but the add flow never writes one here. Key commands have a 15-second deadline; timeout or cancellation stops their whole process group. Leave it out for a local server that takes no key.
 - Without a `models` list, piccosta offers everything `<baseUrl>/models` lists. To name them yourself, or for a server with no `/models`: `"models": [{"id": "my-model", "contextWindow": 128000, "maxTokens": 8192}]`.
 
 The models show up as `myserver/<id>`: pick one with `/model`, or `piccosta -m myserver/my-model`. `/models refresh` fetches the lists again.
@@ -265,6 +277,8 @@ A project's `.piccosta/settings.json` is merged over them, except the model list
 - `models.freshSeconds`: a list fetched more recently than this isn't fetched again at start (900);
 - `models.timeoutSeconds`: how long one list may take (10);
 - `models.codexClientVersion`: the Codex version piccosta asks Codex's list as, since the list leaves out models newer than that. Without it, piccosta asks as the Codex CLI last did, else as `codex --version` says.
+
+`auth.commandTimeoutSeconds` in the agent dir's `settings.json` bounds every `!command` key lookup, including its output pipes (15 seconds by default; a positive whole number). Raise it for password managers that need longer to unlock, for example `{"auth": {"commandTimeoutSeconds": 30}}`.
 
 `web.fetch.maxSizeMB` is the largest page the web tools fetch, a PDF aside (5).
 

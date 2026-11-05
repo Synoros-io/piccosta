@@ -13,7 +13,7 @@ const API: &str = "anthropic-messages";
 const MIN_ANSWER_TOKENS: u64 = 1024;
 const THINKING_BUDGETS: [u64; 4] = [1024, 2048, 8192, 16384];
 // Anthropic's wire version, also used by pi's Messages client.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 // Anthropic's tool ids accept these characters and at most 64 of them (pi's convertMessages).
 const TOOL_ID_LIMIT: usize = 64;
 

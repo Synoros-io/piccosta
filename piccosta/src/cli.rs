@@ -190,6 +190,8 @@ pub const HELP: &str = "piccosta: one agent harness for every model you use
 Usage:
   piccosta [options] [messages...]
   piccosta auth status
+  piccosta models add <url> [--name n] [--api a] [--key-env VAR | --key-command CMD | --key-stdin]
+  piccosta models remove <name>
   piccosta zed [dir]     Zed, with piccosta as its agent
   piccosta t3 [dir]      T3 Code, with piccosta as its Pi provider
   piccosta assistant     The user's assistant service (the terminal UI starts it with manager.autostart)
