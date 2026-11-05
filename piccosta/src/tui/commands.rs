@@ -396,8 +396,8 @@ impl App {
     // session another terminal started or renamed shows. Enter shows one; ctrl+d then enter deletes
     // one and the list comes back without it. "all" lists every project's sessions instead.
     pub(super) fn sessions(&mut self, filter: &str) {
-        if filter == "all" {
-            return self.all_sessions();
+        if !filter.is_empty() {
+            return self.all_sessions(if filter == "all" { "" } else { filter });
         }
         let known: std::collections::HashSet<std::path::PathBuf> = self.slots.iter().filter_map(|slot| slot.path.clone()).collect();
         for summary in self.host.sessions(super::PICKER_SESSIONS) {
@@ -458,10 +458,19 @@ impl App {
 
     // Every project's sessions, newest first, each with its directory. One picked opens in this
     // pane, in its own directory, and joins the sidebar.
-    fn all_sessions(&mut self) {
-        let folders = std::fs::read_dir(self.host.agent_dir.join("sessions")).into_iter().flatten().flatten();
-        let mut found: Vec<crate::host::SessionSummary> = folders.flat_map(|folder| crate::host::sessions_in(&folder.path(), None, super::PICKER_SESSIONS)).collect();
-        found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+    fn all_sessions(&mut self, filter: &str) {
+        let mut found = crate::host::all_sessions(&self.host.agent_dir, usize::MAX);
+        if !filter.is_empty() {
+            let ids: Vec<_> = found.iter().filter(|summary| summary.id.starts_with(filter)).collect();
+            if let [summary] = ids.as_slice() {
+                self.resume_path(summary.path.clone());
+                return;
+            }
+            // An ambiguous id remains a choice of ids, not a coincidental title match.
+            if !ids.is_empty() {
+                found.retain(|summary| summary.id.starts_with(filter));
+            }
+        }
         // Grouped by project: projects in the order of their newest session, newest first in each.
         let mut projects: Vec<std::path::PathBuf> = Vec::new();
         for summary in &found {
@@ -471,18 +480,25 @@ impl App {
         }
         found.sort_by_key(|summary| projects.iter().position(|project| *project == summary.cwd));
         let items = found.iter().enumerate().map(|(place, summary)| {
-            format!("{} · {} · {} · {}", place + 1, super::render::home_relative(&summary.cwd), super::render::fit(&summary.title, ITEM_CHARS), ago(&summary.path))
+            format!("{} · {} · {} · {} · {}", place + 1, super::render::home_relative(&summary.cwd), summary.title, summary.id, ago(&summary.path))
         });
         let items = items.collect();
         self.found = found.into_iter().map(|summary| summary.path.canonicalize().unwrap_or(summary.path)).collect();
-        self.pick("every project's sessions", items, "", |app, choice| {
-            let Some(path) = number(&choice).and_then(|place| app.found.get(place).cloned()) else { return };
-            let slot = app.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)).unwrap_or_else(|| {
-                app.slots.push(super::Slot::new(Some(path), super::NEW_TITLE.into()));
-                app.slots.len() - 1
-            });
-            app.show(slot);
+        self.pick("every project's sessions", items, filter, |app, choice| {
+            if let Some(path) = number(&choice).and_then(|place| app.found.get(place).cloned()) {
+                app.resume_path(path);
+            }
         });
+    }
+
+    fn resume_path(&mut self, path: std::path::PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        crate::session::set_closed(&self.host.agent_dir, &path, false);
+        let slot = self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)).unwrap_or_else(|| {
+            self.slots.push(super::Slot::new(Some(path), super::NEW_TITLE.into()));
+            self.slots.len() - 1
+        });
+        self.show(slot);
     }
 
     // Delete the session shown here, then show the one after it in the list (or before, at the end).
