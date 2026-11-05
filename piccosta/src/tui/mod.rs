@@ -67,6 +67,10 @@ const WORKING_DOT_FRAMES: usize = 5;
 const WHEEL_ROWS: usize = 3;
 // How long a first ctrl+c waits for the second while sessions are running.
 const QUIT_CONFIRM: Duration = Duration::from_secs(2);
+// How long a manager that failed to start on its own waits before the next try, when its file hasn't
+// changed: a minute, so one that failed for a passing reason (no account yet, another piccosta had it)
+// starts soon after, and a broken file costs one read a minute.
+const WAKE_RETRY: Duration = Duration::from_secs(60);
 // How long quitting waits for aborted sessions to write their last messages.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const NEW_TITLE: &str = "new session";
@@ -323,6 +327,9 @@ struct App {
     scans: u64,
     asks: std::sync::mpsc::Sender<Ask>,
     scanning: bool,
+    // Managers open here that failed to start on their own: their file's mtime then, and when. Tried
+    // again once the file changes or WAKE_RETRY has passed.
+    wake_failed: HashMap<PathBuf, (Option<std::time::SystemTime>, Instant)>,
     // This terminal's snapshot, so other terminals can't replace it.
     state_file: PathBuf,
     saved_state: state::Saved,
@@ -489,6 +496,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         delete_armed: None,
         chord: false,
         scans: 0,
+        wake_failed: HashMap::new(),
         state_file,
         saved_state: state::Saved::default(),
         active: crate::clock::now_ms() as u64,
@@ -1107,10 +1115,12 @@ impl App {
     }
 
     // Ask an off-screen runtime to release itself when idle. Never drop its sender on the UI's
-    // delayed view of its work. A pathless draft needs its runtime to keep the row and session.
+    // delayed view of its work. A pathless draft needs its runtime to keep the row and session. A
+    // manager (the assistant, a project's) stays running: its scheduled checks and its lanes' news
+    // reach it as messages, and a message to a session nothing runs only waits for the user.
     fn put_away(&mut self, slot: usize) {
         let view = &self.slots[slot];
-        if self.panes.iter().any(|pane| pane.slot == slot) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() {
+        if self.panes.iter().any(|pane| pane.slot == slot) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() || view.manager {
             return;
         }
         let Some((_, commands)) = &view.live else { return };
@@ -1482,6 +1492,34 @@ impl App {
             }
         }
         self.slots.extend(children);
+        // A manager open here that nothing runs (after a restart, or unloaded by an older piccosta)
+        // starts again, so what was queued for it (a scheduled check, a lane's news) runs now. Its
+        // closed marker is read again now, not from the scan's older view; its lock is tried without
+        // waiting, so a contested one waits for a later scan instead of the UI waiting for it.
+        let mtime = |path: &Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        let free = |path: &Path| std::fs::File::open(path).is_ok_and(|file| crate::platform::try_session_lock(&file).is_ok());
+        self.wake_failed.retain(|path, _| self.slots.iter().any(|slot| slot.path.as_ref() == Some(path)));
+        let asleep: Vec<usize> = (0..self.slots.len()).filter(|&index| {
+            let slot = &self.slots[index];
+            slot.manager && slot.opened && !slot.closed && slot.live.is_none() && !slot.elsewhere && slot.path.as_ref().is_some_and(|path| {
+                path.exists() && statuses.get(path) == Some(&None) && !crate::session::is_closed(&self.host.agent_dir, path)
+                    && self.wake_failed.get(path).is_none_or(|(then, at)| *then != mtime(path) || at.elapsed() >= WAKE_RETRY) && free(path)
+            })
+        }).collect();
+        for index in asleep {
+            let path = self.slots[index].path.clone().unwrap_or_default();
+            match self.reopen(index) {
+                Ok(()) => { self.wake_failed.remove(&path); }
+                Err(error) => {
+                    // Said once for each state of the file: a retry that fails the same way is quiet.
+                    let now = mtime(&path);
+                    if self.wake_failed.get(&path).is_none_or(|(then, _)| *then != now) {
+                        self.notice = Some(format!("Couldn't start the manager {}: {error}", self.slots[index].title));
+                    }
+                    self.wake_failed.insert(path, (now, Instant::now()));
+                }
+            }
+        }
         for index in 0..self.slots.len() {
             let finished = self.slots[index].parent.is_some() && self.slots[index].path.as_ref().is_some_and(|path| statuses.get(path) == Some(&None));
             if finished && !self.slots[index].opened && !self.panes.iter().any(|pane| pane.slot == index) {
