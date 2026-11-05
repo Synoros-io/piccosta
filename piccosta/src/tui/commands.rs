@@ -381,16 +381,12 @@ impl App {
             "quit" | "exit" => self.quit = true,
             // Start again on the binary as it is now (after a build), with everything as it was and
             // the background jobs carrying on. A turn can't go across, so this waits for the running
-            // ones to end (the main loop restarts then); asked again while waiting, it doesn't.
-            "restart" if self.restart_waiting => {
-                self.restart_waiting = false;
-                self.notice = Some("Not restarting.".into());
-            }
+            // ones to end (the main loop restarts then). Repeating it keeps it pending; esc cancels.
             "restart" => {
                 self.restart_waiting = true;
                 let running = self.slots.iter().filter(|slot| slot.busy()).count();
                 if running > 0 {
-                    self.notice = Some(format!("Restarting when {running} running turn{} end{} (esc or /restart: don't).", if running == 1 { "" } else { "s" }, if running == 1 { "s" } else { "" }));
+                    self.notice = Some(format!("Restarting when {running} running turn{} end{} (esc cancels).", if running == 1 { "" } else { "s" }, if running == 1 { "s" } else { "" }));
                 }
             }
             "descent" => self.report(DESCENT.into()),

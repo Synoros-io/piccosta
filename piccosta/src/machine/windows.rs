@@ -6,9 +6,8 @@ pub(super) fn resources() -> Resources {
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = size_of_val(&status) as u32;
     let memory = (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some((status.ullTotalPhys as f64 / 1024.0, status.ullAvailPhys as f64 / 1024.0));
-    // Windows has no Unix load average. ullTotalPageFile is the commit limit, not swap size;
-    // calling it swap would issue false warnings, so only physical memory and disk are reported.
-    Resources { load: None, memory, swap: None }
+    // Windows has no Unix load average: only physical memory and disk are reported.
+    Resources { load: None, memory }
 }
 pub(super) fn disk(path: &std::path::Path) -> Option<(u64, f64, f64)> {
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

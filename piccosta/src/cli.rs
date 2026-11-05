@@ -190,6 +190,10 @@ Usage:
   piccosta t3 [dir]      T3 Code, with piccosta as its Pi provider
   piccosta assistant     The user's assistant service (the terminal UI starts it with manager.autostart)
   piccosta tell <text>   A message for the assistant
+  piccosta tui           List running terminal UIs and their open sessions (JSON)
+  piccosta open <id or name> [--tui <id or pid>]   Open in the sidebar without changing focus
+  piccosta restart [--tui <id or pid>]            Restart after running turns, keeping drafts
+                         Without --tui, open/restart use the most recently active terminal UI
 
 Options:
   -p, --print            Answer the message and exit (also when stdin or stdout isn't a terminal)

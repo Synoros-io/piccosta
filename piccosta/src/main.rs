@@ -230,6 +230,13 @@ async fn run() -> ExitCode {
     // kept that reads waits for them, and says what went wrong. The terminal UI shows that too.
     // --help and --version need none.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // Local UI control needs no model startup and must never become a prompt.
+    if arguments.first().is_some_and(|arg| matches!(arg.as_str(), "open" | "restart" | "tui")) {
+        return match piccosta::tui::control::cli(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { eprintln!("piccosta: {error}"); ExitCode::FAILURE }
+        };
+    }
     // Model setup needs no account login or startup refresh, and must never become a prompt.
     if arguments.first().is_some_and(|arg| arg == "models") {
         return match piccosta::model_add::cli(&arguments[1..]).await {

@@ -62,7 +62,14 @@ pub async fn connect_async(file: &Path) -> std::io::Result<tokio::net::UnixStrea
     let (_dir, address) = address(file)?;
     tokio::net::UnixStream::connect(address).await
 }
-pub async fn accept(listener: &Listener) -> std::io::Result<tokio::net::UnixStream> { listener.accept().await.map(|(stream, _)| stream) }
+pub async fn accept(listener: &Listener) -> std::io::Result<tokio::net::UnixStream> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        // File permissions are the first boundary; peer credentials also reject another uid
+        // even if it could bypass those permissions (or they were changed after binding).
+        if stream.peer_cred()?.uid() == unsafe { libc::geteuid() } { return Ok(stream); }
+    }
+}
 pub fn peer(stream: &Stream) -> Option<i32> {
     #[cfg(target_os = "linux")]
     {

@@ -23,10 +23,5 @@ pub(super) fn resources() -> Resources {
         let available = (u64::from(stats.free_count) + u64::from(stats.inactive_count)) * page as u64;
         Some((total as f64 / 1024.0, available as f64 / 1024.0))
     })();
-    let swap = {
-        let mut usage: libc::xsw_usage = unsafe { std::mem::zeroed() };
-        let mut size = size_of_val(&usage);
-        (unsafe { libc::sysctlbyname(c"vm.swapusage".as_ptr(), (&raw mut usage).cast(), &mut size, std::ptr::null_mut(), 0) } == 0).then_some((usage.xsu_total as f64 / 1024.0, usage.xsu_avail as f64 / 1024.0))
-    };
-    Resources { load, memory, swap }
+    Resources { load, memory }
 }

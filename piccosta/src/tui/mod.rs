@@ -4,6 +4,7 @@
 // here tagged with its slot, so a session keeps working while another one is on screen.
 
 mod clip;
+pub mod control;
 pub(crate) mod commands;
 mod render;
 mod state;
@@ -325,10 +326,12 @@ struct App {
     // This terminal's snapshot, so other terminals can't replace it.
     state_file: PathBuf,
     saved_state: state::Saved,
+    active: u64,
     // /restart: start again on the binary as it is now, once everything here has stopped; and
     // asked for, waiting for the sessions' turns to end.
     restart: bool,
     restart_waiting: bool,
+    restart_replies: futures_util::stream::FuturesUnordered<tokio::sync::oneshot::Receiver<()>>,
     // A file to open in the user's editor (/scale edit), with the screen handed over meanwhile.
     edit: Option<PathBuf>,
     // When this piccosta started, and each session folder's time when last looked at, for the
@@ -461,6 +464,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     if let Some(listing) = host.listing(opening.as_ref(), crate::cli::model_name(&args).as_deref()) {
         listing.await;
     }
+    let state_file = if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or_else(|| state::file(&host.agent_dir));
+    let mut control = control::Control::bind(&state_file)?;
     let mut terminal = setup().map_err(|error| format!("could not set up the terminal: {error}"))?;
     let (sender, updates) = unbounded_channel();
     let mut app = App {
@@ -484,10 +489,12 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         delete_armed: None,
         chord: false,
         scans: 0,
-        state_file: if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or_else(|| state::file(&host.agent_dir)),
+        state_file,
         saved_state: state::Saved::default(),
+        active: crate::clock::now_ms() as u64,
         restart: false,
         restart_waiting: false,
+        restart_replies: futures_util::stream::FuturesUnordered::new(),
         edit: None,
         started: std::time::SystemTime::now(),
         folder_times: HashMap::new(),
@@ -554,6 +561,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 Some(Ok(event)) => app.input(event),
                 _ => app.quit = true,
             },
+            Some(request) = control.requests.recv() => app.control(request),
+            Some(_) = app.restart_replies.next(), if !app.restart_replies.is_empty() => {},
             Some((slot, update)) = app.updates.recv() => app.update(slot, update),
             _ = spinner.tick(), if app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
             _ = agent_scan.tick() => app.scan_agents(),
@@ -570,8 +579,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 if question.answer.as_ref().is_some_and(|answer| !answer.is_closed()) { app.picker = Some(question); break; }
             }
         }
-        // A /restart waiting for turns to end goes ahead once none is running.
-        if app.restart_waiting && !app.slots.iter().any(Slot::busy) {
+        // Wait for turns, unfinished picker/setup input, and the restart's wire acknowledgement.
+        if app.restart_waiting && app.restart_replies.is_empty() && app.picker.is_none() && app.model_add.is_none() && app.model_probe.is_none() && !app.slots.iter().any(Slot::busy) {
             // Check the launcher and force this UI's snapshot out before letting anything go.
             match restart_launcher().and_then(|exe| {
                 app.save_state().map(|()| exe).map_err(|error| format!("could not save this UI: {error}"))
@@ -609,6 +618,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     app.shutdown(match exit_code { 143 => "SIGTERM", 129 => "SIGHUP", _ => "quit" }).await;
     // /restart: this process becomes the binary now at its path (a build replaces the file, which
     // the kernel then names "… (deleted)"), on the same command line, bringing everything back.
+    drop(control);
     if let Some(exe) = restart_exe {
         state::save_handover(&host.agent_dir, &handover).map_err(|error| format!("could not hand the background jobs over: {error}"))?;
         let error = crate::proc::resume(std::process::Command::new(&exe).env(state::RESTORE_FILE, &app.state_file).args(std::env::args_os().skip(1).filter(|argument| argument != "--restore")).arg("--restore"));
@@ -1493,6 +1503,11 @@ impl App {
             return Ok(());
         }
         let session = crate::session::Session::read(&path).map_err(|error| error.to_string())?;
+        self.follow_session(slot, session, modified);
+        Ok(())
+    }
+
+    fn follow_session(&mut self, slot: usize, session: crate::session::Session, modified: Option<std::time::SystemTime>) {
         let context = session.context();
         let model = context.model.as_ref().map_or(String::new(), |(provider, id)| format!("{provider}/{id}"));
         let window = self.host.registry().ok().and_then(|registry| registry.resolve(&model).ok().map(|found| found.context_window));
@@ -1516,7 +1531,6 @@ impl App {
             view.remember(message);
         }
         view.followed = modified;
-        Ok(())
     }
 
     // The sessions in the sidebar's order: open ones, then earlier ones, the gone left out.
@@ -1527,11 +1541,11 @@ impl App {
         let manager = crate::manager::home(&self.host.agent_dir);
         let mut projects = vec![manager.as_path(), self.host.cwd.as_path()];
         for &index in &listed {
-            if !projects.contains(&self.slots[index].cwd.as_path()) {
-                projects.push(&self.slots[index].cwd);
+            if !projects.contains(&self.project_of(index)) {
+                projects.push(self.project_of(index));
             }
         }
-        let project = |index: usize| projects.iter().position(|project| *project == self.slots[index].cwd).unwrap_or(projects.len());
+        let project = |index: usize| projects.iter().position(|project| *project == self.project_of(index)).unwrap_or(projects.len());
         listed.sort_by_key(|&index| (project(index), !self.slots[index].manager, self.slots[index].live.is_none()));
         // A subagent's row comes right after its parent's (and after its siblings').
         let (children, mut order): (Vec<usize>, Vec<usize>) = listed.into_iter().partition(|&index| self.slots[index].parent.is_some());
@@ -1544,6 +1558,19 @@ impl App {
             order.insert(at, child);
         }
         order
+    }
+
+    // The folder a row is listed under: its own, or a subagent's top parent's, so a run a session
+    // started shows under that session wherever it works (a lane in a worktree, say). The steps are
+    // bounded by the number of rows, so a parent loop can't hang the sidebar.
+    fn project_of(&self, mut index: usize) -> &Path {
+        for _ in 0..self.slots.len() {
+            match self.slots[index].parent {
+                Some(parent) if parent < self.slots.len() => index = parent,
+                _ => break,
+            }
+        }
+        &self.slots[index].cwd
     }
 
     // Take a session out of the open ones. Its task ends when its command channel closes; its pane
@@ -1660,6 +1687,9 @@ impl App {
     }
 
     fn input(&mut self, input: Input) {
+        if matches!(input, Input::Key(_) | Input::Paste(_) | Input::FocusGained | Input::Mouse(_)) {
+            self.active = crate::clock::now_ms() as u64;
+        }
         match input {
             Input::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
             Input::Paste(text) => self.paste_text(&text),
@@ -2007,13 +2037,14 @@ impl App {
         let mut project: Option<PathBuf> = None;
         for index in self.listed() {
             let slot = &self.slots[index];
-            if project.as_ref() != Some(&slot.cwd) {
+            let cwd = self.project_of(index);
+            if project.as_deref() != Some(cwd) {
                 if project.is_some() {
                     lines.push(Line::default());
                 }
-                let name = if slot.cwd == crate::config::home() { "~".to_string() } else { slot.cwd.file_name().map_or_else(|| slot.cwd.display().to_string(), |name| name.to_string_lossy().into_owned()) };
+                let name = if cwd == crate::config::home() { "~".to_string() } else { cwd.file_name().map_or_else(|| cwd.display().to_string(), |name| name.to_string_lossy().into_owned()) };
                 lines.push(Line::from(Span::styled(format!(" {}", render::fit(&name, room + 2)), Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD))));
-                project = Some(slot.cwd.clone());
+                project = Some(cwd.to_path_buf());
             }
             let (mark, color) = match &slot.state {
                 State::Running => (render::SPINNER[self.frame % render::SPINNER.len()], theme::ACCENT),
@@ -2113,7 +2144,7 @@ impl App {
             };
             let dots = ".".repeat(1 + self.frame / WORKING_DOT_FRAMES % 3);
             let seconds = slot.working_since.map_or(String::new(), |since| format!(" · {}", render::duration(since.elapsed())));
-            let restart = if self.restart_waiting { " · piccosta restarts when every turn has ended (esc or /restart: don't)" } else { "" };
+            let restart = if self.restart_waiting { " · piccosta restarts when every turn has ended (esc cancels)" } else { "" };
             rows.push(Line::default());
             rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}{restart}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
         }

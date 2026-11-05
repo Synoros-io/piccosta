@@ -456,7 +456,7 @@ impl Session {
     }
 
     // A session from a file's text: the header, then every entry that parses.
-    fn parse(path: &Path, text: &str) -> Result<Session, OpenError> {
+    pub(crate) fn parse(path: &Path, text: &str) -> Result<Session, OpenError> {
         let mut values = text.split('\n').filter_map(parse_line);
         let Some(first) = values.next() else { return Err(OpenError::NotASession(path.to_path_buf())) };
         let header: SessionHeader = match serde_json::from_value::<SessionHeader>(first) {
