@@ -127,6 +127,7 @@ struct Slot {
     path: Option<PathBuf>,
     cwd: PathBuf,
     live: Option<(Handle, UnboundedSender<Command>)>,
+    release_generation: Arc<()>,
     // Kept in this UI until the user closes it, whether its agent runs or its file opens.
     opened: bool,
     // Its tools' shared state, for /ps and /stop.
@@ -191,6 +192,7 @@ impl Slot {
             path,
             cwd: PathBuf::new(),
             live: None,
+            release_generation: Arc::new(()),
             opened: false,
             shared: None,
             model: String::new(),
@@ -318,9 +320,9 @@ struct App {
     scans: u64,
     asks: std::sync::mpsc::Sender<Ask>,
     scanning: bool,
-    // This terminal's snapshot and its last text, so other terminals can't replace it.
+    // This terminal's snapshot, so other terminals can't replace it.
     state_file: PathBuf,
-    saved: String,
+    saved_state: state::Saved,
     // /restart: start again on the binary as it is now, once everything here has stopped; and
     // asked for, waiting for the sessions' turns to end.
     restart: bool,
@@ -479,7 +481,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         chord: false,
         scans: 0,
         state_file: if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or_else(|| state::file(&host.agent_dir)),
-        saved: String::new(),
+        saved_state: state::Saved::default(),
         restart: false,
         restart_waiting: false,
         edit: None,
@@ -559,7 +561,6 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         if app.restart_waiting && !app.slots.iter().any(Slot::busy) {
             // Check the launcher and force this UI's snapshot out before letting anything go.
             match restart_launcher().and_then(|exe| {
-                app.saved.clear();
                 app.save_state().map(|()| exe).map_err(|error| format!("could not save this UI: {error}"))
             }) {
                 Ok(exe) => { restart_exe = Some(exe); (app.restart, app.quit) = (true, true); }
@@ -744,7 +745,7 @@ impl App {
             self.notice = Some(started);
         }
         // -c (and /restart) bring back what was open when piccosta last closed, when there's any.
-        if !((args.restore || args.continue_recent) && self.restore()) {
+        if !((args.restore || args.continue_recent) && self.restore(args.restore && std::env::var_os(state::RESTORE_FILE).is_none())) {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
@@ -756,13 +757,16 @@ impl App {
                 loaded => loaded?,
             }
         }
-        let first = self.panes[self.focus].slot;
-        if let Some(name) = &args.name {
-            self.slots[first].title = name.clone();
-            self.tell(Command::Name(name.clone()));
-        }
-        if let Some(team) = &args.team {
-            self.set_team(team.clone());
+        // /restart keeps the restored pane as it was, including a closed pane's read-only state.
+        if !args.restore {
+            let first = self.panes[self.focus].slot;
+            if let Some(name) = &args.name {
+                self.slots[first].title = name.clone();
+                self.tell(Command::Name(name.clone()));
+            }
+            if let Some(team) = &args.team {
+                self.set_team(team.clone());
+            }
         }
         // This directory's earlier sessions, then the latest few of the projects used most recently,
         // so the sidebar can group them by project.
@@ -799,14 +803,14 @@ impl App {
     // when another piccosta runs it now), scrolled where it was and holding its draft; then the
     // other sessions that were open, as rows. A file that can't open keeps its row and draft;
     // only the user closes it. Output: whether anything was saved to bring back.
-    fn restore(&mut self) -> bool {
-        let Some(state) = state::load(&self.host.agent_dir, &self.state_file) else { return false };
+    fn restore(&mut self, legacy: bool) -> bool {
+        let Some(state) = state::load(&self.host.agent_dir, &self.state_file, legacy) else { return false };
         let on_screen = state.panes.len();
         let mut errors = Vec::new();
         for (index, kept) in state.panes.into_iter().chain(state.open).enumerate() {
             let path = kept.session;
-            // A new session that was never saved comes back only where it was on screen.
-            if path.is_none() && (index >= on_screen || !kept.cwd.is_dir()) {
+            // A new session has no file yet; its draft still belongs here, even off-screen.
+            if path.is_none() && ((index >= on_screen && kept.draft.is_empty()) || !kept.cwd.is_dir()) {
                 continue;
             }
             // Panes that showed one session come back on one slot, sharing its draft.
@@ -822,9 +826,9 @@ impl App {
             self.slots[slot].elsewhere = path.as_deref().is_some_and(crate::runtime::running);
             self.slots[slot].closed = path.as_deref().is_some_and(|path| crate::session::is_closed(&self.host.agent_dir, path));
             // A closed pane is only a view: restoring it must not consume anything left queued.
-            let reopened = if index >= on_screen || self.slots[slot].elsewhere || self.slots[slot].closed { self.follow(slot) } else { self.load(slot, None, None, None) };
+            let reopened = if path.is_some() && (index >= on_screen || self.slots[slot].elsewhere || self.slots[slot].closed) { self.follow(slot) } else { self.load(slot, None, None, None) };
             if let Err(error) = reopened {
-                errors.push(format!("Could not restore {}: {error}", self.slots[slot].title));
+                errors.push(format!("Could not restore TUI session {}: {error}", self.slots[slot].title));
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
@@ -849,8 +853,8 @@ impl App {
         true
     }
 
-    // Save the state as it is now (state.rs), when it has changed since it was last saved. Nothing
-    // is kept for a piccosta whose sessions aren't (--no-session).
+    // Save changed content; state::Saved keeps unchanged snapshots alive without rewriting them.
+    // Nothing is kept for a piccosta whose sessions aren't (--no-session).
     fn save_state(&mut self) -> std::io::Result<()> {
         if !self.persist {
             return Ok(());
@@ -860,15 +864,11 @@ impl App {
         let panes = self.panes.iter().map(|pane| kept(&self.slots[pane.slot], pane.scroll)).collect();
         let elsewhere = |index: usize| !self.panes.iter().any(|pane| pane.slot == index);
         let open = (0..self.slots.len())
-            .filter(|&index| elsewhere(index) && (self.slots[index].opened || !self.slots[index].draft.text.is_empty()) && self.slots[index].path.is_some())
+            .filter(|&index| elsewhere(index) && (self.slots[index].opened || !self.slots[index].draft.text.is_empty()))
             .map(|index| kept(&self.slots[index], 0))
             .collect();
         let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, open }).unwrap_or_default();
-        if text != self.saved {
-            state::save(&self.state_file, &text)?;
-            self.saved = text;
-        }
-        Ok(())
+        self.saved_state.save(&self.state_file, &text)
     }
 
     // /restart: each saved session's running background jobs, and the watcher, for the next image.
@@ -1040,8 +1040,9 @@ impl App {
     }
 
     fn focused(&mut self) -> &mut Slot {
-        let slot = self.panes[self.focus].slot;
-        &mut self.slots[slot]
+        let slot = &mut self.slots[self.panes[self.focus].slot];
+        slot.release_generation = Arc::new(());
+        slot
     }
 
     // Show the session before (`earlier`) or after the focused pane's in the sidebar's list, wrapping
@@ -1060,6 +1061,7 @@ impl App {
     fn show(&mut self, slot: usize) {
         let leaving = self.panes[self.focus].slot;
         self.slots[slot].opened = true;
+        self.slots[slot].release_generation = Arc::new(());
         if self.slots[slot].live.is_none() {
             self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::runtime::running);
             if let Err(error) = self.follow(slot) {
@@ -1071,19 +1073,22 @@ impl App {
         self.put_away(leaving);
     }
 
-    // A session no pane shows any more: one that's empty goes away; one that's idle with nothing
-    // in the background lets its agent and file lock go, but keeps its row open. Typing into it
-    // starts the agent again. One still working keeps its agent until it's done.
+    // Ask an off-screen runtime to release itself when idle. Never drop its sender on the UI's
+    // delayed view of its work. A pathless draft needs its runtime to keep the row and session.
     fn put_away(&mut self, slot: usize) {
         let view = &self.slots[slot];
-        if self.panes.iter().any(|pane| pane.slot == slot) || view.live.is_none() || view.busy() {
+        if self.panes.iter().any(|pane| pane.slot == slot) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() {
             return;
         }
-        let background = view.shared.as_ref().is_some_and(|shared| shared.jobs.running_count() > 0) || !view.agents.is_empty();
-        if view.empty() {
+        let Some((_, commands)) = &view.live else { return };
+        if !commands.is_closed() {
+            let _ = commands.send(Command::ReleaseIfIdle(Arc::downgrade(&view.release_generation)));
+        } else if view.empty() {
             self.slots[slot] = Slot::new(None, NEW_TITLE.into());
-        } else if !background && view.draft.text.is_empty() {
-            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, manager: view.manager, ..Slot::new(view.path.clone(), view.title.clone()) };
+        } else {
+            let draft = std::mem::take(&mut self.slots[slot].draft);
+            let view = &self.slots[slot];
+            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, closed: view.closed, manager: view.manager, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
         }
     }
 
@@ -1110,7 +1115,7 @@ impl App {
     // Make sure the focused pane's session is open here, opening an earlier one shown from its
     // file. Output: false, with a notice, when it can't be (another piccosta runs it).
     fn ensure_open(&mut self) -> bool {
-        if self.current().live.is_some() {
+        if self.current().live.as_ref().is_some_and(|(_, commands)| !commands.is_closed()) {
             return true;
         }
         if self.current().elsewhere {
@@ -1382,14 +1387,15 @@ impl App {
         }
         self.closed = closed;
         for index in 0..self.slots.len() {
+            if self.slots[index].followed.is_some() {
+                let _ = self.follow(index);
+            }
+            self.put_away(index);
             let slot = &mut self.slots[index];
             // A runtime here that ended on its own (a manager's `sessions close`) is let go of
             // where it is: the slot keeps what it shows, its draft and whether it was closed.
             if slot.live.as_ref().is_some_and(|(_, commands)| commands.is_closed()) {
                 (slot.live, slot.shared) = (None, None);
-            }
-            if slot.followed.is_some() {
-                let _ = self.follow(index);
             }
         }
         // One scan out at a time: a stopped runtime holds one up by its wait. Each runtime is asked
@@ -1457,6 +1463,8 @@ impl App {
     fn follow(&mut self, slot: usize) -> Result<(), String> {
         let view = &mut self.slots[slot];
         let Some(path) = view.path.clone() else { return Ok(()) };
+        // A new session's draft can outlive its agent, before there's a file to follow.
+        if !view.saved && !path.exists() { return Ok(()); }
         let modified = path.metadata().and_then(|metadata| metadata.modified()).ok();
         if view.followed.is_some() && view.followed == modified {
             return Ok(());
@@ -1537,6 +1545,7 @@ impl App {
             }
         }
         self.focus = self.focus.min(self.panes.len() - 1);
+        self.focused();
         true
     }
 

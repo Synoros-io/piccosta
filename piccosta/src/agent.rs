@@ -555,6 +555,12 @@ impl Agent {
         self.config.notices.recv().await
     }
 
+    // Releasing an idle runtime must not throw away notices or a prompt it hasn't taken yet.
+    pub fn has_pending_work(&self) -> bool {
+        let inbox = self.handle.lock();
+        !self.config.notices.is_empty() || !self.held.is_empty() || !self.session.queued().is_empty() || !inbox.steer.is_empty() || !inbox.follow_up.is_empty()
+    }
+
     // Run a turn on a background job's finish message, as longcmd does in pi when the session
     // is idle.
     pub async fn take_notice(&mut self, notice: CustomMessage) -> Result<(), String> {

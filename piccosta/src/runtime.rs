@@ -72,6 +72,9 @@ pub enum Command {
     Message(String),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
+    // A weak ticket expires when the frontend shows it again or edits its draft.
+    // Only the runtime knows whether it has settled.
+    ReleaseIfIdle(std::sync::Weak<()>),
     Model(String),
     Thinking(String),
     Name(String),
@@ -518,6 +521,15 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     closing = Some(answer);
                     break;
                 }
+                Work::Command(Command::ReleaseIfIdle(generation)) => {
+                    if generation.upgrade().is_none() { continue; }
+                    held = agent.session.file().map(hold);
+                    if queue.is_empty() && commands.is_empty() && claim.as_ref().is_none_or(|claim| claim.taken.is_empty()) && shared.jobs.running_count() == 0 && !agent.has_pending_work() {
+                        break;
+                    }
+                    held = None;
+                    continue;
+                }
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt.
                 Work::Command(Command::Message(text)) if !wake && !text.is_empty() => {
@@ -670,7 +682,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
             Ok(())
         }
         Command::Model(name) => host.switch_model(agent, &name),
-        Command::Stop(_) | Command::Close(_) => Ok(()),
+        Command::Stop(_) | Command::Close(_) | Command::ReleaseIfIdle(_) => Ok(()),
     }
 }
 
