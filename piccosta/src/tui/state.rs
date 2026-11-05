@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 // Internal to /restart: its children ignore this unless started with --restore.
 pub const RESTORE_FILE: &str = "PICCOSTA_TUI_STATE";
 
-// Jack's 30-day retention window. A daily mtime refresh keeps an unchanged live UI well inside
+// The 30-day retention window. A daily mtime refresh keeps an unchanged live UI well inside
 // it; pruning daily too avoids scanning every terminal's snapshots on each agent scan.
 const SNAPSHOT_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
 const SNAPSHOT_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
