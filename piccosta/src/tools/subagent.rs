@@ -178,6 +178,18 @@ impl Tool for SubagentTool {
         Some("Hand a task to a subagent job, which runs on the model the user set for it")
     }
 
+    // Who's who among the agents and how to start one, since agents started assistants and managers
+    // of their own, ran agents through bash, and handed off long work as one-shot subagents.
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        &[
+            "The assistant and the project managers are the user's: the user makes them. Never start or stop one unless the user asks",
+            "Start other agents only with the subagent tool (a manager also has sessions), never through bash: no piccosta, claude, codex or other agent commands",
+            "A subagent does one task with a clear end and answers once; it can't be messaged meanwhile and starts no agents itself. Long work that needs steering is a manager's lane (sessions start), not a subagent",
+            "In a subagent's task, say what to do, where to look, what's already settled, what to send back and when to stop",
+            "You answer for what you start: read a subagent's answer before you pass it on, and check the claims you repeat",
+        ]
+    }
+
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             let name = arguments.get("agent").and_then(Value::as_str).unwrap_or_default();

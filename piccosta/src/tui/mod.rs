@@ -1419,17 +1419,18 @@ impl App {
         self.tasks.retain(|task| !task.is_finished());
         self.scans += 1;
         let runtimes_due = self.scans.is_multiple_of(RUNTIME_SCAN_EVERY);
-        // Sessions closed or deleted elsewhere leave the recent list, but never the user's open
-        // ones: those stay marked until the user closes them.
+        // Sessions closed or deleted elsewhere leave the list, opened here or not; one on screen stays,
+        // marked, until the user moves off it, so a pane never turns into an empty session.
         let closed = crate::session::closed_sessions(&self.host.agent_dir);
         for index in 0..self.slots.len() {
+            let on_screen = self.panes.iter().any(|pane| pane.slot == index);
             let slot = &mut self.slots[index];
             let Some(path) = slot.path.clone() else { continue };
             let exists = path.exists();
             let closed_since = closed.get(&path).is_some_and(|time| slot.closed || self.closed.get(&path) != Some(time));
             slot.closed = (slot.saved && !exists) || closed_since;
             slot.saved |= exists;
-            if slot.closed && !slot.opened && !slot.busy() && slot.draft.text.is_empty() && self.close(index) {
+            if slot.closed && !on_screen && !slot.busy() && slot.draft.text.is_empty() && self.close(index) {
                 self.slots[index].path = None;
             }
         }
@@ -1486,6 +1487,17 @@ impl App {
             let under = |file: &Path| folder.is_some_and(|folder| file.parent().is_some_and(|parent| parent == folder || parent == folder.join("subagents")));
             let running = statuses.iter().filter_map(|(file, status)| Some((file, status.as_ref()?)));
             slot.agents = running.filter(|(file, status)| under(file) && status["parent"] == slot.id).map(|(file, status)| (file.clone(), status["job"].as_str().map(str::to_string))).collect();
+        }
+        // A subagent's or a lane's session (one in a subagents folder) that nothing runs any more is
+        // done: its row goes unless it's on screen or holds a draft, restored rows too. /resume
+        // still finds it.
+        for index in 0..self.slots.len() {
+            let on_screen = self.panes.iter().any(|pane| pane.slot == index);
+            let slot = &self.slots[index];
+            let finished = slot.path.as_deref().is_some_and(|path| path.parent().and_then(Path::file_name) == Some("subagents".as_ref()) && statuses.get(path) == Some(&None));
+            if finished && slot.live.is_none() && !on_screen && slot.draft.text.is_empty() && self.close(index) {
+                self.slots[index].path = None;
+            }
         }
         let mut children = Vec::new();
         for (index, slot) in self.slots.iter().enumerate() {
