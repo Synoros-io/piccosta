@@ -176,6 +176,9 @@ struct Slot {
     // for a new one, that it's to be made its project's manager when it opens (/manager).
     manager: bool,
     make_manager: bool,
+    // When its runtime let it go while idle off-screen: its file's mtime then. A later change is
+    // something written for it (a lane's report, a job's or a sender's message), so it starts again.
+    released: Option<std::time::SystemTime>,
     // A running subagent's session: the slot of the session that started it.
     parent: Option<usize>,
     // Its own settings, when it was started with flags of its own (/new <dir> --tools …).
@@ -224,6 +227,7 @@ impl Slot {
             working_elsewhere: false,
             manager: false,
             make_manager: false,
+            released: None,
             parent: None,
             host: None,
         }
@@ -1131,7 +1135,8 @@ impl App {
         } else {
             let draft = std::mem::take(&mut self.slots[slot].draft);
             let view = &self.slots[slot];
-            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, closed: view.closed, manager: view.manager, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
+            let released = view.path.as_deref().and_then(|path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok());
+            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, closed: view.closed, manager: view.manager, released, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
         }
     }
 
@@ -1492,29 +1497,32 @@ impl App {
             }
         }
         self.slots.extend(children);
-        // A manager open here that nothing runs (after a restart, or unloaded by an older piccosta)
-        // starts again, so what was queued for it (a scheduled check, a lane's news) runs now. Its
+        // A session open here that nothing runs starts again when something was written for it since
+        // it was let go, and a manager whenever (after a restart), so what was queued for it (a lane's
+        // report, a job's end, a scheduled check) runs now, without the user typing. Its
         // closed marker is read again now, not from the scan's older view; its lock is tried without
         // waiting, so a contested one waits for a later scan instead of the UI waiting for it.
         let mtime = |path: &Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
         let free = |path: &Path| std::fs::File::open(path).is_ok_and(|file| crate::platform::try_session_lock(&file).is_ok());
-        self.wake_failed.retain(|path, _| self.slots.iter().any(|slot| slot.path.as_ref() == Some(path)));
+        self.wake_failed.retain(|path, _| self.slots.iter().any(|slot| slot.opened && slot.path.as_ref() == Some(path)));
         let asleep: Vec<usize> = (0..self.slots.len()).filter(|&index| {
             let slot = &self.slots[index];
-            slot.manager && slot.opened && !slot.closed && slot.live.is_none() && !slot.elsewhere && slot.path.as_ref().is_some_and(|path| {
-                path.exists() && statuses.get(path) == Some(&None) && !crate::session::is_closed(&self.host.agent_dir, path)
+            slot.opened && !slot.closed && slot.live.is_none() && !slot.elsewhere && slot.path.as_ref().is_some_and(|path| {
+                (slot.manager || slot.released.is_some_and(|then| mtime(path) != Some(then))) && path.exists() && statuses.get(path) == Some(&None) && !crate::session::is_closed(&self.host.agent_dir, path)
                     && self.wake_failed.get(path).is_none_or(|(then, at)| *then != mtime(path) || at.elapsed() >= WAKE_RETRY) && free(path)
             })
         }).collect();
         for index in asleep {
-            let path = self.slots[index].path.clone().unwrap_or_default();
+            let (path, released) = (self.slots[index].path.clone().unwrap_or_default(), self.slots[index].released);
             match self.reopen(index) {
                 Ok(()) => { self.wake_failed.remove(&path); }
                 Err(error) => {
+                    // Still let go, so the next report (or WAKE_RETRY) tries it again.
+                    self.slots[index].released = released;
                     // Said once for each state of the file: a retry that fails the same way is quiet.
                     let now = mtime(&path);
                     if self.wake_failed.get(&path).is_none_or(|(then, _)| *then != now) {
-                        self.notice = Some(format!("Couldn't start the manager {}: {error}", self.slots[index].title));
+                        self.notice = Some(format!("Couldn't start {}: {error}", self.slots[index].title));
                     }
                     self.wake_failed.insert(path, (now, Instant::now()));
                 }
