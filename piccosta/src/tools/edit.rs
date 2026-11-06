@@ -145,7 +145,7 @@ impl Tool for EditTool {
     }
 }
 
-async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], context: &ToolContext) -> Result<ToolOutput, String> {
+async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], context: &ToolContext<'_>) -> Result<ToolOutput, String> {
     // Abort is checked between steps, never mid-write (edit.ts:168-172).
     let aborted = || context.cancel.is_cancelled().then(|| "Operation aborted".to_string());
     if let Some(message) = aborted() {

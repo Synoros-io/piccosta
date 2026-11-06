@@ -878,7 +878,13 @@ fn prompt_input(blocks: &[Value], cwd: &Path) -> (String, Vec<Content>) {
         let field = |key: &str| block.get(key).and_then(Value::as_str).unwrap_or("").to_string();
         match block.get("type").and_then(Value::as_str) {
             Some("text") => words.push(field("text")),
-            Some("image") => images.push(Content::Image { data: field("data"), mime_type: field("mimeType") }),
+            Some("image") => {
+                // Keep a source the client gives us: the image bytes alone cannot name it later.
+                if let Some(path) = file_path(&field("uri"), cwd).filter(|path| path.is_file()) {
+                    images.push(Content::text(format!("[image attached from {}]", path.display())));
+                }
+                images.push(Content::Image { data: field("data"), mime_type: field("mimeType") });
+            },
             Some("resource") => {
                 let uri = block.pointer("/resource/uri").and_then(Value::as_str).unwrap_or("");
                 let label = file_path(uri, cwd).map_or(uri.to_string(), |path| path.display().to_string());

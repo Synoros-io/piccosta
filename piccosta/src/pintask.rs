@@ -19,9 +19,8 @@
 // Licensed FSL-1.1-ALv2, Copyright 2026 Synoros.
 
 use crate::compaction::{Preparation, Reason};
-use crate::message::{AgentMessage, Content, TextOrBlocks};
 use crate::js;
-use crate::session::SessionEntry;
+use crate::session::{user_text, SessionEntry};
 use serde_json::{json, Value};
 
 pub const PIN_ALL_ENV: &str = "PICCOSTA_PIN_ALL";
@@ -42,23 +41,6 @@ const INDEX_LINES: usize = 200;
 // On unless PICCOSTA_PIN_ALL=0.
 pub fn enabled() -> bool {
     std::env::var(PIN_ALL_ENV).as_deref() != Ok("0")
-}
-
-// A user message's plain text, images left out (selfcompact.ts userText). Only messages the user
-// sent: custom messages (a job's finish notice) aren't the user's words.
-fn user_text(entry: &SessionEntry) -> Option<String> {
-    let SessionEntry::Message { message: AgentMessage::User(user), .. } = entry else { return None };
-    Some(match &user.content {
-        TextOrBlocks::Text(text) => text.clone(),
-        TextOrBlocks::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                Content::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    })
 }
 
 // The first `count` UTF-16 units of `text`, as JavaScript's slice(0, count).

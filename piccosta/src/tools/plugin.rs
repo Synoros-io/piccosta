@@ -276,7 +276,7 @@ impl Process {
 }
 
 impl Plugin {
-    async fn call(&self, tool: &str, arguments: Map<String, Value>, approved: bool, context: &ToolContext) -> Result<ToolOutput, String> {
+    async fn call(&self, tool: &str, arguments: Map<String, Value>, approved: bool, context: &ToolContext<'_>) -> Result<ToolOutput, String> {
         // One deadline includes the queue, startup and stdin, not just reads. Reset while still
         // holding the lock: dropping it first lets a queued call take the broken process back.
         let deadline = tokio::time::Instant::now().checked_add(context.shared.plugin_call_wait).ok_or("call timeout cannot be represented")?;

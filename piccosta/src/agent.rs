@@ -1252,8 +1252,10 @@ impl Agent {
         Ok(())
     }
 
-    fn tool_context(&self) -> ToolContext {
+    fn tool_context<'a>(&self, session: &'a Session) -> ToolContext<'a> {
         ToolContext {
+            session: Some(session),
+            call_id: String::new(),
             cwd: self.config.cwd.clone(),
             session_id: self.session.id().to_string(),
             session_file: self.session.file().map(PathBuf::from),
@@ -1274,18 +1276,18 @@ impl Agent {
             let Content::ToolCall { id, name, arguments, .. } = block else { continue };
             (self.emit)(&Event::ToolExecutionStart { tool_call_id: id.clone(), tool_name: name.clone(), args: arguments.clone() });
             let run = ToolRun { index, call_id: id.clone(), name: name.clone(), output: Err(truncated_call_text(name)), duration_ms: None };
-            self.emit_tool_end(&run);
+            Self::emit_tool_end(&mut self.emit, &run);
             runs.push(run);
         }
         runs
     }
 
-    fn emit_tool_end(&mut self, run: &ToolRun) {
+    fn emit_tool_end(emit: &mut EventSink, run: &ToolRun) {
         let (result, is_error) = match &run.output {
             Ok(output) => (result_json(&output.content, &output.details), output.is_error),
             Err(message) => (result_json(&[Content::text(message.clone())], &Some(json!({}))), true),
         };
-        (self.emit)(&Event::ToolExecutionEnd {
+        emit(&Event::ToolExecutionEnd {
             tool_call_id: run.call_id.clone(),
             tool_name: run.name.clone(),
             result,
@@ -1332,7 +1334,7 @@ impl Agent {
                 Ok(ready) => ready,
                 Err(output) => {
                     let run = ToolRun { index: slot, call_id: id.clone(), name: name.clone(), output: Err(output), duration_ms: None };
-                    self.emit_tool_end(&run);
+                    Self::emit_tool_end(&mut self.emit, &run);
                     finished[slot] = Some(run);
                     continue;
                 }
@@ -1347,7 +1349,7 @@ impl Agent {
                     }
                 }
             });
-            let context = ToolContext { updates: Some(sender), ..self.tool_context() };
+            let context = ToolContext { call_id: id.clone(), updates: Some(sender), ..self.tool_context(&self.session) };
             let (call_id, call_name) = (id.clone(), name.clone());
             pending.push(async move {
                 let started = Instant::now();
@@ -1360,7 +1362,7 @@ impl Agent {
         while !pending.is_empty() {
             tokio::select! {
                 Some(run) = pending.next() => {
-                    self.emit_tool_end(&run);
+                    Self::emit_tool_end(&mut self.emit, &run);
                     let index = run.index;
                     finished[index] = Some(run);
                 }

@@ -154,14 +154,14 @@ enum Run {
 // A command piccosta builds itself (a subagent's child), run the way the model's commands run but
 // without the settings' shellCommandPrefix: that prefix keeps piccosta's own environment from
 // commands the model writes (a `piccosta` it starts by hand), and this one is meant to have it.
-pub async fn run_own(command: String, context: &ToolContext) -> Result<ToolOutput, String> {
+pub async fn run_own(command: String, context: &ToolContext<'_>) -> Result<ToolOutput, String> {
     match run(&Arguments { command, timeout: None, own: true, background: false }, context).await? {
         Run::Finished(output) | Run::Background(output) => Ok(output),
     }
 }
 
 // The same, straight to the background: the manager's sessions, whose end comes back as a message.
-pub async fn run_in_background(command: String, context: &ToolContext) -> Result<ToolOutput, String> {
+pub async fn run_in_background(command: String, context: &ToolContext<'_>) -> Result<ToolOutput, String> {
     match run(&Arguments { command, timeout: None, own: true, background: true }, context).await? {
         Run::Finished(output) | Run::Background(output) => Ok(output),
     }
@@ -461,7 +461,7 @@ fn append_status(text: &str, status: &str) -> String {
     if text.is_empty() { status.to_string() } else { format!("{text}\n\n{status}") }
 }
 
-async fn run(arguments: &Arguments, context: &ToolContext) -> Result<Run, String> {
+async fn run(arguments: &Arguments, context: &ToolContext<'_>) -> Result<Run, String> {
     let shared = &context.shared;
     let command = match &shared.shell_command_prefix {
         Some(prefix) if !arguments.own => format!("{prefix}\n{}", arguments.command),

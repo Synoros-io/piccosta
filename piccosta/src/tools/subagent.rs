@@ -72,7 +72,7 @@ impl SubagentTool {
     // The job's models that a connected account serves and that have a login, in its order, and a
     // line for each one left out and why. A job that lists none, or none of whose models can run,
     // runs on the calling session's own model.
-    async fn available(&self, job: &Job, context: &ToolContext) -> Result<(Vec<String>, Vec<String>), String> {
+    async fn available(&self, job: &Job, context: &ToolContext<'_>) -> Result<(Vec<String>, Vec<String>), String> {
         let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name)?);
         let own = format!("{}/{}", context.provider, context.model_id);
         if models.is_empty() {
@@ -105,7 +105,7 @@ impl SubagentTool {
     // out. Output: the shell command that prints those lines, then runs the task on the first
     // model and, each time a run fails, on the next. Its first line names the job and the task,
     // which is what a background job's message shows of it.
-    fn command(&self, job: &Job, task: &str, (models, skipped): (Vec<String>, Vec<String>), context: &ToolContext) -> Result<String, String> {
+    fn command(&self, job: &Job, task: &str, message: &str, (models, skipped): (Vec<String>, Vec<String>), context: &ToolContext) -> Result<String, String> {
         let exe = std::env::current_exe().map_err(|error| format!("could not find piccosta's own binary: {error}"))?;
         // A binary replaced while it runs (a rebuild) reads as "<path> (deleted)"; the new one at
         // that path is the one to start.
@@ -120,9 +120,9 @@ impl SubagentTool {
         let flags = flags.join(" ");
         let runs: Vec<String> = models.iter().map(|model| format!("printf '%s' \"$task\" | {CHILD_ENV}={} {} -p --model {} {flags}", quote(&job.name), quote(&exe), quote(model))).collect();
         let notes: String = skipped.iter().map(|line| format!("printf '%s\\n' {}\n", quote(line))).collect();
-        let command = format!("# subagent {}: {}\ntask={}\n{notes}{}", job.name, task.lines().next().unwrap_or_default(), quote(task), runs.join(" ||\n"));
+        let command = format!("# subagent {}: {}\ntask={}\n{notes}{}", job.name, task.lines().next().unwrap_or_default(), quote(message), runs.join(" ||\n"));
         if command.len() > MAX_COMMAND_BYTES {
-            return Err(format!("The task is too long to hand over ({} bytes, the limit is about {MAX_COMMAND_BYTES}). Write it to a file and give the subagent the path.", task.len()));
+            return Err(format!("The task is too long to hand over ({} bytes, the limit is about {MAX_COMMAND_BYTES}). Write it to a file and give the subagent the path.", message.len()));
         }
         Ok(command)
     }
@@ -157,14 +157,15 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. When the user names a model for the task, pass it as model (provider/id), with thinking if they named a level; otherwise leave both out. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent knows only the task you give it, so include the paths, what you already know and what you want back.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. When the user names a model for the task, pass it as model (provider/id), with thinking if they named a level; otherwise leave both out. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",
                 "required": ["agent", "task"],
                 "properties": {
                     "agent": {"type": "string", "enum": names, "description": "The job"},
-                    "task": {"type": "string", "description": "The task, with everything the subagent needs to do it"},
+                    "task": {"type": "string", "description": "What to do and what you want back; the discussion is copied separately"},
+                    "discussed": {"type": "string", "description": "The first words of the user's message where this task was first discussed; piccosta copies the discussion from there, word for word, to the subagent"},
                     "model": {"type": "string", "description": "provider/id, only when the user named the model; else the job's own"},
                     "thinking": {"type": "string", "enum": crate::provider::THINKING_LEVELS, "description": "The level, only with a model the user named"}
                 }
@@ -197,7 +198,8 @@ impl Tool for SubagentTool {
             };
             // Straight to the background: a subagent runs for minutes, and the session stays free
             // to answer meanwhile; its answer comes back as the job's message.
-            super::bash::run_in_background(self.command(job, task, models, context)?, context).await
+            let message = crate::session::delegation_message(context, arguments.get("discussed").and_then(Value::as_str), task)?;
+            super::bash::run_in_background(self.command(job, task, &message, models, context)?, context).await
         })
     }
 }

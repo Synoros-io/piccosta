@@ -153,7 +153,10 @@ impl ToolShared {
 
 // What one tool call knows about the session it runs in.
 #[derive(Clone)]
-pub struct ToolContext {
+pub struct ToolContext<'a> {
+    // Borrowed for this batch, never cloned or reloaded by delegation.
+    pub session: Option<&'a crate::session::Session>,
+    pub call_id: String,
     pub cwd: PathBuf,
     pub session_id: String,
     pub session_file: Option<PathBuf>,

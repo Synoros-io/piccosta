@@ -62,7 +62,7 @@ impl Tool for ReadTool {
         Box::pin(async move {
             let arguments: Arguments = serde_json::from_value(Value::Object(arguments)).map_err(|error| error.to_string())?;
             let absolute = paths::resolve(&arguments.path, &context.cwd);
-            let task_context = context.clone();
+            let task_context = ToolContext { session: None, ..context.clone() };
             let task = tokio::task::spawn_blocking(move || read_file(&arguments, &absolute, &task_context));
             tokio::select! {
                 result = task => result.map_err(|error| error.to_string())?,

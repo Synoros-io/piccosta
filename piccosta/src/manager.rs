@@ -848,7 +848,7 @@ impl Tool for SessionsTool {
     fn definition(&self) -> crate::message::ToolDefinition {
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -858,6 +858,7 @@ impl Tool for SessionsTool {
                     "count": {"type": "number", "description": "How many messages read shows"},
                     "dir": {"type": "string", "description": "The directory a new session works in"},
                     "message": {"type": "string", "description": "What to send the session; start can leave it out"},
+                    "discussed": {"type": "string", "description": "For start: the first words of the user's message where this task was first discussed; piccosta copies the discussion from there, word for word, to the session"},
                     "use": {"type": "string", "description": "The kind of work, from the model scale: piccosta picks its model now"},
                     "model": {"type": "string", "description": "provider/id, when the user named one; else use"},
                     "thinking": {"type": "string"},
@@ -870,7 +871,7 @@ impl Tool for SessionsTool {
         }
     }
 
-    fn execute<'a>(&'a self, arguments: Map<String, Value>, _context: &'a ToolContext) -> ToolFuture<'a> {
+    fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             let need = |key: &str| string(&arguments, key).ok_or_else(|| format!("{key} is needed"));
             match string(&arguments, "action").unwrap_or_default() {
@@ -895,7 +896,8 @@ impl Tool for SessionsTool {
                     match string(&arguments, "message") {
                         Some(message) => {
                             let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
-                            text(format!("{started} {}", self.run(&file, &dir, message, &title).await?))
+                            let message = crate::session::delegation_message(context, string(&arguments, "discussed"), message)?;
+                            text(format!("{started} {}", self.run(&file, &dir, &message, &title).await?))
                         }
                         None => {
                             take_lane(&self.home, &file, &name, None, String::new());
