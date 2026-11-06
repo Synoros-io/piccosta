@@ -877,7 +877,7 @@ fn discard(key: &str, reason: &str) {
 // query (it answered, or was stopped mid-answer) stays: the next message goes into it, and it ends
 // when its cache would have lapsed, its session closes (close) or piccosta exits (shutdown).
 pub fn end_run(session_id: &str) {
-    end_query(session_id, "pi's run ended with the query still live", true);
+    end_query(session_id, "piccosta's run ended with the query still live", true);
 }
 
 // A pi session closed, deleted or replaced: its query, waiting or not, ends now rather than when
@@ -1013,7 +1013,7 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fo
         Ok(start) => start,
         Err(reason) => {
             if let Some(old) = live.remove(key) {
-                let_go(old, &format!("pi's context changed: {reason}"));
+                let_go(old, &format!("the session's context changed: {reason}"));
             }
             return Err((reason, turn));
         }
@@ -1408,7 +1408,7 @@ impl Query {
                 call.check_at = now + LOST_CALL_CHECK;
                 continue;
             }
-            let message = format!("Claude Code dispatched tool call {} [{id}] that pi never received; the query was stopped so the turn would not wait on it forever",
+            let message = format!("Claude Code dispatched tool call {} [{id}] that piccosta never received; the query was stopped so the turn would not wait on it forever",
                 self.parked[&id].tool);
             self.end_open(StopReason::Error, &message);
             return self.discard(&message).await;

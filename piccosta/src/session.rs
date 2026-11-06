@@ -303,7 +303,7 @@ impl std::fmt::Display for OpenError {
             OpenError::NotASession(path) => write!(formatter, "Session file is not a valid session: {}", path.display()),
             OpenError::TooOld { path, version } => write!(
                 formatter,
-                "Session file {} is format version {version}, from before pi 1.0; piccosta reads version {CURRENT_SESSION_VERSION}. Open it once with pi to upgrade it.",
+                "Session file {} is format version {version}, older than piccosta can open (it reads version {CURRENT_SESSION_VERSION}).",
                 path.display()
             ),
         }

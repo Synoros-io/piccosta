@@ -67,6 +67,9 @@ const WORKING_DOT_FRAMES: usize = 5;
 const WHEEL_ROWS: usize = 3;
 // How long a first ctrl+c waits for the second while sessions are running.
 const QUIT_CONFIRM: Duration = Duration::from_secs(2);
+// How long /assistant waits for an assistant it just started to make its session: a service's
+// start and its first session file take a second or two; ten covers a slow login.
+const ASSISTANT_START_WAIT: Duration = Duration::from_secs(10);
 // How long a manager that failed to start on its own waits before the next try, when its file hasn't
 // changed: a minute, so one that failed for a passing reason (no account yet, another piccosta had it)
 // starts soon after, and a broken file costs one read a minute.
@@ -92,6 +95,8 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    // /assistant's start, done: what it did, if anything; the assistant is shown when it's there.
+    Assistant(Option<String>),
     // A tool's per-call question. Dropping its answer (Esc, quit) refuses it.
     Ask(String, tokio::sync::oneshot::Sender<bool>),
     ModelProbe(u64, Result<(crate::model_add::Addition, crate::model_add::Probe), String>),
@@ -776,7 +781,7 @@ impl App {
     // The first pane's session (named, this directory's latest, or new), and the sidebar's list
     // of earlier ones.
     fn start(&mut self, args: &crate::cli::Args) -> Result<(), String> {
-        if let Some(started) = crate::manager::ensure_running(&self.host.settings) {
+        if let Some(started) = crate::manager::ensure_running(&self.host.settings, false) {
             self.notice = Some(started);
         }
         // -c (and /restart) bring back what was open when piccosta last closed, when there's any.
@@ -1665,6 +1670,22 @@ impl App {
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items: vec!["No".into(), "Yes".into()], filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), text: false, masked: false });
             }
             Update::Report(text) => self.report(text),
+            Update::Assistant(started) => {
+                // Said only when it started something: a newer notice isn't cleared for nothing.
+                if started.is_some() {
+                    self.notice = started;
+                }
+                let Some(file) = crate::manager::session_file(&self.host.agent_dir).and_then(|file| file.canonicalize().ok()) else {
+                    self.notice.get_or_insert_with(|| "No assistant runs here yet: `piccosta assistant` starts one.".into());
+                    return;
+                };
+                let slot = self.slots.iter().position(|slot| slot.path.as_ref() == Some(&file)).unwrap_or_else(|| {
+                    let home = crate::manager::home(&self.host.agent_dir);
+                    self.slots.push(Slot { cwd: home, manager: true, ..Slot::new(Some(file), crate::manager::assistant_name(&self.host.agent_dir)) });
+                    self.slots.len() - 1
+                });
+                self.show(slot);
+            }
             Update::ModelProbe(flow, result) => self.probed_model(flow, result),
             Update::Scanned(statuses, agents) => self.scanned(statuses, agents),
             Update::Sent(sent, text) => self.sent(slot, sent, text),

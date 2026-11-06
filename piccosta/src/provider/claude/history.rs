@@ -597,7 +597,7 @@ pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape
     let records: Vec<Value> = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["uuid"].is_string()).collect();
     let mut map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = map.entry(key.to_string()).or_insert((None, None));
-    debug(&format!("kept: {} records of {cc_session_id} for {} pi messages", records.len(), prints.len()));
+    debug(&format!("kept: {} records of {cc_session_id} for {} piccosta messages", records.len(), prints.len()));
     if let Some(sidecar) = &entry.0 {
         let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd,
             "shape": shape, "prints": prints, "roles": roles});

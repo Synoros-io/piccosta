@@ -1145,13 +1145,15 @@ fn unit_text(exe: &str, agent_dir: &Path) -> String {
 // starts at login and comes back if it fails; elsewhere it starts as a detached process of its
 // own. With PICCOSTA_AGENT_DIR set (a second agent dir, a test) it's off, since the unit serves the
 // default one, and so it is for a terminal UI an agent's command started (a test driving it).
+// `asked`: the user asked for it (/assistant), so it starts whatever the setting says, and a unit
+// already there is started as it is (it may run a build the user chose), not rewritten.
 // Output: what it did, for a notice, or None when it's off or already running.
-pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
+pub fn ensure_running(settings: &crate::config::Settings, asked: bool) -> Option<String> {
     let agent_dir = crate::config::agent_dir();
     if session_file(&agent_dir).is_some_and(|file| crate::runtime::running(&file)) {
         return None;
     }
-    if settings.get("manager.autostart").and_then(Value::as_bool) != Some(true) || own_agent_dir() || started_by_agent() {
+    if (!asked && settings.get("manager.autostart").and_then(Value::as_bool) != Some(true)) || own_agent_dir() || started_by_agent() {
         return None;
     }
     let exe = crate::proc::exe().ok()?.to_string_lossy().into_owned();
@@ -1160,7 +1162,7 @@ pub fn ensure_running(settings: &crate::config::Settings) -> Option<String> {
     if systemctl(&["show-environment"]) {
         let unit = unit_text(&exe, &agent_dir);
         let path = config.join("systemd/user").join(UNIT);
-        if fs::read_to_string(&path).ok().as_deref() != Some(unit.as_str()) {
+        if !(asked && path.exists()) && fs::read_to_string(&path).ok().as_deref() != Some(unit.as_str()) {
             fs::create_dir_all(path.parent()?).ok()?;
             fs::write(&path, unit).ok()?;
             systemctl(&["daemon-reload"]);

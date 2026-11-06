@@ -44,12 +44,13 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 42] = [
+const COMMANDS: [(&str, &str); 43] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
     ("/scale", "which model does which kind of work, and how much of each plan is used (--use <kind> picks from it)"),
     ("/manager", "this project's manager: shown, or made (the first session in a directory is one)"),
+    ("/assistant", "the assistant: shown, or started when it isn't running (it runs in the background)"),
     ("/resume [text|all]", "the sessions to switch to (^s; ^d there deletes one); all: every project's"),
     ("/fork, /branch [name]", "copy this session and carry on in the copy"),
     ("/rewind", "go back to before one of your prompts, in a copy, with that prompt in the editor"),
@@ -233,6 +234,19 @@ impl App {
                     }
                 };
                 self.show(slot);
+            }
+            // The assistant runs as a background service. It's started off the UI's thread
+            // (systemctl can be slow), and shown once its session is there (Update::Assistant).
+            "assistant" => {
+                let (settings, agent_dir, sender) = (self.host.settings.clone(), self.host.agent_dir.clone(), self.sender.clone());
+                tokio::task::spawn_blocking(move || {
+                    let started = crate::manager::ensure_running(&settings, true);
+                    let deadline = std::time::Instant::now() + super::ASSISTANT_START_WAIT;
+                    while started.is_some() && crate::manager::session_file(&agent_dir).is_none() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    let _ = sender.send((0, Update::Assistant(started)));
+                });
             }
             "fork" | "branch" => self.fork(None, argument.to_string(), String::new()),
             "rewind" => self.rewind(),
