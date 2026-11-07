@@ -48,6 +48,9 @@ pub mod theme {
 // The status line when there's no notice: what's most used first, since a narrow screen cuts the
 // end; /help has every key and command.
 const HELP: &str = "enter send · esc stop · pgup/pgdn or alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
+// The same for --single, without the keys for other sessions, and what those keys say there.
+const SINGLE_HELP: &str = "enter send · esc stop · ^x^s sends now · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
+const SINGLE: &str = "--single has one session; start piccosta without it for more";
 // How many of this directory's earlier sessions the sidebar lists, and of other projects': the most
 // recently used projects, a few sessions each.
 const RECENT_SESSIONS: usize = 30;
@@ -318,6 +321,8 @@ struct App {
     panes: Vec<Pane>,
     focus: usize,
     sidebar: bool,
+    // --single: one pane on one session, no sidebar, and no other sessions looked for or listed.
+    single: bool,
     flags: Flags,
     frame: usize,
     sender: UnboundedSender<(usize, Update)>,
@@ -480,7 +485,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     if let Some(listing) = host.listing(opening.as_ref(), crate::cli::model_name(&args).as_deref()) {
         listing.await;
     }
-    let state_file = if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or_else(|| state::file(&host.agent_dir));
+    // --single keeps its own file, so it never takes the place of this terminal's full UI's.
+    let own = if args.single { host.agent_dir.join(format!("tui-state-single-{}.json", std::process::id())) } else { state::file(&host.agent_dir) };
+    let state_file = if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or(own);
     let mut control = control::Control::bind(&state_file)?;
     let mut terminal = setup().map_err(|error| format!("could not set up the terminal: {error}"))?;
     let (sender, updates) = unbounded_channel();
@@ -491,6 +498,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         panes: Vec::new(),
         focus: 0,
         sidebar: true,
+        single: args.single,
         flags: Flags::default(),
         frame: 0,
         asks: asker(sender.clone()),
@@ -626,6 +634,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 }
             }
         }
+    }
+    if !app.restart {
+        app.restart_waiting = false;
     }
     let _ = app.save_state();
     let _ = app.tex.clear(&mut stdout);
@@ -781,11 +792,12 @@ impl App {
     // The first pane's session (named, this directory's latest, or new), and the sidebar's list
     // of earlier ones.
     fn start(&mut self, args: &crate::cli::Args) -> Result<(), String> {
-        if let Some(started) = crate::manager::ensure_running(&self.host.settings, false) {
+        if !self.single && let Some(started) = crate::manager::ensure_running(&self.host.settings, false) {
             self.notice = Some(started);
         }
-        // -c (and /restart) bring back what was open when piccosta last closed, when there's any.
-        if !((args.restore || args.continue_recent) && self.restore(args.restore && std::env::var_os(state::RESTORE_FILE).is_none())) {
+        // -c (and /restart) bring back what was open when piccosta last closed, when there's any;
+        // --single's -c is only this directory's latest session.
+        if !((args.restore || (args.continue_recent && !self.single)) && self.restore(args.restore && std::env::var_os(state::RESTORE_FILE).is_none())) {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
@@ -809,24 +821,26 @@ impl App {
             }
         }
         // This directory's earlier sessions, then the latest few of the projects used most recently,
-        // so the sidebar can group them by project.
-        let mut folders: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(self.host.agent_dir.join("sessions"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|folder| folder.path() != self.host.session_dir)
-            .filter_map(|folder| Some((folder.metadata().ok()?.modified().ok()?, folder.path())))
-            .collect();
-        folders.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-        // A project whose directory is gone (a deleted scratch run) has nothing to come back to.
-        let others = folders
-            .iter()
-            .map(|(_, folder)| crate::host::sessions_in(folder, None, RECENT_PER_OTHER_PROJECT))
-            .filter(|sessions| sessions.first().is_some_and(|summary| summary.cwd.is_dir()))
-            .take(OTHER_PROJECTS)
-            .flatten();
-        let others = self.host.sessions(RECENT_SESSIONS).into_iter().chain(others).collect();
-        self.list_sessions(others);
+        // so the sidebar can group them by project. --single has no sidebar, so none.
+        if !self.single {
+            let mut folders: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(self.host.agent_dir.join("sessions"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|folder| folder.path() != self.host.session_dir)
+                .filter_map(|folder| Some((folder.metadata().ok()?.modified().ok()?, folder.path())))
+                .collect();
+            folders.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+            // A project whose directory is gone (a deleted scratch run) has nothing to come back to.
+            let others = folders
+                .iter()
+                .map(|(_, folder)| crate::host::sessions_in(folder, None, RECENT_PER_OTHER_PROJECT))
+                .filter(|sessions| sessions.first().is_some_and(|summary| summary.cwd.is_dir()))
+                .take(OTHER_PROJECTS)
+                .flatten();
+            let others = self.host.sessions(RECENT_SESSIONS).into_iter().chain(others).collect();
+            self.list_sessions(others);
+        }
         // -r with no session named: the picker, over the new session it opened on. A restart
         // doesn't ask again, or send the opening message again.
         if args.resume.as_deref() == Some("") && !args.restore {
@@ -895,8 +909,13 @@ impl App {
 
     // Save changed content; state::Saved keeps unchanged snapshots alive without rewriting them.
     // Nothing is kept for a piccosta whose sessions aren't (--no-session).
+    // --single saves only for /restart, which reads it back as it starts; its file goes otherwise.
     fn save_state(&mut self) -> std::io::Result<()> {
         if !self.persist {
+            return Ok(());
+        }
+        if self.single && !self.restart_waiting {
+            let _ = std::fs::remove_file(&self.state_file);
             return Ok(());
         }
         // Even a missing or unreadable file stays named here until the user closes its row.
@@ -1025,7 +1044,7 @@ impl App {
             && crate::host::sessions_in(&crate::session::default_session_dir(agent_dir, &dir), Some(&dir), 1).is_empty();
         // Home isn't a project: a session started there (outside every project) is a plain one.
         let home = Some(crate::config::home());
-        let eligible = self.persist && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
+        let eligible = self.persist && !self.single && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
         let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
         if eligible && (first || self.slots[slot].make_manager) && crate::manager::role(&session).is_none() {
             crate::manager::make(agent_dir, &mut session, crate::manager::Role::Project).map_err(|error| format!("could not make the project manager: {error}"))?;
@@ -1098,6 +1117,9 @@ impl App {
     // Show the session before (`earlier`) or after the focused pane's in the sidebar's list, wrapping
     // at the ends. Passing an earlier session only shows it, so this never starts an agent.
     fn next_session(&mut self, earlier: bool) {
+        if self.one_session() {
+            return;
+        }
         let listed = self.listed();
         if let Some(at) = listed.iter().position(|&index| index == self.panes[self.focus].slot) {
             let next = if earlier { (at + listed.len() - 1) % listed.len() } else { (at + 1) % listed.len() };
@@ -1110,6 +1132,8 @@ impl App {
     // without an agent. A new session left empty behind it goes away.
     fn show(&mut self, slot: usize) {
         let leaving = self.panes[self.focus].slot;
+        // --single keeps no session open but the one shown (a /fork's or /clear's leaves it).
+        self.slots[leaving].opened &= !self.single;
         self.slots[slot].opened = true;
         self.slots[slot].release_generation = Arc::new(());
         if self.slots[slot].live.is_none() {
@@ -1342,8 +1366,16 @@ impl App {
         }
     }
 
+    // In --single, say that there's only the one session. Output: whether it's --single.
+    fn one_session(&mut self) -> bool {
+        if self.single {
+            self.notice = Some(SINGLE.into());
+        }
+        self.single
+    }
+
     fn split(&mut self) {
-        if self.panes.len() >= MAX_PANES {
+        if self.one_session() || self.panes.len() >= MAX_PANES {
             return;
         }
         if let Some(slot) = self.new_session() {
@@ -1466,9 +1498,11 @@ impl App {
             let scan = move || (0, Update::Scanned(files.into_iter().map(|file| (file.clone(), crate::runtime::status(&file))).collect(), agents));
             self.scanning = self.asks.send(Box::new(scan)).is_ok();
         }
-        self.list_sessions(Vec::new());
-        if runtimes_due {
-            self.find_new_sessions();
+        if !self.single {
+            self.list_sessions(Vec::new());
+            if runtimes_due {
+                self.find_new_sessions();
+            }
         }
         let _ = self.save_state();
     }
@@ -1505,7 +1539,8 @@ impl App {
             }
         }
         let mut children = Vec::new();
-        for (index, slot) in self.slots.iter().enumerate() {
+        // Its agents' rows are the sidebar's, which --single doesn't have.
+        for (index, slot) in self.slots.iter().enumerate().filter(|_| !self.single) {
             for (file, job) in &slot.agents {
                 if !self.slots.iter().chain(&children).any(|other: &Slot| other.path.as_ref() == Some(file)) {
                     let model = crate::session::Session::read(file).ok().and_then(|session| session.context().model).map_or(String::new(), |(_, id)| id);
@@ -1646,7 +1681,11 @@ impl App {
         }
         // Another session to show, needed only when every pane shows this one.
         let showing: Vec<usize> = (0..self.panes.len()).rev().filter(|&pane| self.panes[pane].slot == slot).collect();
-        let next = if showing.len() < self.panes.len() { None } else { self.listed().into_iter().find(|&index| index != slot && self.slots[index].live.is_some()).or_else(|| self.new_session()) };
+        // In --single a fresh session takes the pane, or nothing closes (an empty one would be reused, and
+        // with no model to start on there's none).
+        let next = if showing.len() < self.panes.len() { None } else if self.single {
+            match self.new_session().filter(|&next| next != slot) { Some(next) => Some(next), None => return false }
+        } else { self.listed().into_iter().find(|&index| index != slot && self.slots[index].live.is_some()).or_else(|| self.new_session()) };
         // A fresh view, so opening it again doesn't show its messages twice; never saved, it's gone.
         let path = self.slots[slot].path.clone().filter(|path| path.exists());
         self.slots[slot] = Slot::new(path, self.slots[slot].title.clone());
@@ -1933,9 +1972,10 @@ impl App {
             }
             // Up and down the sidebar's list, one session at a time: alt+↑↓, or page up and down, which
             // get through terminals and remote links that keep alt (or ctrl and shift with the page
-            // keys) for themselves. Alt with the page keys scrolls instead, below.
+            // keys) for themselves. Alt with the page keys scrolls instead, below, as the page keys
+            // alone do in --single.
             KeyCode::Up | KeyCode::Down if alt => self.next_session(key.code == KeyCode::Up),
-            KeyCode::PageUp | KeyCode::PageDown if !alt => self.next_session(key.code == KeyCode::PageUp),
+            KeyCode::PageUp | KeyCode::PageDown if !alt && !self.single => self.next_session(key.code == KeyCode::PageUp),
             KeyCode::Char('s') if control => self.sessions(""),
             KeyCode::Left if alt => self.focus = self.focus.saturating_sub(1),
             KeyCode::Right if alt => self.focus = (self.focus + 1).min(self.panes.len() - 1),
@@ -2064,7 +2104,7 @@ impl App {
         let toward = commands::toward_descent(&self.current().draft.text);
         self.descent_since = if toward { self.descent_since.or_else(|| Some(Instant::now())) } else { None };
         let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-        let sidebar = self.sidebar && main.width >= SIDEBAR_MIN_SCREEN;
+        let sidebar = self.sidebar && !self.single && main.width >= SIDEBAR_MIN_SCREEN;
         let [side, panes] = Layout::horizontal([Constraint::Length(if sidebar { SIDEBAR_WIDTH } else { 0 }), Constraint::Fill(1)]).areas(main);
         self.sidebar_rect = side;
         if sidebar {
@@ -2094,7 +2134,7 @@ impl App {
             }
             clip::highlight(buffer, selection.rect, anchor, head);
         }
-        let line = self.notice.clone().unwrap_or_else(|| HELP.to_string());
+        let line = self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string());
         let cwd = render::home_relative(&self.current().cwd);
         let room = usize::from(status.width).saturating_sub(cwd.width() + 2);
         let text = format!(" {:<room$} {cwd}", render::fit(&line, room));

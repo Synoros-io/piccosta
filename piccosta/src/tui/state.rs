@@ -80,7 +80,7 @@ pub fn load(agent_dir: &Path, own: &Path, legacy: bool) -> Option<State> {
         std::fs::read_dir(agent_dir).ok()?.flatten().filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.starts_with("tui-state") && name.ends_with(".json")
+            name.starts_with("tui-state") && !name.starts_with("tui-state-single-") && name.ends_with(".json")
         }).filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
             .max_by_key(|(time, _)| *time)?.1
     };

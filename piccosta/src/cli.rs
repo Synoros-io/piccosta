@@ -42,6 +42,8 @@ pub struct Args {
     // --restore: the terminal UI as it was when it last closed, whatever else the line asks for
     // (what /restart starts it again with).
     pub restore: bool,
+    // --single: the terminal UI on one session, with no sidebar and no other sessions.
+    pub single: bool,
     pub help: bool,
     pub version: bool,
     pub messages: Vec<String>,
@@ -96,6 +98,7 @@ pub fn parse(arguments: &[String]) -> Args {
             }
             "--continue" | "-c" => args.continue_recent = true,
             "--restore" => args.restore = true,
+            "--single" => args.single = true,
             "--no-session" => args.no_session = true,
             "--yolo" | "--dangerously-skip-permissions" | "--dangerously-bypass-approvals-and-sandbox" => args.yolo = true,
             "--no-context-files" | "-nc" => args.no_context_files = true,
@@ -211,6 +214,7 @@ Options:
   --session <path|id>    Use this session file, or the session with this id or name
   --fork <path|id>       Start a new session holding that one's history
   --no-session           Keep the session in memory only
+  --single               Just this one session in the terminal: no sidebar, no other sessions
   --session-dir <dir>    Where session files go
   -n, --name <name>      Name the session
   --pair <model>         Work with that model as a pair: the two answer each other in turn

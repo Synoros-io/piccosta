@@ -97,6 +97,8 @@ impl App {
     pub(super) fn command(&mut self, line: &str) -> bool {
         let (name, argument) = line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()));
         match name {
+            // --single has one session: the commands that open others only say so.
+            "new" | "manager" | "assistant" if self.one_session() => {}
             // /clear starts this tab over, as Claude Code's does: a new session in the same directory
             // takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
             // /clear <name> names the one left first. A running turn stops first (esc).
@@ -418,6 +420,9 @@ impl App {
     // session another terminal started or renamed shows. Enter shows one; ctrl+d then enter deletes
     // one and the list comes back without it. "all" lists every project's sessions instead.
     pub(super) fn sessions(&mut self, filter: &str) {
+        if self.one_session() {
+            return;
+        }
         if !filter.is_empty() {
             return self.all_sessions(if filter == "all" { "" } else { filter });
         }
@@ -528,7 +533,8 @@ impl App {
         let slot = self.panes[self.focus].slot;
         let listed = self.listed();
         let at = listed.iter().position(|&index| index == slot);
-        let next = at.and_then(|at| listed.get(at + 1).or_else(|| at.checked_sub(1).and_then(|before| listed.get(before)))).copied();
+        // --single shows nothing else: close() leaves a fresh session in its pane.
+        let next = at.filter(|_| !self.single).and_then(|at| listed.get(at + 1).or_else(|| at.checked_sub(1).and_then(|before| listed.get(before)))).copied();
         let failed = self.delete(slot);
         if let Some(next) = next.filter(|&next| !self.slots[next].gone() && self.panes[self.focus].slot != next) {
             self.show(next);

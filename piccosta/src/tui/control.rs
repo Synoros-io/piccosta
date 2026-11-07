@@ -164,6 +164,7 @@ impl App {
                 "open": self.slots.iter().filter(|slot| slot.opened).map(|slot| json!({"id": slot.id, "file": slot.path, "title": slot.title, "working": slot.busy() || slot.working_elsewhere})).collect::<Vec<_>>(),
                 "restarting": self.restart_waiting
             })),
+            Some("open") if self.single => Err(super::SINGLE.into()),
             Some("open") => request.opened.unwrap().and_then(|(session, modified)| self.open_background(session, modified)).map(|()| json!({"ok": true})),
             Some("restart") => {
                 self.command("restart");
