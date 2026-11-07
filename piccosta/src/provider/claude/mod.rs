@@ -149,6 +149,9 @@ const PROVIDER_SETTINGS: &str = r#"{"autoMemoryEnabled":false,"claudeMdExcludes"
 // How long a parked tools/call waits before checking that pi was handed its call, and between
 // checks after (pi-claude-bridge #226): far longer than the stream event announcing it can lag.
 const LOST_CALL_CHECK: Duration = Duration::from_secs(120);
+// What a stopped turn's tool call is answered at once (interrupt): pi dropped that turn with its
+// calls, so nothing else would ever answer it, and Claude Code would wait on it until the check above.
+const STOPPED_CALL: &str = "Not run: the user stopped this turn. Wait for their next message.";
 // How long a non-streamed answer's last tool call waits for another block before the turn ends:
 // Claude Code writes all of a message's blocks at once (pi-claude-bridge #225).
 const FALLBACK_SETTLE: Duration = Duration::from_millis(100);
@@ -1660,6 +1663,12 @@ impl Query {
             self.hand_pending(turn);
         }
         self.child.send(&json!({"type": "control_request", "request_id": request_id(), "request": {"subtype": "interrupt"}})).await;
+        // Calls Claude Code dispatched before the stop went with the stopped answer. Claude Code
+        // cancels them as it stops; each is answered anyway, so none can be left waiting.
+        for (id, call) in std::mem::take(&mut self.parked) {
+            debug(&format!("interrupt: {} [{id}] of the stopped turn answered as not run (session {})", call.tool, self.key));
+            self.answer(call.request_id, call.rpc_id, Err(STOPPED_CALL.into())).await;
+        }
     }
 
     // The next message for a waiting query, as a new turn of it. Its stream opens now; the message
@@ -1749,6 +1758,15 @@ impl Query {
                     None => Err(format!("{name}: tools/call is missing _meta[\"claudecode/toolUseId\"], so its result can't be paired with its call")),
                     Some(id) => match self.queued.remove(&id) {
                         Some(result) => Ok(result),
+                        // A call while a stopped turn ends is that turn's, which pi dropped: sent before
+                        // the stop reached Claude Code (which then cancels it), or Claude Code went on
+                        // past the stop (2.1.319 skips one read before its next turn starts, per its
+                        // code). It's stopped again, now that it runs, and the call answered at once.
+                        None if self.interrupting => {
+                            debug(&format!("interrupt: {name} [{id}] came for the stopped turn, stopped again and answered as not run (session {})", self.key));
+                            self.child.send(&json!({"type": "control_request", "request_id": self::request_id(), "request": {"subtype": "interrupt"}})).await;
+                            Err(STOPPED_CALL.into())
+                        }
                         None => {
                             self.parked.insert(id, Parked { request_id, rpc_id, tool: name, check_at: Instant::now() + LOST_CALL_CHECK });
                             return;
