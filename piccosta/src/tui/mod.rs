@@ -70,6 +70,9 @@ const EDITOR_MAX_ROWS: usize = 8;
 const FRAME: Duration = Duration::from_millis(80);
 const WORKING_DOT_FRAMES: usize = 5;
 const WHEEL_ROWS: usize = 3;
+// Rows a pane scrolls each frame while a selection is dragged past its top or bottom edge (the
+// wheel's three made the view jump past what was wanted; two still reads along).
+const EDGE_ROWS: usize = 2;
 // How long a first ctrl+c waits for the second while sessions are running.
 const QUIT_CONFIRM: Duration = Duration::from_secs(2);
 // How long /assistant waits for an assistant it just started to make its session: a service's
@@ -316,9 +319,6 @@ struct Pane {
     // working line) at the last draw, so rows added under the view raise the scroll by as much and
     // the view stays on what the user was reading.
     anchor: Option<(usize, usize)>,
-    // The slot it showed at the last draw and the row its view ended on, so a mouse selection over
-    // it moves with the text when the text moves.
-    drawn: Option<(usize, usize)>,
 }
 
 struct App {
@@ -388,6 +388,10 @@ struct App {
     // Where things were drawn, for the mouse.
     sidebar_rows: Vec<(u16, usize)>,
     pane_rects: Vec<Rect>,
+    body_rects: Vec<Rect>,
+    // The focused pane's editor text and its first row in view, and whether the mouse is selecting in it.
+    editor_area: (Rect, usize),
+    editor_drag: bool,
     sidebar_rect: Rect,
     // --single (inline.rs): the slot whose messages went into the scrollback and how many, the rows
     // of the reply streaming in printed so far, a rewind's line still to print, the rows the last
@@ -399,14 +403,21 @@ struct App {
     typing_at: Option<Position>,
 }
 
-// Text being selected with the mouse, in one pane: where the drag started and where it is now, in
-// screen cells; by cell, by word (a double click) or by row (a triple click); and whether to copy
-// it when it's next drawn (the button came up, or ctrl+c).
+// Text being selected with the mouse in one pane's conversation, and the session it's of: where it
+// started (found at the next draw) and where its end is now, each as the two ends of what a press
+// there selects (a place, its word for a double click, its row for a triple one), in places that
+// stay on their text as the pane scrolls or wraps again. Where the mouse last was, which the end
+// goes to at the next draw once it `moved` and at every draw while the button's `held`; and whether
+// to copy it when it's next drawn (the button came up, or ctrl+c).
 struct Selection {
-    rect: Rect,
-    anchor: Position,
-    head: Position,
+    pane: usize,
+    slot: usize,
+    anchor: Option<(clip::Point, clip::Point)>,
+    head: (clip::Point, clip::Point),
     clicks: u8,
+    at: Position,
+    moved: bool,
+    held: bool,
     copy: bool,
 }
 
@@ -555,6 +566,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         history: Vec::new(),
         sidebar_rows: Vec::new(),
         pane_rects: Vec::new(),
+        body_rects: Vec::new(),
+        editor_area: Default::default(),
+        editor_drag: false,
         sidebar_rect: Rect::default(),
         printed: (0, 0),
         streamed: Default::default(),
@@ -602,6 +616,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut input = EventStream::new();
     let mut spinner = tokio::time::interval(FRAME);
     let mut agent_scan = tokio::time::interval(AGENT_SCAN);
+    let mut edge = tokio::time::interval(FRAME);
+    edge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stdout = std::io::stdout();
     let mut exit_code = 0;
     let mut restart_exe = None;
@@ -622,6 +638,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
             Some((slot, update)) = app.updates.recv() => app.update(slot, update),
             _ = spinner.tick(), if app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
             _ = agent_scan.tick() => app.scan_agents(),
+            _ = edge.tick(), if app.edge().is_some() => app.edge_scroll(),
         }
         // Everything else already waiting goes in before the next frame.
         while let Ok((slot, update)) = app.updates.try_recv() {
@@ -879,7 +896,7 @@ impl App {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
-            self.panes.push(Pane { slot: first, scroll: 0, anchor: None, drawn: None });
+            self.panes.push(Pane { slot: first, scroll: 0, anchor: None });
             // With no account's models yet there's nothing to open on, but /models refresh and
             // logging in still have to be reachable: the pane opens when something is typed.
             match loaded {
@@ -948,7 +965,7 @@ impl App {
             // Panes that showed one session come back on one slot, sharing its draft.
             if let Some(slot) = path.as_ref().and_then(|path| self.slots.iter().position(|slot| slot.path.as_ref() == Some(path))) {
                 if index < on_screen {
-                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None, drawn: None });
+                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
                 }
                 continue;
             }
@@ -964,7 +981,7 @@ impl App {
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
-                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None, drawn: None });
+                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
             }
         }
         if !errors.is_empty() {
@@ -974,7 +991,7 @@ impl App {
         if self.panes.is_empty()
             && let Some(slot) = self.slots.iter().position(|slot| slot.opened)
         {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None, drawn: None });
+            self.panes.push(Pane { slot, scroll: 0, anchor: None });
         }
         if self.panes.is_empty() {
             self.slots.clear();
@@ -1232,7 +1249,7 @@ impl App {
             }
         }
         self.slots[slot].unread = false;
-        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None, drawn: None };
+        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None };
         self.put_away(leaving);
     }
 
@@ -1468,7 +1485,7 @@ impl App {
             return;
         }
         if let Some(slot) = self.new_session() {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None, drawn: None });
+            self.panes.push(Pane { slot, scroll: 0, anchor: None });
             self.focus = self.panes.len() - 1;
         }
     }
@@ -1783,7 +1800,7 @@ impl App {
             if self.panes.len() > 1 {
                 self.panes.remove(pane);
             } else {
-                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None, drawn: None };
+                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None };
             }
         }
         self.focus = self.focus.min(self.panes.len() - 1);
@@ -1910,14 +1927,25 @@ impl App {
                 let at = Position::new(mouse.column, mouse.row);
                 let pane = self.pane_rects.iter().position(|rect| rect.contains(at));
                 match mouse.kind {
+                    // The wheel scrolls the pane under it, or while a selection is dragged its pane, the
+                    // selection's end going with it.
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                        if let Some(pane) = pane {
+                        if let Some(pane) = self.selection.as_ref().filter(|selection| selection.held).map_or(pane, |selection| Some(selection.pane)) {
                             let scroll = &mut self.panes[pane].scroll;
                             *scroll = if mouse.kind == MouseEventKind::ScrollUp { *scroll + WHEEL_ROWS } else { scroll.saturating_sub(WHEEL_ROWS) };
                         }
                     }
-                    // A press in a pane starts a selection there; a second or third quick press on the
-                    // same cell selects its word or its row.
+                    // A press on a pane's conversation starts a selection there; a second or third quick
+                    // press on the same cell selects its word or its row. One in the editor puts its
+                    // cursor there, and a drag from it selects in the editor.
+                    MouseEventKind::Down(MouseButton::Left) if self.editor_area.0.contains(at) => {
+                        let cursor = self.editor_offset(at);
+                        (self.selection, self.editor_drag) = (None, true);
+                        let draft = &mut self.focused().draft;
+                        (draft.anchor, draft.cursor) = (Some(cursor), cursor);
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if self.editor_drag => self.focused().draft.cursor = self.editor_offset(at),
+                    MouseEventKind::Up(MouseButton::Left) if std::mem::take(&mut self.editor_drag) => self.focused().draft.cursor = self.editor_offset(at),
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(pane) = pane {
                             self.focus = pane;
@@ -1926,7 +1954,8 @@ impl App {
                                 _ => 1,
                             };
                             self.last_click = Some((Instant::now(), at, clicks));
-                            self.selection = Some(Selection { rect: pane_inner(pane, self.pane_rects[pane]), anchor: at, head: at, clicks, copy: false });
+                            let slot = self.panes[pane].slot;
+                            self.selection = self.body_rects.get(pane).is_some_and(|body| body.contains(at)).then_some(Selection { pane, slot, anchor: None, head: Default::default(), clicks, at, moved: true, held: true, copy: false });
                         } else if self.sidebar_rect.contains(at)
                             && let Some(&(_, slot)) = self.sidebar_rows.iter().rev().find(|(row, _)| *row <= mouse.row)
                         {
@@ -1935,17 +1964,13 @@ impl App {
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some(selection) = &mut self.selection {
-                            selection.head = at;
+                            (selection.at, selection.moved) = (at, true);
                         }
                     }
                     // Letting go copies what's selected, as Claude Code does; a plain click selects nothing.
                     MouseEventKind::Up(MouseButton::Left) => {
                         if let Some(selection) = &mut self.selection {
-                            selection.head = at;
-                            selection.copy = selection.anchor != selection.head || selection.clicks > 1;
-                            if !selection.copy {
-                                self.selection = None;
-                            }
+                            (selection.at, selection.moved, selection.held, selection.copy) = (at, true, false, true);
                         }
                     }
                     // A right click pastes the clipboard, a middle click the primary selection.
@@ -1953,6 +1978,11 @@ impl App {
                     MouseEventKind::Down(MouseButton::Middle) => self.paste(true),
                     _ => {}
                 }
+            }
+            // A drag that leaves the window stops there, its selection kept.
+            Input::FocusLost => {
+                self.selection.iter_mut().for_each(|selection| selection.held = false);
+                self.editor_drag = false;
             }
             // tmux drops images sent to a hidden pane; send them all again on coming back.
             Input::FocusGained => {
@@ -1980,15 +2010,16 @@ impl App {
         // A mouse selection: ctrl+c copies it, shift+arrows (and shift+home/end) move its end, the
         // page keys scroll under it; any other key lets it go and does what it does.
         if let Some(selection) = &mut self.selection {
-            let head = &mut selection.head;
+            let at = &mut selection.at;
+            selection.moved = shift;
             match key.code {
                 KeyCode::Char('c') if control => return selection.copy = true,
-                KeyCode::Left if shift => return head.x = head.x.saturating_sub(1),
-                KeyCode::Right if shift => return head.x += 1,
-                KeyCode::Up if shift => return head.y = head.y.saturating_sub(1),
-                KeyCode::Down if shift => return head.y += 1,
-                KeyCode::Home if shift => return head.x = selection.rect.x,
-                KeyCode::End if shift => return head.x = selection.rect.right(),
+                KeyCode::Left if shift => return at.x = at.x.saturating_sub(1),
+                KeyCode::Right if shift => return at.x = at.x.saturating_add(1),
+                KeyCode::Up if shift => return at.y = at.y.saturating_sub(1),
+                KeyCode::Down if shift => return at.y = at.y.saturating_add(1),
+                KeyCode::Home if shift => return at.x = 0,
+                KeyCode::End if shift => return at.x = u16::MAX,
                 KeyCode::PageUp | KeyCode::PageDown => {}
                 _ => self.selection = None,
             }
@@ -2207,27 +2238,14 @@ impl App {
         }
         let rects = Layout::horizontal(vec![Constraint::Fill(1); self.panes.len()]).split(panes);
         self.pane_rects = rects.to_vec();
+        self.body_rects.clear();
+        self.editor_area = Default::default();
+        // A selection goes once its pane loses the focus or shows another session.
+        if self.selection.as_ref().is_some_and(|selection| selection.pane != self.focus || self.panes.get(selection.pane).is_none_or(|pane| pane.slot != selection.slot)) {
+            self.selection = None;
+        }
         for (index, rect) in rects.iter().enumerate() {
             self.draw_pane(frame, index, *rect);
-        }
-        // A mouse selection, over what was just drawn: a double click's ends grow to whole words, a
-        // triple click's to whole rows; copied when due (before the status line, which says so),
-        // then shown reversed.
-        if let Some(selection) = &mut self.selection {
-            let buffer = frame.buffer_mut();
-            let (mut anchor, mut head) = (selection.anchor, selection.head);
-            if selection.clicks > 1 {
-                let whole_rows = selection.clicks == 3;
-                let (anchor_start, anchor_end) = clip::expand(buffer, selection.rect, anchor, whole_rows);
-                let (head_start, head_end) = clip::expand(buffer, selection.rect, head, whole_rows);
-                (anchor, head) = if (anchor.y, anchor.x) <= (head.y, head.x) { (anchor_start, head_end) } else { (anchor_end, head_start) };
-            }
-            if std::mem::take(&mut selection.copy) {
-                let text = clip::text(buffer, selection.rect, anchor, head);
-                let via = clip::copy(&text);
-                self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
-            }
-            clip::highlight(buffer, selection.rect, anchor, head);
         }
         let line = self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string());
         let cwd = render::home_relative(&self.current().cwd);
@@ -2294,7 +2312,7 @@ impl App {
         let width = inner.width;
 
         // The editor (focused pane only) and what's queued above it.
-        let (editor_rows, cursor) = self.slots[slot_index].draft.layout(usize::from(width.saturating_sub(4)).max(1));
+        let (editor_rows, cursor, _) = self.slots[slot_index].draft.layout(usize::from(width.saturating_sub(4)).max(1));
         let queued = self.slots[slot_index].live.as_ref().map(|(handle, _)| handle.queued()).unwrap_or_default();
         let queued: Vec<String> = queued.0.into_iter().chain(queued.1).collect();
         // While a command name is being typed, the ones it could be, on one line (tab takes the first).
@@ -2349,7 +2367,7 @@ impl App {
         }
         // --single's live part takes as many rows as it has (inline.rs), so all of them are counted.
         let wanted = if self.single { usize::MAX } else { height + self.panes[index].scroll };
-        let (mut rows, _) = self.transcript(slot_index, width, wanted, usize::MAX);
+        let (mut rows, _, mut messages) = self.transcript(slot_index, width, wanted, usize::MAX);
         // While it works, a line under the conversation says so, its dots moving and its time
         // counting, so it's plain the model is still at it.
         let slot = &self.slots[slot_index];
@@ -2362,6 +2380,7 @@ impl App {
             let dots = ".".repeat(1 + self.frame / WORKING_DOT_FRAMES % 3);
             let seconds = slot.working_since.map_or(String::new(), |since| format!(" · {}", render::duration(since.elapsed())));
             let restart = if self.restart_waiting { " · piccosta restarts when every turn has ended (esc cancels)" } else { "" };
+            messages.push((slot.messages.len() + 1, 2));
             rows.push(Line::default());
             rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}{restart}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
         }
@@ -2376,26 +2395,50 @@ impl App {
         self.panes[index].anchor = (scroll > 0).then_some((count, tail));
         let end = rows.len() - scroll;
         self.live_rows = 2 + rows.len() + usize::from(queued_height + editor_height);
-        // A mouse selection is held in screen cells: when this pane's text moves under it (rows
-        // added below while it follows, a scroll), it moves by as much, and it goes once it leaves
-        // the pane or the pane shows another session.
-        let moved = match self.panes[index].drawn {
-            Some((slot, before)) if slot == slot_index => Some(end as isize - before as isize),
-            _ => None,
-        };
-        self.panes[index].drawn = Some((slot_index, end));
-        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.rect == pane_inner(index, rect)) {
-            let (top, bottom) = (selection.rect.y as isize, selection.rect.bottom() as isize);
-            let shift = |y: u16| moved.map(|by| y as isize - by).filter(|y| (top..bottom).contains(y));
-            match (shift(selection.anchor.y), shift(selection.head.y)) {
-                (Some(anchor), Some(head)) => (selection.anchor.y, selection.head.y) = (anchor as u16, head as u16),
-                _ => self.selection = None,
-            }
-        }
         let start = end.saturating_sub(height);
         // Rows sit at the bottom, as a chat does, until they fill the pane.
         let top = body.y + (height - (end - start)) as u16;
-        frame.render_widget(Paragraph::new(rows[start..end].to_vec()), Rect { y: top, height: (end - start) as u16, ..body });
+        let shown = Rect { y: top, height: (end - start) as u16, ..body };
+        frame.render_widget(Paragraph::new(rows[start..end].to_vec()), shown);
+        self.body_rects.push(body);
+        // A selection here: the rows in view, with their characters' places, counted from the top of
+        // each one's message (the transcript holds whole messages). Its end goes where the mouse is
+        // (to the row at the edge when the mouse is past it), grown to a word or a row for a double
+        // or triple click; copied when due (before the status line, which says so), else shown
+        // reversed. A plain click selects nothing.
+        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.pane == index && end > start) {
+            let mut view = Vec::new();
+            let mut first = 0;
+            for &(message, length) in &messages {
+                let mut count = 0;
+                for number in (0..length).take_while(|number| first + number < end && first + length > start) {
+                    if first + number >= start {
+                        view.push((first + number, (message, number, count)));
+                    }
+                    count += clip::solid(&rows[first + number]);
+                }
+                first += length;
+            }
+            if (std::mem::replace(&mut selection.moved, false) || selection.held)
+                && let Some(&(row, at)) = view.get(usize::from(selection.at.y.clamp(top, shown.bottom() - 1) - top))
+            {
+                selection.head = clip::word(&clip::cells(&rows[row], at), selection.at.x.saturating_sub(body.x), selection.clicks);
+            }
+            let (anchor, head) = (*selection.anchor.get_or_insert(selection.head), selection.head);
+            let (from, to) = if anchor.0 <= head.0 { (anchor.0, head.1) } else { (head.0, anchor.1) };
+            if std::mem::take(&mut selection.copy) {
+                if from == to && selection.clicks == 1 {
+                    self.selection = None;
+                } else {
+                    let text = self.selected_text(slot_index, width, &rows, &messages, from, to);
+                    let via = clip::copy(&text);
+                    self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
+                }
+            }
+            if self.selection.is_some() {
+                clip::highlight(frame.buffer_mut(), shown, |y| view.get(usize::from(y)).and_then(|&(row, at)| clip::span(&rows[row], at, from, to)));
+            }
+        }
         if scroll > 0 {
             let note = format!(" ↓ {scroll} more ");
             let at = Rect { x: body.right().saturating_sub(note.width() as u16), y: body.bottom().saturating_sub(1), width: note.width() as u16, height: 1 };
@@ -2426,10 +2469,12 @@ impl App {
                 if let Some(range) = draft.selection() {
                     let last = draft.text[..range.end].char_indices().last().map_or(range.start, |(at, _)| at);
                     let width = usize::from(text_area.width).max(1);
-                    let place = |(row, column): (usize, usize)| Position::new(text_area.x + column as u16, text_area.y + row.saturating_sub(first) as u16);
-                    clip::highlight(frame.buffer_mut(), text_area, place(draft.spot(width, range.start)), place(draft.spot(width, last)));
+                    let (from, to) = (draft.spot(width, range.start), draft.spot(width, last));
+                    let row = |y: u16| first + usize::from(y);
+                    clip::highlight(frame.buffer_mut(), text_area, |y| (from.0..=to.0).contains(&row(y)).then(|| (if row(y) == from.0 { from.1 as u16 } else { 0 }, if row(y) == to.0 { to.1 as u16 } else { u16::MAX })));
                 }
             }
+            self.editor_area = (text_area, first);
             self.typing_at = self.picker.is_none().then(|| Position::new(text_area.x + cursor.1 as u16, text_area.y + (cursor.0 - first) as u16));
             if let Some(at) = self.typing_at {
                 frame.set_cursor_position(at);
@@ -2437,17 +2482,62 @@ impl App {
         }
     }
 
+    // While a selection's button is held past its pane's conversation's top or bottom: its pane,
+    // and whether it's the top.
+    fn edge(&self) -> Option<(usize, bool)> {
+        let selection = self.selection.as_ref().filter(|selection| selection.held)?;
+        let body = self.body_rects.get(selection.pane)?;
+        (selection.at.y < body.y || selection.at.y >= body.bottom()).then_some((selection.pane, selection.at.y < body.y))
+    }
+
+    // Then the pane scrolls that way, and the selection's end goes with it at the next draw.
+    fn edge_scroll(&mut self) {
+        if let Some((pane, up)) = self.edge() {
+            let scroll = &mut self.panes[pane].scroll;
+            *scroll = if up { *scroll + EDGE_ROWS } else { scroll.saturating_sub(EDGE_ROWS) };
+        }
+    }
+
+    // The text selected from `from` to `to`: each message's rows as drawn (`rows`, made of
+    // `messages`), or drawn now for one out of view.
+    fn selected_text(&mut self, slot_index: usize, width: u16, rows: &[Line<'static>], messages: &[(usize, usize)], from: clip::Point, to: clip::Point) -> String {
+        let starts: Vec<usize> = messages.iter().scan(0, |at, (_, length)| Some(std::mem::replace(at, *at + length))).collect();
+        let picked: Vec<(usize, Rows)> = (from.0..=to.0)
+            .filter_map(|message| match messages.iter().position(|(index, _)| *index == message) {
+                Some(drawn) => Some((message, rows[starts[drawn]..starts[drawn] + messages[drawn].1].to_vec())),
+                None => (message < self.slots[slot_index].messages.len()).then(|| (message, self.rows_of(slot_index, message, width, self.flags))),
+            })
+            .collect();
+        let cells = picked.iter().flat_map(|(message, rows)| {
+            let mut count = 0;
+            rows.iter().enumerate().map(move |(number, row)| {
+                let cells = clip::cells(row, (*message, number, count));
+                count += clip::solid(row);
+                cells
+            })
+        });
+        clip::text(cells, from, to)
+    }
+
+    // The byte offset in the focused editor's text drawn at a screen cell, or at the nearest one.
+    fn editor_offset(&self, at: Position) -> usize {
+        let (area, first) = self.editor_area;
+        let place = (first + usize::from(at.y.saturating_sub(area.y).min(area.height.saturating_sub(1))), usize::from(at.x.saturating_sub(area.x)));
+        self.current().draft.offset_at(usize::from(area.width).max(1), place)
+    }
+
     // A session's rows, drawn from the bottom up until `wanted` are there (or the session's start).
     // The last `wanted` rows of a slot's conversation, and how many rows come from the answer being
     // written and the messages from index `since` on.
-    fn transcript(&mut self, slot_index: usize, width: u16, wanted: usize, since: usize) -> (Rows, usize) {
-        let mut chunks: Vec<Rows> = Vec::new();
+    // And each message's index and row count, in order, the answer being written counted as the next one.
+    fn transcript(&mut self, slot_index: usize, width: u16, wanted: usize, since: usize) -> (Rows, usize, Vec<(usize, usize)>) {
+        let mut chunks: Vec<(usize, Rows)> = Vec::new();
         let mut count = 0;
         let mut below = 0;
         if let Some(rows) = self.streaming(slot_index, width) {
             count += rows.len();
             below += rows.len();
-            chunks.push(rows);
+            chunks.push((self.slots[slot_index].messages.len(), rows));
         }
         // --single's printed messages are in the scrollback, not here.
         let slot = &self.slots[slot_index];
@@ -2461,9 +2551,10 @@ impl App {
             if index >= since {
                 below += rows.len();
             }
-            chunks.push(rows);
+            chunks.push((index, rows));
         }
-        (chunks.into_iter().rev().flatten().collect(), below)
+        let messages = chunks.iter().rev().map(|(index, rows)| (*index, rows.len())).collect();
+        (chunks.into_iter().rev().flat_map(|(_, rows)| rows).collect(), below, messages)
     }
 
     // One message's rows, `width` wide, kept for the next draw unless a tool of its is still running.
@@ -2609,6 +2700,9 @@ fn result_text(result: &Value) -> String {
     blocks.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
 }
 
+// Each character of an editor's text by byte offset, and the row and column it's drawn at.
+type Places = Vec<(usize, (usize, usize))>;
+
 // The prompt being written. `cursor` is a byte offset into `text`.
 #[derive(Default)]
 struct Editor {
@@ -2651,7 +2745,12 @@ impl Editor {
 
     // The row and column `at` (a byte offset) is drawn at, wrapped at `width`.
     fn spot(&self, width: usize, at: usize) -> (usize, usize) {
-        Editor { text: self.text.clone(), cursor: at, undo: Vec::new(), anchor: None }.layout(width).1
+        self.layout(width).2.iter().find(|(offset, _)| *offset >= at).map_or((0, 0), |place| place.1)
+    }
+
+    // The byte offset of the last character drawn at or before a row and column, wrapped at `width`.
+    fn offset_at(&self, width: usize, place: (usize, usize)) -> usize {
+        self.layout(width).2.iter().rev().find(|(_, spot)| *spot <= place).map_or(0, |found| found.0)
     }
 
     // Keep the state before an edit, for undo.
@@ -2787,12 +2886,15 @@ impl Editor {
         }
     }
 
-    // The text cut into rows of `width` columns, and the cursor's row and column.
-    fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
+    // The text cut into rows of `width` columns, the cursor's row and column, and each character's
+    // (and the end's) by byte offset.
+    fn layout(&self, width: usize) -> (Vec<String>, (usize, usize), Places) {
         let mut rows = vec![String::new()];
         let mut used = 0;
         let mut cursor = (0, 0);
+        let mut places = Vec::new();
         for (index, character) in self.text.char_indices() {
+            places.push((index, (rows.len() - 1, used)));
             if index == self.cursor {
                 cursor = (rows.len() - 1, used);
             }
@@ -2816,6 +2918,7 @@ impl Editor {
             }
             cursor = (rows.len() - 1, used);
         }
-        (rows, cursor)
+        places.push((self.text.len(), (rows.len() - 1, used)));
+        (rows, cursor, places)
     }
 }

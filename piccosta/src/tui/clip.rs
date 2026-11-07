@@ -9,6 +9,7 @@ use base64::Engine;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use unicode_width::UnicodeWidthStr;
@@ -80,67 +81,85 @@ pub fn paste(primary: bool) -> Option<String> {
     })
 }
 
-// A selection's two ends in reading order, both inside `rect`.
-fn ordered(rect: Rect, anchor: Position, head: Position) -> (Position, Position) {
-    let clamp = |at: Position| Position::new(at.x.clamp(rect.x, rect.right().saturating_sub(1)), at.y.clamp(rect.y, rect.bottom().saturating_sub(1)));
-    let (anchor, head) = (clamp(anchor), clamp(head));
-    if (anchor.y, anchor.x) <= (head.y, head.x) { (anchor, head) } else { (head, anchor) }
+// A place in a pane's conversation that stays on its text when the text wraps again: the message
+// it's in; twice the count of non-blank characters before it in that message's rows, one more when
+// it's on a character rather than a blank; and for a blank its row in the message, which tells apart
+// the blanks of one run.
+pub type Point = (usize, usize, usize);
+
+// A row of a message: its message, its number there, and the count of non-blank characters above it.
+pub type Row = (usize, usize, usize);
+
+// A row's non-blank characters.
+pub fn solid(row: &Line) -> usize {
+    row.spans.iter().flat_map(|span| span.content.chars()).filter(|character| !character.is_whitespace()).count()
 }
 
-// The cells from `from` to `to` in reading order, as a terminal selects: the first row from its
-// column to the edge, whole rows between, the last row up to its column.
-fn cells(rect: Rect, from: Position, to: Position) -> impl Iterator<Item = Position> {
-    (from.y..=to.y).flat_map(move |y| {
-        let start = if y == from.y { from.x } else { rect.x };
-        let end = if y == to.y { to.x } else { rect.right().saturating_sub(1) };
-        (start..=end).map(move |x| Position::new(x, y))
-    })
+// A row's characters as ratatui draws them, by grapheme, so an accented letter or a joined emoji is
+// one: each one's first column, width, text and place; then the place past the row's end.
+pub type Cells<'a> = (Vec<(u16, u16, &'a str, Point)>, Point);
+
+pub fn cells<'a>(row: &'a Line, (message, number, before): Row) -> Cells<'a> {
+    let (mut column, mut count) = (0u16, before);
+    let cells = row.styled_graphemes(Style::new()).map(|grapheme| {
+        let (characters, width) = (grapheme.symbol.chars().filter(|character| !character.is_whitespace()).count(), grapheme.symbol.width() as u16);
+        let cell = (column, width, grapheme.symbol, (message, 2 * count + usize::from(characters > 0), if characters > 0 { 0 } else { number }));
+        (column, count) = (column.saturating_add(width), count + characters);
+        cell
+    });
+    (cells.collect(), (message, 2 * count, number))
 }
 
-// Show a selection reversed.
-pub fn highlight(buffer: &mut Buffer, rect: Rect, anchor: Position, head: Position) {
-    let (from, to) = ordered(rect, anchor, head);
-    for at in cells(rect, from, to) {
-        if let Some(cell) = buffer.cell_mut(at) {
-            cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+// The ends of what a press at column `at` of a row selects: the place under it, its word (a run of
+// non-blanks, so a path or URL is one word) for a double click, its whole row for a triple one.
+pub fn word((cells, end): &Cells, at: u16, clicks: u8) -> (Point, Point) {
+    let under = cells.iter().position(|(column, width, ..)| (*column..column + width).contains(&at));
+    let place = under.map_or(*end, |index| cells[index].3);
+    match under {
+        _ if clicks == 3 => (cells.first().map_or(*end, |cell| cell.3), *end),
+        Some(index) if clicks == 2 && place.1 % 2 == 1 => {
+            let solid = |cell: &&(u16, u16, &str, Point)| cell.3.1 % 2 == 1;
+            let first = cells[..index].iter().rev().take_while(solid).count();
+            let last = cells[index..].iter().take_while(solid).count();
+            (cells[index - first].3, cells[index + last - 1].3)
+        }
+        _ => (place, place),
+    }
+}
+
+// Show reversed the first to last columns `selected` gives each row of `area`, counted from its top.
+pub fn highlight(buffer: &mut Buffer, area: Rect, selected: impl Fn(u16) -> Option<(u16, u16)>) {
+    for y in area.top()..area.bottom() {
+        let Some((first, last)) = selected(y - area.y) else { continue };
+        for x in area.x.saturating_add(first)..=area.x.saturating_add(last).min(area.right().saturating_sub(1)) {
+            if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
+                cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+            }
         }
     }
 }
 
-// The text a selection covers, a line per row with the spaces at their ends dropped. A wide
-// character's second cell holds nothing of its own and is skipped.
-pub fn text(buffer: &Buffer, rect: Rect, anchor: Position, head: Position) -> String {
-    let (from, to) = ordered(rect, anchor, head);
-    let mut lines: Vec<String> = vec![String::new()];
-    let mut row = from.y;
-    let mut skip = 0;
-    for at in cells(rect, from, to) {
-        if at.y != row {
-            (row, skip) = (at.y, 0);
-            lines.push(String::new());
-        }
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        let symbol = buffer.cell(at).map_or(" ", |cell| cell.symbol());
-        skip = symbol.width().saturating_sub(1);
-        lines.last_mut().into_iter().for_each(|line| line.push_str(symbol));
+// The first and last columns of a row selected from `from` to `to` (places only grow along a row, so
+// they're one run), to the edge when the selection goes past the row's end. Only a row an end of
+// the selection is on is cut into characters to find them.
+pub fn span(row: &Line, at @ (message, number, before): Row, from: Point, to: Point) -> Option<(u16, u16)> {
+    let (top, bottom) = ((message, 2 * before, 0), (message, 2 * (before + solid(row)), number));
+    if bottom < from || top > to {
+        return None;
     }
-    lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>().join("\n")
+    if from <= top && bottom <= to {
+        return Some((0, u16::MAX));
+    }
+    let (cells, end) = &cells(row, at);
+    let selected = cells.iter().filter(|cell| (from..=to).contains(&cell.3));
+    let span = selected.fold(None, |span: Option<(u16, u16)>, cell| Some((span.map_or(cell.0, |span| span.0), cell.0 + cell.1.max(1) - 1)));
+    let after = cells.last().map_or(0, |cell| cell.0 + cell.1);
+    if (from..=to).contains(end) { Some((span.map_or(after, |span| span.0), u16::MAX)) } else { span }
 }
 
-// The word under `at` on its row (a run of non-spaces, so a path or URL is one word), or the whole
-// row: the two ends to select.
-pub fn expand(buffer: &Buffer, rect: Rect, at: Position, whole_row: bool) -> (Position, Position) {
-    if whole_row {
-        return (Position::new(rect.x, at.y), Position::new(rect.right().saturating_sub(1), at.y));
-    }
-    let blank = |x: u16| buffer.cell(Position::new(x, at.y)).is_none_or(|cell| cell.symbol().trim().is_empty());
-    if blank(at.x) {
-        return (at, at);
-    }
-    let start = (rect.x..=at.x).rev().take_while(|&x| !blank(x)).last().unwrap_or(at.x);
-    let end = (at.x..rect.right()).take_while(|&x| !blank(x)).last().unwrap_or(at.x);
-    (Position::new(start, at.y), Position::new(end, at.y))
+// The text from `from` to `to` on these rows, a line per row with the spaces at its ends dropped.
+pub fn text<'a>(rows: impl Iterator<Item = Cells<'a>>, from: Point, to: Point) -> String {
+    let lines = rows.filter(|(cells, end)| cells.first().map_or(*end, |cell| cell.3) <= to && *end >= from);
+    let lines = lines.map(|(cells, _)| cells.iter().filter(|cell| (from..=to).contains(&cell.3)).map(|cell| cell.2).collect::<String>().trim_end().to_string());
+    lines.collect::<Vec<_>>().join("\n")
 }
