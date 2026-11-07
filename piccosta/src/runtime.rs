@@ -474,6 +474,10 @@ enum Work {
 // through the providers' higher-ranked lifetimes).
 pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: bool, until_idle: bool, mut done: impl FnMut(Done) + 'static) -> (mpsc::UnboundedSender<Command>, tokio::task::JoinHandle<Agent>) {
     let (sender, mut commands) = mpsc::unbounded_channel();
+    // A run of its own and a manager have nobody watching to try a failed request again.
+    if until_idle || agent.manager_home().is_some() {
+        agent.set_retry(host.settings.retry(true));
+    }
     let mut claim = agent.take_claim();
     let watch = claim.as_ref().map_or_else(Arc::default, |claim| claim.watch.clone());
     // Each turn the model ends goes to the subscribers, with how many jobs still run.
@@ -486,8 +490,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             lock(&heard).tell(&json!({"turn_end": {"jobs": jobs.jobs.running_count()}}).to_string());
         }
     });
-    let wait_minutes = host.settings.get("manager.inactiveMinutes").and_then(Value::as_u64).unwrap_or(crate::manager::INACTIVE_MINUTES);
-    let watcher = agent.manager_home().map(|home| tokio::task::spawn_local(crate::manager::watch(home, sender.downgrade(), wait_minutes)));
+    let minutes = |key: &str, default: u64| host.settings.get(key).and_then(Value::as_u64).unwrap_or(default);
+    let (wait_minutes, check_minutes) = (minutes("manager.inactiveMinutes", crate::manager::INACTIVE_MINUTES), minutes("manager.checkMinutes", crate::manager::CHECK_MINUTES));
+    let busy = watch.clone();
+    let watcher = agent.manager_home().map(|home| tokio::task::spawn_local(crate::manager::watch(home, sender.downgrade(), (wait_minutes, check_minutes), move || lock(&busy).since.is_none())));
     let task = tokio::task::spawn_local(async move {
         let handle = agent.handle();
         let mut team = crate::host::team(&agent.session);

@@ -88,6 +88,14 @@ static RETRYABLE: LazyLock<Regex> = LazyLock::new(|| {
         "ResourceExhausted",
         "subscription_sharing_usage_unavailable",
         "subscription_sharing_user_unavailable",
+        // Not pi's, whose patterns are Node's wording: hyper's for a stream cut off mid-body (a
+        // stand-in dropping the connection, 2026-11-07), and the errors that ended managers' and
+        // lanes' turns 2026-11-04..07 with nothing retrying them. Codex ends a websocket after 60
+        // minutes, and a request sent again opens a new one (codex.rs run); the Claude bridge stops
+        // a query whose tool call it never got, and asking again is all that's lost.
+        "error reading a body from connection",
+        "websocket connection limit reached",
+        "never received; the query was stopped",
     ])
 });
 

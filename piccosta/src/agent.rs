@@ -485,6 +485,10 @@ impl Agent {
         self.config.retry.enabled = enabled;
     }
 
+    pub fn set_retry(&mut self, retry: crate::config::RetrySettings) {
+        self.config.retry = retry;
+    }
+
     // Name the session (pi's set_session_name), as a session_info entry.
     pub fn set_name(&mut self, name: &str) -> std::io::Result<()> {
         let base = self.session.next_base();

@@ -115,12 +115,18 @@ const LEDGER_ROLL_BYTES: u64 = 256 * 1024;
 // between looks for quiet ones.
 const POLL: Duration = Duration::from_secs(1);
 const LANE_SCAN_SECONDS: u64 = 60;
-// How long a lane can go without a new entry before its manager hears about it, unless
+// How long a lane not at work can go without a new entry before its manager hears about it, unless
 // `manager.inactiveMinutes` says otherwise: half an hour is long enough that a lane between steps
-// isn't nagged, short enough that a stalled or forgotten one is noticed within the hour. A lane
-// still quiet after a reminder gets the next one after twice the wait, so one left alone costs a
-// few reminders a day, not one an hour.
+// isn't nagged, short enough that a forgotten one is noticed within the hour. A lane still quiet
+// after a reminder gets the next one after twice the wait, so one left alone costs a few reminders
+// a day, not one an hour.
 pub const INACTIVE_MINUTES: u64 = 30;
+// How often a manager with lanes at work gets a check-in on them, unless `manager.checkMinutes`
+// says otherwise (0: never): the same half hour, kept steady however long they run, since a
+// manager left alone with a lane that runs all day didn't look at it for hours. Each lane's line carries the end of its last line of text, up
+// to CHECK_LINE_CHARS: enough to tell what it's at, the rest a `sessions read` away.
+pub const CHECK_MINUTES: u64 = 30;
+const CHECK_LINE_CHARS: usize = 200;
 // How many sessions `sessions list` shows, how many messages `read` gives by default, and how
 // many characters of each it keeps.
 const LIST_LIMIT: usize = 40;
@@ -424,13 +430,31 @@ fn session_id(file: &Path) -> String {
 }
 
 // The model's last finished turn in a session file (one that didn't end on tool calls): its entry's
-// time stamp and its text.
+// time stamp and its text. Read as the model sees it, so an attempt a retry has hidden (agent.rs
+// omit_attempt) isn't taken for the end of a turn that's still going.
 fn last_turn(file: &Path) -> Option<(String, String)> {
     let session = crate::session::Session::read(file).ok()?;
-    let last = session.entries().iter().rev().find(|entry| matches!(entry, crate::session::SessionEntry::Message { .. }))?;
-    let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = last else { return None };
+    let projection = session.projection();
+    let last = projection.iter().rev().find(|entry| !entry.messages.is_empty() && matches!(entry.source, crate::session::SessionEntry::Message { .. }))?;
+    let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = last.source else { return None };
     let text: Vec<&str> = reply.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
-    (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n")))
+    // A turn that failed says why last, where its news keeps it.
+    let failed = reply.error_message.as_ref().map_or(String::new(), |error| format!("\n(Its turn ended in an error: {error})"));
+    (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n") + &failed))
+}
+
+// A lane's line in a check-in: how long since its last reply, and the end of the last line of text
+// it wrote.
+fn check_line(lane: &Lane) -> String {
+    let session = crate::session::Session::read(&lane.file).ok();
+    let mut replies = session.iter().flat_map(|session| session.entries().iter().rev()).filter_map(|entry| match entry {
+        crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } => Some((base.timestamp.as_str(), reply)),
+        _ => None,
+    });
+    let since = replies.clone().next().and_then(|(stamp, _)| crate::clock::ms_from_iso(stamp)).map_or("no reply yet".into(), |at| format!("last reply {} minutes ago", (crate::clock::now_ms() - at) / 60_000));
+    let line = replies.find_map(|(_, reply)| reply.content.iter().rev().find_map(|block| if let Content::Text { text, .. } = block { text.lines().rev().find(|line| !line.trim().is_empty()) } else { None }));
+    let line: Vec<char> = line.unwrap_or_default().trim().chars().collect();
+    format!("- Session {} \"{}\": {since}: {}", session_id(&lane.file), lane.title, line[line.len().saturating_sub(CHECK_LINE_CHARS)..].iter().collect::<String>())
 }
 
 // The last `NEWS_CHARS` characters of a text.
@@ -468,20 +492,33 @@ fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> O
 // finishes, as it ends (a subscription to the lane's runtime, made whenever one runs it); a turn
 // that ended while nobody listened, read from its file as the subscription starts, or when it's
 // first looked at with nothing running it; a run it started that ended without finishing a turn;
-// a lane someone else closed; and
-// every LANE_SCAN_SECONDS, each lane quiet for its wait (the setting's minutes, doubled for each
-// reminder since it last changed). A lane whose file is gone, or that was closed, leaves the list.
-// The news goes to the manager's runtime, as messages.
-pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, wait_minutes: u64) {
+// a lane someone else closed; every LANE_SCAN_SECONDS, each lane not at work that's been quiet for
+// its wait (`wait_minutes`, doubled for each reminder since it last changed); and every
+// `check_minutes`, once the manager is `idle`, a check-in on the lanes at work then, when there are
+// any. A lane whose file is gone, or that was closed, leaves the list. The news goes to the
+// manager's runtime, as messages.
+pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, (wait_minutes, check_minutes): (u64, u64), idle: impl Fn() -> bool) {
     let (heard_sender, mut heard) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, Value)>();
     let mut listening = std::collections::HashSet::new();
     let mut tick = tokio::time::interval(POLL);
-    let mut ticks = 0u64;
+    let (mut ticks, mut due) = (0u64, false);
     loop {
         let news = tokio::select! {
             _ = tick.tick() => {
                 ticks += 1;
-                look(&home, &mut listening, &heard_sender, ticks, wait_minutes)
+                // A check-in waits for the manager's turn to end, one at most: a message mid-turn
+                // steers it and sends its commands to the background.
+                due |= ticks.is_multiple_of(check_minutes.saturating_mul(60));
+                // Which lanes are at work is asked off this thread, which may be a terminal UI's (a
+                // stopped lane holds each ask up to its wait), and only with check-ins on: each
+                // minute, so a lane at work gets check-ins rather than reminders, and for a digest,
+                // after which the manager is asked again whether it's idle, as the check-in goes.
+                let ask = check_minutes > 0 && (ticks.is_multiple_of(LANE_SCAN_SECONDS) || due && idle());
+                let files: Vec<PathBuf> = listening.iter().filter(|_| ask).cloned().collect();
+                let at_work = if ask { Some(tokio::task::spawn_blocking(move || files.into_iter().filter(|file| crate::runtime::status(file).is_some_and(|status| status["working"] == true)).collect()).await.unwrap_or_default()) } else { None };
+                let check = due && at_work.is_some() && idle();
+                due &= !check;
+                look(&home, &mut listening, &heard_sender, ticks, (wait_minutes, at_work.as_ref(), check))
             }
             Some((file, said)) = heard.recv() => {
                 let mut lanes = load_lanes(&home);
@@ -506,13 +543,14 @@ pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSende
     }
 }
 
-// One look at a manager's lanes (watch). Output: the news.
-fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: &tokio::sync::mpsc::UnboundedSender<(PathBuf, Value)>, ticks: u64, wait_minutes: u64) -> Vec<String> {
+// One look at a manager's lanes (watch), with the lanes at work when they were asked (`at_work`),
+// and whether a check-in goes now (`check`). Output: the news.
+fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: &tokio::sync::mpsc::UnboundedSender<(PathBuf, Value)>, ticks: u64, (wait_minutes, at_work, check): (u64, Option<&std::collections::HashSet<PathBuf>>, bool)) -> Vec<String> {
     let mut lanes = load_lanes(home);
     let (remind, first) = (ticks.is_multiple_of(LANE_SCAN_SECONDS), ticks == 1);
     let now = (crate::clock::now_ms() / 1000) as u64;
     let agent_dir = crate::config::agent_dir();
-    let mut news = Vec::new();
+    let (mut news, mut working) = (Vec::new(), Vec::new());
     let mut save = remind || first;
     lanes.retain_mut(|lane| {
         let Some(last) = changed(&lane.file) else {
@@ -540,7 +578,11 @@ fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: 
                 news.extend(catch_up(home, lane, false, Some(first)));
             }
         }
-        if !remind {
+        // A lane at work (a turn, or a run of its own waiting on its jobs) is in the check-in
+        // instead (below); one quiet and not at work gets reminders.
+        let busy = at_work.is_some_and(|at_work| at_work.contains(&lane.file));
+        working.extend((busy && check).then(|| check_line(lane)));
+        if !remind || busy {
             return true;
         }
         if last != lane.quiet_since {
@@ -549,11 +591,14 @@ fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: 
         let quiet_minutes = now.saturating_sub(last) / 60;
         if quiet_minutes >= wait_minutes << lane.reminders.min(16) {
             lane.reminders += 1;
-            let running = if listening.contains(&lane.file) { "it's still running" } else { "nothing is running it" };
+            let running = if listening.contains(&lane.file) { at_work.map_or("it's open", |_| "it's open, not working") } else { "nothing is running it" };
             news.push(format!("[{}, a quiet lane] Session {id} \"{title}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text()));
         }
         true
     });
+    if !working.is_empty() {
+        news.push(format!("[{}, a check-in] Your lanes at work:\n{}\n\nRead any that look stuck, off track or waiting (`sessions read`), act on what you see, and tell the user if they should know.", now_text(), working.join("\n")));
+    }
     if save {
         save_lanes(home, &lanes);
     }
@@ -739,6 +784,10 @@ impl SessionsTool {
     // Sent off this thread, which may be a terminal UI's, since a stopped runtime holds a send up
     // by its wait. Output: what happened, for the reply.
     async fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
+        // A message opens a closed session again, from now: the lane's own run did it only as it
+        // took the message, and the watch, looking in between, dropped the lane as closed by
+        // someone else, never to hear its turns (newC's and Yao's managers, 2026-11-06).
+        crate::session::set_closed(&self.agent_dir, file, false);
         let heard = last_turn(file).map(|(stamp, _)| stamp).unwrap_or_default();
         let (to, cwd, message, log) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file));
         let sent = tokio::task::spawn_blocking(move || crate::runtime::send(&to, &message, Some((&cwd, &log)))).await.map_err(|error| error.to_string())?;

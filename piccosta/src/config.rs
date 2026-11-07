@@ -21,6 +21,11 @@ pub const AGENT_DIR_ENV: &str = "PICCOSTA_AGENT_DIR";
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
 const DEFAULT_RETRY_MAX_RETRIES: u32 = 3;
+// The retries a session nobody watches gets (a manager, a run of its own such as a lane's), which
+// has nobody to try again when pi's three run out: with the same backoff its last one comes about
+// two minutes after the failure (2+4+8+16+32+60 s), past a Codex server's restart (WebSocket closed
+// 1012) or a short overload, and its manager hears of a longer outage soon after.
+const UNATTENDED_RETRIES: u32 = 6;
 const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 2_000;
 // The longest wait between retries (ai/src/utils/retry.ts:140).
 const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 60_000;
@@ -200,11 +205,12 @@ impl Settings {
         self.get_str("shellPath").map(str::to_string)
     }
 
-    // `retry.*`: whether failed model requests are retried, how often, and the backoff.
-    pub fn retry(&self) -> RetrySettings {
+    // `retry.*`: whether failed model requests are retried, how often, and the backoff, for a
+    // session someone watches or one nobody does (`unattended`).
+    pub fn retry(&self, unattended: bool) -> RetrySettings {
         RetrySettings {
             enabled: self.get_bool("retry.enabled").unwrap_or(true),
-            max_retries: self.get_u64("retry.maxRetries").map(|n| n as u32).unwrap_or(DEFAULT_RETRY_MAX_RETRIES),
+            max_retries: self.get_u64("retry.maxRetries").map(|n| n as u32).unwrap_or(if unattended { UNATTENDED_RETRIES } else { DEFAULT_RETRY_MAX_RETRIES }),
             base_delay_ms: self.get_u64("retry.baseDelayMs").unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS),
             max_delay_ms: self.get_u64("retry.maxAgentDelayMs").unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS),
         }

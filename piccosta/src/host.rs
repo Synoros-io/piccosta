@@ -407,7 +407,7 @@ impl Host {
             cwd,
             sections,
             context_files: self.context_files,
-            retry: self.settings.retry(),
+            retry: self.settings.retry(false),
             compaction,
             transport: self.settings.transport(),
             notices,
