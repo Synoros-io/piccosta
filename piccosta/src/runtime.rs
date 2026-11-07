@@ -69,7 +69,7 @@ const READ_WAIT: Duration = Duration::from_secs(1);
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
 pub enum Command {
     Prompt(String, Vec<Content>),
-    Message(String),
+    Message(String, Vec<Content>),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
     // A weak ticket expires when the frontend shows it again or edits its draft.
@@ -159,10 +159,10 @@ impl Drop for Claim {
             lock(&self.gate).take();
             let mut session = Session::open(&self.file, self.file.parent().unwrap_or(Path::new("/"))).ok();
             while let Ok(command) = self.taken.try_recv() {
-                if let (Command::Message(text), Some(session)) = (command, session.as_mut())
+                if let (Command::Message(text, images), Some(session)) = (command, session.as_mut())
                     && !text.is_empty()
                 {
-                    let _ = session.queue(&text);
+                    let _ = session.queue(&text, &images);
                 }
             }
         }
@@ -237,7 +237,7 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                     let (parent, job) = (std::env::var(crate::tools::subagent::SESSION_ENV).ok(), std::env::var(crate::tools::subagent::CHILD_ENV).ok());
                     json!({"working": since.is_some(), "since": since, "parent": parent, "job": job})
                 }
-                "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string()))}),
+                "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string(), Vec::new()))}),
                 kind @ ("stop" | "close") => {
                     let (answer, answered) = oneshot::channel();
                     let sent = send(if kind == "stop" { Command::Stop(Some(answer)) } else { Command::Close(Some(answer)) });
@@ -398,7 +398,7 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
         return Err(format!("{}: no such session", file.display()));
     }
     let mut session = Session::open(file, file.parent().unwrap_or(Path::new("/"))).map_err(|error| error.to_string())?;
-    session.queue(text).map_err(|error| format!("{}: {error}", file.display()))?;
+    session.queue(text, &[]).map_err(|error| format!("{}: {error}", file.display()))?;
     let lane = crate::manager::role(&session).is_none();
     drop(held);
     match launch.filter(|_| lane) {
@@ -522,7 +522,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         }
         // What the last runner left queued is taken at once.
         if wake && !agent.session.queued().is_empty() {
-            queue.push_back(Command::Message(String::new()));
+            queue.push_back(Command::Message(String::new(), Vec::new()));
         }
         let mut closing: Option<Option<oneshot::Sender<()>>> = None;
         // The session file's lock, while a run of its own lets go.
@@ -561,8 +561,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt.
-                Work::Command(Command::Message(text)) if !wake && !text.is_empty() => {
-                    if let Err(error) = agent.session.queue(&text) {
+                Work::Command(Command::Message(text, images)) if !wake && !text.is_empty() => {
+                    if let Err(error) = agent.session.queue(&text, &images) {
                         eprintln!("piccosta: could not queue a message: {error}");
                     }
                     continue;
@@ -573,7 +573,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 work => work,
             };
-            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_)));
+            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(..)));
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
             let result = {
@@ -583,8 +583,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     tokio::select! {
                         result = &mut run => break result,
                         command = next(&mut commands, &mut claim), if closing.is_none() => match command {
-                            Some(Command::Message(text)) => {
-                                handle.steer(text);
+                            Some(Command::Message(text, images)) => {
+                                handle.steer(text, images);
                                 shared.jobs.detach_all();
                             }
                             Some(Command::Stop(answer)) => {
@@ -653,7 +653,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         }
         for command in left.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
             match command {
-                Command::Message(text) if !text.is_empty() => handle.steer(text),
+                Command::Message(text, images) if !text.is_empty() => handle.steer(text, images),
                 Command::Stop(Some(answer)) | Command::Close(Some(answer)) => {
                     let _ = answer.send(());
                 }
@@ -702,8 +702,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         return agent.take_notice(notice).await;
     };
     match command {
-        Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,
-        Command::Message(text) => host.answer(agent, team, &text, Vec::new()).await,
+        Command::Prompt(text, images) | Command::Message(text, images) => host.answer(agent, team, &text, images).await,
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;
             Ok(())
@@ -729,8 +728,8 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
 // its next turn, here or in the next runtime, takes it first.
 fn requeue(agent: &mut Agent) {
     let (steer, follow_up) = agent.handle().clear();
-    for text in steer.into_iter().chain(follow_up) {
-        if let Err(error) = agent.session.queue(&text) {
+    for (text, images) in steer.into_iter().chain(follow_up) {
+        if let Err(error) = agent.session.queue(&text, &images) {
             eprintln!("piccosta: could not keep a message: {error}");
         }
     }

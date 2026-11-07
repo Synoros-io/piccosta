@@ -131,7 +131,7 @@ fn base64_len(bytes: usize) -> usize {
     bytes.div_ceil(3) * 4
 }
 
-pub(super) fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
+pub(crate) fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let rgba = image.to_rgba8();
     image::codecs::png::PngEncoder::new(&mut out)
@@ -149,16 +149,31 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// Decode with the file's EXIF orientation applied, so a phone photo isn't sideways.
-pub(super) fn decode(bytes: &[u8]) -> Option<DynamicImage> {
-    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
-    let mut decoder = reader.into_decoder().ok()?;
+// The most pixels an image may have to be decoded at all: a 48-megapixel phone camera's full frame
+// (8064×6048) with a little room. Its RGBA8 decode, about 200 MB, caps what the decode takes, deep
+// colour included (16 bits a channel doubles it), so a small file that unpacks to gigabytes is
+// refused from its header.
+const MAX_DECODE_PIXELS: u64 = 50_000_000;
+const MAX_DECODE_BYTES: u64 = MAX_DECODE_PIXELS * 4;
+
+// Decode with the file's EXIF orientation applied, so a phone photo isn't sideways. Err: the line
+// saying it's too big to decode, or empty when it isn't an image that decodes.
+pub(crate) fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|_| String::new())?;
+    let mut budget = image::Limits::default();
+    budget.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(budget);
+    let mut decoder = reader.into_decoder().map_err(|_| String::new())?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS || decoder.total_bytes() > MAX_DECODE_BYTES {
+        return Err(format!("[Image omitted: {width}×{height} is more than the {} megapixels or {} MB decoded an image may have.]", MAX_DECODE_PIXELS / 1_000_000, MAX_DECODE_BYTES / 1_000_000));
+    }
     let orientation = decoder.orientation().ok();
-    let mut image = DynamicImage::from_decoder(decoder).ok()?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|_| String::new())?;
     if let Some(orientation) = orientation {
         image.apply_orientation(orientation);
     }
-    Some(image)
+    Ok(image)
 }
 
 // A plugin may supply compressed images, not just screenshots. Four default-sized 2000x2000
@@ -190,8 +205,10 @@ pub(super) fn prepare_plugin(bytes: &[u8], limits: Limits, pixels_left: &mut u64
 // BMP isn't an inline type anywhere, so it's always re-encoded. An image already within both
 // limits goes out as it was.
 pub fn prepare(bytes: &[u8], mime_type: &str, limits: Limits) -> Result<Prepared, String> {
-    let image = decode(bytes).ok_or_else(|| {
-        if mime_type == "image/bmp" {
+    let image = decode(bytes).map_err(|too_big| {
+        if !too_big.is_empty() {
+            too_big
+        } else if mime_type == "image/bmp" {
             "[Image omitted: could not be converted to a supported inline image format.]".to_string()
         } else {
             "[Image omitted: could not be resized below the inline image size limit.]".to_string()

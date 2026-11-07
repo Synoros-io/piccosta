@@ -4,7 +4,7 @@
 
 use super::tex::{self, Formula, Tex};
 use super::theme;
-use crate::message::{AssistantMessage, Content, StopReason};
+use crate::message::{AssistantMessage, Content, StopReason, TextOrBlocks};
 use pulldown_cmark::{CodeBlockKind, Event as Md, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -67,14 +67,38 @@ pub struct Flags {
     pub inline: bool,
 }
 
-// The user's prompt, behind a bar.
-pub fn user(text: &str, width: u16, tex: &mut Tex) -> Rows {
+// How the marker of an image the user attached begins, and the line naming it for the model.
+pub const ATTACHED: &str = "[image ";
+
+// The user's prompt, behind a bar. An image it carries is drawn in place of the line naming it for
+// the model, where the terminal shows images; elsewhere the marker in the text stands for it.
+pub fn user(content: &TextOrBlocks, width: u16, tex: &mut Tex) -> Rows {
     let mut writer = Writer::new(tex, width);
     writer.levels.push(Level::fixed("▌ ", Style::new().fg(theme::USER)));
-    for line in clean(text).lines() {
-        writer.begin_row();
-        writer.text(line, Style::new());
-        writer.flush_line(true);
+    let mut single = None;
+    let blocks = match content {
+        TextOrBlocks::Blocks(blocks) => blocks.as_slice(),
+        TextOrBlocks::Text(text) => std::slice::from_ref(single.insert(Content::text(text.clone()))),
+    };
+    for (index, block) in blocks.iter().enumerate() {
+        let room = writer.room() as u16;
+        if let Content::Text { text, .. } = block
+            && !(text.starts_with(ATTACHED) && matches!(blocks.get(index + 1), Some(Content::Image { .. })))
+        {
+            for line in clean(text).lines() {
+                writer.begin_row();
+                writer.text(line, Style::new());
+                writer.flush_line(true);
+            }
+        }
+        let Content::Image { data, .. } = block else { continue };
+        let Some(&Formula::Image { id, columns, rows }) = writer.tex.picture(data, room) else { continue };
+        for row in 0..rows {
+            let (cells, color) = tex::placeholders(id, row, columns);
+            writer.begin_row();
+            writer.piece(cells, usize::from(columns), Style::new().fg(color));
+            writer.flush_line(false);
+        }
     }
     writer.blank();
     writer.rows

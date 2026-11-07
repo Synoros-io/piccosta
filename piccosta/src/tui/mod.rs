@@ -15,7 +15,7 @@ mod tex;
 use crate::agent::{Event, Handle};
 use crate::host::Host;
 use crate::runtime::{Command, Done};
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, Content};
 use crossterm::event::{Event as Input, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -27,7 +27,7 @@ use render::{Block as Part, Flags, Rows, ToolView};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use unicode_width::UnicodeWidthStr;
@@ -110,6 +110,12 @@ enum Update {
     Scanned(BTreeMap<PathBuf, Option<Value>>, bool),
     // How a message from the slot's editor to a session not run here went, and its text as typed.
     Sent(Result<crate::runtime::Sent, String>, String),
+    // What a paste found on the clipboard (clip::paste), None when no tool answered: numbered in the
+    // order pastes were asked for, with what it's for (Target).
+    Pasted(u64, Target, Option<clip::Pasted>),
+    // An image for the slot's draft (App::prepare_image), by its saved file: fitted, or why it
+    // couldn't be.
+    Attached(PathBuf, Result<crate::tools::image::Prepared, String>),
 }
 
 // Asking runtimes, which waits on their sockets (a stopped one's, up to its wait), so it's done off
@@ -382,6 +388,9 @@ struct App {
     model_add: Option<crate::model_add::Addition>,
     model_flow: u64,
     model_probe: Option<tokio::task::AbortHandle>,
+    // Clipboard pastes: how many were asked for, how many have landed, and the results that came
+    // before an earlier one's (App::pasted).
+    pastes: (u64, u64, BTreeMap<u64, Paste>),
     // The prompts /rewind offered: each one's parent entry and its text.
     rewind: Vec<(Option<String>, String)>,
     history: Vec<String>,
@@ -410,10 +419,38 @@ struct Selection {
     copy: bool,
 }
 
+// Where the images attached in the session `file` are kept: beside it, in a folder named after all
+// of its name.
+fn images_folder(file: &Path) -> PathBuf {
+    file.with_file_name(format!("{}.images", file.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+// `saved` as a file in the session `file`'s image folder, links followed to where it really is; None
+// when it's anywhere else (a link out of the folder included) or isn't a file.
+fn own_image(file: &Path, saved: &Path) -> Option<PathBuf> {
+    let (folder, saved) = (images_folder(file).canonicalize().ok()?, saved.canonicalize().ok()?);
+    (saved.starts_with(folder) && saved.is_file()).then_some(saved)
+}
+
 // A session's id from its file's name (<time>_<id>.jsonl, as session.rs names them).
 fn id_of(path: &Path) -> String {
     path.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit_once('_')).map_or_else(String::new, |(_, id)| id.to_string())
 }
+
+// What a paste is for: a draft (its slot and generation), or the picker it was asked from (its
+// Picker::pasting); and what the clipboard gave.
+type Target = Result<(usize, u64), Weak<()>>;
+type Paste = (Target, Option<clip::Pasted>);
+
+// Whether `text` holds the marker of the image `marker` names, known by its number ("[image 3:"),
+// which no other image in its session has (App::attach).
+fn shows(text: &str, marker: &str) -> bool {
+    text.contains(marker.split_inclusive(':').next().unwrap_or(marker))
+}
+
+// An image in a draft: its marker in the text and saved file, and once it's ready (Update::Attached),
+// the line naming it for the model and the image.
+type Attachment = (String, PathBuf, Option<(String, Content)>);
 
 // A list to choose from, filtered by what's typed.
 struct Picker {
@@ -431,6 +468,8 @@ struct Picker {
     answer: Option<tokio::sync::oneshot::Sender<bool>>,
     text: bool,
     masked: bool,
+    // Held by this picker alone, so a paste asked from it lands only while it's open (App::pasted).
+    pasting: Arc<()>,
 }
 
 impl Picker {
@@ -551,6 +590,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         model_add: None,
         model_flow: 0,
         model_probe: None,
+        pastes: Default::default(),
         rewind: Vec::new(),
         history: Vec::new(),
         sidebar_rows: Vec::new(),
@@ -926,7 +966,7 @@ impl App {
         }
         let opening = args.messages.join("\n");
         if !opening.trim().is_empty() && !args.restore {
-            self.send(opening);
+            self.send(opening, Vec::new());
         }
         Ok(())
     }
@@ -963,6 +1003,14 @@ impl App {
                 errors.push(format!("Could not restore TUI session {}: {error}", self.slots[slot].title));
             }
             self.slots[slot].draft.insert(&kept.draft);
+            // A file it names is taken only from the session's own image folder: the state file could
+            // name any, and a draft that's cleared deletes its images.
+            for (marker, saved) in kept.images {
+                match self.slots[slot].path.as_deref().and_then(|file| own_image(file, &saved)) {
+                    Some(saved) => self.prepare_image(slot, marker, saved.clone(), Err(saved)),
+                    None => errors.push(format!("Left out the image {} in {}'s draft: it isn't a file in the session's own image folder", saved.display(), self.slots[slot].title)),
+                }
+            }
             if index < on_screen {
                 self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None, drawn: None });
             }
@@ -997,7 +1045,7 @@ impl App {
             return Ok(());
         }
         // Even a missing or unreadable file stays named here until the user closes its row.
-        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| slot.saved || path.exists()), title: slot.title.clone(), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone() };
+        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| slot.saved || path.exists()), title: slot.title.clone(), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone(), images: slot.draft.images.iter().map(|(marker, saved, ..)| (marker.clone(), saved.clone())).collect() };
         let panes = self.panes.iter().map(|pane| kept(&self.slots[pane.slot], pane.scroll)).collect();
         let elsewhere = |index: usize| !self.panes.iter().any(|pane| pane.slot == index);
         let open = (0..self.slots.len())
@@ -1259,23 +1307,104 @@ impl App {
     }
 
     // Text pasted into the picker's filter or the editor, with line ends and tabs evened out.
-    fn paste_text(&mut self, text: &str) {
+    // Text pasted into the picker open (None, the terminal's own paste), else into `slot`'s draft or
+    // the focused one's.
+    fn paste_text(&mut self, slot: Option<usize>, text: &str) {
         // An early/repeated key paste must not reach an ordinary picker or the draft.
         if self.model_probe.is_some() || self.model_add.is_some() && self.picker.as_ref().is_some_and(|picker| !picker.text) { return; }
         let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', TAB_SPACES);
-        if let Some(picker) = &mut self.picker {
-            picker.filter.push_str(&text);
-        } else {
-            self.focused().draft.insert(&text);
+        match (&mut self.picker, slot) {
+            (Some(picker), None) => picker.filter.push_str(&text),
+            (_, Some(slot)) => self.slots[slot].draft.insert(&text),
+            (None, None) => self.focused().draft.insert(&text),
         }
     }
 
-    // Paste from the clipboard (or the primary selection), read through the desktop's tool.
+    // Paste from the clipboard (or the primary selection), read through the desktop's tool off this
+    // thread (Update::Pasted), for the draft it's asked from or the picker open. An image on the
+    // clipboard goes into the message being written.
     fn paste(&mut self, primary: bool) {
-        match clip::paste(primary) {
-            Some(text) => self.paste_text(&text),
-            None => self.notice = Some("Nothing to paste: no clipboard tool (wl-paste, xclip, xsel) answered; the terminal's own paste key still works".into()),
+        let target = match &self.picker {
+            Some(picker) => Err(Arc::downgrade(&picker.pasting)),
+            None => Ok((self.panes[self.focus].slot, self.current().draft.generation)),
+        };
+        let (sender, image, number) = (self.sender.clone(), !primary && target.is_ok() && self.model_probe.is_none(), self.pastes.0);
+        self.pastes.0 += 1;
+        std::thread::spawn(move || {
+            let _ = sender.send((0, Update::Pasted(number, target, clip::paste(primary, image))));
+        });
+    }
+
+    // A paste's result, held until the ones asked for before it have landed, then each in turn: into
+    // the draft or picker it was asked from, unless that draft's been sent or cleared since or that
+    // picker has closed, when it's dropped.
+    fn pasted(&mut self, number: u64, target: Target, pasted: Option<clip::Pasted>) {
+        self.pastes.2.insert(number, (target, pasted));
+        while let Some((target, pasted)) = self.pastes.2.remove(&self.pastes.1) {
+            self.pastes.1 += 1;
+            let open = |picker: &Weak<()>| self.picker.as_ref().is_some_and(|open| Weak::ptr_eq(picker, &Arc::downgrade(&open.pasting)));
+            if !target.as_ref().map_or_else(open, |&(slot, generation)| self.slots[slot].draft.generation == generation) {
+                continue;
+            }
+            match (pasted, target) {
+                (Some(clip::Pasted::Image(bytes)), Ok((slot, _))) => self.attach(slot, Ok(bytes)).unwrap_or_else(|error| self.notice = Some(error)),
+                (Some(clip::Pasted::Text(text)), target) => self.paste_text(target.ok().map(|(slot, _)| slot), &text),
+                _ => self.notice = Some("Nothing to paste: no clipboard tool (wl-paste, xclip, xsel) answered; the terminal's own paste key still works".into()),
+            }
         }
+    }
+
+    // Attach an image (pasted, or /image's file) to the slot's draft: its marker goes in at the
+    // cursor at once, sized when it's ready (prepare_image). Its number comes from the `next` file in
+    // the session's image folder, which only ever counts up, so a number is never used twice in a
+    // session, even after its image is gone; a marker and a message's image are matched by it.
+    fn attach(&mut self, slot: usize, source: Result<Vec<u8>, PathBuf>) -> Result<(), String> {
+        let view = &self.slots[slot];
+        if view.elsewhere {
+            return Err("Another piccosta is running this session; this pane follows it, and nothing typed here goes to it.".into());
+        }
+        let file = view.path.clone().ok_or("This session isn't saved, so there's nowhere to keep an image.")?;
+        let (folder, next) = (images_folder(&file), images_folder(&file).join("next"));
+        let number = std::fs::read_to_string(&next).ok().and_then(|number| number.trim().parse::<u64>().ok()).unwrap_or(1);
+        // Written whole: a new file renamed over the old, so a crash never leaves it half there.
+        let staged = folder.join("next.new");
+        std::fs::create_dir_all(&folder).and_then(|()| std::fs::write(&staged, (number + 1).to_string())).and_then(|()| std::fs::rename(&staged, &next)).map_err(|error| format!("Couldn't save the image: {error}"))?;
+        let marker = format!("{}{number}: …]", render::ATTACHED);
+        self.slots[slot].draft.insert(&marker);
+        self.prepare_image(slot, marker, folder.join(format!("{number}-{}", uuid::Uuid::new_v4())), source);
+        Ok(())
+    }
+
+    // Put the image whose marker is in the slot's draft and whose file is `saved` with the draft at
+    // once, then off this thread: read `source` (bytes, or a file, which must be a regular one so a
+    // FIFO can't hang the read), save it to `saved` unless it's that file already (a restored draft),
+    // and fit it to the slot's model as `read` fits one, a big photo's decode included. The original
+    // is saved before the decode, so a draft kept across a restart names a file that's there. It's
+    // ready when Update::Attached comes. A model without image input gets the saved path and a line
+    // saying it can't see it (provider/transform.rs).
+    fn prepare_image(&mut self, slot: usize, marker: String, saved: PathBuf, source: Result<Vec<u8>, PathBuf>) {
+        use crate::tools::image;
+        self.slots[slot].draft.images.push((marker, saved.clone(), None));
+        let (models, model, sender) = (self.host.agent_dir.join("models.json"), self.slots[slot].model.clone(), self.sender.clone());
+        std::thread::spawn(move || {
+            let prepared = (|| -> Result<_, String> {
+                let copy = source.as_ref().err() != Some(&saved);
+                let bytes = match source {
+                    Ok(bytes) => bytes,
+                    Err(path) if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()) => std::fs::read(&path).map_err(|error| format!("Couldn't read {}: {error}", path.display()))?,
+                    Err(path) => return Err(format!("{} isn't a file.", path.display())),
+                };
+                let mime_type = image::sniff_mime_type(&bytes[..bytes.len().min(image::SNIFF_BYTES)]).ok_or("That isn't a png, jpeg, gif or webp image.")?;
+                // A file that's made but can't be written whole (a full disk) goes with the error (Update::Attached).
+                if copy {
+                    std::fs::File::create_new(&saved).and_then(|mut file| std::io::Write::write_all(&mut file, &bytes)).map_err(|error| format!("Couldn't save the image: {error}"))?;
+                }
+                let registry = crate::model::ModelRegistry::load(&models)?;
+                let limits = image::Limits::of(registry.resolve(&model).ok().and_then(|model| model.input_limits.clone()).as_ref());
+                image::prepare(&bytes, mime_type, limits)
+            })();
+            let _ = sender.send((slot, Update::Attached(saved, prepared)));
+        });
     }
 
     // Make sure the focused pane's session is open here, opening an earlier one shown from its
@@ -1343,9 +1472,20 @@ impl App {
         Some(slot)
     }
 
-    // The editor's text: a command, a prompt, or steering for a run in progress.
+    // The editor's text: a command, a prompt, or steering for a run in progress, with its images
+    // (take_draft). `/image <file>` starting it attaches the file in its place instead; ending it,
+    // after a space, it does when there is such a file, else it's words like the rest. What's
+    // before it stays to go on writing.
     fn submit(&mut self) {
-        let text = self.focused().draft.take();
+        let (draft, cwd) = (&self.current().draft.text, &self.current().cwd);
+        let file = |at: usize| crate::tools::paths::resolve(draft[at + "/image ".len()..].trim(), cwd);
+        let command = draft.starts_with("/image ").then_some(0).or_else(|| draft.rfind(" /image ").map(|at| at + 1).filter(|&at| file(at).is_file()));
+        if let Some(at) = command.filter(|&at| !draft[at..].contains('\n')) {
+            let (path, end) = (file(at), draft.len());
+            self.focused().draft.cut(at..end);
+            return self.attach(self.panes[self.focus].slot, Err(path)).unwrap_or_else(|error| self.notice = Some(error));
+        }
+        let Some((text, images)) = self.take_draft() else { return };
         if text.trim().is_empty() {
             return;
         }
@@ -1359,18 +1499,37 @@ impl App {
         {
             return;
         }
-        self.send(text);
+        self.send(text, images);
     }
 
-    fn send(&mut self, text: String) {
+    // The focused draft's text, taken out, and the images whose markers are still in it, each after a
+    // line naming its saved file; one whose marker was deleted is deleted (Editor::take). None, with
+    // a notice and the draft left as it is, while one of them is still being prepared.
+    fn take_draft(&mut self) -> Option<(String, Vec<Content>)> {
+        let draft = &mut self.focused().draft;
+        if draft.images.iter().any(|(marker, _, ready)| ready.is_none() && shows(&draft.text, marker)) {
+            self.notice = Some("An image is still being prepared: send once its marker shows its size.".into());
+            return None;
+        }
+        let (kept, dropped): (Vec<_>, _) = std::mem::take(&mut draft.images).into_iter().partition(|(marker, ..)| shows(&draft.text, marker));
+        draft.images = dropped;
+        Some((draft.take(), kept.into_iter().filter_map(|(.., ready)| ready).flat_map(|(line, image)| [Content::text(line), image]).collect()))
+    }
+
+    // A message for the focused session, with any images attached to it; one for a session another
+    // piccosta runs takes only its text, which names where they're saved.
+    fn send(&mut self, text: String, images: Vec<Content>) {
         let pane = self.focus;
         self.panes[pane].scroll = 0;
         // A message for a session not open here goes to whatever runs it (the assistant's service,
         // another terminal), as the user's when it's a manager's, sent off this thread (asker, then
         // sent).
+        // Images go only to a session open here, so one whose runtime let go opens here again first.
         if self.current().live.is_none()
+            && (images.is_empty() || self.current().elsewhere)
             && let Some(path) = self.current().path.clone().filter(|path| path.exists())
         {
+            let text = if images.is_empty() { text } else { format!("{text}\n\n{}", crate::message::TextOrBlocks::Blocks(images).text()) };
             let (slot, sent) = (self.panes[pane].slot, if self.current().manager { crate::manager::from_user(&text) } else { text.clone() });
             let _ = self.asks.send(Box::new(move || (slot, Update::Sent(crate::runtime::send(&path, &sent, None), text))));
             return;
@@ -1383,8 +1542,8 @@ impl App {
         let Some((_, commands)) = &slot.live else { return };
         // While the model works, a message waits for the step it's on, and the commands that step
         // is running move to the background (they carry on and report when they end), so it isn't
-        // left waiting on them; else it starts a turn (runtime.rs).
-        let _ = commands.send(Command::Message(text.clone()));
+        // left waiting on them; else it starts a turn (runtime.rs). Its images go with it either way.
+        let _ = commands.send(Command::Message(text.clone(), images));
         if slot.busy() {
             return;
         }
@@ -1438,7 +1597,7 @@ impl App {
 
     // Choose from a list; an argument that matches one item picks it at once.
     fn pick(&mut self, title: &'static str, items: Vec<String>, filter: &str, apply: fn(&mut App, String)) {
-        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None, text: false, masked: false };
+        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None, text: false, masked: false, pasting: Arc::default() };
         let shown = picker.shown();
         if !filter.is_empty() && (shown.len() == 1 || shown.iter().any(|item| item.as_str() == filter)) {
             let choice = shown.iter().find(|item| item.as_str() == filter).unwrap_or(&shown[0]).to_string();
@@ -1489,9 +1648,9 @@ impl App {
         let Some((handle, commands)) = &self.focused().live else { return };
         let (steer, follow_up) = handle.clear();
         let _ = commands.send(Command::Stop(None));
-        let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
-        if !queued.is_empty() {
-            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new()));
+        let (texts, images): (Vec<String>, Vec<Vec<Content>>) = steer.into_iter().chain(follow_up).unzip();
+        if !texts.is_empty() {
+            let _ = commands.send(Command::Prompt(texts.join("\n\n"), images.concat()));
         }
     }
 
@@ -1504,11 +1663,11 @@ impl App {
             self.submit();
             return;
         }
-        let text = self.focused().draft.take();
+        let Some((text, images)) = self.take_draft() else { return };
         if !text.trim().is_empty() {
             self.history.push(text.clone());
             if let Some((handle, _)) = &self.current().live {
-                handle.steer(text);
+                handle.steer(text, images);
             }
         }
         let detached = self.current().shared.as_ref().is_some_and(|shared| shared.jobs.detach_all());
@@ -1517,18 +1676,26 @@ impl App {
         }
     }
 
-    // Take what's queued back into the editor, one per line ahead of the draft. Output: whether
-    // there was anything.
+    // Take what's queued back into the editor, one per line ahead of the draft, with its images.
+    // Output: whether there was anything.
     fn take_back(&mut self) -> bool {
         let slot = self.focused();
         let Some((handle, _)) = &slot.live else { return false };
         let (steer, follow_up) = handle.clear();
-        let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
+        let (queued, images): (Vec<String>, Vec<Vec<Content>>) = steer.into_iter().chain(follow_up).unzip();
         if queued.is_empty() {
             return false;
         }
+        // Each image comes after the line naming it (its marker, then " is " and its file: Update::Attached).
+        for pair in images.concat().chunks(2) {
+            if let [Content::Text { text: line, .. }, image] = pair
+                && let Some((marker, rest)) = line.split_once(" is ")
+            {
+                slot.draft.images.push((marker.to_string(), PathBuf::from(rest.lines().next().unwrap_or_default()), Some((line.clone(), image.clone()))));
+            }
+        }
         let text = format!("{}{}", queued.join("\n"), if slot.draft.text.is_empty() { String::new() } else { format!("\n{}", slot.draft.text) });
-        slot.draft = Editor::with(text);
+        slot.draft.set(text);
         true
     }
 
@@ -1796,7 +1963,7 @@ impl App {
         let view = &mut self.slots[slot];
         match update {
             Update::Ask(question, answer) => {
-                self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items: vec!["No".into(), "Yes".into()], filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), text: false, masked: false });
+                self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items: vec!["No".into(), "Yes".into()], filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), text: false, masked: false, pasting: Arc::default() });
             }
             Update::Report(text) => self.report(text),
             Update::Assistant(started) => {
@@ -1818,6 +1985,32 @@ impl App {
             Update::ModelProbe(flow, result) => self.probed_model(flow, result),
             Update::Scanned(statuses, agents) => self.scanned(statuses, agents),
             Update::Sent(sent, text) => self.sent(slot, sent, text),
+            Update::Pasted(number, target, pasted) => self.pasted(number, target, pasted),
+            // An image ready: a new one's marker gets its size. One its draft let go of meanwhile
+            // (Editor::take, which may have come before its file was saved) goes, its file with it;
+            // so does one that couldn't be prepared, its marker too.
+            Update::Attached(saved, prepared) => {
+                let draft = &mut view.draft;
+                let at = draft.images.iter().position(|(_, kept, ready)| *kept == saved && ready.is_none());
+                let (at, prepared) = match (at, prepared) {
+                    (Some(at), Ok(prepared)) => (at, prepared),
+                    (at, prepared) => {
+                        let _ = std::fs::remove_file(saved);
+                        if let Some(at) = at {
+                            let (marker, ..) = draft.images.remove(at);
+                            draft.swap(&marker, "");
+                        }
+                        self.notice = prepared.err().or(self.notice.take());
+                        return;
+                    }
+                };
+                let marker = draft.images[at].0.clone();
+                let ready = marker.strip_suffix(" …]").map_or_else(|| marker.clone(), |head| format!("{head} {}×{}, {} KB]", prepared.width, prepared.height, (prepared.data.len() * 3 / 4).div_ceil(1024)));
+                draft.swap(&marker, &ready);
+                // The hints go on lines of their own, so the file's path is the first line's end (take_back).
+                let line = std::iter::once(format!("{ready} is {}", saved.display())).chain(prepared.hints).collect::<Vec<_>>().join("\n");
+                draft.images[at] = (ready, saved, Some((line, Content::Image { data: prepared.data, mime_type: prepared.mime_type })));
+            }
             Update::Done(done) => {
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
@@ -1905,7 +2098,7 @@ impl App {
         }
         match input {
             Input::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
-            Input::Paste(text) => self.paste_text(&text),
+            Input::Paste(text) => self.paste_text(None, &text),
             Input::Mouse(mouse) => {
                 let at = Position::new(mouse.column, mouse.row);
                 let pane = self.pane_rects.iter().position(|rect| rect.contains(at));
@@ -2098,7 +2291,7 @@ impl App {
             KeyCode::Tab if self.current().draft.text.starts_with('/') && !self.current().draft.text.contains(char::is_whitespace) => {
                 if let Some(name) = commands::completions(&self.current().draft.text, false).first() {
                     let text = format!("{name} ");
-                    self.focused().draft = Editor::with(text);
+                    self.focused().draft.set(text);
                 }
             }
             // Down from a recalled prompt steps to the newer one, and past the newest to empty.
@@ -2106,7 +2299,7 @@ impl App {
                 let current = self.current().draft.text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(0);
                 let text = self.history.get(position + 1).cloned().unwrap_or_default();
-                self.focused().draft = Editor::with(text);
+                self.focused().draft.set(text);
             }
             // Up from the editor's first line takes back what's queued, as in Claude Code.
             KeyCode::Up if !shift && !self.current().draft.text[..self.current().draft.cursor].contains('\n') && self.take_back() => {}
@@ -2114,7 +2307,7 @@ impl App {
                 let current = self.current().draft.text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(self.history.len());
                 if let Some(previous) = position.checked_sub(1).and_then(|index| self.history.get(index)).cloned() {
-                    self.focused().draft = Editor::with(previous);
+                    self.focused().draft.set(previous);
                 }
             }
             _ => self.focused().draft.key(key),
@@ -2540,7 +2733,7 @@ fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags
         // but it's for the model: shown as a notice. The user's own words sent to it from
         // elsewhere, "[<time>, from the user]", stay the user's.
         AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags),
-        AgentMessage::User(user) => render::user(&user.content.text(), width, tex),
+        AgentMessage::User(user) => render::user(&user.content, width, tex),
         AgentMessage::Assistant(assistant) => {
             render::assistant(&render::blocks(assistant), Some((&assistant.stop_reason, assistant.error_message.as_deref())), tools, flags, frame, width, tex)
         }
@@ -2618,12 +2811,33 @@ struct Editor {
     undo: Vec<(String, usize)>,
     // Where a shift+arrow selection began; the selection runs from here to the cursor.
     anchor: Option<usize>,
+    // The images attached (App::attach).
+    images: Vec<Attachment>,
+    // Sent or cleared so many times, so a paste asked for before then doesn't land in what's here now.
+    generation: u64,
 }
 
 impl Editor {
     // An editor holding `text`, the cursor at its end.
     fn with(text: String) -> Editor {
-        Editor { cursor: text.len(), text, undo: Vec::new(), anchor: None }
+        Editor { cursor: text.len(), text, ..Editor::default() }
+    }
+
+    // Its text replaced by `text`, its images kept, to go with it or be deleted (take).
+    fn set(&mut self, text: String) {
+        *self = Editor { images: std::mem::take(&mut self.images), generation: self.generation, ..Editor::with(text) };
+    }
+
+    // `old` (an image's marker) made `new` where it is, the cursor kept beside what it was beside.
+    fn swap(&mut self, old: &str, new: &str) {
+        let Some(at) = self.text.find(old) else { return };
+        self.text.replace_range(at..at + old.len(), new);
+        if self.cursor >= at + old.len() {
+            self.cursor = self.cursor + new.len() - old.len();
+        } else if self.cursor > at {
+            self.cursor = at + new.len();
+        }
+        self.anchor = None;
     }
 
     // What's typed or pasted replaces the selection, if there is one.
@@ -2651,7 +2865,7 @@ impl Editor {
 
     // The row and column `at` (a byte offset) is drawn at, wrapped at `width`.
     fn spot(&self, width: usize, at: usize) -> (usize, usize) {
-        Editor { text: self.text.clone(), cursor: at, undo: Vec::new(), anchor: None }.layout(width).1
+        Editor { text: self.text.clone(), cursor: at, ..Editor::default() }.layout(width).1
     }
 
     // Keep the state before an edit, for undo.
@@ -2687,6 +2901,11 @@ impl Editor {
         self.cursor = 0;
         self.undo.clear();
         self.anchor = None;
+        self.generation += 1;
+        // The images still here go with it (cleared, or their markers deleted); a draft kept across a quit keeps its own.
+        for (_, saved, ..) in self.images.drain(..) {
+            let _ = std::fs::remove_file(saved);
+        }
         std::mem::take(&mut self.text)
     }
 

@@ -269,7 +269,7 @@ impl Rpc {
                 if live.streaming {
                     match command.get("streamingBehavior").and_then(Value::as_str) {
                         Some("steer") => {
-                            live.handle.steer(message);
+                            live.handle.steer(message, Vec::new());
                             live.shared.jobs.detach_all();
                         }
                         Some("followUp") => live.handle.follow_up(message),
@@ -287,7 +287,7 @@ impl Rpc {
             }
             "steer" | "follow_up" => {
                 let message = text("message");
-                if kind == "steer" { live.handle.steer(message) } else { live.handle.follow_up(message) }
+                if kind == "steer" { live.handle.steer(message, Vec::new()) } else { live.handle.follow_up(message) }
                 self.announce_queue();
                 Some(json!({"disposition": "queued"}))
             }
@@ -303,7 +303,8 @@ impl Rpc {
             "clear_queue" => {
                 let (steering, follow_up) = live.handle.clear();
                 self.announce_queue();
-                Some(json!({"steering": steering, "followUp": follow_up}))
+                let texts = |queue: Vec<crate::agent::Queued>| queue.into_iter().map(|(text, _)| text).collect::<Vec<_>>();
+                Some(json!({"steering": texts(steering), "followUp": texts(follow_up)}))
             }
             "new_session" => {
                 let parent = command.get("parentSession").and_then(Value::as_str).map(str::to_string);

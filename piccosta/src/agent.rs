@@ -166,8 +166,8 @@ struct Inbox {
     // The token of the run in progress; each prompt puts in a fresh one, so a handle taken before
     // the prompt still aborts it.
     cancel: CancellationToken,
-    steer: Vec<String>,
-    follow_up: Vec<String>,
+    steer: Vec<Queued>,
+    follow_up: Vec<Queued>,
     steering_all: bool,
     follow_up_all: bool,
     // A /fast that came during the run, for its next request.
@@ -179,13 +179,13 @@ impl Handle {
         self.lock().cancel.cancel();
     }
 
-    pub fn steer(&self, text: String) {
-        self.lock().steer.push(text);
+    pub fn steer(&self, text: String, images: Vec<Content>) {
+        self.lock().steer.push((text, images));
         self.0.1.notify_one();
     }
 
     pub fn follow_up(&self, text: String) {
-        self.lock().follow_up.push(text);
+        self.lock().follow_up.push((text, Vec::new()));
         self.0.1.notify_one();
     }
 
@@ -205,11 +205,12 @@ impl Handle {
     // What's queued and not sent yet: steering, then follow-ups.
     pub fn queued(&self) -> (Vec<String>, Vec<String>) {
         let inbox = self.lock();
-        (inbox.steer.clone(), inbox.follow_up.clone())
+        let texts = |queue: &[Queued]| queue.iter().map(|(text, _)| text.clone()).collect();
+        (texts(&inbox.steer), texts(&inbox.follow_up))
     }
 
     // Take back everything queued (pi's clear_queue), e.g. to put it back in the editor on abort.
-    pub fn clear(&self) -> (Vec<String>, Vec<String>) {
+    pub fn clear(&self) -> (Vec<Queued>, Vec<Queued>) {
         let mut inbox = self.lock();
         (std::mem::take(&mut inbox.steer), std::mem::take(&mut inbox.follow_up))
     }
@@ -219,13 +220,12 @@ impl Handle {
     }
 }
 
-fn dequeue(queue: &mut Vec<String>, all: bool) -> Vec<String> {
+// A message queued for the session: its text, then the images the user attached to it.
+pub type Queued = (String, Vec<Content>);
+
+fn dequeue(queue: &mut Vec<Queued>, all: bool) -> Vec<Queued> {
     let count = if all { queue.len() } else { queue.len().min(1) };
     queue.drain(..count).collect()
-}
-
-fn user_message(text: &str) -> AgentMessage {
-    with_images(text, Vec::new())
 }
 
 // The user's text, then any images they attached (pi puts them after the text).
@@ -621,7 +621,7 @@ impl Agent {
     // A run, starting with the messages queued in the session (sent while nothing ran it, or left
     // by a stop), then `first`.
     async fn run_from(&mut self, first: Option<AgentMessage>) -> Result<(), String> {
-        let queued: Vec<AgentMessage> = self.session.queued().iter().map(|text| user_message(text)).collect();
+        let queued: Vec<AgentMessage> = self.session.queued().into_iter().map(|(text, images)| with_images(&text, images)).collect();
         if queued.is_empty() && first.is_none() {
             return Ok(());
         }
@@ -719,7 +719,7 @@ impl Agent {
         if !queued.is_empty() {
             self.announce_queue();
         }
-        queued.iter().map(|text| user_message(text)).collect()
+        queued.into_iter().map(|(text, images)| with_images(&text, images)).collect()
     }
 
     // Print and json mode with a job still running after the model's last turn: wait for its
@@ -874,7 +874,7 @@ impl Agent {
             let all = inbox.steering_all;
             dequeue(&mut inbox.steer, all)
         };
-        messages.extend(steer.iter().map(|text| user_message(text)));
+        messages.extend(steer.into_iter().map(|(text, images)| with_images(&text, images)));
         messages
     }
 
