@@ -80,6 +80,7 @@ pub enum Command {
     Name(String),
     Compact(Option<String>),
     AutoCompaction(bool),
+    Fast(bool),
     AutoRetry(bool),
     // Work with other models from the next prompt on (none: alone again).
     Team(Team),
@@ -590,6 +591,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                                 handle.abort();
                                 closing = Some(answer);
                             }
+                            // Fast mode changes from the run's next request (Agent::respond), unless
+                            // commands typed before it wait: then it waits behind them, in order.
+                            Some(Command::Fast(on)) if queue.is_empty() => {
+                                handle.swap_fast(Some(on));
+                            }
                             Some(other) => queue.push_back(other),
                             None => {
                                 handle.abort();
@@ -600,6 +606,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
             };
             lock(&watch).since = None;
+            // A /fast no request took is done as a command of its own, before what came after it.
+            if let Some(on) = handle.swap_fast(None) {
+                queue.push_front(Command::Fast(on));
+            }
             // What a stop left unread stays queued here, for the session's next turn (or rpc's
             // clear_queue); it goes into the file when the session is given up.
             let stopped = !stops.is_empty();
@@ -695,6 +705,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         Command::Compact(instructions) => agent.compact(instructions.as_deref()).await,
         Command::Thinking(level) => written(agent.set_thinking_level(&level)),
         Command::Name(name) => written(agent.set_name(&name)),
+        Command::Fast(on) => agent.set_fast(on),
         Command::AutoCompaction(enabled) => {
             agent.set_auto_compaction(enabled);
             Ok(())

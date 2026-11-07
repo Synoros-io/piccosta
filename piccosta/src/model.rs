@@ -485,8 +485,9 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<IndexMap<String, String>>,
     // The service tier to ask for, set per model in models.json's modelOverrides: OpenAI's
-    // "priority" is Codex's fast mode (about twice as fast, counted higher against the plan). It
-    // stays the same for a session's whole life, so the prompt cache is unaffected. None: default.
+    // "priority" is Codex's fast mode (about twice as fast, counted higher against the plan), and
+    // Claude Code's fast mode on the Claude bridge. A session's /fast replaces it (agent::service_tier).
+    // It's a request field, outside the prompt. None: default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
 }

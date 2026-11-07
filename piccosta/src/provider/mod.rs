@@ -37,6 +37,11 @@ pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 // (coding-agent/src/core/provider-attribution.ts:9, 67-77). Without it opencode answers 400 MissingSessionID.
 const OPENCODE_HOST: &str = "opencode.ai";
 
+// The service tier /fast puts on a session's model, and the APIs that read it: OpenAI's "priority"
+// is Codex's fast mode, and the Claude bridge turns it into Claude Code's fastMode.
+pub const FAST_TIER: &str = "priority";
+pub const FAST_APIS: [&str; 2] = ["openai-codex-responses", claude::PROVIDER];
+
 // pi's thinking levels, lowest to highest (models.ts:1258).
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 

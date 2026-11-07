@@ -321,11 +321,11 @@ fn version() -> Option<&'static str> {
 // Once per process, when the Claude Code the bridge ran is newer than VERIFIED_VERSION: a line for
 // the user saying so. Never asks for the version itself, so a process that never ran the bridge
 // gets nothing.
-pub fn take_notice() -> Option<String> {
-    let version = VERSION.get()?.as_deref()?;
+// The session's own line first, if Claude Code refused it something (fast mode).
+pub fn take_notice(session_id: &str) -> Option<String> {
     let numbers = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    (numbers(version) > numbers(VERIFIED_VERSION) && !NOTICED.swap(true, Ordering::Relaxed)).then(|| format!(
-        "Claude Code {version} is newer than {VERIFIED_VERSION}, the last version the bridge was checked against; if tool results arrive cut short, look there first"))
+    lock(&NOTES).remove(session_id).or_else(|| VERSION.get().cloned().flatten().filter(|version| numbers(version) > numbers(VERIFIED_VERSION) && !NOTICED.swap(true, Ordering::Relaxed)).map(|version| format!(
+        "Claude Code {version} is newer than {VERIFIED_VERSION}, the last version the bridge was checked against; if tool results arrive cut short, look there first")))
 }
 
 fn append(path: &PathBuf, line: &str) {
@@ -653,6 +653,8 @@ pub async fn shutdown() {
 
 // How a waiting query's get_usage request id begins, so its answer is told from the session's own.
 const USAGE_REQUEST: &str = "usage-";
+// And a fast-mode request's, followed by the value it asks for ("true-" or "false-").
+const FAST_REQUEST: &str = "fast-";
 
 fn request_id() -> String {
     Uuid::new_v4().simple().to_string()[..13].to_string()
@@ -817,6 +819,8 @@ struct State {
     waiting: bool,
     idle_since: Instant,
     kept_base: (Vec<String>, Vec<String>),
+    // Whether Claude Code was told fast mode is on (/fast).
+    fast: bool,
 }
 
 struct Live {
@@ -833,6 +837,8 @@ enum Command {
     Discard(String),
     // Ask Claude Code for the plan's usage (ask_usage).
     Usage,
+    // Fast mode on or off from its next request, as the flag setting it started with would.
+    Fast(bool),
 }
 
 // One provider call's stream: where its events go, the message it ends with, and its abort.
@@ -846,6 +852,9 @@ static LIVE: LazyLock<Mutex<HashMap<String, Live>>> = LazyLock::new(Default::def
 static NEXT_QUERY: AtomicU64 = AtomicU64::new(1);
 // Why each session's latest call started a new Claude Code query, for the cache monitor.
 static REWRITES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+// A line for each session's user, taken with take_notice.
+static NOTES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 
 // The reason the session's latest call started a new query, if it did.
 pub fn take_rewrite(session_id: &str) -> Option<String> {
@@ -930,6 +939,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     let (cli_model, _) = runtime_model(&model.id);
     let effort = effort(model, request.thinking_level);
     let thinking_off = request.thinking_level == "off";
+    let fast = model.service_tier.as_deref() == Some(super::FAST_TIER);
     let cwd = request.cwd.to_string_lossy().into_owned();
     let (key, one_shot) = (request.session_id.unwrap_or("(none)").to_string(), !request.cache);
     if !one_shot {
@@ -946,7 +956,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     loop {
         let (reply, answer) = oneshot::channel();
         let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
-        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, forced.take(), turn) {
+        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, forced.take(), turn) {
             Ok(()) => match answer.await {
                 Ok(message) => return message,
                 // The query ended before it took them: rewrite like any other mismatch.
@@ -961,7 +971,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         if !one_shot {
             lock(&REWRITES).insert(key.clone(), reason.clone());
         }
-        let start = Start { key: &key, model, cli_model: &cli_model, effort: effort.as_deref(), thinking_off, system_prompt: &system_prompt,
+        let start = Start { key: &key, model, cli_model: &cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
             tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, one_shot };
         if let Err(error) = start_query(start, turn) {
             return failed(model, StopReason::Error, &error);
@@ -1003,7 +1013,7 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
 // Hand this call's tool results to the parked query when the sync check allows it. Output: Ok once
 // they're sent (the next turn streams into `turn`), else the rewrite reason and the turn back; the
 // live query, if any, is discarded then.
-fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
+fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
     let mut live = lock(&LIVE);
     let decision = match forced {
         Some(reason) => Err(reason),
@@ -1022,6 +1032,11 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fo
     // A waiting query takes the user messages that came after its turn as its next message; a
     // parked one, the results of the calls it's parked on.
     let mut state = lock(&entry.state);
+    // Fast mode is a request field, not part of the prompt, so a running query takes it as it is.
+    if state.fast != fast {
+        state.fast = fast;
+        let _ = entry.commands.send(Command::Fast(fast));
+    }
     let command = if state.waiting {
         let content = messages[start..].iter().filter_map(|message| match message {
             Message::User(user) => Some(history::anthropic_blocks(&user.content.clone().into_blocks())),
@@ -1060,6 +1075,7 @@ struct Start<'a> {
     cli_model: &'a str,
     effort: Option<&'a str>,
     thinking_off: bool,
+    fast: bool,
     system_prompt: &'a str,
     tools: &'a [ToolDefinition],
     messages: &'a [Message],
@@ -1107,7 +1123,9 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     if start.effort.is_some() {
         args.extend(["--thinking-display", "summarized"].map(String::from));
     }
-    args.extend(["--settings", PROVIDER_SETTINGS].map(String::from));
+    // Fast mode (/fast) is one more flag setting, put in before the closing brace.
+    let settings = if start.fast { PROVIDER_SETTINGS.replace('}', r#","fastMode":true}"#) } else { PROVIDER_SETTINGS.into() };
+    args.extend(["--settings".into(), settings]);
     // A turn Claude Code answers on resume runs before the initialize request's prompt applies, so
     // without this it goes out with Claude Code's own system prompt: none of pi's, no AGENTS.md, a
     // prompt cache miss on everything, and the model told it may answer "No response requested."
@@ -1135,7 +1153,7 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         opening.push(json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null}));
     }
     let state = Arc::new(Mutex::new(State { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None, waiting: false,
-        idle_since: Instant::now(), kept_base: kept_base(&visible) }));
+        idle_since: Instant::now(), kept_base: kept_base(&visible), fast: start.fast }));
     let (commands, inbox) = mpsc::unbounded_channel();
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
     let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
@@ -1225,18 +1243,20 @@ struct Query {
     result_cost: Option<f64>,
     // This query's tool turns handed to pi with their cost pending since its last priced turn.
     pending_turns: u32,
+    // The fast mode Claude Code last took: its flag setting at start, then each apply_flag_settings it answered.
+    fast: bool,
 }
 
 impl Query {
     #[allow(clippy::too_many_arguments)]
     fn new(id: u64, key: &str, model: Model, tools: &[ToolDefinition], child: Child, inbox: mpsc::UnboundedReceiver<Command>, state: Arc<Mutex<State>>,
         project_path: String, cwd: &str, shape: Shape, written: Option<String>) -> Query {
-        let out = new_output(&model, PROVIDER);
+        let (out, fast) = (new_output(&model, PROVIDER), lock(&state).fast);
         Query { id, key: key.to_string(), out, model, tools: tools.iter().map(|tool| tool.name.clone()).collect(), manifest: manifest(tools), child, inbox, state,
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
-            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, one_shot: false, interrupting: false, next_prompt: None, hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0 }
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, one_shot: false, interrupting: false, next_prompt: None, hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
     }
 
     async fn run(mut self, opening: Vec<Value>) {
@@ -1264,6 +1284,7 @@ impl Query {
                 Wake::Command(Some(Command::Deliver(results, turn))) => self.deliver(results, turn).await,
                 Wake::Command(Some(Command::Prompt(content, turn))) => self.prompt(content, turn).await,
                 Wake::Command(Some(Command::Discard(reason))) => self.discard(&reason).await,
+                Wake::Command(Some(Command::Fast(on))) => self.child.send(&json!({"type": "control_request", "request_id": format!("{FAST_REQUEST}{on}-{}", request_id()), "request": {"subtype": "apply_flag_settings", "settings": {"fastMode": on}}})).await,
                 Wake::Command(Some(Command::Usage)) => self.child.send(&json!({"type": "control_request", "request_id": format!("{USAGE_REQUEST}{}", request_id()), "request": {"subtype": "get_usage"}})).await,
                 Wake::Command(None) => self.discard("the bridge let go of it").await,
                 Wake::Idle => self.idle().await,
@@ -1494,6 +1515,17 @@ impl Query {
         }
         let Ok(message) = serde_json::from_str::<Value>(line) else { return };
         self.last_activity = Instant::now();
+        // A fast-mode answer: a refusal keeps the query and the mode Claude Code last took, and says why.
+        let answer = &message["response"];
+        if let Some(asked) = answer["request_id"].as_str().and_then(|id| id.strip_prefix(FAST_REQUEST)).filter(|_| message["type"] == "control_response") {
+            if answer["subtype"] != "error" {
+                self.fast = asked.starts_with("true");
+            } else {
+                let why = answer["error"].as_str().unwrap_or("no reason given");
+                lock(&NOTES).insert(self.key.clone(), format!("Claude Code refused fast mode, which stays {}: {why}", if self.fast { "on" } else { "off" }));
+            }
+            return;
+        }
         match message["type"].as_str().unwrap_or_default() {
             "control_request" => self.control(&message).await,
             // A usage answer, or its failure, which is no fault of the session's.

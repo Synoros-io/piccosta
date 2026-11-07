@@ -315,10 +315,12 @@ fn item_texts(items: &[Value]) -> Vec<String> {
     items.iter().map(Value::to_string).collect()
 }
 
+// The tier (/fast) is left out too: it's a request field outside the prompt, so a toggle continues.
 fn without_input(body: &Map<String, Value>) -> String {
     let mut rest = body.clone();
     rest.shift_remove("input");
     rest.shift_remove("previous_response_id");
+    rest.shift_remove("service_tier");
     Value::Object(rest).to_string()
 }
 

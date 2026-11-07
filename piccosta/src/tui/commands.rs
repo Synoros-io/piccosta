@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 43] = [
+const COMMANDS: [(&str, &str); 44] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -62,6 +62,7 @@ const COMMANDS: [(&str, &str); 43] = [
     ("/pair [model|off]", "work with a second model as a pair: the two answer each other in turn until one says it's done, then you speak"),
     ("/trio [model|off]", "work with a second model as a trio: it checks each answer once, then you speak"),
     ("/thinking, /effort [level|auto]", "set the thinking level, saved for the model; auto forgets it"),
+    ("/fast [on|off]", "fast mode on Codex and Claude, from the next request; alone, switches it"),
     ("/compact [focus]", "summarize the conversation to free context"),
     ("/autocompact [on|off]", "compact on its own when the context fills; alone, says which"),
     ("/status", "model, session, context and cost"),
@@ -346,6 +347,11 @@ impl App {
             "compact" => {
                 self.focused().state = State::Compacting;
                 self.tell(Command::Compact(Some(argument.to_string()).filter(|text| !text.is_empty())));
+            }
+            "fast" => {
+                let on = if argument.is_empty() { !self.current().fast } else { argument == "on" };
+                self.tell(Command::Fast(on));
+                self.notice = Some(format!("fast mode {}", if on { "on" } else { "off" }));
             }
             "autocompact" if argument == "on" || argument == "off" => {
                 self.focused().auto_compaction = argument == "on";

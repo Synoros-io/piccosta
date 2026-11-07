@@ -170,6 +170,8 @@ struct Inbox {
     follow_up: Vec<String>,
     steering_all: bool,
     follow_up_all: bool,
+    // A /fast that came during the run, for its next request.
+    fast: Option<bool>,
 }
 
 impl Handle {
@@ -193,6 +195,11 @@ impl Handle {
 
     pub fn set_follow_up_mode(&self, mode: &str) {
         self.lock().follow_up_all = mode == "all";
+    }
+
+    // Put in (Some) or take out (None) a /fast for the run's next request. Output: what was there.
+    pub fn swap_fast(&self, on: Option<bool>) -> Option<bool> {
+        std::mem::replace(&mut self.lock().fast, on)
     }
 
     // What's queued and not sent yet: steering, then follow-ups.
@@ -328,6 +335,21 @@ fn looping(text: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&tail[tail.len() - unit..]).into_owned())
 }
 
+// The session entry /fast writes, {"on": true or false}. A session without one runs at its model's
+// own serviceTier from models.json.
+pub const FAST_TYPE: &str = "piccosta-fast";
+
+// The service tier `model`'s requests ask for in `session`: /fast's last choice there, on a model
+// that offers fast mode, else the model's own.
+pub fn service_tier(session: &Session, model: &Model) -> Option<String> {
+    let offered = provider::FAST_APIS.contains(&model.api.as_str());
+    let chosen = session.path_to_leaf().into_iter().rev().filter(|_| offered).find_map(|entry| match entry {
+        SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == FAST_TYPE => data["on"].as_bool(),
+        _ => None,
+    });
+    chosen.map_or_else(|| model.service_tier.clone(), |on| on.then(|| provider::FAST_TIER.to_string()))
+}
+
 struct ToolRun {
     index: usize,
     call_id: String,
@@ -352,7 +374,8 @@ impl Agent {
             let base = session.next_base();
             session.append(SessionEntry::ThinkingLevelChange { base, thinking_level: level.clone() })?;
         }
-        let config = AgentConfig { thinking_level: level, ..config };
+        let mut config = AgentConfig { thinking_level: level, ..config };
+        config.model.service_tier = service_tier(&session, &config.model);
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
         Ok(Agent { session, pending_plugins: None, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0), machine_noted: None })
@@ -416,7 +439,7 @@ impl Agent {
             let base = self.session.next_base();
             self.session.append(SessionEntry::ModelChange { base, provider: model.provider.clone(), model_id: model.id.clone() })?;
         }
-        self.config.model = model;
+        self.config.model = Model { service_tier: service_tier(&self.session, &model), ..model };
         // A provider added since this session opened must bring its credential settings too.
         self.config.registry = registry;
         self.config.sections = sections;
@@ -435,6 +458,16 @@ impl Agent {
             self.session.append(SessionEntry::ThinkingLevelChange { base, thinking_level: level.clone() })?;
             self.config.thinking_level = level;
         }
+        Ok(())
+    }
+
+    // Fast mode on or off from the next request on, on the APIs that offer it, kept in the session.
+    pub fn set_fast(&mut self, on: bool) -> Result<(), String> {
+        if !provider::FAST_APIS.contains(&self.config.model.api.as_str()) {
+            return Err(format!("fast mode isn't offered on {}", self.config.model.provider));
+        }
+        self.session.append_custom(FAST_TYPE, Some(json!({"on": on}))).map_err(|error| format!("could not write the session: {error}"))?;
+        self.config.model.service_tier = service_tier(&self.session, &self.config.model);
         Ok(())
     }
 
@@ -857,6 +890,10 @@ impl Agent {
     // Ask the model for one response and stream it out as events. Output: the response, already
     // in the session, and its entry id.
     async fn respond(&mut self) -> Result<(AssistantMessage, String), String> {
+        // A /fast from during the run applies here; one this model doesn't take waits for the run's end.
+        if let Some(on) = self.handle.swap_fast(None) && self.set_fast(on).is_err() {
+            self.handle.swap_fast(Some(on));
+        }
         let messages = crate::message::to_model_messages(&self.session.context().messages);
         let model = &self.config.model;
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
@@ -945,7 +982,7 @@ impl Agent {
             (self.emit)(&Event::EntryAppended { entry });
         }
         // The bridge's one notice, that Claude Code is newer than the version it was checked against.
-        if let Some(text) = provider::claude::take_notice() {
+        if let Some(text) = provider::claude::take_notice(self.session.id()) {
             let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: provider::claude::NOTICE_TYPE.into(), data: Some(json!({"text": text})) };
             self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
             (self.emit)(&Event::EntryAppended { entry });

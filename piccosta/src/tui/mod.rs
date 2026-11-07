@@ -171,6 +171,8 @@ struct Slot {
     agents: Vec<(PathBuf, Option<String>)>,
     // When its current run started, for the working line under the conversation.
     working_since: Option<Instant>,
+    // Whether its requests ask for fast mode (/fast).
+    fast: bool,
     // Whether it compacts on its own (/autocompact), and the models it works with (/pair, /trio).
     auto_compaction: bool,
     team: crate::host::Team,
@@ -216,6 +218,7 @@ impl Slot {
             model: String::new(),
             context_window: 0,
             thinking: String::new(),
+            fast: false,
             messages: Vec::new(),
             partial: None,
             tools: HashMap::new(),
@@ -1075,6 +1078,7 @@ impl App {
         view.model = format!("{}/{}", agent.model().provider, agent.model().id);
         view.context_window = agent.model().context_window;
         view.thinking = agent.thinking_level().to_string();
+        view.fast = agent.model().service_tier.as_deref() == Some(crate::provider::FAST_TIER);
         // The prompts it holds join the history, older than what's typed here, and its context is
         // the projected one (after a compaction the last response's usage measured the old one).
         let mut prompts = Vec::new();
@@ -1608,9 +1612,10 @@ impl App {
     fn follow_session(&mut self, slot: usize, session: crate::session::Session, modified: Option<std::time::SystemTime>) {
         let context = session.context();
         let model = context.model.as_ref().map_or(String::new(), |(provider, id)| format!("{provider}/{id}"));
-        let window = self.host.registry().ok().and_then(|registry| registry.resolve(&model).ok().map(|found| found.context_window));
+        let found = self.host.registry().ok().and_then(|registry| registry.resolve(&model).ok().map(|found| (found.context_window, crate::agent::service_tier(&session, found))));
         let view = &mut self.slots[slot];
-        view.context_window = window.unwrap_or(0);
+        view.context_window = found.as_ref().map_or(0, |found| found.0);
+        view.fast = found.and_then(|found| found.1).as_deref() == Some(crate::provider::FAST_TIER);
         view.messages.clear();
         view.tools.clear();
         view.call_owner.clear();
@@ -1732,6 +1737,7 @@ impl App {
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
                 view.thinking = done.thinking;
+                view.fast = done.model.service_tier.as_deref() == Some(crate::provider::FAST_TIER);
                 // A command finished, so the session's task is idle, whatever the last event said.
                 view.state = State::Idle;
                 view.working_since = None;
@@ -2211,7 +2217,7 @@ impl App {
 
         let slot = &self.slots[slot_index];
         let mut spans = vec![Span::styled(render::fit(&slot.title, usize::from(width) / 2), if focused { Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) })];
-        let mut facts = format!("  {} · {} · {}/{} context", slot.model, slot.thinking, crate::cache::tokens(slot.context_tokens), crate::cache::tokens(slot.context_window));
+        let mut facts = format!("  {} · {}{} · {}/{} context", slot.model, slot.thinking, if slot.fast { " · fast" } else { "" }, crate::cache::tokens(slot.context_tokens), crate::cache::tokens(slot.context_window));
         if !slot.team.models.is_empty() {
             let names: Vec<&str> = slot.team.models.iter().map(|model| model.rsplit('/').next().unwrap_or(model)).collect();
             facts.push_str(&format!(" · {} with {}", if slot.team.pair { "pair" } else { "trio" }, names.join(" and ")));
