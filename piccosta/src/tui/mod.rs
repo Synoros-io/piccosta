@@ -4,6 +4,7 @@
 // here tagged with its slot, so a session keeps working while another one is on screen.
 
 mod clip;
+mod inline;
 pub mod control;
 pub(crate) mod commands;
 mod render;
@@ -48,8 +49,9 @@ pub mod theme {
 // The status line when there's no notice: what's most used first, since a narrow screen cuts the
 // end; /help has every key and command.
 const HELP: &str = "enter send · esc stop · pgup/pgdn or alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
-// The same for --single, without the keys for other sessions, and what those keys say there.
-const SINGLE_HELP: &str = "enter send · esc stop · ^x^s sends now · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
+// The same for --single, without the keys for other sessions or the mouse's (the terminal has the
+// mouse there), and what those keys say there.
+const SINGLE_HELP: &str = "enter send · esc stop · ^x^s sends now · /pair, /trio a second model · /help all keys · ^c ^c quit";
 const SINGLE: &str = "--single has one session; start piccosta without it for more";
 // How many of this directory's earlier sessions the sidebar lists, and of other projects': the most
 // recently used projects, a few sessions each.
@@ -151,8 +153,9 @@ struct Slot {
     context_window: u64,
     thinking: String,
     messages: Vec<AgentMessage>,
-    // The response streaming in, built from its deltas.
+    // The response streaming in, built from its deltas, and the model writing it and when it began.
     partial: Option<Vec<Part>>,
+    partial_model: Option<(String, i64)>,
     tools: HashMap<String, ToolView>,
     // Which message holds each tool call, so its result redraws only that message.
     call_owner: HashMap<String, usize>,
@@ -221,6 +224,7 @@ impl Slot {
             fast: false,
             messages: Vec::new(),
             partial: None,
+            partial_model: None,
             tools: HashMap::new(),
             call_owner: HashMap::new(),
             state: State::Idle,
@@ -385,6 +389,14 @@ struct App {
     sidebar_rows: Vec<(u16, usize)>,
     pane_rects: Vec<Rect>,
     sidebar_rect: Rect,
+    // --single (inline.rs): the slot whose messages went into the scrollback and how many, the rows
+    // of the reply streaming in printed so far, a rewind's line still to print, the rows the last
+    // frame's live part wanted, and where its typing cursor was.
+    printed: (usize, usize),
+    streamed: inline::Streamed,
+    rewound: Option<String>,
+    live_rows: usize,
+    typing_at: Option<Position>,
 }
 
 // Text being selected with the mouse, in one pane: where the drag started and where it is now, in
@@ -492,11 +504,14 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let own = if args.single { host.agent_dir.join(format!("tui-state-single-{}.json", std::process::id())) } else { state::file(&host.agent_dir) };
     let state_file = if args.restore { std::env::var_os(state::RESTORE_FILE).map(PathBuf::from) } else { None }.unwrap_or(own);
     let mut control = control::Control::bind(&state_file)?;
-    let mut terminal = setup().map_err(|error| format!("could not set up the terminal: {error}"))?;
+    // The terminal goes back as it was however this returns, a setup that failed partway included.
+    let _restore = Restore;
+    let mut terminal = setup(args.single).map_err(|error| format!("could not set up the terminal: {error}"))?;
+    let mut inline = if args.single { Some(inline::Inline::start().map_err(|error| format!("could not set up the terminal: {error}"))?) } else { None };
     let (sender, updates) = unbounded_channel();
     let mut app = App {
         host: host.clone(),
-        tex: tex::Tex::detect(),
+        tex: if args.single { tex::Tex::detect().text_only() } else { tex::Tex::detect() },
         slots: Vec::new(),
         panes: Vec::new(),
         focus: 0,
@@ -542,8 +557,13 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         sidebar_rows: Vec::new(),
         pane_rects: Vec::new(),
         sidebar_rect: Rect::default(),
+        printed: (0, 0),
+        streamed: Default::default(),
+        rewound: None,
+        live_rows: 0,
+        typing_at: None,
     };
-    if !app.tex.images() && std::env::var_os("TMUX").is_some() && std::env::var_os("PICCOSTA_TEX").is_none() {
+    if !args.single && !app.tex.images() && std::env::var_os("TMUX").is_some() && std::env::var_os("PICCOSTA_TEX").is_none() {
         app.notice = Some("TeX shows as text: for typeset images inside tmux, add `set -g allow-passthrough on` to tmux.conf".into());
     }
     let opened = app.start(&args);
@@ -561,6 +581,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         app.notice = Some("Invalid settings; details are shown above.".into());
     }
     app.adopt_jobs(handover.sessions);
+    // After a /restart the conversation is in the scrollback already.
+    if args.restore {
+        app.printed = (app.panes[0].slot, app.current().messages.len());
+    }
     // What went wrong fetching the model lists as piccosta started, once they're in.
     if let Some(refresh) = crate::model::STARTUP_REFRESH.get().cloned() {
         let sender = app.sender.clone();
@@ -578,7 +602,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut exit_code = 0;
     let mut restart_exe = None;
     while !app.quit {
-        if let Err(error) = terminal.draw(|frame| app.draw(frame)).and_then(|_| app.tex.flush(&mut stdout)) {
+        if let Err(error) = inline::draw(&mut terminal, &mut app, inline.as_mut()).and_then(|()| app.tex.flush(&mut stdout)) {
             restore();
             app.shutdown("error").await;
             return Err(format!("could not draw: {error}"));
@@ -625,8 +649,11 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 Some(editor) => {
                     restore();
                     let ran = std::process::Command::new(&editor).arg(&path).status();
-                    terminal = setup().map_err(|error| format!("could not set up the terminal again: {error}"))?;
-                    terminal.clear().map_err(|error| error.to_string())?;
+                    terminal = setup(app.single).map_err(|error| format!("could not set up the terminal again: {error}"))?;
+                    match &mut inline {
+                        Some(inline) => *inline = inline::Inline::start().map_err(|error| error.to_string())?,
+                        None => terminal.clear().map_err(|error| error.to_string())?,
+                    }
                     app.notice = Some(match ran {
                         Ok(_) => match crate::scale::changes(&app.host.agent_dir) {
                             Ok(_) => format!("{} saved; new sessions and subagents use it", path.display()),
@@ -643,6 +670,11 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     }
     let _ = app.save_state();
     let _ = app.tex.clear(&mut stdout);
+    // --single leaves the conversation in the scrollback and the cursor under it (restore clears
+    // the live part).
+    if let Some(inline) = &mut inline {
+        let _ = inline.frame(&mut terminal, &mut app);
+    }
     restore();
     // /restart hands the background jobs over before the sessions end, so their end doesn't kill them.
     let handover = if app.restart { app.hand_over() } else { state::Handover::default() };
@@ -714,10 +746,18 @@ fn reap_inherited_children(handover: &state::Handover) {
     }
 }
 
-fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
+// Input: whether it's --single, which stays in the normal screen and leaves the mouse to the
+// terminal, so its own scrolling, selection and copy work on the scrollback.
+fn setup(single: bool) -> std::io::Result<ratatui::DefaultTerminal> {
     use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
     crossterm::terminal::enable_raw_mode()?;
-    let entered = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture, EnableFocusChange);
+    SET_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+    INLINE.store(single, std::sync::atomic::Ordering::Relaxed);
+    let entered = if single {
+        crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange)
+    } else {
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture, EnableFocusChange)
+    };
     // Keys like shift+enter get codes of their own through kitty's keyboard protocol. Windows'
     // console has nothing like it (crossterm refuses the request there), so it's asked for on Unix.
     #[cfg(unix)]
@@ -727,11 +767,8 @@ fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
         KEYBOARD_PUSHED.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     });
-    // A terminal that refused part of it goes back as it was, not left raw.
-    if let Err(error) = entered {
-        restore();
-        return Err(error);
-    }
+    // A terminal that refused part of it goes back as it was, not left raw, by the caller's Restore.
+    entered?;
     // tmux passes on keys like shift+enter and ctrl+enter only to a pane that asks in xterm's way
     // (modifyOtherKeys), and only with `extended-keys on` in tmux.conf; the kitty request above
     // doesn't reach it.
@@ -756,12 +793,28 @@ fn setup() -> std::io::Result<ratatui::DefaultTerminal> {
         restore();
         previous(info);
     }));
-    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).inspect_err(|_| restore())
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
 }
+
+// Puts the terminal back when it's dropped, so no early return leaves it raw.
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        restore();
+    }
+}
+
+// Whether the terminal is set up and not yet put back, so restore runs once for each setup: a
+// second LeaveAlternateScreen would move the cursor back to where the first saved it.
+static SET_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Whether setup asked for kitty's keyboard protocol, so restore takes back only what was asked for.
 #[cfg(unix)]
 static KEYBOARD_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Whether setup stayed in the normal screen (--single), so restore doesn't leave an alternate one.
+static INLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Where a background task's panic is written, in the agent dir.
 const PANIC_LOG: &str = "panic.log";
@@ -771,6 +824,9 @@ const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;1m";
 const MODIFY_OTHER_KEYS_OFF: &str = "\x1b[>4m";
 
 fn restore() {
+    if !SET_UP.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if std::env::var_os("TMUX").is_some() {
         print!("{MODIFY_OTHER_KEYS_OFF}");
     }
@@ -785,9 +841,15 @@ fn restore() {
         DisableFocusChange,
         DisableMouseCapture,
         DisableBracketedPaste,
-        crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
     );
+    // --single's live part comes off the screen, so what's printed next (a panic, an error,
+    // the shell) goes under the conversation, not into the input box.
+    if INLINE.load(std::sync::atomic::Ordering::Relaxed) {
+        inline::leave();
+    } else {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    }
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
@@ -1756,14 +1818,18 @@ impl App {
                     view.partial = None;
                     view.unread = !visible;
                 }
-                Event::MessageStart { message: AgentMessage::Assistant(_) } => view.partial = Some(Vec::new()),
+                Event::MessageStart { message: AgentMessage::Assistant(assistant) } => (view.partial, view.partial_model) = (Some(Vec::new()), Some((format!("{}/{}", assistant.provider, assistant.model), assistant.timestamp))),
                 Event::MessageUpdate { assistant_message_event, .. } => {
                     if let Some(parts) = &mut view.partial {
                         apply_delta(parts, &assistant_message_event);
                     }
                 }
                 Event::MessageEnd { message } => {
-                    if matches!(message, AgentMessage::Assistant(_)) {
+                    if let AgentMessage::Assistant(reply) = &message {
+                        // What --single printed of it while it streamed goes with it (inline.rs).
+                        if view.partial_model.as_ref().is_some_and(|(_, started)| *started == self.streamed.0) {
+                            self.streamed.0 = reply.timestamp;
+                        }
                         view.partial = None;
                     }
                     view.remember(message);
@@ -2147,6 +2213,7 @@ impl App {
         frame.render_widget(Paragraph::new(text).style(Style::new().fg(theme::DIM)), status);
         if self.picker.is_some() {
             self.draw_picker(frame, main);
+            self.live_rows = usize::MAX;
         }
     }
 
@@ -2257,7 +2324,9 @@ impl App {
             self.panes[index].scroll += now.saturating_sub(before);
             below = (count == self.slots[slot_index].messages.len()).then_some(now);
         }
-        let (mut rows, _) = self.transcript(slot_index, width, height + self.panes[index].scroll, usize::MAX);
+        // --single's live part takes as many rows as it has (inline.rs), so all of them are counted.
+        let wanted = if self.single { usize::MAX } else { height + self.panes[index].scroll };
+        let (mut rows, _) = self.transcript(slot_index, width, wanted, usize::MAX);
         // While it works, a line under the conversation says so, its dots moving and its time
         // counting, so it's plain the model is still at it.
         let slot = &self.slots[slot_index];
@@ -2283,6 +2352,7 @@ impl App {
         };
         self.panes[index].anchor = (scroll > 0).then_some((count, tail));
         let end = rows.len() - scroll;
+        self.live_rows = 2 + rows.len() + usize::from(queued_height + editor_height);
         // A mouse selection is held in screen cells: when this pane's text moves under it (rows
         // added below while it follows, a scroll), it moves by as much, and it goes once it leaves
         // the pane or the pane shows another session.
@@ -2337,8 +2407,9 @@ impl App {
                     clip::highlight(frame.buffer_mut(), text_area, place(draft.spot(width, range.start)), place(draft.spot(width, last)));
                 }
             }
-            if self.picker.is_none() {
-                frame.set_cursor_position(Position::new(text_area.x + cursor.1 as u16, text_area.y + (cursor.0 - first) as u16));
+            self.typing_at = self.picker.is_none().then(|| Position::new(text_area.x + cursor.1 as u16, text_area.y + (cursor.0 - first) as u16));
+            if let Some(at) = self.typing_at {
+                frame.set_cursor_position(at);
             }
         }
     }
@@ -2347,43 +2418,22 @@ impl App {
     // The last `wanted` rows of a slot's conversation, and how many rows come from the answer being
     // written and the messages from index `since` on.
     fn transcript(&mut self, slot_index: usize, width: u16, wanted: usize, since: usize) -> (Rows, usize) {
-        let flags = self.flags;
-        let frame = self.frame;
-        let slot = &mut self.slots[slot_index];
         let mut chunks: Vec<Rows> = Vec::new();
         let mut count = 0;
         let mut below = 0;
-        if let Some(parts) = &slot.partial {
-            let rows = render::assistant(parts, None, &slot.tools, flags, frame, width, &mut self.tex);
+        if let Some(rows) = self.streaming(slot_index, width) {
             count += rows.len();
             below += rows.len();
             chunks.push(rows);
         }
-        for index in (0..slot.messages.len()).rev() {
+        // --single's printed messages are in the scrollback, not here.
+        let slot = &self.slots[slot_index];
+        let first = if self.single && self.printed.0 == slot_index { self.printed.1.min(slot.messages.len()) } else { 0 };
+        for index in (first..self.slots[slot_index].messages.len()).rev() {
             if count >= wanted && index < since {
                 break;
             }
-            let cached = slot.cache.get(&index).filter(|(cached_width, cached_flags, _)| *cached_width == width && *cached_flags == flags);
-            let rows = match cached {
-                Some((_, _, rows)) => rows.clone(),
-                None => {
-                    let mut rows = message_rows(&slot.messages[index], &slot.tools, flags, frame, width, &mut self.tex);
-                    // A response from a different model than the one before it says whose it is
-                    // (a pair's turns, a /model switch).
-                    let model_of = |message: &AgentMessage| if let AgentMessage::Assistant(assistant) = message { Some(format!("{}/{}", assistant.provider, assistant.model)) } else { None };
-                    if let Some(model) = model_of(&slot.messages[index])
-                        && slot.messages[..index].iter().rev().find_map(model_of).is_some_and(|previous| previous != model)
-                    {
-                        rows.insert(0, Line::from(Span::styled(format!("  {model}"), Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC))));
-                    }
-                    // A message with a tool still running keeps redrawing for its spinner.
-                    let running = slot.call_owner.iter().any(|(id, owner)| *owner == index && slot.tools.get(id).is_some_and(|tool| tool.running));
-                    if !running {
-                        slot.cache.insert(index, (width, flags, rows.clone()));
-                    }
-                    rows
-                }
-            };
+            let rows = self.unprinted(slot_index, index, width, self.flags);
             count += rows.len();
             if index >= since {
                 below += rows.len();
@@ -2391,6 +2441,23 @@ impl App {
             chunks.push(rows);
         }
         (chunks.into_iter().rev().flatten().collect(), below)
+    }
+
+    // One message's rows, `width` wide, kept for the next draw unless a tool of its is still running.
+    fn rows_of(&mut self, slot_index: usize, index: usize, width: u16, flags: Flags) -> Rows {
+        let frame = self.frame;
+        let slot = &mut self.slots[slot_index];
+        if let Some((_, _, rows)) = slot.cache.get(&index).filter(|(cached_width, cached_flags, _)| *cached_width == width && *cached_flags == flags) {
+            return rows.clone();
+        }
+        let mut rows = model_row(&slot.messages[..index], model_of(&slot.messages[index]));
+        rows.extend(message_rows(&slot.messages[index], &slot.tools, flags, frame, width, &mut self.tex));
+        // A message with a tool still running keeps redrawing for its spinner.
+        let running = slot.call_owner.iter().any(|(id, owner)| *owner == index && slot.tools.get(id).is_some_and(|tool| tool.running));
+        if !running {
+            slot.cache.insert(index, (width, flags, rows.clone()));
+        }
+        rows
     }
 
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
@@ -2431,12 +2498,25 @@ fn pane_inner(index: usize, rect: Rect) -> Rect {
     block.inner(rect).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 })
 }
 
+// A response from a different model than the one before it (in `earlier`) says whose it is (a
+// pair's turns, a /model switch): a row naming it, else none.
+fn model_row(earlier: &[AgentMessage], model: Option<String>) -> Rows {
+    match model {
+        Some(model) if earlier.iter().rev().find_map(model_of).is_some_and(|previous| previous != model) => vec![Line::from(Span::styled(format!("  {model}"), Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC)))],
+        _ => Vec::new(),
+    }
+}
+
+fn model_of(message: &AgentMessage) -> Option<String> {
+    if let AgentMessage::Assistant(assistant) = message { Some(format!("{}/{}", assistant.provider, assistant.model)) } else { None }
+}
+
 fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut tex::Tex) -> Rows {
     match message {
         // A manager's news (a lane's turn, a schedule) comes in as its message, "[<time>, what]",
         // but it's for the model: shown as a notice. The user's own words sent to it from
         // elsewhere, "[<time>, from the user]", stay the user's.
-        AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags.tools_open),
+        AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags),
         AgentMessage::User(user) => render::user(&user.content.text(), width, tex),
         AgentMessage::Assistant(assistant) => {
             render::assistant(&render::blocks(assistant), Some((&assistant.stop_reason, assistant.error_message.as_deref())), tools, flags, frame, width, tex)
@@ -2456,7 +2536,7 @@ fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags
             };
             vec![Line::default(), Line::from(Span::styled(text, Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)))]
         }
-        AgentMessage::Custom(custom) if custom.display => render::news(&custom.content.text(), width, tex, flags.tools_open),
+        AgentMessage::Custom(custom) if custom.display => render::news(&custom.content.text(), width, tex, flags),
         AgentMessage::CompactionSummary(_) => render::note("earlier context compacted into a summary", width, tex),
         AgentMessage::BranchSummary(_) => render::note("a branch's summary", width, tex),
         _ => Vec::new(),

@@ -693,6 +693,7 @@ impl App {
             self.notice = Some("Nothing to copy yet.".into());
             return;
         };
+        let rewinding = leaf.is_some();
         let forked = Session::open(&path, &self.current().cwd).map_err(|error| error.to_string()).and_then(|source| {
             let leaf = leaf.unwrap_or_else(|| source.leaf_id().map(str::to_string));
             source.branch(leaf.as_deref(), &self.host.session_dir).map_err(|error| error.to_string())
@@ -707,7 +708,17 @@ impl App {
         };
         match opened {
             Ok(Some(slot)) => {
+                let printed = self.printed.1;
                 self.show(slot);
+                // --single: what the copy shares with this session is in the scrollback already, and
+                // a rewind says where it went back to before what follows (inline.rs).
+                if self.single {
+                    let messages = &self.slots[slot].messages;
+                    let prompts = messages.iter().filter(|message| matches!(message, AgentMessage::User(_))).count();
+                    // A fork keeps what was printed of a reply it shares; a rewind starts over.
+                    (self.printed, self.streamed) = ((slot, printed.min(messages.len())), if rewinding { Default::default() } else { self.streamed });
+                    self.rewound = rewinding.then(|| format!("rewound to before prompt {}", prompts + 1));
+                }
                 if !name.is_empty() {
                     self.focused().title = name.clone();
                     self.tell(Command::Name(name));

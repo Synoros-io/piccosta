@@ -16,12 +16,19 @@ pub type Rows = Vec<Line<'static>>;
 
 // How many rows of a tool's output show while tools are folded, and the most they ever show.
 const TOOL_OPEN_ROWS: usize = 400;
+// How many rows of a finished tool's output --single prints into the scrollback, where ctrl+o can't
+// open it later: a short command's whole output or a small edit's diff, while a run of calls still
+// leaves the conversation on the screen.
+const INLINE_TOOL_ROWS: usize = 20;
 // Arguments a tool call is best summed up by, in the order they're looked for.
 const SUMMARY_KEYS: [&str; 8] = ["command", "path", "file_path", "pattern", "query", "url", "prompt", "description"];
+// The Markdown a reply is drawn with; inline.rs finds a streaming reply's finished blocks with it too.
+pub const MARKDOWN: Options = Options::ENABLE_MATH.union(Options::ENABLE_TABLES).union(Options::ENABLE_STRIKETHROUGH).union(Options::ENABLE_TASKLISTS);
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // An assistant message's content as the transcript draws it; a streaming one is built from its
 // deltas in the same shape.
+#[derive(Clone)]
 pub enum Block {
     Text(String),
     Thinking(String),
@@ -55,6 +62,9 @@ pub struct ToolView {
 pub struct Flags {
     pub tools_open: bool,
     pub thinking_open: bool,
+    // --single's printing into the scrollback: tools open but capped at INLINE_TOOL_ROWS, a
+    // subagent's report and a notice whole.
+    pub inline: bool,
 }
 
 // The user's prompt, behind a bar.
@@ -72,18 +82,19 @@ pub fn user(text: &str, width: u16, tex: &mut Tex) -> Rows {
 
 // A note from outside the conversation: a background job's finish, a compaction.
 pub fn note(text: &str, width: u16, tex: &mut Tex) -> Rows {
-    news(text, width, tex, false)
+    news(text, width, tex, Flags::default())
 }
 
 // A notice for the model (a background job's end, a lane's news): its first line, dim, with how
 // many more it has; all of them with tools open (ctrl+o). It's for the model to read, so it stays
 // out of the way of the conversation.
-pub fn news(text: &str, width: u16, tex: &mut Tex, open: bool) -> Rows {
+pub fn news(text: &str, width: u16, tex: &mut Tex, flags: Flags) -> Rows {
+    let open = flags.tools_open;
     let mut writer = Writer::new(tex, width);
     writer.levels.push(Level::fixed("◆ ", Style::new().fg(theme::DIM)));
     let text = clean(text);
     let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-    let shown = if open { TOOL_OPEN_ROWS } else { 1 };
+    let shown = if flags.inline { usize::MAX } else if open { TOOL_OPEN_ROWS } else { 1 };
     for (index, line) in lines.iter().take(shown).enumerate() {
         let more = if index == 0 && !open && lines.len() > 1 { format!(" · {} more lines (ctrl+o)", lines.len() - 1) } else { String::new() };
         let room = (width as usize).saturating_sub(2 + more.width());
@@ -292,9 +303,8 @@ impl<'t> Writer<'t> {
     }
 
     fn markdown(&mut self, text: &str) {
-        let options = Options::ENABLE_MATH | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
         let source = dollar_math(&clean(text));
-        for event in Parser::new_ext(&source, options) {
+        for event in Parser::new_ext(&source, MARKDOWN) {
             if let Some(table) = &mut self.table {
                 match event {
                     Md::Start(Tag::TableRow | Tag::TableHead) => table.push(Vec::new()),
@@ -530,7 +540,11 @@ impl<'t> Writer<'t> {
         if !flags.tools_open {
             return;
         }
-        let shown = TOOL_OPEN_ROWS;
+        let shown = match (flags.inline, name) {
+            (true, crate::tools::subagent::NAME) => usize::MAX,
+            (true, _) => INLINE_TOOL_ROWS,
+            _ => TOOL_OPEN_ROWS,
+        };
         self.levels.push(Level { first: "  ⎿ ".into(), rest: "    ".into(), style: Style::new().fg(theme::DIM), fresh: true });
         for line in lines.iter().take(shown) {
             let style = match line.chars().next() {
@@ -545,7 +559,11 @@ impl<'t> Writer<'t> {
             self.flush_line(false);
         }
         if lines.len() > shown {
-            self.word(&format!("… {} more lines (ctrl+o)", lines.len() - shown), Style::new().fg(theme::DIM));
+            // Printed, it can't be opened later: the line says where all of it is, the log a long
+            // command's output ends by naming, else the session file.
+            let log = lines.last().and_then(|line| line.split_once("Full output")).and_then(|(_, rest)| rest.rsplit_once(": ")).map(|(_, path)| path.trim_end_matches(']'));
+            let more = if flags.inline { format!("all of it in {}", log.unwrap_or("the session file")) } else { "ctrl+o".into() };
+            self.word(&format!("… {} more lines ({more})", lines.len() - shown), Style::new().fg(theme::DIM));
             self.flush_line(false);
         }
         self.levels.pop();

@@ -108,6 +108,12 @@ impl Tex {
         self.images
     }
 
+    // Text only: --single prints into the scrollback, where an image placed by a frame isn't taken back.
+    pub fn text_only(mut self) -> Tex {
+        self.images = false;
+        self
+    }
+
     // A formula, typeset once and kept. `display` is block math ($$..$$), set in TeX's display
     // style at its natural size; inline math is set in text style and scaled to one row so it
     // stays in its line. Output: None when nothing can draw it.
