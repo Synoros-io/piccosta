@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 45] = [
+const COMMANDS: [(&str, &str); 44] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -71,7 +71,6 @@ const COMMANDS: [(&str, &str); 45] = [
     ("/diff", "git diff against HEAD, new files included"),
     ("/pwd", "the working directory"),
     ("/copy [n]", "copy the last (or nth last) response"),
-    ("/image <file>", "attach a png, jpeg, gif or webp to the message being written (ctrl+v pastes one)"),
     ("/export [file]", "write the conversation as Markdown"),
     ("/init", "have the model write AGENTS.md, direction.md and ledger.md"),
     ("/review [what]", "hand a review of the changes to the review job"),
@@ -372,7 +371,7 @@ impl App {
                 if self.current().title == super::NEW_TITLE {
                     self.focused().title = format!("/{line}");
                 }
-                self.send(crate::prompt::command_prompt(&format!("/{line}")).unwrap_or_default(), Vec::new());
+                self.send(crate::prompt::command_prompt(&format!("/{line}")).unwrap_or_default());
             }
             "agents" => match crate::tools::subagent::SubagentTool::load(&self.host.agent_dir) {
                 Some(tool) => self.report(tool.describe().join("\n")),
@@ -883,14 +882,14 @@ fn markdown(messages: &[AgentMessage]) -> String {
     out
 }
 
-// A session's file to the trash, with the Claude bridge's record of it and the folder of images
-// attached in it (App::attach) beside it; a socket a piccosta that died left there goes. The
-// session's own file goes last, so a piccosta stopped partway leaves the session listed where it was. When one can't go, the ones already moved come
+// A session's file to the trash, with the Claude bridge's record of it beside it; a socket a
+// piccosta that died left there goes. The session's own file goes last, so a piccosta stopped
+// partway leaves the session listed where it was. When one can't go, the ones already moved come
 // back; nothing is ever deleted outright. Output: Ok when they all went, else what happened, naming
 // any file that couldn't come back and where it is.
 pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
     crate::ipc::remove(path);
-    let beside = [crate::provider::claude::SIDECAR_SUFFIX, ".images"].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
+    let beside = [crate::provider::claude::SIDECAR_SUFFIX].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
     let mut moved: Vec<(&Path, (std::path::PathBuf, std::path::PathBuf))> = Vec::new();
     for file in beside.iter().map(|file| file.as_path()).filter(|file| file.exists()).chain(std::iter::once(path)) {
         let Some(went) = trash(file) else {

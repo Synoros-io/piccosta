@@ -9,48 +9,33 @@ use base64::Engine;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 // A desktop's clipboard tools: the variable that says the desktop is there, then the commands that
-// copy to the clipboard and the primary selection and paste from them, and, when the tool reads
-// images, the commands that list the clipboard's types and read one (the type goes on the end).
+// copy to the clipboard and the primary selection and paste from them.
 struct Tools {
     desktop: &'static str,
     copy: [&'static [&'static str]; 2],
     paste: [&'static [&'static str]; 2],
-    image: Option<[&'static [&'static str]; 2]>,
 }
-
-// How long a clipboard tool gets to answer: wl-paste waits as long as the clipboard's owner does,
-// and an owner that hasn't written in two seconds is stuck. It's looked at every CLIPBOARD_POLL, so
-// a tool that's done is seen within 2 ms.
-const CLIPBOARD_WAIT: Duration = Duration::from_secs(2);
-const CLIPBOARD_POLL: Duration = Duration::from_millis(2);
-
-// The image types a paste takes from the clipboard, the one a screenshot tool puts there first.
-const IMAGE_TYPES: [&str; 2] = ["image/png", "image/jpeg"];
 
 const TOOLS: [Tools; 3] = [
     Tools {
         desktop: "WAYLAND_DISPLAY",
         copy: [&["wl-copy"], &["wl-copy", "--primary"]],
         paste: [&["wl-paste", "--no-newline"], &["wl-paste", "--no-newline", "--primary"]],
-        image: Some([&["wl-paste", "--list-types"], &["wl-paste", "--type"]]),
     },
     Tools {
         desktop: "DISPLAY",
         copy: [&["xclip", "-selection", "clipboard"], &["xclip", "-selection", "primary"]],
         paste: [&["xclip", "-o", "-selection", "clipboard"], &["xclip", "-o", "-selection", "primary"]],
-        image: Some([&["xclip", "-o", "-selection", "clipboard", "-t", "TARGETS"], &["xclip", "-o", "-selection", "clipboard", "-t"]]),
     },
     Tools {
         desktop: "DISPLAY",
         copy: [&["xsel", "--clipboard", "--input"], &["xsel", "--primary", "--input"]],
         paste: [&["xsel", "--clipboard", "--output"], &["xsel", "--primary", "--output"]],
-        image: None,
     },
 ];
 
@@ -85,51 +70,14 @@ pub fn copy(text: &str) -> String {
     "the terminal (OSC 52)".into()
 }
 
-// What a paste takes from the clipboard: the image on it, when asked for one and it offers one as
-// png or jpeg, else its text.
-pub enum Pasted {
-    Image(Vec<u8>),
-    Text(String),
-}
-
 // The clipboard's text, or the primary selection's (what was last selected anywhere, the middle
-// click's paste), or with `image` the image on the clipboard first. The text is read while the
-// image is looked for, so a text paste waits no longer than it did. None when no tool answers.
-pub fn paste(primary: bool, image: bool) -> Option<Pasted> {
-    std::thread::scope(|scope| {
-        let text = scope.spawn(|| tools().find_map(|tools| run(tools.paste[usize::from(primary)], None)));
-        let image = tools().filter(|_| image).find_map(|tools| {
-            let [list, read] = tools.image?;
-            let types = String::from_utf8_lossy(&run(list, None)?).into_owned();
-            let kind = IMAGE_TYPES.into_iter().find(|kind| types.lines().any(|offered| offered.trim() == *kind))?;
-            run(read, Some(kind)).filter(|bytes| !bytes.is_empty())
-        });
-        image.map(Pasted::Image).or_else(|| text.join().ok().flatten().map(|bytes| Pasted::Text(String::from_utf8_lossy(&bytes).into_owned())))
+// click's paste). None when no tool answers.
+pub fn paste(primary: bool) -> Option<String> {
+    tools().find_map(|tools| {
+        let command = tools.paste[usize::from(primary)];
+        let output = Command::new(command[0]).args(&command[1..]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     })
-}
-
-// What a clipboard command prints, with `last` added to its arguments; None when it fails, or
-// hasn't finished by CLIPBOARD_WAIT, when it's killed.
-fn run(command: &[&str], last: Option<&str>) -> Option<Vec<u8>> {
-    let mut child = Command::new(command[0]).args(&command[1..]).args(last).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    let read = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now() + CLIPBOARD_WAIT;
-    let status = loop {
-        match child.try_wait().ok()? {
-            Some(status) => break status,
-            None if Instant::now() > deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            None => std::thread::sleep(CLIPBOARD_POLL),
-        }
-    };
-    read.join().ok()?.ok().filter(|_| status.success())
 }
 
 // A selection's two ends in reading order, both inside `rect`.

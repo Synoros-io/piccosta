@@ -29,9 +29,6 @@ const QUERY_WAIT: Duration = Duration::from_millis(500);
 const TMUX_GRACE: Duration = Duration::from_millis(150);
 // A cell's size in pixels when the terminal doesn't say.
 const FALLBACK_CELL: (u32, u32) = (10, 20);
-// The most rows an image the user attached takes in the transcript: a third of a 36-row terminal,
-// so the conversation around it stays on the screen.
-const PICTURE_ROWS: u32 = 12;
 // Base64 bytes per graphics command; the protocol's limit is 4096.
 const CHUNK: usize = 4096;
 // The protocol's placeholder character. Each cell adds a diacritic for its row and one for its
@@ -157,37 +154,9 @@ impl Tex {
             rows = (rows * u32::from(max_columns)).div_ceil(columns).max(1);
             columns = u32::from(max_columns).max(1);
         }
-        Some(self.upload(&png, columns, rows))
-    }
-
-    // An image the user attached (base64, any type `read` takes), at most `max_columns` wide and
-    // PICTURE_ROWS high, kept like a formula. None where the terminal shows no images.
-    pub fn picture(&mut self, data: &str, max_columns: u16) -> Option<&Formula> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        data.hash(&mut hasher);
-        let key = (format!("picture {:x}", hasher.finish()), true, max_columns);
-        if self.images && !self.cache.contains_key(&key) {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-            let image = crate::tools::image::decode(&bytes).ok()?;
-            let png = crate::tools::image::encode_png(&image)?;
-            // The cells it fills keep its shape: as wide as it is or the room, then no taller than
-            // PICTURE_ROWS, narrowing to match.
-            let ((cell_width, cell_height), width, height) = (self.cell, image.width().max(1) as f32, image.height().max(1) as f32);
-            let columns = (width / cell_width as f32).ceil().min(f32::from(max_columns)).max(1.0);
-            let rows = (height * columns * cell_width as f32 / width / cell_height as f32).ceil().clamp(1.0, PICTURE_ROWS as f32);
-            let columns = columns.min((width * rows * cell_height as f32 / height / cell_width as f32).ceil()).max(1.0);
-            let formula = self.upload(&png, columns as u32, rows as u32);
-            self.cache.insert(key.clone(), Some(formula));
-        }
-        self.cache.get(&key).and_then(Option::as_ref)
-    }
-
-    // Send a PNG to the terminal (before the next frame), placed over `columns` by `rows` cells.
-    fn upload(&mut self, png: &[u8], columns: u32, rows: u32) -> Formula {
         let id = self.next_id;
         self.next_id += 1;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
         let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(CHUNK).collect();
         for (index, chunk) in chunks.iter().enumerate() {
             let more = u8::from(index + 1 < chunks.len());
@@ -195,7 +164,7 @@ impl Tex {
             command(&mut self.pending, &control, chunk, self.tmux);
         }
         command(&mut self.pending, &format!("a=p,U=1,i={id},c={columns},r={rows},q=2"), b"", self.tmux);
-        Formula::Image { id, columns: columns as u16, rows: rows as u16 }
+        Some(Formula::Image { id, columns: columns as u16, rows: rows as u16 })
     }
 
     // Write the uploads made since the last frame. Call before drawing it.

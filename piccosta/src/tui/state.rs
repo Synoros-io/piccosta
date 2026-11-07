@@ -77,9 +77,6 @@ pub struct Kept {
     pub scroll: usize,
     #[serde(default)]
     pub draft: String,
-    // Its images' markers in the draft and their saved files (App::prepare_image).
-    #[serde(default)]
-    pub images: Vec<(String, PathBuf)>,
 }
 
 pub fn load(agent_dir: &Path, own: &Path, legacy: bool) -> Option<State> {

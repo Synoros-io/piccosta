@@ -679,34 +679,23 @@ impl Session {
         Ok(())
     }
 
-    // Queue a message for the session's next turn (QUEUED_TYPE), with the images attached to it. A
-    // piccosta from before images reads only "text", so with images that's the text and the lines
-    // naming where they're saved, and "message" holds the text and images as sent.
-    pub fn queue(&mut self, text: &str, images: &[Content]) -> io::Result<String> {
-        let data = match images {
-            [] => serde_json::json!({ "text": text }),
-            _ => serde_json::json!({ "text": format!("{text}\n\n{}", TextOrBlocks::Blocks(images.to_vec()).text()), "message": (text, images) }),
-        };
-        self.append_custom(QUEUED_TYPE, Some(data))
+    // Queue a message for the session's next turn (QUEUED_TYPE).
+    pub fn queue(&mut self, text: &str) -> io::Result<String> {
+        self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text })))
     }
 
     // The messages queued at the leaf and not taken yet, oldest first: those after its last message
     // from the user, since a turn takes them all as user messages before anything else. An entry
-    // holds one (its text and images in "message", else its text), or the several of an old inbox (its
-    // texts; runtime.rs claim).
-    pub fn queued(&self) -> Vec<crate::agent::Queued> {
+    // holds one (its text), or the several of an old inbox (its texts; runtime.rs claim).
+    pub fn queued(&self) -> Vec<String> {
         let path = self.path_to_leaf();
         let after = path.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::User(_), .. })).map_or(0, |at| at + 1);
         let queued = path[after..].iter().filter_map(|entry| match entry {
             SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => Some(data),
             _ => None,
         });
-        let messages = queued.flat_map(|data| {
-            let text = |text: &Value| Some((text.as_str()?.to_string(), Vec::new()));
-            let one = serde_json::from_value(data["message"].clone()).ok().or_else(|| text(data.get("text")?));
-            one.into_iter().chain(data["texts"].as_array().into_iter().flatten().filter_map(text))
-        });
-        messages.collect()
+        let texts = queued.flat_map(|data| data.get("text").into_iter().chain(data["texts"].as_array().into_iter().flatten()));
+        texts.filter_map(|text| text.as_str().map(str::to_string)).collect()
     }
 
     // The header and every entry as file text. Unknown entries are written back as they were read.

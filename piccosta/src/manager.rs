@@ -538,7 +538,7 @@ pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSende
         };
         let Some(manager) = manager.upgrade() else { return };
         for text in news {
-            let _ = manager.send(Command::Message(text, Vec::new()));
+            let _ = manager.send(Command::Message(text));
         }
     }
 }
@@ -1284,7 +1284,7 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
             // them wherever they run, or wait in their sessions.
             _ = poll.tick() => {
                 for schedule in due_schedules(&home) {
-                    let _ = commands.send(Command::Message(scheduled(schedule), Vec::new()));
+                    let _ = commands.send(Command::Message(scheduled(schedule)));
                 }
                 for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
                     let Some(manager) = pointer(&project_home) else { continue };
