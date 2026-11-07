@@ -423,12 +423,13 @@ impl Jobs {
         handed
     }
 
-    // The next image takes a handed job back: listed again under its id, its log opened to go on.
-    pub fn adopt(&self, handed: &HandedJob, kill: CancellationToken) -> std::io::Result<Job> {
-        let log = std::fs::OpenOptions::new().append(true).open(&handed.log_path)?;
+    // The next image takes a handed job back: listed again under its id, its log opened to go on, or
+    // none if it can't be (its output then kept only as the tail): never refused (tui adopt_jobs).
+    pub fn adopt(&self, handed: &HandedJob, kill: CancellationToken) -> Job {
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(&handed.log_path).ok();
         self.next_id.fetch_max(handed.id + 1, Ordering::SeqCst);
         let started = Instant::now().checked_sub(Duration::from_millis(handed.elapsed_ms)).unwrap_or_else(Instant::now);
-        Ok(self.list(handed.id, handed.pid, &handed.command, started, handed.log_path.clone(), Some(log), kill))
+        self.list(handed.id, handed.pid, &handed.command, started, handed.log_path.clone(), log, kill)
     }
 
     // Input: a job whose command ended, the command, its output tail and how it ended. Closes the

@@ -57,7 +57,7 @@ pub fn shell_setup(command: &mut std::process::Command, _read_only: bool) {
     command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
 }
 pub fn group(command: &mut tokio::process::Command) { command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP); }
-pub fn parent_death(command: &mut tokio::process::Command) { group(command); }
+pub fn parent_death(command: &mut std::process::Command) { command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP); }
 
 // Start suspended, assign the job, then resume. Assigning after a normal spawn loses a fast
 // child that starts helpers before assignment. A failed assignment must never run unsupervised.

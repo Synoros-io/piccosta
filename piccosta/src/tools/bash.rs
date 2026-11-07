@@ -239,7 +239,7 @@ pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Resu
     // The watcher already lists its group, and came across too.
     let pipe = Arc::new(Receiver::from_owned_fd(super::reaper::inherited(handed.pipe))?);
     let kill = CancellationToken::new();
-    let job = shared.jobs.adopt(&handed, kill.clone())?;
+    let job = shared.jobs.adopt(&handed, kill.clone());
     shared.jobs.shells().push(Shell { pid: handed.pid, own: handed.own, plugin: None, kill_at: None, pipe: pipe.clone(), handed: false });
     let (event_sender, events) = mpsc::unbounded_channel();
     tokio::spawn(watch(shared.clone(), pipe, handed.pid, kill, None, event_sender));
@@ -316,23 +316,8 @@ async fn exit_of(_jobs: &jobs::Jobs, pid: u32) -> std::io::Result<std::process::
 #[cfg(unix)]
 async fn exit_of(jobs: &jobs::Jobs, pid: u32) -> std::io::Result<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
-    #[cfg(target_os = "linux")]
-    {
-        let shell = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
-        // SAFETY: AsyncFd owns the pidfd until it has reported this child's exit.
-        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(shell.fd) }.map_err(std::io::Error::from)?;
-        let _ready = pidfd.readable().await?;
-    }
-    #[cfg(target_os = "macos")]
-    tokio::task::spawn_blocking(move || {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // WNOWAIT observes the exit without reaping, so /restart can still hand it over.
-        loop {
-            if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 { return Ok(()); }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
-        }
-    }).await.map_err(std::io::Error::other)??;
+    // Unreaped, so /restart can still hand it over.
+    crate::proc::exited(pid).await?;
     // The check and the reap happen under the list's lock, so hand_over can't come between them.
     let reaped = {
         let shells = jobs.shells();

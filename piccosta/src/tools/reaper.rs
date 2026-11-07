@@ -108,9 +108,12 @@ fn record(pid: u32, identity: Option<u64>, running: bool, plugin: bool) {
     }
 }
 
-// /restart is about to exec: keep the pipe open across it. Output: the pipe's descriptor and the
+// /restart is about to exec: keep the pipe open across it, and every descriptor the image before
+// left that nobody here took back (from a handover that couldn't be read), so what waits at the
+// other end (a watcher, a job's shell) never sees it close. Output: the pipe's descriptor and the
 // watcher's pid, for the next image's adopt; None when no watcher was started.
 pub fn hand_over() -> Option<(i32, u32)> {
+    INHERITED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).0.iter().for_each(|&fd| keep_across_exec(fd));
     let pipe = PIPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (stdin, pid) = pipe.as_ref()?.as_ref()?;
     keep_across_exec(stdin.as_raw_fd());
@@ -128,14 +131,45 @@ pub fn keep_across_exec(fd: i32) {
     unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
 }
 
-// A descriptor the image before this one kept across the exec, owned here from now on and closed
-// on the next exec again, so the commands this image starts don't inherit it.
+// What an image /restart started inherited, as main found it before anything could spawn: the
+// descriptors open past stdin, stdout and stderr (the ones not yet claimed or closed), and the children.
+static INHERITED: Mutex<(Vec<i32>, Vec<i32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+// First thing in an image /restart started: each descriptor it inherited closes on exec from now
+// on, so no command started here gets one, and they and the children still running are listed.
+pub fn inherit() {
+    let listed: Vec<i32> = std::fs::read_dir("/dev/fd").into_iter().flatten().flatten().filter_map(|entry| entry.file_name().to_str()?.parse().ok()).collect();
+    // SAFETY: fcntl on numbers that may not be open: the listing's own, closed by now, fails.
+    let open = listed.into_iter().filter(|&fd| fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0).collect();
+    *INHERITED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = (open, crate::proc::children());
+}
+
+// A descriptor the image before this one kept across the exec, claimed and owned here from now on,
+// and closed on exec (again, should inherit have found no listing).
 pub fn inherited(fd: i32) -> OwnedFd {
+    INHERITED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).0.retain(|&open| open != fd);
     // SAFETY: the image before left it open for this one, and nothing else here owns it.
     unsafe {
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         OwnedFd::from_raw_fd(fd)
     }
+}
+
+// The children the image before left, once (tui reap_inherited_children).
+pub fn inherited_children() -> Vec<i32> { std::mem::take(&mut INHERITED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).1) }
+
+// Reap a child the image before left that nobody here took back, so it's no zombie when it ends.
+// One to end gets SIGTERM, then SIGKILL after `ending` (nothing, if it's gone: only this reaps it,
+// so its pid is its own till then). Then the `pipes` (a Claude Code's) nobody claimed close.
+pub fn reap_inherited(pid: i32, ending: Option<std::time::Duration>, pipes: Vec<i32>) {
+    let listed = INHERITED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).0.clone();
+    let pipes: Vec<OwnedFd> = pipes.into_iter().filter(|fd| listed.contains(fd)).map(inherited).collect();
+    // SAFETY: signals and waitpid on this process's own unreaped child.
+    std::thread::spawn(move || unsafe {
+        if let Some(grace) = ending { libc::kill(pid, libc::SIGTERM); std::thread::sleep(grace); libc::kill(pid, libc::SIGKILL); }
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+        drop(pipes);
+    });
 }
 
 // Start the watcher: this binary again, with the pipe as its stdin and nothing else open.

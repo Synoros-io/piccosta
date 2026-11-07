@@ -216,6 +216,9 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     if std::env::var_os(piccosta::tools::plugin_host::HOST_ENV).is_some() { piccosta::tools::plugin_host::run(); }
+    // An image /restart started: what it inherited closes on exec before anything can spawn.
+    #[cfg(unix)]
+    if std::env::args_os().any(|argument| argument == "--restore") { piccosta::tools::reaper::inherit(); }
     run()
 }
 

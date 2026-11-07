@@ -483,13 +483,12 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let host = Arc::new(Host::for_args(&args));
     crate::scale::watch();
     // After /restart: the watcher and the background jobs the image before handed over.
-    let handover = if args.restore { state::take_handover(&host.agent_dir) } else { state::Handover::default() };
+    let (mut handover, unread) = if args.restore { state::take_handover(&host.agent_dir) } else { Default::default() };
     if let Some((fd, pid)) = handover.reaper {
         crate::tools::reaper::adopt(fd, pid);
     }
-    if args.restore {
-        reap_inherited_children(&handover);
-    }
+    let (ended, left) = if args.restore { reap_inherited_children(&handover) } else { Default::default() };
+    crate::provider::claude::adopt(std::mem::take(&mut handover.claude));
     // --use becomes the model and level the scale picks, before anything opens.
     let note;
     (args.model, args.thinking, note) = host.launch(&args)?;
@@ -585,6 +584,11 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     if args.restore {
         app.printed = (app.panes[0].slot, app.current().messages.len());
     }
+    if let Some(problem) = unread {
+        let list = |names: Vec<String>| if names.is_empty() { "none".to_string() } else { names.join(", ") };
+        app.report(format!("The handover from before the restart couldn't all be read: {problem}.\nClaude Code processes ended, since their records still named them by pid and start time: {}.\nLeft running as they were, since no record names them: {}. A Claude Code among them idles until piccosta quits.", list(ended), list(left)));
+        app.notice = Some("The restart's handover couldn't all be read; details are shown above.".into());
+    }
     // What went wrong fetching the model lists as piccosta started, once they're in.
     if let Some(refresh) = crate::model::STARTUP_REFRESH.get().cloned() {
         let sender = app.sender.clone();
@@ -676,8 +680,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         let _ = inline.frame(&mut terminal, &mut app);
     }
     restore();
-    // /restart hands the background jobs over before the sessions end, so their end doesn't kill them.
-    let handover = if app.restart { app.hand_over() } else { state::Handover::default() };
+    // /restart hands the background jobs and waiting Claude Code processes over before the sessions
+    // end, so their end doesn't kill them.
+    let handover = if app.restart { app.hand_over().await } else { state::Handover::default() };
     app.shutdown(match exit_code { 143 => "SIGTERM", 129 => "SIGHUP", _ => "quit" }).await;
     // /restart: this process becomes the binary now at its path (a build replaces the file, which
     // the kernel then names "… (deleted)"), on the same command line, bringing everything back.
@@ -728,22 +733,30 @@ fn restart_launcher() -> Result<PathBuf, String> {
 }
 
 // After /restart, the processes the old image started are still this process's children. The
-// jobs it handed over are taken back and reaped by bash's watch tasks, and the watcher
-// (tools/reaper.rs) runs on; any other child (a Claude process still closing, say) would stay a
-// zombie when it ends, since nothing in this image waits on it, so a thread waits on each. Only children that existed before this image started any are
-// listed, so none of its own are taken from tokio.
+// jobs it handed over are taken back and reaped by bash's watch tasks, its waiting Claude Code
+// processes by the bridge, and the watcher (tools/reaper.rs) runs on. Any other child would stay a
+// zombie when it ends, since nothing in this image waits on it, so a thread waits on each. None of
+// them is signalled (a clipboard tool serving a copy, a job or watcher from a handover that couldn't
+// be read), except a Claude Code its unreadable record still names by pid and start time: it's
+// ended, and its pipes close once it's reaped. One nothing names (a wholly unreadable handover)
+// idles until piccosta quits. Only the children main found are listed (reaper::inherit), so none of
+// this image's own are taken from tokio. Output: those ended and those left, each pid and command line.
 #[cfg(windows)]
-fn reap_inherited_children(_handover: &state::Handover) {}
+fn reap_inherited_children(_handover: &state::Handover) -> (Vec<String>, Vec<String>) { Default::default() }
 
 #[cfg(unix)]
-fn reap_inherited_children(handover: &state::Handover) {
-    let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid)).collect();
-    for pid in crate::proc::children() {
-        if !kept.contains(&(pid as u32)) {
-            // SAFETY: waitpid on a known child pid with a status pointer it may ignore.
-            std::thread::spawn(move || unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) });
-        }
+fn reap_inherited_children(handover: &state::Handover) -> (Vec<String>, Vec<String>) {
+    let kept: Vec<u32> = handover.sessions.iter().flat_map(|(_, jobs)| jobs.iter().map(|job| job.pid)).chain(handover.reaper.map(|(_, pid)| pid))
+        .chain(handover.claude.iter().map(|query| query.pid)).collect();
+    let unread = |pid: i32| handover.unread.iter().find(|(named, ..)| *named == pid as u32);
+    let (ended, left): (Vec<i32>, Vec<i32>) = crate::tools::reaper::inherited_children().into_iter().filter(|&pid| !kept.contains(&(pid as u32)))
+        .partition(|&pid| unread(pid).is_some_and(|&(_, start, _)| crate::proc::Process::started(pid, start).is_some()));
+    let named = |pids: &[i32]| pids.iter().map(|pid| render::fit(&format!("{pid} {}", String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default()).replace('\0', " ").trim()), 60)).collect();
+    let names = (named(&ended), named(&left));
+    for &pid in ended.iter().chain(&left) {
+        crate::tools::reaper::reap_inherited(pid, ended.contains(&pid).then_some(crate::provider::claude::TERM_GRACE), unread(pid).map(|(.., pipes)| pipes.clone()).unwrap_or_default());
     }
+    names
 }
 
 // Input: whether it's --single, which stays in the normal screen and leaves the mouse to the
@@ -995,10 +1008,11 @@ impl App {
         self.saved_state.save(&self.state_file, &text)
     }
 
-    // /restart: each saved session's running background jobs, and the watcher, for the next image.
-    fn hand_over(&self) -> state::Handover {
+    // /restart: each saved session's running background jobs, the watcher, and the Claude Code
+    // processes waiting for a next message, for the next image.
+    async fn hand_over(&self) -> state::Handover {
         let sessions = self.slots.iter().filter_map(|slot| Some((slot.path.clone()?, slot.shared.as_ref()?.jobs.hand_over()))).filter(|(_, jobs)| !jobs.is_empty()).collect();
-        state::Handover { reaper: crate::tools::reaper::hand_over(), sessions }
+        state::Handover { reaper: crate::tools::reaper::hand_over(), sessions, claude: crate::provider::claude::hand_over().await, ..Default::default() }
     }
 
     // After /restart: open each session that had background jobs, where restore didn't, and give
@@ -1012,9 +1026,18 @@ impl App {
                 None => self.open(Some(path.clone()), None, None),
             };
             let shared = slot.map(|slot| self.slots[slot].shared.clone());
-            for job in jobs {
+            for mut job in jobs {
                 let adopted = match &shared {
-                    Ok(Some(shared)) => crate::tools::bash::adopt(shared.clone(), job).map_err(|error| error.to_string()),
+                    // A log that can't be reopened (made read-only, or its directory gone, since) gives way
+                    // to one in the agent dir under its name, and the job is taken back all the same.
+                    Ok(Some(shared)) => {
+                        if let Err(error) = std::fs::OpenOptions::new().append(true).open(&job.log_path) {
+                            let fallback = self.host.agent_dir.join(format!("restart-{}", job.log_path.file_name().unwrap_or_default().to_string_lossy()));
+                            self.report(format!("Background job {} of {} runs on, but its log {} couldn't be reopened ({error}): what it prints from now on goes to {}.", job.id, path.display(), job.log_path.display(), fallback.display()));
+                            job.log_path = fallback;
+                        }
+                        crate::tools::bash::adopt(shared.clone(), job).map_err(|error| error.to_string())
+                    }
                     Ok(None) => Err("its session didn't open".into()),
                     Err(error) => Err(error.clone()),
                 };

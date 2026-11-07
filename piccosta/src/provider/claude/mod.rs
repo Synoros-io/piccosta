@@ -12,7 +12,8 @@
 // as long as its prompt cache lives. The next call either delivers exactly those results (or that
 // message) to it, or discards it and starts a new one from a session file holding exactly pi's
 // context (history.rs says how). A one-off summary (compaction's) is a query of its own that ends
-// with its turn.
+// with its turn. A waiting query outlives the TUI's /restart: its Claude Code goes on in the new
+// image (hand_over, adopt).
 //
 // Based on piccosta's TypeScript bridge, itself built on pi-claude-bridge (MIT, Eli Dickinson,
 // see LICENSE.md), without the Agent SDK: the parts of its control protocol the
@@ -70,7 +71,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, timeout, Instant};
@@ -153,7 +154,7 @@ const LOST_CALL_CHECK: Duration = Duration::from_secs(120);
 const FALLBACK_SETTLE: Duration = Duration::from_millis(100);
 // Closing a child: stdin ends, then SIGTERM after 2 s, then SIGKILL after 5 more (the SDK's close).
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
-const TERM_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(5);
 // The longest shutdown waits for the queries' tasks to close their children that way.
 const SHUTDOWN_WAIT: Duration = CLOSE_GRACE.saturating_add(TERM_GRACE).saturating_add(CLOSE_GRACE);
 // How long a query that answered stays open for the next message: the life of the prompt cache it
@@ -398,21 +399,17 @@ pub async fn offered_models() -> Result<Vec<Value>, String> {
 // A control request sent alone to a Claude Code started for it, which asks no model. Input: its
 // subtype. Output: Claude Code's control_response.
 async fn ask_alone(subtype: &str) -> Result<Value, String> {
-    let mut command = tokio::process::Command::new(&SETTINGS.claude);
+    let mut command = claude_command();
     command.args(base_args(false, None)).args(["--tools=", "--setting-sources=", "--strict-mcp-config", "--no-session-persistence"]);
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     for name in PARENT_ENV {
         command.env_remove(name);
     }
-    if let Some(dir) = &SETTINGS.config_dir {
-        command.env("CLAUDE_CONFIG_DIR", dir);
-    }
-    // Killed and waited for here however the answer went.
+    // Killed and reaped as it's dropped here, however the answer went.
     let mut child = start(command)?;
     let id = request_id();
     child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": subtype}})).await;
     let answer = timeout(OFFERED_WAIT, async {
-        while let Ok(Some(line)) = child.lines.next_line().await {
+        while let Some(line) = child.next_line().await {
             let message: Value = serde_json::from_str(&line).unwrap_or_default();
             if message["type"] == "control_response" && message["response"]["request_id"] == id.as_str() {
                 return Some(message);
@@ -420,7 +417,7 @@ async fn ask_alone(subtype: &str) -> Result<Value, String> {
         }
         None
     }).await;
-    let _ = child.process.kill().await;
+    drop(child);
     answer.map_err(|_| format!("Claude Code didn't answer {subtype}"))?.ok_or_else(|| format!("Claude Code ended before answering {subtype}"))
 }
 
@@ -503,22 +500,30 @@ fn effort(model: &Model, level: &str) -> Option<String> {
 
 // --- The child process ---
 
+// A claude: its pid and its three pipes. It's waited for and reaped by hand (wait), not by tokio,
+// so one waiting for its session's next message can go to the image /restart execs, where it's
+// still this process's child (hand_over, adopt).
 struct Child {
-    process: tokio::process::Child,
-    #[cfg(not(target_os = "linux"))]
     pid: u32,
+    // How it exited, once it has and was reaped here; from then on its pid may be another process's.
+    status: Option<ExitStatus>,
     stdin: Option<ChildStdin>,
-    lines: Lines<BufReader<ChildStdout>>,
+    // Its stdout, and the line being read from it: a read stopped midway leaves its part there.
+    stdout: BufReader<ChildStdout>,
+    line: Vec<u8>,
     // The last STDERR_TAIL bytes of its stderr, and the task keeping them, stopped by stderr_tail or
-    // when the child is dropped, so a descendant holding stderr open can't keep it alive.
+    // when the child is dropped, so a descendant holding stderr open can't keep it alive; and a copy
+    // of that pipe's descriptor, held for its life (the reader's goes with the reader), for a handover.
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_reader: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(unix)]
+    stderr_fd: std::os::fd::OwnedFd,
 }
 
 fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String> {
     version();
-    let mut command = tokio::process::Command::from(claude_command());
-    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut command = claude_command();
+    command.args(args).current_dir(cwd);
     for name in PARENT_ENV {
         command.env_remove(name);
     }
@@ -530,41 +535,27 @@ fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String
     start(command)
 }
 
-// Start a claude. It ends when its Child is dropped (kill_on_drop), and with this piccosta
+// Start a claude. It's killed when its Child is dropped unreaped, and ends with this piccosta
 // however that ends: the kernel sends it SIGKILL as the thread that started it ends (bash.rs spawn
 // says when that is), which is after every query has had its chance to close it (shutdown).
-fn start(mut command: tokio::process::Command) -> Result<Child, String> {
+fn start(mut command: std::process::Command) -> Result<Child, String> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::proc::parent_death(&mut command);
     let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
+    let child = Child::new(process.id(), process.stdin.take(), process.stdout.take(), process.stderr.take(), Vec::new()).map_err(|error| {
+        let _ = process.kill().and_then(|()| process.wait());
+        format!("Claude Code's pipes: {error}")
+    })?;
     #[cfg(not(target_os = "linux"))]
-    let pid = {
-        let pid = process.id().ok_or("Claude Code exited before assignment")?;
-        crate::proc::attach(pid).map_err(|error| format!("Claude Code job: {error}"))?;
-        crate::tools::reaper::track(pid, true);
-        pid
-    };
-    let stdout = process.stdout.take().ok_or("Claude Code started without a stdout")?;
-    let stderr = Arc::new(Mutex::new(Vec::new()));
-    let stderr_reader = process.stderr.take().map(|mut pipe| {
-        let tail = stderr.clone();
-        tokio::spawn(async move {
-            let mut chunk = [0u8; STDERR_TAIL];
-            while let Ok(read) = pipe.read(&mut chunk).await && read > 0 {
-                let mut tail = lock(&tail);
-                tail.extend_from_slice(&chunk[..read]);
-                let excess = tail.len().saturating_sub(STDERR_TAIL);
-                tail.drain(..excess);
-            }
-        })
-    });
-    Ok(Child { stdin: process.stdin.take(), process, lines: BufReader::new(stdout).lines(), stderr, stderr_reader,
-        #[cfg(not(target_os = "linux"))]
-        pid,
-    })
+    {
+        crate::proc::attach(child.pid).map_err(|error| format!("Claude Code job: {error}"))?;
+        crate::tools::reaper::track(child.pid, true);
+    }
+    Ok(child)
 }
 
-// However a child ends, its stderr reader goes when it's dropped (kill_on_drop stops one still
-// running then).
+// However a child ends, its stderr reader goes when it's dropped. One never reaped here is killed,
+// and a thread reaps it.
 impl Drop for Child {
     fn drop(&mut self) {
         #[cfg(not(target_os = "linux"))]
@@ -573,6 +564,15 @@ impl Drop for Child {
             crate::proc::release(self.pid);
             crate::tools::reaper::track(self.pid, false);
         }
+        if self.status.is_none() {
+            self.signal(crate::proc::KILL);
+            #[cfg(unix)]
+            {
+                let pid = self.pid as libc::pid_t;
+                // SAFETY: waitpid on this process's own child, which nothing else reaps.
+                std::thread::spawn(move || unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) });
+            }
+        }
         if let Some(reader) = &self.stderr_reader {
             reader.abort();
         }
@@ -580,6 +580,55 @@ impl Drop for Child {
 }
 
 impl Child {
+    // A claude from its pid and pipes: one this image started, or one the image before handed over
+    // (with the stderr tail it had read).
+    fn new(pid: u32, stdin: Option<std::process::ChildStdin>, stdout: Option<std::process::ChildStdout>, stderr: Option<std::process::ChildStderr>, tail: Vec<u8>) -> std::io::Result<Child> {
+        let missing = || std::io::Error::other("a pipe is missing");
+        let (stdin, stdout, stderr) = (ChildStdin::from_std(stdin.ok_or_else(missing)?)?, ChildStdout::from_std(stdout.ok_or_else(missing)?)?, stderr.ok_or_else(missing)?);
+        #[cfg(unix)]
+        let stderr_fd = std::os::fd::AsFd::as_fd(&stderr).try_clone_to_owned()?;
+        let mut pipe = tokio::process::ChildStderr::from_std(stderr)?;
+        let stderr = Arc::new(Mutex::new(tail));
+        let tail = stderr.clone();
+        let stderr_reader = Some(tokio::spawn(async move {
+            let mut chunk = [0u8; STDERR_TAIL];
+            while let Ok(read) = pipe.read(&mut chunk).await && read > 0 {
+                let mut tail = lock(&tail);
+                tail.extend_from_slice(&chunk[..read]);
+                let excess = tail.len().saturating_sub(STDERR_TAIL);
+                tail.drain(..excess);
+            }
+        }));
+        Ok(Child { pid, status: None, stdin: Some(stdin), stdout: BufReader::new(stdout), line: Vec::new(), stderr, stderr_reader,
+            #[cfg(unix)]
+            stderr_fd,
+        })
+    }
+
+    // Wait for it to exit and reap it, once.
+    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let status = crate::proc::wait(self.pid).await?;
+        self.status = Some(status);
+        Ok(status)
+    }
+
+    // A signal, only while it's unreaped and its pid still its own.
+    fn signal(&self, signal: i32) {
+        if self.status.is_none() && let Some(process) = crate::proc::Process::open(self.pid as i32) {
+            process.signal(signal);
+        }
+    }
+
+    // The next line it writes, None at the end of its output. A call dropped midway (another branch
+    // of a select won) leaves what it read in `line`, and the next goes on from there.
+    async fn next_line(&mut self) -> Option<String> {
+        if self.stdout.read_until(b'\n', &mut self.line).await.ok()? == 0 { return None; }
+        Some(String::from_utf8_lossy(std::mem::take(&mut self.line).trim_ascii_end()).into_owned())
+    }
+
     // One protocol message, one line. A child that stopped reading just loses the rest.
     async fn send(&mut self, message: &Value) {
         if let Some(stdin) = &mut self.stdin
@@ -592,14 +641,14 @@ impl Child {
     // End its input, then SIGTERM and SIGKILL if it doesn't go. Output: how it exited.
     async fn close(&mut self) -> Option<ExitStatus> {
         self.stdin = None;
-        let pid = self.process.id();
-        let mut status = timeout(CLOSE_GRACE, self.process.wait()).await.ok().and_then(Result::ok);
-        if let (None, Some(pid)) = (status, pid) {
-            if let Some(process) = crate::proc::Process::open(pid as i32) { process.signal(crate::proc::TERM); }
-            status = timeout(TERM_GRACE, self.process.wait()).await.ok().and_then(Result::ok);
+        let mut status = timeout(CLOSE_GRACE, self.wait()).await.ok().and_then(Result::ok);
+        if status.is_none() {
+            self.signal(crate::proc::TERM);
+            status = timeout(TERM_GRACE, self.wait()).await.ok().and_then(Result::ok);
         }
         if status.is_none() {
-            let _ = self.process.kill().await;
+            self.signal(crate::proc::KILL);
+            let _ = self.wait().await;
         }
         status
     }
@@ -636,9 +685,10 @@ fn with_stderr(failure: String, tail: &str) -> String {
 static QUERIES: AtomicUsize = AtomicUsize::new(0);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 
-// piccosta is exiting (a quit, /restart's exec, a signal), where nothing would be dropped: stop
-// every live query and wait for every query task, these and the ones let go of earlier, to close
-// its child (end of input, SIGTERM, SIGKILL) and delete its session files. A child still there
+// piccosta is exiting (a quit, a signal, /restart's exec once hand_over has taken the waiting
+// queries out), where nothing would be dropped: stop every live query and wait for every query
+// task, these and the ones let go of earlier, to close its child (end of input, SIGTERM, SIGKILL)
+// and delete its session files. A child still there
 // after that (Claude Code's model listing, or one that didn't close in time) dies with this
 // piccosta (start), or at /restart's exec, where its input closes.
 pub async fn shutdown() {
@@ -699,7 +749,8 @@ fn initialize(system_prompt: &str, tools: &[ToolDefinition]) -> Value {
 
 // One API request's counters, as its frames (message_start, message_delta, a whole message) have
 // built them up: each frame reports running totals, so a counter it carries replaces the last.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Counters {
     input: u64,
     output: u64,
@@ -839,7 +890,102 @@ enum Command {
     Usage,
     // Fast mode on or off from its next request, as the flag setting it started with would.
     Fast(bool),
+    // /restart: give the query to the next image, if it waits for its next message (hand_over).
+    HandOver(oneshot::Sender<Handed>),
 }
+
+// A query waiting for its session's next message, as /restart hands it to the image it execs (the
+// TUI's handover file): its Claude Code, still this process's child, with copies of its stdin,
+// stdout and stderr kept open across the exec, and what the bridge knows of it. The next message
+// goes into that same process, so the request repeats what its prompt cache holds.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Handed {
+    // Its pid and start time, which name it for sure even when the rest of the record can't be read,
+    // and its pipes' copies, closed once it's reaped then (tui reap_inherited_children).
+    pub pid: u32,
+    start: Option<u64>,
+    fds: [i32; 3],
+    key: String,
+    model: Model,
+    tools: Vec<String>,
+    manifest: Value,
+    shape: Shape,
+    prints: Vec<String>,
+    project_path: String,
+    cwd: String,
+    written: Option<String>,
+    cc_session: Option<String>,
+    hold_ms: Option<u64>,
+    cost_seen: f64,
+    pending_turns: u32,
+    // Every request of the query so far, which a result's usage is weighed against
+    // (add_unstreamed_usage) as if there had been no restart; and what it had written to stderr.
+    // A record without them (an earlier build's) has none: a result of Claude Code 2.1.319 counts
+    // only its own turn's usage, so nothing is counted twice.
+    #[serde(default)]
+    requests: Vec<Counters>,
+    #[serde(default)]
+    stderr: Vec<u8>,
+    // Whether its model came with prices (model.rs ModelCost, whose serde always reads true). Not
+    // known: priced as unpriced, at Claude Code's own reckoning where it bills by the token (price).
+    #[serde(default)]
+    cost_supplied: bool,
+    // Fast mode as the session last asked for it and as Claude Code last took it (/fast), and a
+    // refusal's line the session hasn't shown yet.
+    #[serde(default)]
+    fast: (bool, bool),
+    #[serde(default)]
+    notice: Option<String>,
+}
+
+// /restart: each query waiting for its next message gives its Claude Code to the image this process
+// execs (adopt); any other closes in shutdown, as at every exit. Output: one record each, its
+// pipes' copies now kept open across the exec.
+pub async fn hand_over() -> Vec<Handed> {
+    let asked: Vec<oneshot::Receiver<Handed>> = lock(&LIVE).values().filter_map(|live| {
+        let (reply, answer) = oneshot::channel();
+        live.commands.send(Command::HandOver(reply)).ok().map(|()| answer)
+    }).collect();
+    let handed: Vec<Handed> = futures_util::future::join_all(asked).await.into_iter().flatten().collect();
+    #[cfg(unix)]
+    handed.iter().flat_map(|query| query.fds).for_each(crate::tools::reaper::keep_across_exec);
+    handed
+}
+
+// After /restart: take back the queries the image before handed over. Each Claude Code waits, as
+// it did, for its session's next message, which then goes into it (decide) as if nothing happened.
+#[cfg(unix)]
+pub fn adopt(handed: Vec<Handed>) {
+    for query in handed {
+        let [stdin, stdout, stderr] = query.fds.map(crate::tools::reaper::inherited);
+        let Ok(child) = Child::new(query.pid, Some(stdin.into()), Some(stdout.into()), Some(stderr.into()), query.stderr) else {
+            // Its pipes closed with that; reaped here, since nothing else would, and ended only while
+            // its pid still names the process the record started (its start time), never another.
+            let named = query.start.is_some_and(|start| crate::proc::Process::started(query.pid as i32, start).is_some());
+            crate::tools::reaper::reap_inherited(query.pid as i32, named.then_some(TERM_GRACE), Vec::new());
+            continue;
+        };
+        debug(&format!("adopt: session {} keeps Claude Code {} across the restart", query.key, query.pid));
+        if let Some(notice) = query.notice {
+            lock(&NOTES).insert(query.key.clone(), notice);
+        }
+        let state = Arc::new(Mutex::new(State { shape: query.shape.clone(), prints: query.prints, pending: None, waiting: true,
+            idle_since: Instant::now(), kept_base: Default::default(), fast: query.fast.0 }));
+        let (commands, inbox) = mpsc::unbounded_channel();
+        let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
+        let mut adopted = Query::new(id, &query.key, query.model, &[], child, inbox, state.clone(), query.project_path, &query.cwd, query.shape, query.written);
+        (adopted.tools, adopted.manifest, adopted.cc_session, adopted.fast) = (query.tools, query.manifest, query.cc_session, query.fast.1);
+        (adopted.cost_seen, adopted.pending_turns, adopted.requests) = (query.cost_seen, query.pending_turns, query.requests);
+        adopted.model.cost.supplied = query.cost_supplied;
+        adopted.hold_until = query.hold_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        lock(&LIVE).insert(query.key, Live { id, state, commands });
+        QUERIES.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(adopted.run(Vec::new()));
+    }
+}
+
+#[cfg(windows)]
+pub fn adopt(_handed: Vec<Handed>) {}
 
 // One provider call's stream: where its events go, the message it ends with, and its abort.
 struct Turn {
@@ -1270,7 +1416,7 @@ impl Query {
             let cancel = self.turn.as_ref().map_or_else(CancellationToken::new, |turn| turn.cancel.clone());
             let lost = self.parked.values().map(|call| call.check_at).min();
             let wake = tokio::select! {
-                line = self.child.lines.next_line() => Wake::Line(line.ok().flatten()),
+                line = self.child.next_line() => Wake::Line(line),
                 command = self.inbox.recv() => Wake::Command(command),
                 () = sleep_until(self.last_activity + BODY_IDLE_TIMEOUT), if streaming => Wake::Idle,
                 () = sleep_until(self.settle_at.unwrap_or(far)), if self.settle_at.is_some() => Wake::Settle,
@@ -1286,6 +1432,12 @@ impl Query {
                 Wake::Command(Some(Command::Discard(reason))) => self.discard(&reason).await,
                 Wake::Command(Some(Command::Fast(on))) => self.child.send(&json!({"type": "control_request", "request_id": format!("{FAST_REQUEST}{on}-{}", request_id()), "request": {"subtype": "apply_flag_settings", "settings": {"fastMode": on}}})).await,
                 Wake::Command(Some(Command::Usage)) => self.child.send(&json!({"type": "control_request", "request_id": format!("{USAGE_REQUEST}{}", request_id()), "request": {"subtype": "get_usage"}})).await,
+                // Taken: its Claude Code goes on in the next image, so nothing here may close it.
+                Wake::Command(Some(Command::HandOver(reply))) => if let Some(handed) = self.hand_over().await && reply.send(handed).is_ok() {
+                    self.forget();
+                    QUERIES.fetch_sub(1, Ordering::SeqCst);
+                    return std::mem::forget(self);
+                },
                 Wake::Command(None) => self.discard("the bridge let go of it").await,
                 Wake::Idle => self.idle().await,
                 Wake::Settle => self.end_turn_on_tool_use(),
@@ -1382,6 +1534,39 @@ impl Query {
             self.end_turn_on_tool_use();
         }
     }
+
+    // /restart: a query waiting for its next message gives its Claude Code to the next image as it
+    // is. Output: its record, with copies of its pipes for the next image; None when it isn't
+    // waiting (a turn runs, or a stopped one hasn't ended yet), or holds output it hasn't handled
+    // yet (a line read in part included), and then it closes as usual.
+    #[cfg(unix)]
+    async fn hand_over(&mut self) -> Option<Handed> {
+        use std::os::fd::AsRawFd;
+        if !lock(&self.state).waiting || self.interrupting || !self.child.stdout.buffer().is_empty() || !self.child.line.is_empty() {
+            return None;
+        }
+        let fds = [self.child.stdin.as_ref()?.as_raw_fd(), self.child.stdout.get_ref().as_raw_fd(), self.child.stderr_fd.as_raw_fd()];
+        // SAFETY: fcntl on descriptors this child holds open. The copies are the next image's.
+        let fds = fds.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) });
+        // Its stderr reader stopped and gone, what it read goes in the record, and the rest is the
+        // next image's to read.
+        if let Some(reader) = self.child.stderr_reader.take() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        // Still waiting: the session may have given it a message meanwhile (decide).
+        let state = lock(&self.state);
+        debug(&format!("hand over: session {}, Claude Code {}", self.key, self.child.pid));
+        (!fds.contains(&-1) && state.waiting).then(|| Handed { pid: self.child.pid, start: crate::proc::start(self.child.pid as i32), fds, key: self.key.clone(), model: self.model.clone(), tools: self.tools.clone(),
+            manifest: self.manifest.clone(), shape: state.shape.clone(), prints: state.prints.clone(), project_path: self.project_path.clone(),
+            cwd: self.cwd.clone(), written: self.written.clone(), cc_session: self.cc_session.clone(),
+            hold_ms: self.hold_until.map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64), cost_seen: self.cost_seen,
+            pending_turns: self.pending_turns, requests: self.requests.clone(), stderr: lock(&self.child.stderr).clone(),
+            cost_supplied: self.model.cost.supplied, fast: (state.fast, self.fast), notice: lock(&NOTES).remove(&self.key) })
+    }
+
+    #[cfg(windows)]
+    async fn hand_over(&mut self) -> Option<Handed> { None }
 
     // Out of LIVE, unless a later query of the session has taken its place.
     fn forget(&self) {

@@ -40,6 +40,38 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
 
 pub fn resume(command: &mut std::process::Command) -> std::io::Error { command.exec() }
 
+// Wait for this process's child `pid` to exit, and leave it unreaped, so its pid is still its own
+// (to signal, or to hand to the image /restart execs): through a pidfd on Linux, and on macOS
+// waitid's WNOWAIT, which sees the exit without reaping.
+pub async fn exited(pid: u32) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let child = crate::proc::Process::open(pid as i32).ok_or_else(std::io::Error::last_os_error)?;
+        // SAFETY: AsyncFd owns the pidfd until it has reported this child's exit.
+        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(child.fd) }.map_err(std::io::Error::from)?;
+        let _ready = pidfd.readable().await?;
+    }
+    #[cfg(target_os = "macos")]
+    tokio::task::spawn_blocking(move || {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 { return Ok(()); }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
+        }
+    }).await.map_err(std::io::Error::other)??;
+    Ok(())
+}
+
+// Wait for this process's child `pid` to exit, and reap it: from then on the pid may be another's.
+pub async fn wait(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    exited(pid).await?;
+    let mut status = 0;
+    // SAFETY: waitpid on our own child, which has exited, into a local status.
+    if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } < 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(std::process::ExitStatus::from_raw(status))
+}
+
 pub fn link(exe: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(exe, link)
 }
@@ -72,7 +104,7 @@ pub fn shell_setup(command: &mut std::process::Command, read_only: bool) {
     }); }
 }
 
-pub fn parent_death(command: &mut tokio::process::Command) {
+pub fn parent_death(command: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
     {
         let parent = std::process::id();
@@ -84,5 +116,5 @@ pub fn parent_death(command: &mut tokio::process::Command) {
         }); }
     }
     #[cfg(target_os = "macos")]
-    group(command);
+    own_group(command);
 }

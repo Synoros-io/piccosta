@@ -8,7 +8,8 @@
 // file and -c reads the newest. /restart passes its file explicitly, even without a terminal.
 //
 // /restart also leaves a handover for the image it execs: the background jobs still running, by
-// session, and the watcher (tools/reaper.rs). It's named by the process id, which the exec keeps, so only that
+// session, the watcher (tools/reaper.rs), and the Claude Code processes waiting for their sessions'
+// next messages (provider/claude). It's named by the process id, which the exec keeps, so only that
 // image reads it, and it reads it once.
 
 use serde::{Deserialize, Serialize};
@@ -52,11 +53,16 @@ pub struct State {
     pub open: Vec<Kept>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Default)]
 pub struct Handover {
     // The watcher's pipe descriptor and pid (tools/reaper.rs).
     pub reaper: Option<(i32, u32)>,
     pub sessions: Vec<(PathBuf, Vec<crate::tools::jobs::HandedJob>)>,
+    pub claude: Vec<crate::provider::claude::Handed>,
+    // As read back: each Claude Code record that couldn't be read but gives its pid and start time,
+    // with its pipes' descriptors when those read too.
+    #[serde(skip)]
+    pub unread: Vec<(u32, u64, Vec<i32>)>,
 }
 
 // A session as it was left: its file (None for a new one never saved, which starts again in its
@@ -131,9 +137,34 @@ pub fn save_handover(agent_dir: &Path, handover: &Handover) -> std::io::Result<(
 }
 
 // The handover this process's image before left, removed as it's read; empty when there's none.
-pub fn take_handover(agent_dir: &Path) -> Handover {
+// Each part (the watcher, the jobs, each Claude Code) is read on its own, so one a different build
+// wrote leaves the rest to take back. What can't be read is left out and the file is moved aside,
+// kept; the error says what and where.
+pub fn take_handover(agent_dir: &Path) -> (Handover, Option<String>) {
     let file = handover_file(agent_dir);
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
-    let _ = std::fs::remove_file(file);
-    serde_json::from_str(&text).unwrap_or_default()
+    let mut problems = Vec::new();
+    let value = match std::fs::read_to_string(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (Handover::default(), None),
+        text => text.map_err(|error| error.to_string()).and_then(|text| serde_json::from_str(&text).map_err(|error| error.to_string())),
+    }.unwrap_or_else(|error| { problems.push(error); serde_json::Map::new() });
+    let mut handover = Handover { reaper: part(&value, "reaper", &mut problems), sessions: part(&value, "sessions", &mut problems), ..Handover::default() };
+    for record in part::<Vec<serde_json::Value>>(&value, "claude", &mut problems) {
+        match crate::provider::claude::Handed::deserialize(&record) {
+            Ok(query) => handover.claude.push(query),
+            Err(error) => { problems.push(format!("claude: {error}")); handover.unread.extend(record["pid"].as_u64().zip(record["start"].as_u64()).map(|(pid, start)| (pid as u32, start, Vec::deserialize(&record["fds"]).unwrap_or_default()))); }
+        }
+    }
+    if problems.is_empty() {
+        let _ = std::fs::remove_file(file);
+        return (handover, None);
+    }
+    let aside = file.with_extension(format!("unreadable-{}.json", crate::clock::now_ms()));
+    let kept = std::fs::rename(&file, &aside).map_or_else(|error| format!("still at {} ({error})", file.display()), |()| format!("kept at {}", aside.display()));
+    (handover, Some(format!("{}; the file is {kept}", problems.join("; "))))
+}
+
+// One part of a handover: its default when there's none, else what's there, or the default with
+// the problem noted.
+fn part<T: serde::de::DeserializeOwned + Default>(value: &serde_json::Map<String, serde_json::Value>, name: &str, problems: &mut Vec<String>) -> T {
+    value.get(name).map_or(Ok(T::default()), T::deserialize).unwrap_or_else(|error| { problems.push(format!("{name}: {error}")); T::default() })
 }
