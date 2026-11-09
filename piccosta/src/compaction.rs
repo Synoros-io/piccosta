@@ -110,13 +110,20 @@ What the user asked for.
 
 Only what's in the messages above; don't guess at what comes later.";
 
-// What set a compaction off, as pi's events name it.
+// Idle compaction's summary is asked for at the end of the session's own request, under the
+// session's system prompt, so the summarizer's role (SUMMARIZATION_SYSTEM_PROMPT) goes in the message.
+const IN_PLACE_PROMPT: &str = "piccosta is compacting this session now. Answer this message alone, in text, calling no tool.";
+// What the session's views say of an idle compaction (Claude Code's words for its own).
+pub const IDLE_LINE: &str = "Compacted while idle, before the prompt cache expired";
+
+// What set a compaction off, as pi's events name it, and idle compaction's, which pi doesn't have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Reason {
     Manual,
     Threshold,
     Overflow,
+    Idle,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,6 +658,7 @@ async fn request_once(request: &SummaryRequest<'_>, prompt_text: &str) -> Assist
             credential: request.credential,
             session_id: Some(&session_id),
             cache: false,
+            in_place: false,
             transport: request.transport,
             thinking_level,
             session_file: None,
@@ -694,7 +702,8 @@ async fn request_with_retry(request: &SummaryRequest<'_>, prompt_text: &str, not
 }
 
 // The text of a summary response, or why it can't be stored (compaction.ts:585-593, 742-750). A
-// length stop is a partial summary and must never become a checkpoint.
+// length stop is a partial summary and must never become a checkpoint, nor may an empty one, which
+// would keep nothing of what came before the cut.
 fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, String> {
     match response.stop_reason {
         StopReason::Error => {
@@ -707,7 +716,7 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
     if response.content.iter().any(|block| matches!(block, Content::ToolCall { .. })) {
         return Err(format!("{label} attempted to call a tool"));
     }
-    Ok(blocks_text(&response.content, "\n"))
+    Some(blocks_text(&response.content, "\n")).filter(|text| !text.trim().is_empty()).ok_or_else(|| format!("{label} returned empty text"))
 }
 
 // The prompt that summarizes `messages`, updating `previous_summary` when there is one
@@ -785,7 +794,7 @@ pub async fn summarize_with(
         let response = complete(&history_prompt(&preparation.messages_to_summarize, previous, custom_instructions)).await;
         Ok((summary_text(&response, "Summarization")?, response.usage))
     };
-    let (mut summary, usage) = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+    let (summary, usage) = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
         let (history, history_usage) = if preparation.messages_to_summarize.is_empty() {
             (previous.unwrap_or("No prior history.").to_string(), None)
         } else {
@@ -802,13 +811,31 @@ pub async fn summarize_with(
     } else {
         history_summary(previous).await?
     };
+    Ok(finish(preparation, summary, usage))
+}
+
+// Idle compaction's summary (agent.rs): `request` is the session's own, as its turns send it, and
+// the summary prompt goes after its messages as one more, so the provider reads everything before
+// it from its cache rather than a request of the summarizer's own (request_once) writing it all
+// again. One request: the model sees the whole context, split turn or not. Not retried: a failure
+// leaves the session as it was, for the next turn.
+pub async fn summarize_in_place(preparation: &Preparation, request: Request<'_>) -> Result<Summary, String> {
+    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}");
+    let messages = [request.messages, &[Message::User(UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms() })]].concat();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    let response = provider::stream(Request { messages: &messages, in_place: true, ..request }, sender).await;
+    Ok(finish(preparation, summary_text(&response, "Summarization")?, response.usage))
+}
+
+// The summary with the file lists after it, and what pi stores with it.
+fn finish(preparation: &Preparation, mut summary: String, usage: Usage) -> Summary {
     let (read_files, modified_files) = preparation.file_ops.lists();
     summary.push_str(&format_file_operations(&read_files, &modified_files));
-    Ok(Summary {
+    Summary {
         summary,
         first_kept_entry_id: preparation.first_kept_entry_id.clone(),
         tokens_before: preparation.tokens_before,
         usage,
         details: json!({"readFiles": read_files, "modifiedFiles": modified_files}),
-    })
+    }
 }

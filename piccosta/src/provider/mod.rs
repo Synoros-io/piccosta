@@ -42,6 +42,27 @@ const OPENCODE_HOST: &str = "opencode.ai";
 pub const FAST_TIER: &str = "priority";
 pub const FAST_APIS: [&str; 2] = ["openai-codex-responses", claude::PROVIDER];
 
+// How long a prompt cache lives where piccosta knows it: Anthropic's for its hour-long writes, and
+// for the plain ephemeral marker anthropic_messages sends, as Anthropic's prompt caching docs give
+// them (checked 2026-11-08).
+const HOUR_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const ANTHROPIC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const ANTHROPIC_PROVIDER: &str = "anthropic";
+
+// How long the prompt cache a response's request wrote lives (idle compaction, agent.rs): an hour
+// when the provider says it wrote hour-long entries (cacheWrite1h), Claude Code's own on the bridge,
+// 5 minutes on Anthropic's API. None where it isn't known: OpenAI's (and so Codex's) default keeps
+// an unused prefix "5 to 10 minutes, up to an hour", not a set time, and the other gateways (opencode,
+// which serves its other models on Anthropic's API too) don't say.
+pub fn cache_ttl(model: &Model, usage: &Usage) -> Option<Duration> {
+    match model.provider.as_str() {
+        _ if usage.cache_write_1h.unwrap_or(0) > 0 => Some(HOUR_CACHE_TTL),
+        claude::PROVIDER => Some(claude::cache_ttl()),
+        ANTHROPIC_PROVIDER => Some(ANTHROPIC_CACHE_TTL),
+        _ => None,
+    }
+}
+
 // pi's thinking levels, lowest to highest (models.ts:1258).
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -81,6 +102,9 @@ pub struct Request<'a> {
     // False for pi's cacheRetention "none" (a one-off summary): no cache key and no cache-affinity
     // headers, though a provider that routes every request by session (opencode) still gets the id.
     pub cache: bool,
+    // Idle compaction's summary, asked for at the end of the session's own context (compaction.rs
+    // summarize_in_place): the Claude bridge only puts it to the query already holding that context.
+    pub in_place: bool,
     // pi's `transport` setting, for an API that has a choice (Codex): "auto" (a websocket that
     // sends only new input when it can, SSE when it can't be used), "websocket" (always the full
     // input), "websocket-cached", or "sse".

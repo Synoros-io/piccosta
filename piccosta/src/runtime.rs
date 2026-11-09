@@ -64,6 +64,9 @@ const STATUS_WAIT: Duration = Duration::from_millis(250);
 const INBOX_SUFFIX: &str = ".inbox";
 // How long a runtime waits for a request's line once a client connects.
 const READ_WAIT: Duration = Duration::from_secs(1);
+// How late idle compaction's time may come before it's skipped (Claude Code 2.1.319's 60 s): later,
+// the session was opened after it or the computer slept, and the cache may be gone.
+const IDLE_LATE_MS: i64 = 60_000;
 
 // What a runtime is asked. Message, Stop and Close are taken at once; the rest wait their turn.
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
@@ -464,6 +467,13 @@ pub async fn subscribe(file: &Path, mut heard: impl FnMut(Value)) -> bool {
 enum Work {
     Command(Command),
     Notice(crate::message::CustomMessage),
+    // Idle compaction's time (Agent::idle_compaction_due).
+    Idle,
+}
+
+// A sleep until `at` (epoch ms), over at once when that's past.
+fn until(at: i64) -> tokio::time::Sleep {
+    tokio::time::sleep(Duration::from_millis(at.saturating_sub(crate::clock::now_ms()).max(0) as u64))
 }
 
 // Start a session's runtime. Input: what Host::open made; `wake`, whether it starts turns no
@@ -527,16 +537,49 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         let mut closing: Option<Option<oneshot::Sender<()>>> = None;
         // The session file's lock, while a run of its own lets go.
         let mut held = None;
+        // Idle compaction: the time set for the session's last request and that request's (epoch ms),
+        // which goes off only while nothing runs, once per request (`spent`), and never in a run of
+        // its own, which ends when it's idle. What it does, or why not, goes to the debug log once.
+        let (mut idle, mut spent, mut said, id) = (None::<(i64, i64)>, 0, String::new(), agent.session.id().to_string());
+        // A release asked for while idle compaction is still to come, done once it has come.
+        let mut release = None;
+        let mut say = move |line: String| if line != said {
+            crate::provider::claude::debug(&format!("idle compaction, session {id}: {line}"));
+            said = line;
+        };
+        let at = crate::clock::iso_from_ms;
         loop {
+            // Set before anything queued is taken, a release included, which waits while it's due.
+            match (!until_idle).then(|| agent.idle_compaction_due()) {
+                Some(Ok((due, request))) if request != spent => {
+                    if let Some((_, was)) = idle.filter(|&(_, was)| was != request) {
+                        say(format!("skipped for the request at {}: a newer request", at(was)));
+                    }
+                    idle = Some((due, request));
+                    say(format!("due at {} for the request at {}", at(due), at(request)));
+                }
+                Some(Err(why)) => {
+                    idle = None;
+                    say(why);
+                }
+                _ => {}
+            }
             let work = match queue.pop_front() {
                 Some(command) => Work::Command(command),
-                None => tokio::select! {
-                    command = next(&mut commands, &mut claim) => match command {
-                        Some(command) => Work::Command(command),
-                        None => break,
-                    },
-                    Some(notice) = agent.notice(), if wake => Work::Notice(notice),
-                },
+                None => {
+                    if let Some(generation) = release.take_if(|_| idle.is_none()) {
+                        queue.push_back(Command::ReleaseIfIdle(generation));
+                        continue;
+                    }
+                    tokio::select! {
+                        command = next(&mut commands, &mut claim) => match command {
+                            Some(command) => Work::Command(command),
+                            None => break,
+                        },
+                        Some(notice) = agent.notice(), if wake => Work::Notice(notice),
+                        () = until(idle.map_or(0, |(due, _)| due)), if idle.is_some() => Work::Idle,
+                    }
+                }
             };
             let work = match work {
                 Work::Command(Command::Stop(answer)) => {
@@ -552,6 +595,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 Work::Command(Command::ReleaseIfIdle(generation)) => {
                     if generation.upgrade().is_none() { continue; }
+                    if idle.is_some() {
+                        release = Some(generation);
+                        continue;
+                    }
                     held = agent.session.file().map(hold);
                     if queue.is_empty() && commands.is_empty() && claim.as_ref().is_none_or(|claim| claim.taken.is_empty()) && shared.jobs.running_count() == 0 && !agent.has_pending_work() {
                         break;
@@ -571,9 +618,26 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     agent.hold_notice(notice);
                     continue;
                 }
+                // Skipped when work is waiting or a background job runs (its report would come into
+                // the summary's context), when it came late, or when what it was set for no longer
+                // holds (the cache's life can run out first, and the plan's usage can change).
+                Work::Idle => {
+                    let Some((due, request)) = idle.take() else { continue };
+                    spent = request;
+                    let waiting = !commands.is_empty() || claim.as_ref().is_some_and(|claim| !claim.taken.is_empty()) || agent.has_pending_work() || shared.jobs.running_count() > 0;
+                    let late = crate::clock::now_ms() - due;
+                    let skip = if waiting { Some("busy, work is waiting or a background job runs".into()) } else if late > IDLE_LATE_MS { Some(format!("{} s late", late / 1000)) } else { agent.idle_compaction_due().err() };
+                    if let Some(why) = skip {
+                        say(format!("skipped for the request at {}: {why}", at(request)));
+                        continue;
+                    }
+                    say(format!("compacting for the request at {}", at(request)));
+                    Work::Idle
+                }
                 work => work,
             };
             let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_)));
+            let compacting = matches!(work, Work::Idle);
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
             let result = {
@@ -582,7 +646,17 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 loop {
                     tokio::select! {
                         result = &mut run => break result,
+                        () = until(idle.map_or(0, |(due, _)| due)), if idle.is_some() => if let Some((_, request)) = idle.take() {
+                            spent = request;
+                            say(format!("skipped for the request at {}: busy, the session was working", at(request)));
+                        },
                         command = next(&mut commands, &mut claim), if closing.is_none() => match command {
+                            // A message for a session compacting while idle stops the compaction and
+                            // goes next: its turn reads the cache that's still warm.
+                            Some(command @ (Command::Message(_) | Command::Prompt(..))) if compacting => {
+                                handle.abort();
+                                queue.push_back(command);
+                            }
                             Some(Command::Message(text)) => {
                                 handle.steer(text);
                                 shared.jobs.detach_all();
@@ -622,7 +696,12 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             stops.into_iter().flatten().for_each(|answer| {
                 let _ = answer.send(());
             });
-            done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+            // Idle compaction was no frontend's work, so none hears of it but through its events.
+            match result {
+                Err(error) if compacting => say(format!("failed: {error}")),
+                _ if compacting => {}
+                result => done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() }),
+            }
             if closing.is_some() || (until_idle && stopped) {
                 break;
             }
@@ -693,13 +772,14 @@ async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Optio
     }
 }
 
-// One piece of work: a frontend's command, a message (a turn on it, with the session's team), or a
-// background job's end.
+// One piece of work: a frontend's command, a message (a turn on it, with the session's team), a
+// background job's end, or idle compaction.
 async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) -> Result<(), String> {
     let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
-    let Work::Command(command) = work else {
-        let Work::Notice(notice) = work else { unreachable!("a command is matched above") };
-        return agent.take_notice(notice).await;
+    let command = match work {
+        Work::Command(command) => command,
+        Work::Notice(notice) => return agent.take_notice(notice).await,
+        Work::Idle => return agent.compact_idle().await,
     };
     match command {
         Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,

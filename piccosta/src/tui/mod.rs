@@ -1892,13 +1892,16 @@ impl App {
                 }
                 Event::CompactionStart { .. } => view.state = State::Compacting,
                 // A compaction says what it did, and the context is the summary's size from now on.
-                Event::CompactionEnd { error_message, result, .. } => {
-                    view.state = State::Running;
+                // One while idle ran on its own, so the session is idle again after it.
+                Event::CompactionEnd { reason, error_message, result, .. } => {
+                    let idle = reason == crate::compaction::Reason::Idle;
+                    view.state = if idle { State::Idle } else { State::Running };
                     if let Some(result) = result {
                         let before = result.get("tokensBefore").and_then(Value::as_u64).unwrap_or(0);
                         let after = result.get("estimatedTokensAfter").and_then(Value::as_u64).unwrap_or(0);
                         view.context_tokens = after;
-                        let text = format!("Compacted: {} → about {} tokens of context", crate::cache::tokens(before), crate::cache::tokens(after));
+                        let what = if idle { crate::compaction::IDLE_LINE } else { "Compacted" };
+                        let text = format!("{what}: {} → about {} tokens of context", crate::cache::tokens(before), crate::cache::tokens(after));
                         view.messages.push(commands::report_message(text));
                     }
                     if let Some(error) = error_message {

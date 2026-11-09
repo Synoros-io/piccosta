@@ -20,6 +20,10 @@ pub const AGENT_DIR_ENV: &str = "PICCOSTA_AGENT_DIR";
 // Defaults from settings-defaults.ts, used when neither settings file sets the key.
 const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+// The least context idle compaction runs for (agent.rs idle_compaction_due), and how low the
+// setting may take it: Claude Code 2.1.319's max(100000, CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS ?? 200000).
+const DEFAULT_IDLE_MIN_TOKENS: u64 = 200_000;
+const IDLE_MIN_TOKENS_FLOOR: u64 = 100_000;
 const DEFAULT_RETRY_MAX_RETRIES: u32 = 3;
 // The retries a session nobody watches gets (a manager, a run of its own such as a lane's), which
 // has nobody to try again when pi's three run out: with the same backoff its last one comes about
@@ -247,6 +251,9 @@ impl Settings {
             reserve_tokens: token_setting("reserveTokens", DEFAULT_COMPACTION_RESERVE_TOKENS),
             keep_recent_tokens: token_setting("keepRecentTokens", DEFAULT_COMPACTION_KEEP_RECENT_TOKENS),
             compact_at: Some(token_setting("compactAt", 0)).filter(|tokens| *tokens > 0).or_else(|| crate::scale::compact_at(&agent_dir(), &model_key)),
+            idle: self.get_bool("compaction.idle").unwrap_or(true),
+            idle_min_tokens: token_setting("idleMinTokens", DEFAULT_IDLE_MIN_TOKENS).max(IDLE_MIN_TOKENS_FLOOR),
+            cache_seconds: Some(token_setting("cacheSeconds", 0)).filter(|seconds| *seconds > 0),
         }
     }
 }
@@ -356,4 +363,11 @@ pub struct CompactionSettings {
     // Compact once the context passes this many tokens, before the window would make it (the
     // model scale's compactAt, or compaction.compactAt); None leaves it to the window.
     pub compact_at: Option<u64>,
+    // Compact a session left idle before its prompt cache expires (compaction.idle), once its
+    // context is this big (compaction.idleMinTokens).
+    pub idle: bool,
+    pub idle_min_tokens: u64,
+    // How long the provider's prompt cache lives, in seconds, where piccosta doesn't know it or the
+    // user knows better (compaction.cacheSeconds; provider::cache_ttl otherwise).
+    pub cache_seconds: Option<u64>,
 }

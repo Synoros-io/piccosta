@@ -339,6 +339,14 @@ fn looping(text: &str) -> Option<String> {
 // own serviceTier from models.json.
 pub const FAST_TYPE: &str = "piccosta-fast";
 
+// How far into its prompt cache's life an idle session compacts: Claude Code 2.1.319's
+// lastActivityAt + (expiresAt - lastActivityAt) * 0.9, 54 minutes of an hour.
+const IDLE_SHARE: f64 = 0.9;
+// How long idle compaction's request may take to go out once it's decided on: a terminal UI draws on
+// the sessions' thread, and a debug build drawing a 450 KB transcript held the request back 3.2 to
+// 3.6 s (2026-11-08). Closer than this to the cache's expiry, it doesn't run.
+const IDLE_SEND_MS: i64 = 5_000;
+
 // The service tier `model`'s requests ask for in `session`: /fast's last choice there, on a model
 // that offers fast mode, else the model's own.
 pub fn service_tier(session: &Session, model: &Model) -> Option<String> {
@@ -907,19 +915,7 @@ impl Agent {
                 // The stream loop guard stops the request through its own token, so a stopped loop
                 // isn't taken for the user's abort.
                 let guard = self.cancel.child_token();
-                let request = Request {
-                    model,
-                    messages: &messages,
-                    credential: &credential,
-                    session_id: Some(self.session.id()),
-                    cache: true,
-                    transport: &self.config.transport,
-                    thinking_level: &self.config.thinking_level,
-                    session_file: self.session.file(),
-                    cwd: &self.config.cwd,
-                    cancel: guard.clone(),
-                };
-                let response = provider::stream(request, sender);
+                let response = provider::stream(Self::request(&self.config, &self.session, &messages, &credential, guard.clone()), sender);
                 tokio::pin!(response);
                 let emit = &mut self.emit;
                 let mut started = false;
@@ -996,6 +992,64 @@ impl Agent {
             self.overflow_recovery_attempted = false;
         }
         Ok((message, id))
+    }
+
+    // A request on the session's own context, the same for each turn and for idle compaction: its
+    // model, level, transport, files and cache key, so the provider keeps the one cached prefix.
+    fn request<'a>(config: &'a AgentConfig, session: &'a Session, messages: &'a [crate::message::Message], credential: &'a auth::Credential, cancel: CancellationToken) -> Request<'a> {
+        Request { model: &config.model, messages, credential, session_id: Some(session.id()), cache: true, in_place: false, transport: &config.transport,
+            thinking_level: &config.thinking_level, session_file: session.file(), cwd: &config.cwd, cancel }
+    }
+
+    // When this session compacts while idle (runtime.rs keeps the time), as Claude Code's
+    // idleCompaction does: IDLE_SHARE of the way from its last request to the expiry of the prompt
+    // cache that request wrote, so the next turn sends the summary rather than writing the whole
+    // context to the cache again. Output: that time and the request's (epoch ms), or why not:
+    // compaction or compaction.idle is off; the last request failed or was stopped, or the context
+    // changed after it (a compaction, another model or level, a new prompt), so its cache isn't what
+    // the next request reads; the provider's cache life isn't known, or ends before a request would get
+    // there; on the Claude bridge, no query of Claude Code's waits with that cache; the context is under
+    // compaction.idleMinTokens; or the model's plan is running low.
+    pub fn idle_compaction_due(&self) -> Result<(i64, i64), String> {
+        let (settings, model) = (self.config.compaction, &self.config.model);
+        if !settings.enabled || !settings.idle {
+            return Err("compaction or compaction.idle is off".into());
+        }
+        let branch = self.session.path_to_leaf();
+        let found = branch.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::Assistant(_), .. }));
+        let Some((at, SessionEntry::Message { message: AgentMessage::Assistant(last), .. })) = found.map(|at| (at, branch[at])) else { return Err("no request yet".into()) };
+        if matches!(last.stop_reason, StopReason::Error | StopReason::Aborted) {
+            return Err("the last request failed or was stopped, so what it cached isn't known".into());
+        }
+        let changed = |entry: &&SessionEntry| matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } | SessionEntry::ThinkingLevelChange { .. }
+            | SessionEntry::Message { message: AgentMessage::System(_), .. });
+        if branch[at + 1..].iter().any(changed) {
+            return Err("the cache is cold: the context changed since the last request".into());
+        }
+        let Some(ttl) = settings.cache_seconds.map(Duration::from_secs).or_else(|| provider::cache_ttl(model, &last.usage)) else {
+            return Err(format!("{}'s cache life isn't known (compaction.cacheSeconds sets one)", model.provider));
+        };
+        let expires = last.timestamp + ttl.as_millis() as i64;
+        if crate::clock::now_ms() + IDLE_SEND_MS >= expires {
+            return Err(format!("the cache expires at {}, before a request would get there", crate::clock::iso_from_ms(expires)));
+        }
+        if model.provider == provider::claude::PROVIDER && !provider::claude::waiting(self.session.id()) {
+            return Err("no Claude Code query waits with this session's context, and a new one would write all of it again".into());
+        }
+        let tokens = compaction::estimate_projected_context_tokens(&self.session.projection(), &branch).tokens;
+        if tokens < settings.idle_min_tokens {
+            return Err(format!("{tokens} tokens of context, under compaction.idleMinTokens ({})", settings.idle_min_tokens));
+        }
+        if crate::scale::low(&crate::config::agent_dir(), &format!("{}/{}", model.provider, model.id)) {
+            return Err("the model's plan is running low".into());
+        }
+        Ok((last.timestamp + (ttl.as_millis() as f64 * IDLE_SHARE) as i64, last.timestamp))
+    }
+
+    // Compact now, while idle, the summary asked for in the session's own request (above).
+    pub async fn compact_idle(&mut self) -> Result<(), String> {
+        self.fresh_cancel();
+        self.run_auto_compaction(Reason::Idle, false, None).await.map(drop)
     }
 
     // The newest response in the model's context, and the entry it came from.
@@ -1194,6 +1248,10 @@ impl Agent {
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
         let outcome = match credential {
             Err(error) => Err(error),
+            Ok(credential) if reason == Reason::Idle => {
+                let messages = crate::message::to_model_messages(&self.session.context().messages);
+                compaction::summarize_in_place(&preparation, Self::request(&self.config, &self.session, &messages, &credential, cancel.clone())).await
+            }
             Ok(credential) => {
                 let request = compaction::SummaryRequest {
                     model,

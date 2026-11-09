@@ -348,7 +348,12 @@ pub fn debug(line: &str) {
 // a longer gap is one the cache had already lapsed for. Unset, it's the life of the cache Claude
 // Code asks for: 5 minutes on an API key, an hour on a subscription.
 pub fn hold_time() -> Duration {
-    SETTINGS.hold.unwrap_or_else(|| if AUTH.as_ref().is_some_and(|auth| auth["authMethod"] == "api_key") { API_KEY_CACHE_TTL } else { CACHE_TTL })
+    SETTINGS.hold.unwrap_or_else(cache_ttl)
+}
+
+// The life of the prompt cache Claude Code asks for on this login (CACHE_TTL).
+pub fn cache_ttl() -> Duration {
+    if AUTH.as_ref().is_some_and(|auth| auth["authMethod"] == "api_key") { API_KEY_CACHE_TTL } else { CACHE_TTL }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1044,6 +1049,12 @@ pub fn close(session_id: &str) {
     end_query(session_id, "the session was closed", false);
 }
 
+// Whether the session's query waits for its next message, which is the only one an idle
+// compaction may ask (agent.rs idle_compaction_due).
+pub fn waiting(session_id: &str) -> bool {
+    lock(&LIVE).get(session_id).is_some_and(|live| lock(&live.state).waiting)
+}
+
 // Let go of the session's query, unless it waits and `keep_waiting` says to leave it.
 fn end_query(session_id: &str, reason: &str, keep_waiting: bool) {
     let mut all = lock(&LIVE);
@@ -1078,7 +1089,7 @@ fn make_room(key: &str) {
 // Input: the request and where its events go. Output: the turn's message. A cacheRetention "none"
 // request (pi's compaction and branch summaries, under a fresh session id) starts a query of its
 // own that ends with its turn and keeps nothing; every other one delivers to the session's query or
-// rewrites.
+// rewrites, but an idle compaction's (in_place), which only delivers.
 pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamEvent>) -> AssistantMessage {
     let model = request.model;
     let system = transcript::current_system_message(request.messages);
@@ -1097,17 +1108,27 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     }
     let shape = history::shape(&system_prompt, &tools, &cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
     let prints: Vec<String> = messages.iter().map(fingerprint).collect();
+    // An idle compaction stopped this early leaves the waiting query for the message that stopped it.
     if request.cancel.is_cancelled() {
-        discard(&key, "the run was aborted");
+        if !request.in_place { discard(&key, "the run was aborted"); }
         return failed(model, StopReason::Aborted, "Operation aborted");
     }
+    // And one that went in leaves the query's continuation as it found it: stopped, or its summary
+    // refused, the session's next message goes into the query as if it hadn't run (Claude Code keeps
+    // the turn, after the context the cache holds); kept, the context is the summary's, a new query.
+    let before = request.in_place.then(|| lock(&LIVE).get(&key).map(|live| lock(&live.state).prints.clone())).flatten();
     let mut forced: Option<String> = one_shot.then(|| "a one-off summary".into());
     loop {
         let (reply, answer) = oneshot::channel();
         let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
         let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, forced.take(), turn) {
             Ok(()) => match answer.await {
-                Ok(message) => return message,
+                Ok(message) => {
+                    if let Some(prints) = before && let Some(live) = lock(&LIVE).get(&key) {
+                        lock(&live.state).prints = prints;
+                    }
+                    return message;
+                }
                 // The query ended before it took them: rewrite like any other mismatch.
                 Err(_) => {
                     forced = Some("the parked query ended before it took the results".into());
@@ -1116,6 +1137,12 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
             },
             Err(rewrite) => rewrite,
         };
+        // An idle compaction asks only the query holding the session's cache: a new one would write
+        // the whole context again, the cost the compaction is there to spare.
+        if request.in_place {
+            debug(&format!("idle compaction: no rewrite for it, {reason} (session {key})"));
+            return failed(model, StopReason::Error, &format!("no Claude Code query waits with this session's context: {reason}"));
+        }
         debug(&format!("sync: rewrite, {reason} (session {key})"));
         if !one_shot {
             lock(&REWRITES).insert(key.clone(), reason.clone());
@@ -1125,12 +1152,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         if let Err(error) = start_query(start, turn) {
             return failed(model, StopReason::Error, &error);
         }
-        let mut answer = answer.await.unwrap_or_else(|_| failed(model, StopReason::Error, "Claude Code ended the query without answering"));
-        // A summary with no text in it failed: a compaction would keep an empty checkpoint.
-        if one_shot && answer.stop_reason == StopReason::Stop && !answer.content.iter().any(|block| matches!(block, Content::Text { text, .. } if !text.trim().is_empty())) {
-            (answer.stop_reason, answer.error_message) = (StopReason::Error, Some("Claude Code summary returned empty text".into()));
-        }
-        return answer;
+        return answer.await.unwrap_or_else(|_| failed(model, StopReason::Error, "Claude Code ended the query without answering"));
     }
 }
 

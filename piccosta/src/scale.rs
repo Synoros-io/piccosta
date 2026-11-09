@@ -362,7 +362,7 @@ async fn ask_opencode(agent_dir: &Path, credential: &crate::auth::Credential) ->
     Ok(())
 }
 
-fn low(agent_dir: &Path, model: &str) -> bool {
+pub fn low(agent_dir: &Path, model: &str) -> bool {
     used(agent_dir, plan(model)).is_some_and(|percent| percent >= low_usage_percent(agent_dir))
 }
 
