@@ -87,7 +87,7 @@ fn write_line(line: &str) {
 }
 
 // A print or json run: what's queued in the session, every message in turn, then whatever is sent
-// to its runtime while it runs, and (text mode) the last answer on stdout. Output: the exit code, or
+// to its runtime while it runs, and (text mode) the last prompt's answer on stdout. Output: the exit code, or
 // the error that stopped the run before it began.
 async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     let json = args.mode.as_deref() == Some("json");
@@ -189,22 +189,26 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
 
     // The last message, when it's the model's (print-mode.ts:139-159). A run that ended in an
     // error exits 1 in json mode too, so a script checking $? sees it (pi's json mode exits 0).
-    let last = agent.session.context().messages.pop();
-    let Some(AgentMessage::Assistant(answer)) = last else { return Ok(ExitCode::SUCCESS) };
+    let messages = agent.session.context().messages;
+    let Some(AgentMessage::Assistant(answer)) = messages.last() else { return Ok(ExitCode::SUCCESS) };
     if matches!(answer.stop_reason, StopReason::Error | StopReason::Aborted) {
         if !json {
             let reason = if answer.stop_reason == StopReason::Error { "error" } else { "aborted" };
-            eprintln!("{}", answer.error_message.unwrap_or_else(|| format!("Request {reason}")));
+            eprintln!("{}", answer.error_message.clone().unwrap_or_else(|| format!("Request {reason}")));
         }
         return Ok(ExitCode::FAILURE);
     }
     if json || !team.models.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
-    for block in &answer.content {
-        if let Content::Text { text, .. } = block {
-            write_line(text);
-        }
+    // The answer is every turn that ended since the last prompt, in order: a job still running
+    // after the model's answer starts another turn when it ends, and the model's reply to that
+    // news (often "nothing to do") would otherwise be all a subagent's parent gets.
+    let since_prompt = messages.iter().rposition(|message| matches!(message, AgentMessage::User(_))).map_or(0, |prompt| prompt + 1);
+    for message in &messages[since_prompt..] {
+        let AgentMessage::Assistant(reply) = message else { continue };
+        if reply.stop_reason == StopReason::ToolUse { continue }
+        reply.content.iter().for_each(|block| if let Content::Text { text, .. } = block { write_line(text) });
     }
     if answer.stop_reason == StopReason::Length {
         eprintln!("Response was truncated: the model reached its output token limit.");

@@ -385,7 +385,7 @@ impl App {
                 }
                 self.send(crate::prompt::command_prompt(&format!("/{line}")).unwrap_or_default());
             }
-            "agents" => match crate::tools::subagent::SubagentTool::load(&self.host.agent_dir) {
+            "agents" => match crate::tools::subagent::SubagentTool::load(&self.host.agent_dir, None) {
                 Some(tool) => self.report(tool.describe().join("\n")),
                 None => self.notice = Some("No subagent jobs are enabled.".into()),
             },

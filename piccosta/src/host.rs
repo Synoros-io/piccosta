@@ -257,7 +257,7 @@ impl Host {
     }
 
     // The model's tools: the built-in ones, the subagent tool (not in a subagent, which can't hand
-    // its task on) and, for a manager (`role`, in `cwd`), its own; cut to --tools when given.
+    // its task on; in a manager's lane, with the jobs its manager granted) and, for a manager (`role`, in `cwd`), its own; cut to --tools when given.
     // A session that can hand work on leaves the tools a kind of work owns to that kind's job, so
     // searching (say) runs on the scale's search models; a manager keeps them all, and so does a
     // subagent, which has no one to hand them to. --tools naming one keeps it. A session started
@@ -271,9 +271,10 @@ impl Host {
             return Ok(Vec::new());
         }
         let mut list = tools::builtin();
-        let subagents = std::env::var_os(tools::subagent::CHILD_ENV).is_none().then(|| tools::subagent::SubagentTool::load(&self.agent_dir)).flatten();
+        let granted = crate::manager::granted(session);
+        let subagents = std::env::var_os(tools::subagent::CHILD_ENV).is_none().then(|| tools::subagent::SubagentTool::load(&self.agent_dir, granted.as_deref())).flatten();
         let owned: Vec<String> = match (&subagents, role, crate::manager::work(session)) {
-            (Some(_), None, None) => crate::scale::owned(&self.agent_dir).into_iter().map(|(tool, _)| tool).collect(),
+            (Some(_), None, None) => crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| granted.as_ref().is_none_or(|jobs| jobs.contains(kind))).map(|(tool, _)| tool).collect(),
             _ => Vec::new(),
         };
         list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));

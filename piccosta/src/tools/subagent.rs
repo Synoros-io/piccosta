@@ -17,7 +17,8 @@
 // waits for it. The child's session goes in a `subagents` folder next to the parent's, out of the
 // parent folder's list. A subagent gets no subagent tool of its own (CHILD_ENV), and its session
 // records its job as its kind of work, so it has the job's tools and readOnly when it's reopened
-// too (host.rs tool_list).
+// too (host.rs tool_list). A manager's lane hands work only to the jobs its manager granted it, and
+// search (manager.rs granted).
 
 use super::{Tool, ToolContext, ToolFuture};
 use crate::auth::{credential_for, CredentialPaths};
@@ -44,6 +45,8 @@ struct Job {
 pub struct SubagentTool {
     jobs: Vec<Job>,
     agent_dir: PathBuf,
+    // Whether these are only the jobs a manager granted (a lane's), not every one.
+    granted: bool,
 }
 
 // Text as one single-quoted shell word.
@@ -52,12 +55,14 @@ fn quote(text: &str) -> String {
 }
 
 impl SubagentTool {
-    // The scale's jobs for an agent dir. None when none is on (no tool then).
-    pub fn load(agent_dir: &Path) -> Option<SubagentTool> {
+    // The scale's jobs for an agent dir, only those `granted` when it names some. None when none
+    // is on (no tool then).
+    pub fn load(agent_dir: &Path, granted: Option<&[String]>) -> Option<SubagentTool> {
         let strings = |entry: &Map<String, Value>, key: &str| -> Vec<String> { entry.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect() };
         let text = |entry: &Map<String, Value>, key: &str| entry.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string);
         let jobs: Vec<Job> = crate::scale::jobs(agent_dir)
             .into_iter()
+            .filter(|(name, _)| granted.is_none_or(|jobs| jobs.contains(name)))
             .map(|(name, entry)| Job {
                 description: text(&entry, "for").unwrap_or_default(),
                 tools: Some(strings(&entry, "tools").join(",")).filter(|tools| !tools.is_empty()),
@@ -66,7 +71,7 @@ impl SubagentTool {
                 name,
             })
             .collect();
-        (!jobs.is_empty()).then(|| SubagentTool { jobs, agent_dir: agent_dir.to_path_buf() })
+        (!jobs.is_empty()).then(|| SubagentTool { jobs, agent_dir: agent_dir.to_path_buf(), granted: granted.is_some() })
     }
 
     // The job's models that a connected account serves and that have a login, in its order, and a
@@ -196,7 +201,8 @@ impl Tool for SubagentTool {
             let task = arguments.get("task").and_then(Value::as_str).unwrap_or_default();
             let Some(job) = self.jobs.iter().find(|job| job.name == name) else {
                 let names: Vec<&str> = self.jobs.iter().map(|job| job.name.as_str()).collect();
-                return Err(format!("No subagent job \"{name}\". Jobs: {}", names.join(", ")));
+                let granted = if self.granted { " Your manager granted this session only these: do the rest of the work yourself." } else { "" };
+                return Err(format!("No subagent job \"{name}\". Jobs: {}.{granted}", names.join(", ")));
             };
             // The model the user named for this task, else the job's own.
             let models = match arguments.get("model").and_then(Value::as_str).filter(|model| !model.is_empty()) {
@@ -221,7 +227,7 @@ pub const SESSION_ENV: &str = "PICCOSTA_SESSION_ID";
 
 // The tools a job's subagent runs with, for an approval card: its own list, or "all tools".
 pub fn tools_of(job: &str) -> String {
-    let jobs = SubagentTool::load(&crate::config::agent_dir()).map(|tool| tool.jobs).unwrap_or_default();
+    let jobs = SubagentTool::load(&crate::config::agent_dir(), None).map(|tool| tool.jobs).unwrap_or_default();
     let Some(job) = jobs.into_iter().find(|candidate| candidate.name == job) else { return "all tools".into() };
     let tools = job.tools.unwrap_or_else(|| "all tools".into());
     if job.read_only { format!("{tools}, changing no files") } else { tools }

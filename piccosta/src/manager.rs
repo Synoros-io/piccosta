@@ -59,7 +59,7 @@ const PROJECT_ROLE: &str = "You are this project's manager: its sessions are you
 // Who an advisor's message to its own manager says it's from, which its manager's answer is to.
 const FROM_ADVISOR: &str = "your advisor";
 // {manager} is who it advises.
-const ADVISOR_ROLE: &str = "You are the advisor of {manager}: each turn your manager ends reaches you, and you advise it on direction, research design and what it may be missing. Search the web, fetch and read files freely, and take responsibility for what you advise: check it before you say it. Be direct and brief, and end your turn without a message when there's nothing to say. You start no work yourself: what should be done goes to your manager, or to the manager of the project it's in. The user talks to both of you, and the user's word decides. Check any findings, keep the user in the loop of both yourself and the manager to advisor.";
+const ADVISOR_ROLE: &str = "You are the advisor of {manager}: when the user or your manager messages you, you advise it on direction, research design and what it may be missing. Search the web, fetch and read files freely, and take responsibility for what you advise: check it before you say it. Be direct and brief, and end your turn without a message when there's nothing to say. You start no work yourself: what should be done goes to your manager, or to the manager of the project it's in. The user talks to both of you, and the user's word decides. Check any findings, keep the user in the loop of both yourself and the manager to advisor.";
 // How long a manager's command runs before it moves to the background, since nothing should run in
 // a manager's foreground: a quick look (ls, rg, git status) comes back whole, and anything slower,
 // a subagent above all, goes to the background so the manager stays free for the user. The usual
@@ -170,6 +170,9 @@ const ROLE_ENTRY: &str = "piccosta-manager";
 // The session entry that records the kind of work (the scale's) a session was started for, whose
 // tools and readOnly it gets wherever it's opened (host.rs tool_list).
 const WORK_ENTRY: &str = "piccosta-work";
+// The session entry that records the subagent jobs a manager granted a lane at `sessions start`
+// (its `subagents`: a list, or true for all), so it has those wherever it's opened (host.rs tool_list).
+const GRANT_ENTRY: &str = "piccosta-subagents";
 // The names managers take, which the sidebar and `sessions list` show.
 pub const ASSISTANT_NAME: &str = "assistant";
 pub const PROJECT_NAME: &str = "manager";
@@ -223,6 +226,18 @@ pub fn work(session: &crate::session::Session) -> Option<String> {
     })
 }
 
+// The subagent jobs a session may hand work to: None for all (no grant recorded, as in the user's
+// own sessions and managers, or true), else the ones its manager granted, and always search, since
+// web search goes to that job.
+pub fn granted(session: &crate::session::Session) -> Option<Vec<String>> {
+    let jobs = session.entries().iter().rev().find_map(|entry| match entry {
+        crate::session::SessionEntry::Custom { custom_type, data, .. } if custom_type == GRANT_ENTRY => data.as_ref()?.get("jobs").cloned(),
+        _ => None,
+    })?;
+    let jobs = jobs.as_array()?.iter().filter_map(Value::as_str).map(str::to_string);
+    Some(jobs.chain([crate::tools::web::openai_search::SEARCH_KIND.to_string()]).collect())
+}
+
 // The assistant's home, and a project's (a directory's) manager's.
 pub fn home(agent_dir: &Path) -> PathBuf {
     agent_dir.join("assistant")
@@ -273,10 +288,8 @@ pub fn make(agent_dir: &Path, session: &mut crate::session::Session, role: Role)
     let cwd = PathBuf::from(&session.header().cwd);
     let home = home_for(agent_dir, role, &cwd);
     fs::create_dir_all(&home)?;
-    // An advisor's one lane is its manager, whose turns it hears from the next one on.
     if role == Role::Advisor {
-        let manager = advised(agent_dir, &cwd).ok_or_else(|| std::io::Error::other("there's no manager here to advise: /manager makes one"))?;
-        take_lane(&home, &manager, PROJECT_NAME, None, last_turn(&manager).map(|(stamp, _)| stamp).unwrap_or_default());
+        advised(agent_dir, &cwd).ok_or_else(|| std::io::Error::other("there's no manager here to advise: /manager makes one"))?;
         set_work(session, ADVISOR_KIND)?;
     }
     let (kind, name) = match role {
@@ -464,14 +477,6 @@ fn last_turn(file: &Path) -> Option<(String, String)> {
     (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n") + &failed))
 }
 
-// Whether a session's latest user message, the one its last turn answers, is from its advisor.
-fn answers_advisor(file: &Path) -> bool {
-    let Ok(session) = crate::session::Session::read(file) else { return false };
-    let projection = session.projection();
-    let last = projection.iter().rev().flat_map(|entry| entry.messages.iter().rev()).find_map(|message| if let AgentMessage::User(user) = message { Some(user.content.text()) } else { None });
-    last.is_some_and(|text| text.lines().next().is_some_and(|line| line.ends_with(&format!(", from {FROM_ADVISOR}]"))))
-}
-
 // A lane's line in a check-in: how long since its last reply, and the end of the last line of text
 // it wrote.
 fn check_line(lane: &Lane) -> String {
@@ -499,20 +504,10 @@ fn ending(text: &str) -> String {
 fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> Option<String> {
     let (id, title) = (session_id(&lane.file), lane.title.clone());
     let news = match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
-        // An advisor's one lane is its manager, and a turn answering the advisor's own message
-        // isn't news to it: each would wake the other.
-        Some((stamp, _)) if home.ends_with(ADVISOR_DIR) && answers_advisor(&lane.file) => {
-            lane.reported = stamp;
-            None
-        }
         Some((stamp, said)) => {
             lane.reported = stamp;
             let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
-            Some(if home.ends_with(ADVISOR_DIR) {
-                format!("[{}, your manager ended its turn] What it said, the end of it:\n{}\n\nMessage it (`sessions message`) only when it should hear something from you.", now_text(), ending(&said))
-            } else {
-                format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said))
-            })
+            Some(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)))
         }
         None if ended == Some(false) && lane.launched.is_some() => {
             let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
@@ -536,9 +531,11 @@ fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> O
 // `check_minutes`, once the manager is `idle`, a check-in on the lanes at work then, when there are
 // any. A lane whose file is gone, or that was closed, leaves the list. The news goes to the
 // manager's runtime, as messages.
-// An advisor's manager gets no reminders or check-ins.
+// An advisor has no lanes: it hears from the user and its manager only when they message it.
 pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, (wait_minutes, check_minutes): (u64, u64), idle: impl Fn() -> bool) {
-    let (wait_minutes, check_minutes) = if home.ends_with(ADVISOR_DIR) { (u64::MAX, 0) } else { (wait_minutes, check_minutes) };
+    if home.ends_with(ADVISOR_DIR) {
+        return;
+    }
     let (heard_sender, mut heard) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, Value)>();
     let mut listening = std::collections::HashSet::new();
     let mut tick = tokio::time::interval(POLL);
@@ -845,8 +842,7 @@ impl SessionsTool {
             Sent::Unconfirmed => ("It was sent, not confirmed: the piccosta running it didn't answer in time (stopped, or stuck), or its connection ended without an answer. It isn't sent again. Read the session later, or stop it (`sessions stop`).".to_string(), None),
             Sent::Queued => ("It's a manager's session, so the message waits in it for the service or a terminal UI to open it; read the session later to see what came of it.".to_string(), None),
         };
-        // An advisor answers its manager by message, so it isn't a lane: each would wake the other.
-        // An advisor's one lane is its own manager, from the start, so its messages add none.
+        // An advisor answers its manager by message, so it isn't a lane, and an advisor has none.
         if !self.advising && crate::session::Session::read(file).ok().and_then(|session| role(&session)) != Some(Role::Advisor) {
             take_lane(&self.home, file, title, run, heard);
         }
@@ -961,8 +957,8 @@ impl Tool for SessionsTool {
         }
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: format!("The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, and the model scale with each plan's usage now.
-A session you start or message is one of your lanes: its run carries on in a process of its own, and you get a message with what it said when its turn ends. Messages reach you from the user, your lanes, your schedules, the assistant and your advisor, each saying which, with the time; an advisor's advice is advice, the user's word decides. A turn that ended isn't proof the work was done: read it before you tell the user what happened and which session to open (`ledger notify` when they'd want to know now). Report what was asked; suggest next steps only when asked, or when something needs their decision. Check in on lanes while they work, not only when they end (read them; `ledger schedule` your next look), and act on one stuck, off track, repeating itself or waiting: message or stop it, and tell the user. Close a lane once its work is done: one left quiet keeps reminding you. When the user asks for a session and not for work in it, start it without a message; don't make up a first task. A project with its own manager (projects shows which) gets its work through that manager, not sessions you start there. Choose models with use, the kind of work from the model scale (usage shows it): piccosta picks the model and moves on when a plan runs low. Say which use and why, and consider a second model for long or important lanes (trio: it checks each answer once; pair: the two work it through together). Name a model only when the user did, and when something you read disagrees with the scale, ask the user. {}", self.quota),
+            description: format!("The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name; subagents: the subagent jobs it may use, or true for all; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, and the model scale with each plan's usage now.
+A session you start or message is one of your lanes: its run carries on in a process of its own, and you get a message with what it said when its turn ends. Messages reach you from the user, your lanes, your schedules, the assistant and your advisor, each saying which, with the time; an advisor's advice is advice, the user's word decides. A turn that ended isn't proof the work was done: read it before you tell the user what happened and which session to open (`ledger notify` when they'd want to know now). Report what was asked; suggest next steps only when asked, or when something needs their decision. Check in on lanes while they work, not only when they end (read them; `ledger schedule` your next look), and act on one stuck, off track, repeating itself or waiting: message or stop it, and tell the user. Close a lane once its work is done: one left quiet keeps reminding you. A lane carries out its task itself: subagents flatten research and lose the structure the user gave it, and spend usage the user didn't start. Grant a lane subagents (which jobs) only when its task truly needs handing parts on; search is always there. When the user asks for a session and not for work in it, start it without a message; don't make up a first task. A project with its own manager (projects shows which) gets its work through that manager, not sessions you start there. Choose models with use, the kind of work from the model scale (usage shows it): piccosta picks the model and moves on when a plan runs low. Say which use and why, and consider a second model for long or important lanes (trio: it checks each answer once; pair: the two work it through together). Name a model only when the user did, and when something you read disagrees with the scale, ask the user. {}", self.quota),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -978,7 +974,8 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     "thinking": {"type": "string"},
                     "pair": {"type": "string", "description": "A model to work with as a pair: the two answer each other in turn until one says it's done, then the user (or you) speaks"},
                     "trio": {"type": "string", "description": "A model to work with as a trio: it checks each answer once, then the user (or you) speaks"},
-                    "name": {"type": "string"}
+                    "name": {"type": "string"},
+                    "subagents": {"type": ["array", "boolean"], "items": {"type": "string"}, "description": "For start: the subagent jobs the session may use (search it always has), or true for all; left out, none"}
                 }
             }),
             constrained_sampling: None,
@@ -1014,10 +1011,24 @@ A session you start or message is one of your lanes: its run carries on in a pro
                 "start" => {
                     let dir = PathBuf::from(need("dir")?);
                     let dir = dir.canonicalize().map_err(|error| format!("{}: {error}", dir.display()))?;
+                    // The lane's subagents: none but search unless granted, and only jobs the scale has. A
+                    // session started without a task is the user's to work in, so it keeps them all.
+                    let grant = match arguments.get("subagents") {
+                        Some(Value::Bool(all)) => if *all { json!(true) } else { json!([]) },
+                        Some(Value::Array(jobs)) => json!(jobs),
+                        None if string(&arguments, "message").is_none() => json!(true),
+                        None => json!([]),
+                        Some(other) => return Err(format!("subagents is a list of jobs or true, not {other}")),
+                    };
+                    let jobs: Vec<String> = crate::scale::jobs(&self.agent_dir).into_iter().map(|(name, _)| name).collect();
+                    if let Some(unknown) = grant.as_array().into_iter().flatten().find(|job| !job.as_str().is_some_and(|job| jobs.iter().any(|known| known == job))) {
+                        return Err(format!("No subagent job {unknown}. Jobs: {}", jobs.join(", ")));
+                    }
                     // Written whole now, so it's listed at once and a run opens this very session.
                     let folder = crate::session::default_session_dir(&self.agent_dir, &dir);
                     let mut session = crate::session::Session::create(&dir, Some(&folder));
                     session.persist_now().map_err(|error| error.to_string())?;
+                    session.append_custom(GRANT_ENTRY, Some(json!({ "jobs": grant }))).map_err(|error| error.to_string())?;
                     let (model, note) = self.configure(&mut session, &arguments)?;
                     let file = session.file().ok_or("could not name the session's file")?.to_path_buf();
                     // Kept, so this manager may delete it later: a manager deletes only what it made.

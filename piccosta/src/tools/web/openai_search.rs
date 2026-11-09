@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 // The scale kind whose models web_search asks when `web.searchModel` isn't set.
-const SEARCH_KIND: &str = "search";
+pub const SEARCH_KIND: &str = "search";
 // The wire protocols this request speaks: Codex's backend and the Responses API as opencode-go
 // serves it.
 const CODEX_API: &str = "openai-codex-responses";
