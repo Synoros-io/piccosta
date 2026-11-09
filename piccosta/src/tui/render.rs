@@ -130,7 +130,9 @@ pub fn report(text: &str, width: u16, tex: &mut Tex) -> Rows {
 // wasn't normally. `frame` turns running tools' spinners.
 pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut Tex) -> Rows {
     let mut writer = Writer::new(tex, width);
-    for block in blocks {
+    let view = |id: &String| tools.get(id).cloned().unwrap_or(ToolView { running: ended.is_none(), ..Default::default() });
+    let mut blocks = blocks.iter().peekable();
+    while let Some(block) = blocks.next() {
         match block {
             Block::Thinking(text) if !text.trim().is_empty() => {
                 let style = Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC);
@@ -150,9 +152,21 @@ pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, t
             }
             Block::Thinking(_) => {}
             Block::Text(text) => writer.markdown(text),
-            Block::Call { id, name, arguments } => {
-                let view = tools.get(id).cloned().unwrap_or(ToolView { running: ended.is_none(), ..Default::default() });
-                writer.tool(name, arguments, &view, flags, frame);
+            // Calls in a row: while tools are folded, the ones that have ended are one line counting
+            // them, so a wall of commands doesn't fill the screen; a call still running keeps its
+            // own line under it. ctrl+o opens them all.
+            Block::Call { .. } => {
+                let mut calls = vec![block];
+                calls.extend(std::iter::from_fn(|| blocks.next_if(|next| matches!(next, Block::Call { .. }))));
+                let calls: Vec<(&String, &Map<String, Value>, ToolView)> = calls.into_iter().filter_map(|call| if let Block::Call { id, name, arguments } = call { Some((name, arguments, view(id))) } else { None }).collect();
+                let ended = calls.iter().filter(|(_, _, view)| !view.running).count();
+                let folded = !flags.tools_open && ended > 1;
+                if folded {
+                    writer.run(calls.iter().filter(|(_, _, view)| !view.running).map(|(name, _, view)| (name.as_str(), view.is_error)));
+                }
+                for (name, arguments, view) in calls.iter().filter(|(_, _, view)| !folded || view.running) {
+                    writer.tool(name, arguments, view, flags, frame);
+                }
             }
         }
     }
@@ -515,9 +529,27 @@ impl<'t> Writer<'t> {
         self.blank();
     }
 
+    // Calls that have ended, as one line: how many, by tool in the order first called, and how many
+    // failed. Input: each call's tool name and whether it failed.
+    fn run<'a>(&mut self, calls: impl Iterator<Item = (&'a str, bool)>) {
+        let (mut names, mut count, mut failed): (Vec<(&str, usize)>, usize, usize) = (Vec::new(), 0, 0);
+        for (name, is_error) in calls {
+            match names.iter_mut().find(|(seen, _)| *seen == name) {
+                Some((_, times)) => *times += 1,
+                None => names.push((name, 1)),
+            }
+            (count, failed) = (count + 1, failed + usize::from(is_error));
+        }
+        let names: Vec<String> = names.iter().map(|(name, times)| if *times > 1 { format!("{name} ×{times}") } else { name.to_string() }).collect();
+        self.text(&format!("▸ {count} calls: {}", names.join(", ")), Style::new().fg(theme::DIM));
+        if failed > 0 {
+            self.word(&format!(", {failed} failed"), Style::new().fg(theme::ERROR));
+        }
+        self.flush_line(false);
+    }
+
     // A tool call: one line naming it, with how many lines of output it has hidden; with tools open
-    // (ctrl+o), its output (a diff for an edit) under it, up to TOOL_OPEN_ROWS. A run of calls stays
-    // a run of lines, so the conversation, not the commands, fills the screen.
+    // (ctrl+o), its output (a diff for an edit) under it, up to TOOL_OPEN_ROWS.
     fn tool(&mut self, name: &str, arguments: &Map<String, Value>, view: &ToolView, flags: Flags, frame: usize) {
         let (mark, color) = match (view.running, view.is_error) {
             (true, _) => (SPINNER[frame % SPINNER.len()], theme::ACCENT),

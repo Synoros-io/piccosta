@@ -289,6 +289,10 @@ impl Slot {
                         self.call_owner.insert(id, self.messages.len());
                     }
                 }
+                // The reply before may end in calls this one's carry on as a run: draw it again.
+                if let Some(before) = self.messages.iter().rposition(|earlier| matches!(earlier, AgentMessage::Assistant(_))) {
+                    self.cache.remove(&before);
+                }
                 let usage = &assistant.usage;
                 if usage.total_tokens > 0 {
                     self.context_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
@@ -2372,15 +2376,16 @@ impl App {
 
         let height = usize::from(body.height);
         // Scrolled up, the rows added below the view since the last draw (the answer being written,
-        // new messages, the working line) raise the scroll by as much, before the transcript is cut
-        // to the window, so the view stays on what the user was reading. At the bottom it follows.
+        // new messages, the working line) raise the scroll by as much, and the rows gone from there
+        // (a call that ended folding into its run's line) lower it, before the transcript is cut to
+        // the window, so the view stays on what the user was reading. At the bottom it follows.
         let busy_rows = usize::from(self.slots[slot_index].busy()) * 2;
         let mut below = None;
         if let Some((count, before)) = self.panes[index].anchor
             && self.panes[index].scroll > 0
         {
             let now = self.transcript(slot_index, width, 0, count).1 + busy_rows;
-            self.panes[index].scroll += now.saturating_sub(before);
+            self.panes[index].scroll = (self.panes[index].scroll + now).saturating_sub(before);
             below = (count == self.slots[slot_index].messages.len()).then_some(now);
         }
         // --single's live part takes as many rows as it has (inline.rs), so all of them are counted.
@@ -2404,7 +2409,9 @@ impl App {
         }
         let scroll = self.panes[index].scroll.min(rows.len().saturating_sub(height));
         self.panes[index].scroll = scroll;
-        let count = self.slots[slot_index].messages.len();
+        // Counted from the last reply on, since a reply joining a run moves that one's line to it.
+        let history = &self.slots[slot_index].messages;
+        let count = history.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))).unwrap_or(history.len());
         let tail = match below {
             Some(now) => now,
             None if scroll > 0 => self.transcript(slot_index, width, 0, count).1 + busy_rows,
@@ -2582,9 +2589,18 @@ impl App {
         if let Some((_, _, rows)) = slot.cache.get(&index).filter(|(cached_width, cached_flags, _)| *cached_width == width && *cached_flags == flags) {
             return rows.clone();
         }
+        // While tools are folded, a run of calls over several messages draws on its last one, so its
+        // ended calls fold into one line. --single prints its calls open instead.
+        let run = (!flags.tools_open && !self.single).then(|| run_of(&slot.messages, index, flags)).flatten();
+        // One that draws nothing of a run still names a switched-to model where the switch was.
         let mut rows = model_row(&slot.messages[..index], model_of(&slot.messages[index]));
-        rows.extend(message_rows(&slot.messages[index], &slot.tools, flags, frame, width, &mut self.tex));
-        // A message with a tool still running keeps redrawing for its spinner.
+        rows.extend(match (&run, &slot.messages[index]) {
+            (Some(calls), _) if calls.is_empty() => Vec::new(),
+            (Some(calls), AgentMessage::Assistant(reply)) => render::assistant(calls, Some((&reply.stop_reason, None)), &slot.tools, flags, frame, width, &mut self.tex),
+            _ => message_rows(&slot.messages[index], &slot.tools, flags, frame, width, &mut self.tex),
+        });
+        // A message with a tool still running keeps redrawing for its spinner. A run's members are
+        // kept too: a reply after one clears the one before it (remember), the only one that changes.
         let running = slot.call_owner.iter().any(|(id, owner)| *owner == index && slot.tools.get(id).is_some_and(|tool| tool.running));
         if !running {
             slot.cache.insert(index, (width, flags, rows.clone()));
@@ -2639,6 +2655,43 @@ fn model_row(earlier: &[AgentMessage], model: Option<String>) -> Rows {
         Some(model) if earlier.iter().rev().find_map(model_of).is_some_and(|previous| previous != model) => vec![Line::from(Span::styled(format!("  {model}"), Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC)))],
         _ => Vec::new(),
     }
+}
+
+// The run of calls a message is in: the calls ending a reply (after its text, or all of it), the
+// replies after it that are only calls (and folded thinking), and the tool results between them.
+// Input: a slot's messages and one of them. Output: None outside a run; for a message a later one in
+// the run draws for, what of it comes before its calls; for the run's last, all of the run's calls.
+fn run_of(messages: &[AgentMessage], index: usize, flags: Flags) -> Option<Vec<Part>> {
+    // A reply split into what's shown before its last calls, and those calls.
+    let split = |message: &AgentMessage| match message {
+        AgentMessage::Assistant(reply) if !matches!(reply.stop_reason, crate::message::StopReason::Error | crate::message::StopReason::Aborted) => {
+            let blocks = render::blocks(reply);
+            let shown = |block: &Part| match block {
+                Part::Call { .. } => false,
+                Part::Text(text) => !text.trim().is_empty(),
+                Part::Thinking(text) => flags.thinking_open && !text.trim().is_empty(),
+            };
+            let at = blocks.iter().rposition(shown).map_or(0, |at| at + 1);
+            Some((blocks[..at].to_vec(), blocks[at..].iter().filter(|block| matches!(block, Part::Call { .. })).cloned().collect::<Vec<_>>()))
+        }
+        AgentMessage::ToolResult(_) => Some((Vec::new(), Vec::new())),
+        _ => None,
+    };
+    let (before, own) = split(&messages[index]).filter(|(_, own)| !own.is_empty())?;
+    if messages[index + 1..].iter().map_while(split).take_while(|(before, _)| before.is_empty()).any(|(_, later)| !later.is_empty()) {
+        return Some(before);
+    }
+    if !before.is_empty() {
+        return None;
+    }
+    let mut run = own;
+    for (before, calls) in messages[..index].iter().rev().map_while(split) {
+        run.splice(0..0, calls);
+        if !before.is_empty() {
+            break;
+        }
+    }
+    Some(run)
 }
 
 fn model_of(message: &AgentMessage) -> Option<String> {
