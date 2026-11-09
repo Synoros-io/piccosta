@@ -42,7 +42,8 @@
 //                                  next message (default the login's cache life, hold_time; 0 ends
 //                                  it with each turn)
 //   CLAUDE_BRIDGE_HOLD_MAX, holdMax         how many such queries may wait at once in this piccosta
-//                                  process (default HOLD_MAX); past it the longest idle one closes
+//                                  process (default HOLD_MAX); past it the one with the smallest
+//                                  context closes, never a manager's
 //   CLAUDE_BRIDGE_STRICT_MCP, strictMcp     off: let Claude Code load MCP servers from
 //                                  ~/.claude.json and .mcp.json
 //   CLAUDE_BRIDGE_ONE_M, oneM; CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE, longContextExtraUsage;
@@ -802,6 +803,12 @@ fn usage_of<'a>(requests: impl Iterator<Item = &'a Counters>) -> Usage {
         reasoning: sum.reasoning, total_tokens: sum.input + sum.output + sum.cache_read + sum.cache_write, cost: Default::default() }
 }
 
+// The context a query holds, which a rewrite would write to the cache again: its largest request's
+// (a query's context only grows, and a surplus the result counted is no request of its own).
+fn context(requests: &[Counters]) -> u64 {
+    requests.iter().map(|request| request.input + request.cache_read + request.cache_write).max().unwrap_or(0)
+}
+
 // The response a message came from, as pi's own Anthropic provider names it: responseModel only
 // when the served model isn't the one asked for.
 fn record_response(output: &mut AssistantMessage, id: &Value, served: &Value, model: &Model) {
@@ -873,10 +880,12 @@ struct State {
     prints: Vec<String>,
     pending: Option<Vec<String>>,
     // Its turn is over, stopped mid-answer (pi's abort) or answered, and it waits, as Claude Code
-    // does at its prompt, for the next message, which goes into this same query (interrupt, hold),
-    // since when (for the cap on waiting queries).
+    // does at its prompt, for the next message, which goes into this same query (interrupt, hold).
     waiting: bool,
-    idle_since: Instant,
+    // For the cap on waiting queries: what closing it would write again (the context it holds, in
+    // tokens), and whether it's a manager's, which is never closed.
+    context: u64,
+    manager: bool,
     kept_base: (Vec<String>, Vec<String>),
     // Whether Claude Code was told fast mode is on (/fast).
     fast: bool,
@@ -938,12 +947,14 @@ pub struct Handed {
     // known: priced as unpriced, at Claude Code's own reckoning where it bills by the token (price).
     #[serde(default)]
     cost_supplied: bool,
-    // Fast mode as the session last asked for it and as Claude Code last took it (/fast), and a
-    // refusal's line the session hasn't shown yet.
+    // Fast mode as the session last asked for it and as Claude Code last took it (/fast), a
+    // refusal's line the session hasn't shown yet, and whether it's a manager's (State).
     #[serde(default)]
     fast: (bool, bool),
     #[serde(default)]
     notice: Option<String>,
+    #[serde(default)]
+    manager: bool,
 }
 
 // /restart: each query waiting for its next message gives its Claude Code to the image this process
@@ -978,7 +989,7 @@ pub fn adopt(handed: Vec<Handed>) {
             lock(&NOTES).insert(query.key.clone(), notice);
         }
         let state = Arc::new(Mutex::new(State { shape: query.shape.clone(), prints: query.prints, pending: None, waiting: true,
-            idle_since: Instant::now(), kept_base: Default::default(), fast: query.fast.0 }));
+            context: context(&query.requests), manager: query.manager, kept_base: Default::default(), fast: query.fast.0 }));
         let (commands, inbox) = mpsc::unbounded_channel();
         let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
         let mut adopted = Query::new(id, &query.key, query.model, &[], child, inbox, state.clone(), query.project_path, &query.cwd, query.shape, query.written);
@@ -1066,19 +1077,22 @@ fn end_query(session_id: &str, reason: &str, keep_waiting: bool) {
     }
 }
 
-// Keep the waiting queries within CLAUDE_BRIDGE_HOLD_MAX, `key`'s own query counted as one of
-// them: a new query is about to start for it, or its query just started waiting. The longest idle
-// of the others close first.
-fn make_room(key: &str) {
+// Keep the waiting queries within CLAUDE_BRIDGE_HOLD_MAX, as each starts waiting, once its context
+// is known. The ones with the smallest context close first, the one just waiting too, since their
+// rewrites write the least again. A manager's never closes: it's the standing session its lanes
+// and schedules message.
+fn make_room() {
     let mut all = lock(&LIVE);
-    let mut waiting: Vec<(Instant, String)> = all.iter().filter(|(other, _)| *other != key).filter_map(|(other, live)| {
+    let mut waiting: Vec<(u64, String, bool)> = all.iter().filter_map(|(key, live)| {
         let state = lock(&live.state);
-        state.waiting.then(|| (state.idle_since, other.clone()))
+        state.waiting.then(|| (state.context, key.clone(), state.manager))
     }).collect();
+    // Managers don't count toward the limit, so other sessions keep their hold however many wait.
+    waiting.retain(|(.., manager)| !manager);
+    let over = waiting.len().saturating_sub(SETTINGS.hold_max);
     waiting.sort();
-    let over = (waiting.len() + 1).saturating_sub(SETTINGS.hold_max);
-    for (_, other) in waiting.into_iter().take(over) {
-        if let Some(live) = all.remove(&other) {
+    for (_, key, _) in waiting.into_iter().take(over) {
+        if let Some(live) = all.remove(&key) {
             let_go(live, &format!("more than {} queries waiting (claudeBridge.holdMax)", SETTINGS.hold_max));
         }
     }
@@ -1121,7 +1135,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
     loop {
         let (reply, answer) = oneshot::channel();
         let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
-        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, forced.take(), turn) {
+        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, request.manager, forced.take(), turn) {
             Ok(()) => match answer.await {
                 Ok(message) => {
                     if let Some(prints) = before && let Some(live) = lock(&LIVE).get(&key) {
@@ -1148,7 +1162,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
             lock(&REWRITES).insert(key.clone(), reason.clone());
         }
         let start = Start { key: &key, model, cli_model: &cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
-            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, one_shot };
+            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, one_shot, manager: request.manager };
         if let Err(error) = start_query(start, turn) {
             return failed(model, StopReason::Error, &error);
         }
@@ -1184,7 +1198,8 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
 // Hand this call's tool results to the parked query when the sync check allows it. Output: Ok once
 // they're sent (the next turn streams into `turn`), else the rewrite reason and the turn back; the
 // live query, if any, is discarded then.
-fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
+#[allow(clippy::too_many_arguments)]
+fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, manager: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
     let mut live = lock(&LIVE);
     let decision = match forced {
         Some(reason) => Err(reason),
@@ -1204,6 +1219,8 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
     // parked one, the results of the calls it's parked on.
     let mut state = lock(&entry.state);
     // Fast mode is a request field, not part of the prompt, so a running query takes it as it is.
+    // Whether it's a manager's, from the session each turn (a query adopted from an older piccosta lacks it).
+    state.manager = manager;
     if state.fast != fast {
         state.fast = fast;
         let _ = entry.commands.send(Command::Fast(fast));
@@ -1256,6 +1273,7 @@ struct Start<'a> {
     // A summary's: it ends with its turn, keeps no records, takes no tools and leaves the waiting
     // queries alone.
     one_shot: bool,
+    manager: bool,
 }
 
 // Start a query holding exactly pi's context: the history in a fresh session file it resumes, the
@@ -1311,9 +1329,6 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         }
         args.extend(["--system-prompt-file".to_string(), file.to_string_lossy().into_owned()]);
     }
-    if !start.one_shot {
-        make_room(start.key);
-    }
     let child = spawn(&args, start.cwd, resumes_turn).inspect_err(|_| {
         if let Some(id) = &written {
             history::delete_session(id, &project_path);
@@ -1324,7 +1339,7 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
         opening.push(json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null}));
     }
     let state = Arc::new(Mutex::new(State { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None, waiting: false,
-        idle_since: Instant::now(), kept_base: kept_base(&visible), fast: start.fast }));
+        context: 0, manager: start.manager, kept_base: kept_base(&visible), fast: start.fast }));
     let (commands, inbox) = mpsc::unbounded_channel();
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
     let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
@@ -1587,7 +1602,7 @@ impl Query {
             cwd: self.cwd.clone(), written: self.written.clone(), cc_session: self.cc_session.clone(),
             hold_ms: self.hold_until.map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64), cost_seen: self.cost_seen,
             pending_turns: self.pending_turns, requests: self.requests.clone(), stderr: lock(&self.child.stderr).clone(),
-            cost_supplied: self.model.cost.supplied, fast: (state.fast, self.fast), notice: lock(&NOTES).remove(&self.key) })
+            cost_supplied: self.model.cost.supplied, fast: (state.fast, self.fast), notice: lock(&NOTES).remove(&self.key), manager: state.manager })
     }
 
     #[cfg(windows)]
@@ -1676,9 +1691,9 @@ impl Query {
             let mut state = lock(&self.state);
             state.pending = None;
             state.waiting = true;
-            state.idle_since = Instant::now();
+            state.context = context(&self.requests);
         }
-        make_room(&self.key);
+        make_room();
         if let Some(turn) = self.turn.take() {
             self.out.stop_reason = StopReason::Aborted;
             self.out.error_message.get_or_insert_with(|| "Operation aborted".to_string());
@@ -1913,9 +1928,9 @@ impl Query {
             let mut state = lock(&self.state);
             state.prints.push(fingerprint(&Message::Assistant(self.out.clone())));
             state.waiting = true;
-            state.idle_since = Instant::now();
+            state.context = context(&self.requests);
         }
-        make_room(&self.key);
+        make_room();
         self.hold_until = Some(Instant::now() + hold_time());
         debug(&format!("sync: waiting for the next message for {} s (session {})", hold_time().as_secs(), self.key));
         self.reply();

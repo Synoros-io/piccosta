@@ -105,6 +105,9 @@ pub struct Request<'a> {
     // Idle compaction's summary, asked for at the end of the session's own context (compaction.rs
     // summarize_in_place): the Claude bridge only puts it to the query already holding that context.
     pub in_place: bool,
+    // Whether the session is a manager (the assistant or a project's), whose waiting Claude Code the
+    // bridge's cap on waiting queries never closes.
+    pub manager: bool,
     // pi's `transport` setting, for an API that has a choice (Codex): "auto" (a websocket that
     // sends only new input when it can, SSE when it can't be used), "websocket" (always the full
     // input), "websocket-cached", or "sse".

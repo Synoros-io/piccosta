@@ -659,6 +659,7 @@ async fn request_once(request: &SummaryRequest<'_>, prompt_text: &str) -> Assist
             session_id: Some(&session_id),
             cache: false,
             in_place: false,
+            manager: false,
             transport: request.transport,
             thinking_level,
             session_file: None,

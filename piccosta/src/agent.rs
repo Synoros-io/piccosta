@@ -997,7 +997,7 @@ impl Agent {
     // A request on the session's own context, the same for each turn and for idle compaction: its
     // model, level, transport, files and cache key, so the provider keeps the one cached prefix.
     fn request<'a>(config: &'a AgentConfig, session: &'a Session, messages: &'a [crate::message::Message], credential: &'a auth::Credential, cancel: CancellationToken) -> Request<'a> {
-        Request { model: &config.model, messages, credential, session_id: Some(session.id()), cache: true, in_place: false, transport: &config.transport,
+        Request { model: &config.model, messages, credential, session_id: Some(session.id()), cache: true, in_place: false, manager: config.manager_home.is_some(), transport: &config.transport,
             thinking_level: &config.thinking_level, session_file: session.file(), cwd: &config.cwd, cancel }
     }
 
