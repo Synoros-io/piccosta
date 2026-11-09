@@ -972,6 +972,12 @@ impl Agent {
                 failed
             }
         };
+        // A Claude model's first turn can learn that it gets 200K, not 1M (claude::stream); the
+        // session compacts against that from here.
+        let model = &mut self.config.model;
+        if model.provider == provider::claude::PROVIDER {
+            model.context_window = model.context_window.min(provider::claude::context_window(&model.id, model.max_tokens));
+        }
         (self.emit)(&Event::MessageEnd { message: AgentMessage::Assistant(message.clone()) });
         let id = self.session.append_message(AgentMessage::Assistant(message.clone())).map_err(|error| format!("Could not write the session: {error}"))?;
         // The cache monitor: a response that had to write most of its context to the cache again
@@ -1213,7 +1219,7 @@ impl Agent {
     // Right before a response, inside a run (its messages and tool results all in): compact only
     // when the request wouldn't fit, since a compaction rewrites the whole prompt cache (on the Claude
     // bridge, all of it). So compactAt waits for the turn's end, and the room kept for the reply
-    // is reserveTokens, except on the bridge, whose window already keeps it (claude effective_window).
+    // is reserveTokens, except on the bridge, whose window already keeps it (claude context_window).
     // An estimate that falls short still gets the overflow's compact-and-retry after the run.
     async fn compact_before_next_response(&mut self) -> Result<(), String> {
         let context_window = self.config.model.context_window;

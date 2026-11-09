@@ -46,7 +46,7 @@
 //                                  context closes, never a manager's
 //   CLAUDE_BRIDGE_STRICT_MCP, strictMcp     off: let Claude Code load MCP servers from
 //                                  ~/.claude.json and .mcp.json
-//   CLAUDE_BRIDGE_ONE_M, oneM; CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE, longContextExtraUsage;
+//   CLAUDE_BRIDGE_LONG_CONTEXT_EXTRA_USAGE, longContextExtraUsage;
 //   CLAUDE_BRIDGE_FORCE_200K, force200k     which models get 1M context (runtime_model); lists
 //                                  are comma-separated in the environment, arrays in settings.json
 //   CLAUDE_BRIDGE_NO_THINKING_OFF, noThinkingOff   models that can't turn thinking off
@@ -90,11 +90,13 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
 const MCP_RESULT_MAX_CHARS: u64 = 500_000;
 // The file a resumed query reads pi's prompt from, in the session's own dir (deleted with it).
 const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
-// The ids Claude Code answers 1M context for when asked with [1m] (measured on every plan by
-// 2026-11-02; a newer model serves 200K until it's measured and added to `claudeBridge.oneM`). An
-// unentitled [1m] fails every turn, so the default is the bare id at 200K.
-const MEASURED_ONE_M: [&str; 9] = ["claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
-    "claude-opus-4-7", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+// Every model is asked for with [1m], at 1M. An account not entitled to that gets every such turn
+// refused with one of these (Claude Code 2.1.321, read in the binary: the API's 429 message, which
+// its own check for the case matches, and the line it puts in its place on a subscription). The
+// model is then asked for bare, at 200K, from that turn on, and kept in REFUSED_1M_FILE beside the
+// model lists so a restart and the model list know it.
+const LONG_CONTEXT_REFUSALS: [&str; 3] = ["Extra usage is required for long context", "Usage credits are required for long context", "Usage credits required for 1M context"];
+const REFUSED_1M_FILE: &str = "claude-bridge-200k.json";
 const ONE_M: u64 = 1_000_000;
 const TWO_HUNDRED_K: u64 = 200_000;
 // Models Claude Code won't run with thinking off: given --thinking=disabled it still asks for
@@ -201,7 +203,6 @@ pub struct Settings {
     hold: Option<Duration>,
     hold_max: usize,
     strict_mcp: bool,
-    one_m: Vec<String>,
     no_thinking_off: Vec<String>,
     extra_usage: bool,
     force_200k: Vec<String>,
@@ -242,7 +243,6 @@ pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
         hold: if hold_max == 0 { Some(Duration::ZERO) } else { hold },
         hold_max,
         strict_mcp: setting("STRICT_MCP", "strictMcp").is_none_or(|strict| is_on(&strict)),
-        one_m: list("ONE_M", "oneM", &MEASURED_ONE_M),
         no_thinking_off: list("NO_THINKING_OFF", "noThinkingOff", &NO_THINKING_OFF),
         extra_usage: setting("LONG_CONTEXT_EXTRA_USAGE", "longContextExtraUsage").is_some_and(|extra| is_on(&extra)),
         force_200k: list("FORCE_200K", "force200k", &[]),
@@ -363,17 +363,40 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // --- Models ---
 
+// The models Claude Code refused 1M context for, as REFUSED_1M_FILE kept them, read once per process.
+static REFUSED_1M: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(read_refused_1m()));
+
+fn refused_1m_path() -> PathBuf {
+    crate::config::agent_dir().join(crate::model::LISTS_DIR).join(REFUSED_1M_FILE)
+}
+
+fn read_refused_1m() -> HashSet<String> {
+    std::fs::read_to_string(refused_1m_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+// Keep a model as refused 1M, with what another piccosta process kept meanwhile.
+fn refuse_1m(id: &str) {
+    let mut refused = lock(&REFUSED_1M);
+    refused.insert(id.to_string());
+    refused.extend(read_refused_1m());
+    let _ = crate::platform::private_dir(&crate::config::agent_dir().join(crate::model::LISTS_DIR));
+    if let Err(error) = crate::auth::write_private_json(&refused_1m_path(), &json!(refused.iter().collect::<std::collections::BTreeSet<_>>())) {
+        debug(&format!("couldn't keep {id} as refused 1M: {error}"));
+    }
+}
+
 // Input: a model id. Output: the id Claude Code is asked for and the window it serves. 1M needs the
-// [1m] suffix, given only where measured; opus-4-6 serves it on Max or with extra usage, sonnet-4-6
-// with extra usage only.
+// [1m] suffix, given unless Claude Code refused it (REFUSED_1M) or the user pinned the model to
+// 200K; opus-4-6 and sonnet-4-6 bill 1M as extra usage, so they get it only where that's asked for
+// (opus-4-6 also on Max, where it's in the plan).
 fn runtime_model(id: &str) -> (String, u64) {
     let settings = &*SETTINGS;
-    let gated = match id {
-        "claude-opus-4-6" => settings.extra_usage || AUTH.as_ref().is_some_and(|auth| auth["subscriptionType"] == "max"),
-        "claude-sonnet-4-6" => settings.extra_usage,
+    let billed = match id {
+        "claude-opus-4-6" => !settings.extra_usage && AUTH.as_ref().is_none_or(|auth| auth["subscriptionType"] != "max"),
+        "claude-sonnet-4-6" => !settings.extra_usage,
         _ => false,
     };
-    if !settings.force_200k.iter().any(|forced| forced == id) && (settings.one_m.iter().any(|one_m| one_m == id) || gated) {
+    if !billed && !settings.force_200k.iter().any(|forced| forced == id) && !lock(&REFUSED_1M).contains(id) {
         (format!("{id}[1m]"), ONE_M)
     } else {
         (id.to_string(), TWO_HUNDRED_K)
@@ -382,7 +405,9 @@ fn runtime_model(id: &str) -> (String, u64) {
 
 // The window pi compacts against: where Claude Code starts refusing, or what its own overrides
 // (CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE; CLAUDE_CODE_MAX_CONTEXT_TOKENS with DISABLE_COMPACT) make it.
-fn effective_window(window: u64, max_tokens: u64) -> u64 {
+// Input: the model's id and output limit.
+pub fn context_window(id: &str, max_tokens: u64) -> u64 {
+    let (_, window) = runtime_model(id);
     let positive = |name: &str| env(name).and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0);
     if let Some(limit) = positive("CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE") {
         return limit;
@@ -475,12 +500,13 @@ pub fn bridge_models(anthropic: Vec<Map<String, Value>>) -> Vec<Map<String, Valu
         let id = model.get("id")?.as_str()?.to_string();
         let (_, window) = runtime_model(&id);
         let max_tokens = model.get("maxTokens").and_then(Value::as_u64).unwrap_or(OUTPUT_RESERVE_CAP);
+        let context_window = context_window(&id, max_tokens);
         let name = model.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
         let says_1m = name.split(|c: char| !c.is_alphanumeric()).any(|word| word.eq_ignore_ascii_case("1m"));
         let name = if window > TWO_HUNDRED_K && !says_1m { format!("{name} 1M") } else { name };
         let mut out = json!({"id": id, "name": name, "api": PROVIDER, "provider": PROVIDER, "baseUrl": PROVIDER,
             "reasoning": model.get("reasoning").cloned().unwrap_or(json!(false)), "input": model.get("input").cloned().unwrap_or(json!(["text"])),
-            "contextWindow": effective_window(window, max_tokens), "maxTokens": max_tokens});
+            "contextWindow": context_window, "maxTokens": max_tokens});
         if let Some(map) = model.get("thinkingLevelMap") {
             out["thinkingLevelMap"] = map.clone();
         }
@@ -1105,12 +1131,40 @@ fn make_room() {
 // own that ends with its turn and keeps nothing; every other one delivers to the session's query or
 // rewrites, but an idle compaction's (in_place), which only delivers.
 pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamEvent>) -> AssistantMessage {
+    let id = &request.model.id;
+    let (cli_model, _) = runtime_model(id);
+    let mut answer = stream_as(request, events, &cli_model).await;
+    // A refused 1M is that model's last: kept as 200K, and this same turn asked again bare. The
+    // refusal streamed nothing to pi (assistant keeps Claude Code's report off the stream). A model
+    // that quietly serves only 200K says so as an overflow well short of 1M, which counts the same.
+    let refused = |answer: &AssistantMessage| answer.error_message.as_deref().is_some_and(|error| LONG_CONTEXT_REFUSALS.iter().any(|refusal| error.contains(refusal)));
+    let short = |answer: &AssistantMessage| crate::retry::is_context_overflow(answer, 0)
+        && !answer.error_message.as_deref().is_some_and(|error| ["1000000", "1,000,000", "1M"].iter().any(|million| error.contains(million)));
+    if (refused(&answer) || short(&answer)) && cli_model != *id {
+        debug(&format!("Claude Code refused 1M context for {id}; asking for it bare at 200K from now on"));
+        // With extra usage on, a refusal is its spending limit, not the plan: this process stays at
+        // 200K (no flip back each turn), and the next start asks for 1M again.
+        let kept = if SETTINGS.extra_usage { lock(&REFUSED_1M).insert(id.to_string()); "until piccosta restarts".to_string() } else { refuse_1m(id); format!("from now on (kept in {})", refused_1m_path().display()) };
+        if let Some(session) = request.session_id {
+            lock(&NOTES).insert(session.to_string(), format!("Claude Code refused 1M context for {id} on this account, so it runs at 200K {kept}"));
+        }
+        answer = stream_as(request, events, id).await;
+    }
+    // A model with 1M of its own gets no long-context flag to refuse, only a context past 200K, and
+    // that one is refused bare too: said as an overflow, so pi compacts to fit 200K and asks again.
+    if refused(&answer) {
+        answer.error_message = Some(format!("Prompt is too long for {id} at 200K context"));
+    }
+    answer
+}
+
+// One provider call as `stream` makes it, asking Claude Code for `cli_model`.
+async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamEvent>, cli_model: &str) -> AssistantMessage {
     let model = request.model;
     let system = transcript::current_system_message(request.messages);
     let system_prompt = system.as_ref().map(transcript::system_message_text).unwrap_or_default();
     let tools = system.and_then(|system| system.tools_added).unwrap_or_default();
     let messages = fold_into_results(request.messages.iter().filter(|message| !matches!(message, Message::System(_))).cloned());
-    let (cli_model, _) = runtime_model(&model.id);
     let effort = effort(model, request.thinking_level);
     let thinking_off = request.thinking_level == "off";
     let fast = model.service_tier.as_deref() == Some(super::FAST_TIER);
@@ -1120,7 +1174,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         history::attach(&key, request.session_file);
         lock(&REWRITES).remove(&key);
     }
-    let shape = history::shape(&system_prompt, &tools, &cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
+    let shape = history::shape(&system_prompt, &tools, cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
     let prints: Vec<String> = messages.iter().map(fingerprint).collect();
     // An idle compaction stopped this early leaves the waiting query for the message that stopped it.
     if request.cancel.is_cancelled() {
@@ -1161,7 +1215,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
         if !one_shot {
             lock(&REWRITES).insert(key.clone(), reason.clone());
         }
-        let start = Start { key: &key, model, cli_model: &cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
+        let start = Start { key: &key, model, cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
             tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, one_shot, manager: request.manager };
         if let Err(error) = start_query(start, turn) {
             return failed(model, StopReason::Error, &error);
