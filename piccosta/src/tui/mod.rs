@@ -2585,8 +2585,10 @@ impl App {
         // session's name. Wrap all of it above the choices, which still start on No.
         let mut lines = if picker.answer.is_some() { render::report(&picker.title, width.saturating_sub(2), &mut self.tex) } else { Vec::new() };
         let question_rows = lines.len() as u16;
-        let height = (question_rows + shown.len() as u16 + 3).min(area.height.saturating_sub(4)).max(4);
-        let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + area.height / 5, width, height };
+        // As tall as its items, up to the whole area less a row each side, and moved up as far as it
+        // needs so its last row stays on screen.
+        let height = (question_rows + shown.len() as u16 + 3).min(area.height.saturating_sub(2)).max(4).min(area.height);
+        let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height / 5).min(area.height - height), width, height };
         frame.render_widget(Clear, rect);
         let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else if picker.answer.is_some() { "allow this call? enter chooses · esc refuses" } else { &picker.title };
         let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::ACCENT)).title(format!(" {title} "));
