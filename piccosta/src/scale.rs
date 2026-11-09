@@ -2,7 +2,8 @@
 // runs low. Each kind is also a subagent job (tools/subagent.rs): the subagent tool hands work to
 // a kind by name. All of it is one file: piccosta/scale.json ships compiled in, and the user's
 // <agent dir>/scale.json changes it by name, field by field (a kind it names gets those fields, new
-// names join; "off": true drops one, false brings back one that ships off). /scale shows it,
+// names join; "off": true drops one from the lists and the jobs, false brings back one that ships
+// off; one that's off still runs what names it, as an advisor names advice). /scale shows it,
 // /scale edit writes the whole of it there and opens it, and /scale <kind> <model[:level]> ...
 // sets one kind's models.
 //
@@ -95,15 +96,20 @@ fn merged(agent_dir: &Path) -> Map<String, Value> {
     scale
 }
 
-// A section's entries that aren't off, by name.
-fn entries(scale: &Map<String, Value>, section: &str) -> Vec<(String, Map<String, Value>)> {
+// A section's entries that aren't off (with `off`, those that are too), by name.
+fn entries(scale: &Map<String, Value>, section: &str, off: bool) -> Vec<(String, Map<String, Value>)> {
     let all = scale.get(section).and_then(Value::as_object).cloned().unwrap_or_default();
-    all.into_iter().filter_map(|(name, entry)| Some((name, entry.as_object()?.clone()))).filter(|(_, entry)| entry.get("off").and_then(Value::as_bool) != Some(true)).collect()
+    all.into_iter().filter_map(|(name, entry)| Some((name, entry.as_object()?.clone()))).filter(|(_, entry)| off || entry.get("off").and_then(Value::as_bool) != Some(true)).collect()
 }
 
 // The kinds of work as subagent jobs, each as its name and fields.
 pub fn jobs(agent_dir: &Path) -> Vec<(String, Map<String, Value>)> {
-    entries(&merged(agent_dir), "uses")
+    entries(&merged(agent_dir), "uses", false)
+}
+
+// One kind's fields, off or not, for a session started for it.
+pub fn job(agent_dir: &Path, name: &str) -> Option<Map<String, Value>> {
+    entries(&merged(agent_dir), "uses", true).into_iter().find_map(|(kind, entry)| (kind == name).then_some(entry))
 }
 
 // The tools kinds of work own, each with the kind that owns it.
@@ -114,7 +120,7 @@ pub fn owned(agent_dir: &Path) -> Vec<(String, String)> {
 
 // Set one use's models (first choice first) in the user's file, leaving the rest of it as it is.
 pub fn set_use(agent_dir: &Path, name: &str, models: &[String]) -> Result<(), String> {
-    find(agent_dir, name)?;
+    find(agent_dir, name, true)?;
     let mut file = changes(agent_dir)?;
     let section = file.entry("uses").or_insert_with(|| json!({}));
     let entry = section.as_object_mut().ok_or("its \"uses\" isn't an object")?.entry(name).or_insert_with(|| json!({}));
@@ -133,9 +139,13 @@ pub fn write_out(agent_dir: &Path) -> Result<PathBuf, String> {
     Ok(file)
 }
 
-// Every use that isn't off.
+// Every use that isn't off; every_use with `off`, those that are too.
 pub fn uses(agent_dir: &Path) -> Vec<Use> {
-    entries(&merged(agent_dir), "uses")
+    every_use(agent_dir, false)
+}
+
+fn every_use(agent_dir: &Path, off: bool) -> Vec<Use> {
+    entries(&merged(agent_dir), "uses", off)
         .into_iter()
         .map(|(name, entry)| Use {
             name,
@@ -146,8 +156,9 @@ pub fn uses(agent_dir: &Path) -> Vec<Use> {
         .collect()
 }
 
-pub fn find(agent_dir: &Path, name: &str) -> Result<Use, String> {
-    let all = uses(agent_dir);
+// A use by name; with `off`, one that's off too (an advisor's advice).
+pub fn find(agent_dir: &Path, name: &str, off: bool) -> Result<Use, String> {
+    let all = every_use(agent_dir, off);
     let names: Vec<String> = all.iter().map(|entry| entry.name.clone()).collect();
     all.into_iter().find(|entry| entry.name == name).ok_or_else(|| format!("No use \"{name}\" in the model scale: {}", names.join(", ")))
 }
@@ -383,9 +394,9 @@ pub type Pick = (Option<String>, Option<String>, Option<String>);
 
 // The model and level a use runs on now: its first available model, or None for the model and a
 // line saying so when no connected account serves any of them, so the caller runs on the session's
-// or the default model. An error only for a use the scale doesn't have.
-pub fn pick(agent_dir: &Path, name: &str) -> Result<Pick, String> {
-    let entry = find(agent_dir, name)?;
+// or the default model. An error only for a use the scale doesn't have (or has off, without `off`).
+pub fn pick(agent_dir: &Path, name: &str, off: bool) -> Result<Pick, String> {
+    let entry = find(agent_dir, name, off)?;
     let Some(first) = available(agent_dir, &entry).into_iter().next() else {
         return Ok((None, None, Some(format!("None of the \"{name}\" kind's models is served by a connected account, so it runs on the session's model, or the default one; /scale {name} <model> sets one"))));
     };

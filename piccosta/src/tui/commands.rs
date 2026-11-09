@@ -44,12 +44,13 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 44] = [
+const COMMANDS: [(&str, &str); 45] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
     ("/scale", "which model does which kind of work, and how much of each plan is used (--use <kind> picks from it)"),
     ("/manager", "this project's manager: shown, or made (the first session in a directory is one)"),
+    ("/advisor", "the advisor of this pane's manager (or this project's): shown, or made; it advises the manager, and you can talk to both"),
     ("/assistant", "the assistant: shown, or started when it isn't running (it runs in the background)"),
     ("/resume [text|all]", "the sessions to switch to (^s; ^d there deletes one); all: every project's"),
     ("/fork, /branch [name]", "copy this session and carry on in the copy"),
@@ -99,7 +100,7 @@ impl App {
         let (name, argument) = line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()));
         match name {
             // --single has one session: the commands that open others only say so.
-            "new" | "manager" | "assistant" if self.one_session() => {}
+            "new" | "manager" | "advisor" | "assistant" if self.one_session() => {}
             // /clear starts this tab over, as Claude Code's does: a new session in the same directory
             // takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
             // /clear <name> names the one left first. A running turn stops first (esc).
@@ -214,21 +215,32 @@ impl App {
                 let path = crate::scale::path(&self.host.agent_dir);
                 self.report(format!("The model scale: each kind of work, its models, and the subagent job of its name. It's one file, {} (/scale edit opens it; /scale <kind> <model[:level]> … sets a kind's models).\n\n{}{problem}", path.display(), crate::scale::describe(&self.host.agent_dir)));
             }
-            // This directory's project manager: shown when there is one, else made, as a new session.
-            "manager" => {
+            // This directory's project manager, or the advisor of this pane's manager (the
+            // assistant's, from its pane): shown when there is one, else made, as a new session.
+            "manager" | "advisor" => {
+                use crate::manager::Role;
+                let (role, title) = if name == "advisor" { (Role::Advisor, crate::manager::ADVISOR_NAME) } else { (Role::Project, crate::manager::PROJECT_NAME) };
                 // From the assistant's pane, the project piccosta was started in.
                 let cwd = self.current().cwd.clone();
-                let cwd = if cwd.as_os_str().is_empty() || cwd == crate::manager::home(&self.host.agent_dir) { self.host.cwd.clone() } else { cwd };
-                let existing = crate::manager::project_manager(&self.host.agent_dir, &cwd).and_then(|file| file.canonicalize().ok());
-                let slot = match existing {
+                let cwd = if cwd.as_os_str().is_empty() || (role == Role::Project && cwd == crate::manager::home(&self.host.agent_dir)) { self.host.cwd.clone() } else { cwd };
+                let existing = if role == Role::Advisor { crate::manager::advisor(&self.host.agent_dir, &cwd) } else { crate::manager::project_manager(&self.host.agent_dir, &cwd) };
+                if role == Role::Advisor && crate::manager::advised(&self.host.agent_dir, &cwd).is_none() {
+                    self.notice = Some("There's no manager here to advise: /manager makes one.".into());
+                    return true;
+                }
+                let slot = match existing.and_then(|file| file.canonicalize().ok()) {
                     Some(file) => self.slots.iter().position(|slot| slot.path.as_ref() == Some(&file)).unwrap_or_else(|| {
-                        self.slots.push(super::Slot { cwd: cwd.clone(), manager: true, ..super::Slot::new(Some(file), crate::manager::PROJECT_NAME.into()) });
+                        self.slots.push(super::Slot { cwd: cwd.clone(), manager: true, advisor: role == Role::Advisor, ..super::Slot::new(Some(file), title.into()) });
                         self.slots.len() - 1
                     }),
                     None => {
-                        self.slots.push(super::Slot { cwd, make_manager: true, ..super::Slot::new(None, super::NEW_TITLE.into()) });
+                        // An advisor runs on the scale's advice kind, which ships off so nothing
+                        // else hands work to it.
+                        let (model, level, note) = if role == Role::Advisor { crate::scale::pick(&self.host.agent_dir, crate::manager::ADVISOR_KIND, true).unwrap_or_else(|error| (None, None, Some(error))) } else { (None, None, None) };
+                        self.slots.push(super::Slot { cwd, make: Some(role), ..super::Slot::new(None, super::NEW_TITLE.into()) });
                         let slot = self.slots.len() - 1;
-                        if let Err(error) = self.load(slot, None, None, None) {
+                        self.notice = note;
+                        if let Err(error) = self.load(slot, model, level, None) {
                             self.slots.pop();
                             self.notice = Some(error);
                             return true;

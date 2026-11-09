@@ -9,6 +9,11 @@
 //   agent's command started, or one on a scratch agent dir, makes none on its own (host.rs open). It runs wherever it's opened, or headless when it's messaged;
 //   the assistant's service fires its schedules. Its home is <agent dir>/projects/<the directory's
 //   session folder name>.
+// Either can have an advisor (/advisor), a standing session on the scale's advice kind that
+// advises its manager: its home is <manager's home>/advisor, its manager is its lane, so each
+// manager turn that ends reaches it as news (watch), and its `sessions` reads any session and
+// messages managers only, its own or another's, each message marked as from it. It starts no
+// work itself. The user talks to both.
 //
 // A session's kind is recorded in its file (ROLE_ENTRY), so it's a manager wherever it's opened.
 // Each manager's home holds:
@@ -45,30 +50,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-// What a manager is, the same for the assistant and a project's manager but for who it is (the
-// general assistant and lead director, or a senior project manager); then what it has to work
-// with.
-// {role} is who it is and {job} what it looks after (the assistant: the computer and every project;
-// a project's manager: its project only), {project} what a project's manager does besides.
-const PROMPT: &str = "{role} Your job is to {job}, delegate responsibly using piccosta's features, and interact with the user helpfully. Since you live on a computer, you can act on their behalf. You should delegate to a cheaper agent for exploration and such, keep this main context to a minimum to preserve your ability to act over the longer term and efficiently manage different threads.
-
-How you work:{project}
-- Nothing you run makes the user wait: a command or subagent still going after a few seconds moves to the background, and its result comes to you as a message when it ends. Answer the user meanwhile; don't wait, sleep or poll.
-- Messages reach you from the user, from your lanes as their turns end, and from your schedules; each says which, with the time.
-- `sessions` lists, reads, starts and messages the sessions on this computer, in any project, on any model, lists the projects (`sessions projects`) and reports what sessions cost. `sessions start` makes a real session in a directory, listed under its project for the user to open. Given a first message, it starts work at once, in a process of its own that carries on when you stop or restart. Without one it just waits, for the user or for you; start it that way when the user asks for a session and not for work in it, and don't make up a first task. When a lane's turn ends you get a message with what it said: a turn that ended isn't proof the work was done, so read it (`sessions read`) before you say what happened. Then tell the user what happened and which session to open, and use `ledger notify` when it's something they'd want to know now. Report what was asked; suggest next steps only when they asked, or when something needs their decision.
-- {quota}
-- Your ledger ({ledger}) is your running record of what's happening and what's going on {scope}: `ledger append` adds an entry, a line or two, of the lanes you started and why (session ids, models), what each is doing and what came of it, what the user decided, and what's next. piccosta carries its newest entries through your compactions; `ledger search` finds the rest, and anything the user said to you, word for word. A project's own files (AGENTS.md, direction.md, its ledger.md) belong to the project and the sessions working in it; when one of those should change, tell the user.{memory_line}
-- `ledger schedule` keeps messages for you at set times or on a repeat.
-- The sessions you start or message are your lanes. Check in on them while they work, not only when they end: read their latest turns (`sessions read`), and when a lane will run a while, schedule your next look (`ledger schedule`). Act on what you see: a lane stuck, off track, repeating itself or waiting on something gets a message or a stop (`sessions stop`), and the user hears what you did. When a lane finishes a turn you get what it said; tell the user what came of it, then close the lane (`sessions close`: it stops anything the lane still runs and takes it out of the list) once its work is done, or message it with what's next. Don't leave a finished lane open: one left quiet keeps reminding you until you close or update it.
-- A project can have its own manager, a standing session that looks after that project: `sessions list` and `sessions projects` show which. Hand a project's work to its manager (`sessions message`) rather than starting sessions there yourself.
-- Choose models by the user's model scale: start a session with `use`, the kind of work, and piccosta picks the model, moving to the next one when a plan runs low. Pick the use that fits, say which and why, and consider a second model for long or important lanes (`trio`: it checks each answer once; `pair`: the two work it through together). Name a `model` only when the user did. When something you read (a project's docs, the user's standards) disagrees with the scale about which model to use, ask the user before you choose.
-
-The model scale (`sessions usage` shows it with the plans' usage now):
-{scale}{memory}";
-const ASSISTANT_ROLE: &str = "You are the general assistant, the lead director.";
-const ASSISTANT_JOB: &str = "monitor the network or the single computer, check in on and manage agents in each project";
-const PROJECT_JOB: &str = "check in on and manage the agents in this project";
-const ASSISTANT_MEMORY: &str = "\n- Your memory ({path}) is what should hold from one day to the next, whatever is happening: what the user wants done and how, the projects and machines you look after, who to hand what. `ledger remember` adds a line, `ledger forget` takes out the lines holding a phrase. All of it is below, and after every compaction. Never a credential, key or password, in it or in your ledger. When the user gives you a name, take it with `ledger name`.";
+// Who a manager or an advisor is: its whole part of the prompt, after the constitution, but for
+// the assistant's memory. What it does with its tools is in their descriptions (SessionsTool,
+// ManagerTools), so the prompt holds no times, counts or usage and stays the same bytes from turn
+// to turn and restart to restart: any change rewrites a Claude prompt cache.
+const ASSISTANT_ROLE: &str = "You are the assistant, the user's lead director: you look after this computer and the agents in every project, and hand work, exploration above all, to other agents to keep your own context small. Since you live on a computer, you can act on the user's behalf.";
+const PROJECT_ROLE: &str = "You are this project's manager: its sessions are yours to direct. Since you live on a computer, you can act on the user's behalf. Delegate exploration and such to a cheaper agent, and keep your own context to a minimum to preserve your ability to act over the longer term. Review their work and run the builds yourself, leave long, large arms of work and plans to lanes, and for real work start twins (pair or trio), asking the user first. Answer the assistant, the user's lead director, as you would the user.";
+// Who an advisor's message to its own manager says it's from, which its manager's answer is to.
+const FROM_ADVISOR: &str = "your advisor";
+// {manager} is who it advises.
+const ADVISOR_ROLE: &str = "You are the advisor of {manager}: each turn your manager ends reaches you, and you advise it on direction, research design and what it may be missing. Search the web, fetch and read files freely, and take responsibility for what you advise: check it before you say it. Be direct and brief, and end your turn without a message when there's nothing to say. You start no work yourself: what should be done goes to your manager, or to the manager of the project it's in. The user talks to both of you, and the user's word decides. Check any findings, keep the user in the loop of both yourself and the manager to advisor.";
 // How long a manager's command runs before it moves to the background, since nothing should run in
 // a manager's foreground: a quick look (ls, rg, git status) comes back whole, and anything slower,
 // a subagent above all, goes to the background so the manager stays free for the user. The usual
@@ -147,6 +138,7 @@ const DAY_MS: i64 = 86_400_000;
 pub enum Role {
     Assistant,
     Project,
+    Advisor,
 }
 
 // Whether this piccosta was started by an agent's command: bash sets PICCOSTA_SESSION_ID for everything
@@ -181,6 +173,10 @@ const WORK_ENTRY: &str = "piccosta-work";
 // The names managers take, which the sidebar and `sessions list` show.
 pub const ASSISTANT_NAME: &str = "assistant";
 pub const PROJECT_NAME: &str = "manager";
+pub const ADVISOR_NAME: &str = "advisor";
+// An advisor's home, in its manager's, and the scale's kind it runs on.
+const ADVISOR_DIR: &str = "advisor";
+pub const ADVISOR_KIND: &str = "advice";
 // The file in the assistant's home that holds its name.
 const NAME_FILE: &str = "name";
 
@@ -207,6 +203,7 @@ pub fn role(session: &crate::session::Session) -> Option<Role> {
         crate::session::SessionEntry::Custom { custom_type, data, .. } if custom_type == ROLE_ENTRY => match data.as_ref()?.get("role")?.as_str()? {
             "assistant" => Some(Role::Assistant),
             "project" => Some(Role::Project),
+            "advisor" => Some(Role::Advisor),
             _ => None,
         },
         _ => None,
@@ -236,8 +233,13 @@ pub fn project_home(agent_dir: &Path, cwd: &Path) -> PathBuf {
     agent_dir.join("projects").join(folder.file_name().unwrap_or_default())
 }
 
+// An advisor works where its manager does, so the assistant's is the one in the assistant's home.
 pub fn home_for(agent_dir: &Path, role: Role, cwd: &Path) -> PathBuf {
-    if role == Role::Assistant { home(agent_dir) } else { project_home(agent_dir, cwd) }
+    match role {
+        Role::Assistant => home(agent_dir),
+        Role::Project => project_home(agent_dir, cwd),
+        Role::Advisor => home_for(agent_dir, if cwd == home(agent_dir) { Role::Assistant } else { Role::Project }, cwd).join(ADVISOR_DIR),
+    }
 }
 
 // A manager's session file, read from its home, while the file is there.
@@ -255,6 +257,15 @@ pub fn project_manager(agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
     pointer(&project_home(agent_dir, cwd))
 }
 
+// The session file of the advisor of the manager working in `cwd`, and of that manager.
+pub fn advisor(agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
+    pointer(&home_for(agent_dir, Role::Advisor, cwd))
+}
+
+pub fn advised(agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
+    pointer(home_for(agent_dir, Role::Advisor, cwd).parent()?)
+}
+
 // Make a session a manager: record its kind and name in it, and its file in its home. A new
 // session's entries reach the file with its first message; until then the home points at a file
 // that isn't there, which counts as no manager.
@@ -262,10 +273,20 @@ pub fn make(agent_dir: &Path, session: &mut crate::session::Session, role: Role)
     let cwd = PathBuf::from(&session.header().cwd);
     let home = home_for(agent_dir, role, &cwd);
     fs::create_dir_all(&home)?;
-    let kind = if role == Role::Assistant { "assistant" } else { "project" };
+    // An advisor's one lane is its manager, whose turns it hears from the next one on.
+    if role == Role::Advisor {
+        let manager = advised(agent_dir, &cwd).ok_or_else(|| std::io::Error::other("there's no manager here to advise: /manager makes one"))?;
+        take_lane(&home, &manager, PROJECT_NAME, None, last_turn(&manager).map(|(stamp, _)| stamp).unwrap_or_default());
+        set_work(session, ADVISOR_KIND)?;
+    }
+    let (kind, name) = match role {
+        Role::Assistant => ("assistant", ASSISTANT_NAME),
+        Role::Project => ("project", PROJECT_NAME),
+        Role::Advisor => ("advisor", ADVISOR_NAME),
+    };
     session.append_custom(ROLE_ENTRY, Some(json!({ "role": kind })))?;
     let base = session.next_base();
-    session.append(crate::session::SessionEntry::SessionInfo { base, name: Some((if role == Role::Assistant { ASSISTANT_NAME } else { PROJECT_NAME }).to_string()) })?;
+    session.append(crate::session::SessionEntry::SessionInfo { base, name: Some(name.to_string()) })?;
     let file = session.file().map(|file| file.to_string_lossy().into_owned()).unwrap_or_default();
     fs::write(home.join("session"), file)
 }
@@ -443,6 +464,14 @@ fn last_turn(file: &Path) -> Option<(String, String)> {
     (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n") + &failed))
 }
 
+// Whether a session's latest user message, the one its last turn answers, is from its advisor.
+fn answers_advisor(file: &Path) -> bool {
+    let Ok(session) = crate::session::Session::read(file) else { return false };
+    let projection = session.projection();
+    let last = projection.iter().rev().flat_map(|entry| entry.messages.iter().rev()).find_map(|message| if let AgentMessage::User(user) = message { Some(user.content.text()) } else { None });
+    last.is_some_and(|text| text.lines().next().is_some_and(|line| line.ends_with(&format!(", from {FROM_ADVISOR}]"))))
+}
+
 // A lane's line in a check-in: how long since its last reply, and the end of the last line of text
 // it wrote.
 fn check_line(lane: &Lane) -> String {
@@ -470,10 +499,20 @@ fn ending(text: &str) -> String {
 fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> Option<String> {
     let (id, title) = (session_id(&lane.file), lane.title.clone());
     let news = match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
+        // An advisor's one lane is its manager, and a turn answering the advisor's own message
+        // isn't news to it: each would wake the other.
+        Some((stamp, _)) if home.ends_with(ADVISOR_DIR) && answers_advisor(&lane.file) => {
+            lane.reported = stamp;
+            None
+        }
         Some((stamp, said)) => {
             lane.reported = stamp;
             let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
-            Some(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)))
+            Some(if home.ends_with(ADVISOR_DIR) {
+                format!("[{}, your manager ended its turn] What it said, the end of it:\n{}\n\nMessage it (`sessions message`) only when it should hear something from you.", now_text(), ending(&said))
+            } else {
+                format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said))
+            })
         }
         None if ended == Some(false) && lane.launched.is_some() => {
             let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
@@ -497,7 +536,9 @@ fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> O
 // `check_minutes`, once the manager is `idle`, a check-in on the lanes at work then, when there are
 // any. A lane whose file is gone, or that was closed, leaves the list. The news goes to the
 // manager's runtime, as messages.
+// An advisor's manager gets no reminders or check-ins.
 pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, (wait_minutes, check_minutes): (u64, u64), idle: impl Fn() -> bool) {
+    let (wait_minutes, check_minutes) = if home.ends_with(ADVISOR_DIR) { (u64::MAX, 0) } else { (wait_minutes, check_minutes) };
     let (heard_sender, mut heard) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, Value)>();
     let mut listening = std::collections::HashSet::new();
     let mut tick = tokio::time::interval(POLL);
@@ -747,6 +788,10 @@ pub struct SessionsTool {
     agent_dir: PathBuf,
     // The manager's home, where the lanes it answers for are listed.
     home: PathBuf,
+    // What the user wants asked before their plans are spent (quota), and whether it's an
+    // advisor's, which reads and messages managers and starts nothing.
+    quota: String,
+    advising: bool,
 }
 
 impl SessionsTool {
@@ -759,6 +804,7 @@ impl SessionsTool {
                 let kind = match session.as_ref().and_then(role) {
                     Some(Role::Assistant) => " · the assistant (you)",
                     Some(Role::Project) => " · this project's manager",
+                    Some(Role::Advisor) => " · a manager's advisor",
                     None => "",
                 };
                 let model = session.as_ref().and_then(|session| session.context().model).map_or(String::new(), |(provider, id)| format!(" · {provider}/{id}"));
@@ -791,13 +837,19 @@ impl SessionsTool {
         let heard = last_turn(file).map(|(stamp, _)| stamp).unwrap_or_default();
         let (to, cwd, message, log) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file));
         let sent = tokio::task::spawn_blocking(move || crate::runtime::send(&to, &message, Some((&cwd, &log)))).await.map_err(|error| error.to_string())?;
+        // A message from an advisor isn't followed: its answer is to be read.
+        let after = if self.advising { "its answer doesn't reach you: read it later (`sessions read`)" } else { "when its turn ends you get a message with what it said" };
         let (said, run) = match sent.map_err(|error| format!("Couldn't send it: {error}"))? {
-            Sent::Started(run) => (format!("Its run started (pid {}) in a process of its own; when its turn ends you get a message with what it said.", run.pid), Some(run)),
-            Sent::Delivered => ("It's running, and reads it at its next step; when its turn ends you get a message with what it said.".to_string(), None),
+            Sent::Started(run) => (format!("Its run started (pid {}) in a process of its own; {after}.", run.pid), Some(run)),
+            Sent::Delivered => (format!("It's running, and reads it at its next step; {after}."), None),
             Sent::Unconfirmed => ("It was sent, not confirmed: the piccosta running it didn't answer in time (stopped, or stuck), or its connection ended without an answer. It isn't sent again. Read the session later, or stop it (`sessions stop`).".to_string(), None),
             Sent::Queued => ("It's a manager's session, so the message waits in it for the service or a terminal UI to open it; read the session later to see what came of it.".to_string(), None),
         };
-        take_lane(&self.home, file, title, run, heard);
+        // An advisor answers its manager by message, so it isn't a lane: each would wake the other.
+        // An advisor's one lane is its own manager, from the start, so its messages add none.
+        if !self.advising && crate::session::Session::read(file).ok().and_then(|session| role(&session)) != Some(Role::Advisor) {
+            take_lane(&self.home, file, title, run, heard);
+        }
         Ok(said)
     }
 
@@ -811,7 +863,7 @@ impl SessionsTool {
         let written = |result: std::io::Result<String>| result.map(drop).map_err(|error| error.to_string());
         let (model, scale_level, note) = match (string(arguments, "model"), string(arguments, "use")) {
             (Some(model), _) => (Some(model.to_string()), None, None),
-            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind)?,
+            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind, false)?,
             (None, None) => (None, None, None),
         };
         // The kind is kept in the session, so it runs with that kind's tools and readOnly.
@@ -894,10 +946,23 @@ impl Tool for SessionsTool {
         "sessions"
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some(if self.advising { "read any session; message your manager, or another project's manager" } else { "start, message, read, stop and close the sessions on this computer, your lanes; the projects and their managers; what sessions cost, and the model scale" })
+    }
+
     fn definition(&self) -> crate::message::ToolDefinition {
+        if self.advising {
+            return crate::message::ToolDefinition {
+                name: "sessions".into(),
+                description: "The sessions on this computer. action list: the latest, with their id, directory and model. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count; without session, your manager's). message: a message to your manager (no session) or to another manager (session), marked as from you. Its answer doesn't reach you: read it later. Your manager's other turns reach you as they end. You start, stop and close no sessions: what you want done, ask a manager for.".into(),
+                parameters: json!({"type": "object", "required": ["action"], "properties": {"action": {"type": "string", "enum": ["list", "projects", "read", "message"]}, "session": {"type": "string", "description": "A session's id, the start of one, or its name; leave it out for your manager"}, "count": {"type": "number"}, "message": {"type": "string"}}}),
+                constrained_sampling: None,
+            };
+        }
         crate::message::ToolDefinition {
             name: "sessions".into(),
-            description: "The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. You get a message with what a run said when its turn ends. A session you start or message is one of your lanes: you get a message when it finishes a turn, and reminders while it's quiet, until you close it. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, by provider.".into(),
+            description: format!("The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model, only when the user named one; thinking, pair or trio, name; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, and the model scale with each plan's usage now.
+A session you start or message is one of your lanes: its run carries on in a process of its own, and you get a message with what it said when its turn ends. Messages reach you from the user, your lanes, your schedules, the assistant and your advisor, each saying which, with the time; an advisor's advice is advice, the user's word decides. A turn that ended isn't proof the work was done: read it before you tell the user what happened and which session to open (`ledger notify` when they'd want to know now). Report what was asked; suggest next steps only when asked, or when something needs their decision. Check in on lanes while they work, not only when they end (read them; `ledger schedule` your next look), and act on one stuck, off track, repeating itself or waiting: message or stop it, and tell the user. Close a lane once its work is done: one left quiet keeps reminding you. When the user asks for a session and not for work in it, start it without a message; don't make up a first task. A project with its own manager (projects shows which) gets its work through that manager, not sessions you start there. Choose models with use, the kind of work from the model scale (usage shows it): piccosta picks the model and moves on when a plan runs low. Say which use and why, and consider a second model for long or important lanes (trio: it checks each answer once; pair: the two work it through together). Name a model only when the user did, and when something you read disagrees with the scale, ask the user. {}", self.quota),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -923,10 +988,28 @@ impl Tool for SessionsTool {
     fn execute<'a>(&'a self, arguments: Map<String, Value>, context: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             let need = |key: &str| string(&arguments, key).ok_or_else(|| format!("{key} is needed"));
+            let count = arguments.get("count").and_then(Value::as_u64).map_or(READ_MESSAGES, |count| count as usize);
+            // An advisor's session, left out, is its manager; it messages managers only, its own
+            // or another's, and starts nothing.
+            if self.advising {
+                let manager = find(&self.agent_dir, &session_id(&self.home.parent().and_then(pointer).ok_or("Your manager's session isn't there.")?))?;
+                let summary = string(&arguments, "session").map_or(Ok(manager.clone()), |wanted| find(&self.agent_dir, wanted))?;
+                let from = if summary.path == manager.path { FROM_ADVISOR.to_string() } else if manager.cwd == home(&self.agent_dir) { "the assistant's advisor".to_string() } else { format!("the advisor of the manager in {}", manager.cwd.display()) };
+                return match string(&arguments, "action").unwrap_or_default() {
+                    "list" => text(self.list()),
+                    "projects" => text(self.projects()),
+                    "read" => text(self.read(&summary.id, count)?),
+                    "message" if crate::session::Session::read(&summary.path).ok().and_then(|session| role(&session)).is_some_and(|role| role != Role::Advisor) => {
+                        text(self.run(&summary.path, &summary.cwd, &format!("[{}, from {from}]\n{}", now_text(), need("message")?), &summary.title).await?)
+                    }
+                    "message" => Err(format!("\"{}\" isn't a manager: you message managers only, and they hand out the work.", summary.title)),
+                    action => Err(format!("No action \"{action}\" for an advisor: list, projects, read or message. What you want done, ask a manager for.")),
+                };
+            }
             match string(&arguments, "action").unwrap_or_default() {
                 "list" => text(self.list()),
                 "projects" => text(self.projects()),
-                "read" => text(self.read(need("session")?, arguments.get("count").and_then(Value::as_u64).map_or(READ_MESSAGES, |count| count as usize))?),
+                "read" => text(self.read(need("session")?, count)?),
                 "usage" => text(self.usage()),
                 "start" => {
                     let dir = PathBuf::from(need("dir")?);
@@ -1026,15 +1109,20 @@ impl Tool for ManagerTools {
         "ledger"
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some(if self.memory { "your ledger, memory, schedules and desktop notifications" } else { "your ledger, schedules and desktop notifications" })
+    }
+
     fn definition(&self) -> crate::message::ToolDefinition {
         let mut actions = vec!["append", "search", "notify", "schedule", "schedules", "unschedule"];
-        let memory = if self.memory { " remember: add a line to your memory (text). forget: take out the lines of your memory that hold a phrase (text). name: take the name the user gives you (text)." } else { "" };
+        let memory = if self.memory { " remember: add a line to your memory (text): what should hold from one day to the next, what the user wants done and how, the projects and machines you look after, who to hand what; all of it is in your prompt, through every compaction. forget: take out the lines of your memory that hold a phrase (text). name: take the name the user gives you (text). Never a credential, key or password in your memory or your ledger." } else { " Never a credential, key or password in your ledger." };
+        let scope = if self.memory { "across the projects" } else { "in the project" };
         if self.memory {
             actions.extend(["remember", "forget", "name"]);
         }
         crate::message::ToolDefinition {
             name: "ledger".into(),
-            description: format!("Your ledger, your schedules and your notes to the user. action append: add an entry to your ledger, the record of what's happening (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text). schedule: a message to yourself at a time (text, at: an ISO time with its offset, or in: \"30m\"/\"2h\"/\"1d\"), optionally repeating (every: \"1d\"). schedules: list them. unschedule: remove one (id).{memory}"),
+            description: format!("Your ledger, your schedules and your notes to the user. Your ledger is your running record of what's going on {scope}: its newest entries ride through your compactions, and search finds the rest. A project's own files (AGENTS.md, direction.md, its ledger.md) belong to it: when one should change, tell the user. action append: add an entry to your ledger, a line or two: the lanes you started and why (session ids, models), what came of each, what the user decided and what's next (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text). schedule: a message to yourself at a time (text, at: an ISO time with its offset, or in: \"30m\"/\"2h\"/\"1d\"), optionally repeating (every: \"1d\"). schedules: list them. unschedule: remove one (id).{memory}"),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -1105,40 +1193,29 @@ pub fn tools(agent_dir: &Path, settings: &crate::config::Settings, role: Role, c
     let notify = settings.get("manager.notifyCommand").and_then(Value::as_array).map(|words| words.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()).filter(|words| !words.is_empty());
     let notify = notify.unwrap_or_else(|| DEFAULT_NOTIFY.map(str::to_string).to_vec());
     let home = home_for(agent_dir, role, cwd);
-    vec![Arc::new(SessionsTool { agent_dir: agent_dir.to_path_buf(), home: home.clone() }), Arc::new(ManagerTools { home, notify, memory: role == Role::Assistant })]
+    let quota = quota(settings, settings.get("manager.askBeforePlanQuota").and_then(Value::as_bool).unwrap_or(true));
+    let sessions: Arc<dyn Tool> = Arc::new(SessionsTool { agent_dir: agent_dir.to_path_buf(), home: home.clone(), quota, advising: role == Role::Advisor });
+    if role == Role::Advisor { vec![sessions] } else { vec![sessions, Arc::new(ManagerTools { home, notify, memory: role == Role::Assistant })] }
 }
 
-// A manager's system prompt addition.
-pub fn prompt(settings: &crate::config::Settings, role: Role, cwd: &Path) -> String {
-    let ask = settings.get("manager.askBeforePlanQuota").and_then(Value::as_bool).unwrap_or(true);
-    // A project's manager is encouraged to start sessions with a second model (asking the user
-    // first) and to manage the reviewing and the builds, leaving long, large arms of work and plans
-    // to subsessions.
-    let (who, job, project) = match role {
-        Role::Assistant => {
-            let name = assistant_name(&crate::config::agent_dir());
-            let named = if name == ASSISTANT_NAME { String::new() } else { format!(" The user calls you {name}.") };
-            (format!("{ASSISTANT_ROLE}{named}"), ASSISTANT_JOB, String::new())
-        }
-        Role::Project => (
-            format!("You are a senior project manager: the manager of the project in {}.", cwd.display()),
-            PROJECT_JOB,
-            "\n- Its sessions are yours to watch and direct. The assistant, the user's lead director, may message you too; answer it as you would the user.\n- For real work, start sessions with a second model (`sessions start` with `trio` to have it check each answer, `pair` to have the two work it through together); ask the user before you start them. Manage the reviewing and the builds yourself, and leave long, large arms of work and plans to subsessions.".to_string(),
-        ),
-    };
+// A manager's or an advisor's part of the system prompt: who it is, and the assistant's memory,
+// which changes only by its own `ledger remember` and `forget`, as does the name the user gave it.
+pub fn prompt(role: Role, cwd: &Path) -> String {
     let agent_dir = crate::config::agent_dir();
-    let scale = crate::scale::uses(&agent_dir).iter().map(|entry| format!("- {}: {}. {}", entry.name, entry.purpose, crate::scale::available(&agent_dir, entry).join(", then "))).collect::<Vec<_>>().join("\n");
-    let home = home_for(&crate::config::agent_dir(), role, cwd);
-    let memory = fs::read_to_string(home.join("memory.md")).unwrap_or_default();
-    let memory = if role != Role::Assistant { String::new() } else if memory.trim().is_empty() { "\n\nYour memory: nothing yet.".into() } else { format!("\n\nYour memory:\n{}", memory.trim_end()) };
-    PROMPT.replace("{scale}", &scale).replace("{role}", &who).replace("{job}", job).replace("{project}", &project).replace("{quota}", &quota(settings, ask))
-        .replace("{ledger}", &home.join("ledger.md").display().to_string())
-        .replace("{scope}", if role == Role::Assistant { "across the projects" } else { "in the project" })
-        .replace("{memory_line}", &if role == Role::Assistant { ASSISTANT_MEMORY.replace("{path}", &home.join("memory.md").display().to_string()) } else { String::new() })
-        .replace("{memory}", &memory)
+    match role {
+        Role::Advisor => ADVISOR_ROLE.replace("{manager}", if cwd == home(&agent_dir) { "the assistant" } else { "this project's manager" }),
+        Role::Project => PROJECT_ROLE.to_string(),
+        Role::Assistant => {
+            let name = assistant_name(&agent_dir);
+            let named = if name == ASSISTANT_NAME { String::new() } else { format!(" The user calls you {name}.") };
+            let memory = fs::read_to_string(home(&agent_dir).join("memory.md")).unwrap_or_default();
+            let memory = if memory.trim().is_empty() { "nothing yet.".to_string() } else { format!("\n{}", memory.trim_end()) };
+            format!("{ASSISTANT_ROLE}{named}\n\nYour memory: {memory}")
+        }
+    }
 }
 
-// A message from the user to a manager, saying so with the time, as the manager's prompt says its
+// A message from the user to a manager, saying so with the time, as its sessions tool says its
 // messages do.
 pub fn from_user(text: &str) -> String {
     format!("[{}, from the user]\n{text}", now_text())
@@ -1258,7 +1335,7 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     let (model, thinking, note) = host.launch(&args)?;
     let (model, level, note) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
         Some(model) => (Some(model), None, note),
-        None => crate::scale::pick(&agent_dir, MANAGER_KIND)?,
+        None => crate::scale::pick(&agent_dir, MANAGER_KIND, false)?,
     };
     if let Some(note) = note {
         eprintln!("{note}");

@@ -277,9 +277,10 @@ impl Host {
             _ => Vec::new(),
         };
         list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
-        if let Some(role) = role {
-            list.extend(crate::manager::tools(&self.agent_dir, &self.settings, role, cwd));
-        }
+        // A manager's own tools stay whatever its kind lists (an advisor's sessions, on advice).
+        let own = role.map(|role| crate::manager::tools(&self.agent_dir, &self.settings, role, cwd)).unwrap_or_default();
+        let own_names: Vec<String> = own.iter().map(|tool| tool.name().to_string()).collect();
+        list.extend(own);
         let Some(plugins) = plugins else { return Ok(list) };
         list.extend(plugins);
         for name in self.tool_names.iter().flatten().chain(&self.exclude_tools) {
@@ -291,7 +292,7 @@ impl Host {
         let named = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_some_and(|names| names.iter().any(|name| name == tool.name()));
         let wanted = |tool: &Arc<dyn tools::Tool>| match &work_tools {
             // A kind's list, narrowed further by an explicit --tools.
-            Some(names) => names.iter().any(|name| name == tool.name()) && (self.tool_names.is_none() || named(tool)),
+            Some(names) => (names.iter().any(|name| name == tool.name()) || own_names.iter().any(|name| name == tool.name())) && (self.tool_names.is_none() || named(tool)),
             None => (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool),
         };
         let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write");
@@ -303,7 +304,7 @@ impl Host {
     // false); one whose kind has since left the scale is read-only, so it doesn't gain rights.
     fn work(&self, session: &Session) -> (Option<Vec<String>>, bool) {
         let Some(kind) = crate::manager::work(session) else { return (None, false) };
-        let Some((_, entry)) = crate::scale::jobs(&self.agent_dir).into_iter().find(|(name, _)| *name == kind) else { return (None, true) };
+        let Some(entry) = crate::scale::job(&self.agent_dir, &kind) else { return (None, true) };
         let tools: Vec<String> = entry.get("tools").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
         (Some(tools).filter(|tools| !tools.is_empty()), entry.get("readOnly").and_then(Value::as_bool) == Some(true))
     }
@@ -318,7 +319,7 @@ impl Host {
         let constitution = prompt::constitution(&model.name)?;
         let (custom_prompt, discovered_append) = prompt::custom_prompts(&self.agent_dir);
         let append_prompt = self.append_prompt.clone().or(discovered_append);
-        let manager = role.map(|role| crate::manager::prompt(&self.settings, role, cwd));
+        let manager = role.map(|role| crate::manager::prompt(role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
         Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
     }
@@ -441,7 +442,7 @@ impl Host {
     pub fn launch(&self, args: &crate::cli::Args) -> Result<crate::scale::Pick, String> {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
-                let (model, level, note) = crate::scale::pick(&self.agent_dir, name)?;
+                let (model, level, note) = crate::scale::pick(&self.agent_dir, name, false)?;
                 Ok((model, args.thinking.clone().or(level), note))
             }
             (model, _) => Ok((model, args.thinking.clone(), None)),

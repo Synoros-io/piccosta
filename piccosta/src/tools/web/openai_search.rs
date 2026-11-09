@@ -62,7 +62,7 @@ pub fn targets(registry: &ModelRegistry, configured: Option<&str>, agent_dir: &s
         }
         return Ok(vec![target(model)]);
     }
-    let kind = crate::scale::find(agent_dir, SEARCH_KIND)?;
+    let kind = crate::scale::find(agent_dir, SEARCH_KIND, false)?;
     let (mut targets, mut skipped) = (Vec::new(), Vec::new());
     for name in crate::scale::order(agent_dir, &kind) {
         match registry.resolve(crate::scale::split(&name).0) {

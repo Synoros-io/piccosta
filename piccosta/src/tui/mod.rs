@@ -188,10 +188,12 @@ struct Slot {
     elsewhere: bool,
     followed: Option<std::time::SystemTime>,
     working_elsewhere: bool,
-    // A manager's session (the assistant, or its project's manager), which leads its group; and,
-    // for a new one, that it's to be made its project's manager when it opens (/manager).
+    // A manager's session (the assistant, its project's manager, or an advisor, listed right under
+    // its manager), which leads its group; and, for a new one, the kind it's to be made when it
+    // opens (/manager, /advisor).
     manager: bool,
-    make_manager: bool,
+    advisor: bool,
+    make: Option<crate::manager::Role>,
     // When its runtime let it go while idle off-screen: its file's mtime then. A later change is
     // something written for it (a lane's report, a job's or a sender's message), so it starts again.
     released: Option<std::time::SystemTime>,
@@ -244,7 +246,8 @@ impl Slot {
             followed: None,
             working_elsewhere: false,
             manager: false,
-            make_manager: false,
+            advisor: false,
+            make: None,
             released: None,
             parent: None,
             host: None,
@@ -1078,12 +1081,17 @@ impl App {
         let projects: BTreeSet<PathBuf> = std::iter::once(self.host.cwd.clone()).chain(self.slots.iter().map(|slot| slot.cwd.clone())).collect();
         let managers = projects.into_iter().filter_map(|cwd| crate::manager::project_manager(&self.host.agent_dir, &cwd).map(|path| (cwd, path, crate::manager::PROJECT_NAME.to_string())))
             .chain(crate::manager::session_file(&self.host.agent_dir).map(|path| (crate::manager::home(&self.host.agent_dir), path, crate::manager::assistant_name(&self.host.agent_dir))));
-        for (cwd, path, title) in managers {
+        // Each with its advisor, when it has one.
+        let managers: Vec<_> = managers.flat_map(|(cwd, path, title)| {
+            let advisor = crate::manager::advisor(&self.host.agent_dir, &cwd).map(|file| (cwd.clone(), file, crate::manager::ADVISOR_NAME.to_string(), true));
+            [Some((cwd, path, title, false)), advisor]
+        }).flatten().collect();
+        for (cwd, path, title, advisor) in managers {
             let path = path.canonicalize().unwrap_or(path);
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.path.as_ref() == Some(&path)) {
-                slot.manager = true;
+                (slot.manager, slot.advisor) = (true, advisor);
             } else if !crate::session::is_closed(&self.host.agent_dir, &path) {
-                self.slots.push(Slot { cwd, manager: true, ..Slot::new(Some(path), title) });
+                self.slots.push(Slot { cwd, manager: true, advisor, ..Slot::new(Some(path), title) });
             }
         }
     }
@@ -1108,7 +1116,7 @@ impl App {
     fn reopen(&mut self, slot: usize) -> Result<(), String> {
         let view = &mut self.slots[slot];
         let draft = std::mem::take(&mut view.draft);
-        self.slots[slot] = Slot { cwd: view.cwd.clone(), saved: view.saved, opened: view.opened, manager: view.manager, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
+        self.slots[slot] = Slot { cwd: view.cwd.clone(), saved: view.saved, opened: view.opened, manager: view.manager, advisor: view.advisor, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
         self.load(slot, None, None, None)
     }
 
@@ -1138,9 +1146,9 @@ impl App {
             None => self.host.session(self.slots[slot].path.as_deref(), false, self.persist)?,
         };
         // The first session ever in a directory is its project's manager, and so is one /manager
-        // asked for. Not a session kept in memory, a subagent's, the assistant's, or one in home;
-        // and not the first one on its own in a piccosta an agent's command started or on a
-        // scratch agent dir, since managers are the user's (/manager still makes one there).
+        // asked for; one /advisor asked for is its manager's advisor. Not a session kept in memory,
+        // a subagent's, the assistant's, or one in home; and not the first one on its own in a
+        // piccosta an agent's command started or on a scratch agent dir, since managers are the user's (/manager still makes one there).
         let mut session = session;
         let dir = PathBuf::from(&session.header().cwd);
         let agent_dir = &self.host.agent_dir;
@@ -1151,8 +1159,13 @@ impl App {
         let home = Some(crate::config::home());
         let eligible = self.persist && !self.single && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
         let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
-        if eligible && (first || self.slots[slot].make_manager) && crate::manager::role(&session).is_none() {
-            crate::manager::make(agent_dir, &mut session, crate::manager::Role::Project).map_err(|error| format!("could not make the project manager: {error}"))?;
+        let role = match self.slots[slot].make {
+            Some(crate::manager::Role::Advisor) => self.persist.then_some(crate::manager::Role::Advisor),
+            make if eligible && (first || make.is_some()) => Some(crate::manager::Role::Project),
+            _ => None,
+        };
+        if let Some(role) = role.filter(|_| crate::manager::role(&session).is_none()) {
+            crate::manager::make(agent_dir, &mut session, role).map_err(|error| format!("could not make the {}: {error}", if role == crate::manager::Role::Advisor { "advisor" } else { "project manager" }))?;
         }
         let sender = self.sender.clone();
         let emit: crate::agent::EventSink = Box::new(move |event: &Event| {
@@ -1174,6 +1187,7 @@ impl App {
         view.opened = true;
         view.title = crate::manager::title(&self.host.agent_dir, &agent.session);
         view.manager = crate::manager::role(&agent.session).is_some();
+        view.advisor = crate::manager::role(&agent.session) == Some(crate::manager::Role::Advisor);
         view.path = agent.session.file().map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         view.saved |= view.path.as_deref().is_some_and(Path::exists);
         view.cwd = PathBuf::from(&agent.session.header().cwd);
@@ -1271,7 +1285,7 @@ impl App {
             let draft = std::mem::take(&mut self.slots[slot].draft);
             let view = &self.slots[slot];
             let released = view.path.as_deref().and_then(|path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok());
-            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, closed: view.closed, manager: view.manager, released, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
+            self.slots[slot] = Slot { cwd: view.cwd.clone(), opened: view.opened, saved: view.saved, closed: view.closed, manager: view.manager, advisor: view.advisor, released, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
         }
     }
 
@@ -1730,6 +1744,7 @@ impl App {
         view.model = model;
         view.thinking = context.thinking_level.clone();
         view.manager = crate::manager::role(&session).is_some();
+        view.advisor = crate::manager::role(&session) == Some(crate::manager::Role::Advisor);
         view.team = crate::host::team(&session);
         view.context_tokens = crate::compaction::estimate_projected_context_tokens(&session.projection(), &session.path_to_leaf()).tokens;
         for message in context.messages {
@@ -1751,7 +1766,7 @@ impl App {
             }
         }
         let project = |index: usize| projects.iter().position(|project| *project == self.project_of(index)).unwrap_or(projects.len());
-        listed.sort_by_key(|&index| (project(index), !self.slots[index].manager, self.slots[index].live.is_none()));
+        listed.sort_by_key(|&index| (project(index), !self.slots[index].manager, self.slots[index].advisor, self.slots[index].live.is_none()));
         // A subagent's row comes right after its parent's (and after its siblings').
         let (children, mut order): (Vec<usize>, Vec<usize>) = listed.into_iter().partition(|&index| self.slots[index].parent.is_some());
         for child in children {

@@ -73,7 +73,7 @@ impl SubagentTool {
     // line for each one left out and why. A job that lists none, or none of whose models can run,
     // runs on the calling session's own model.
     async fn available(&self, job: &Job, context: &ToolContext<'_>) -> Result<(Vec<String>, Vec<String>), String> {
-        let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name)?);
+        let models = crate::scale::order(&self.agent_dir, &crate::scale::find(&self.agent_dir, &job.name, false)?);
         let own = format!("{}/{}", context.provider, context.model_id);
         if models.is_empty() {
             return Ok((vec![own], Vec::new()));
@@ -135,7 +135,7 @@ impl SubagentTool {
         self.jobs
             .iter()
             .map(|job| {
-                let models = crate::scale::find(&self.agent_dir, &job.name).map(|entry| crate::scale::available(&self.agent_dir, &entry).join(", else ")).unwrap_or_default();
+                let models = crate::scale::find(&self.agent_dir, &job.name, false).map(|entry| crate::scale::available(&self.agent_dir, &entry).join(", else ")).unwrap_or_default();
                 let models = if models.is_empty() { "your own model".to_string() } else { models };
                 let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
                 let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
