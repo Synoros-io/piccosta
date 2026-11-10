@@ -1174,8 +1174,8 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     let thinking_off = request.thinking_level == "off";
     let fast = model.service_tier.as_deref() == Some(super::FAST_TIER);
     let cwd = request.cwd.to_string_lossy().into_owned();
-    let (key, one_shot) = (request.session_id.unwrap_or("(none)").to_string(), !request.cache);
-    if !one_shot {
+    let key = request.session_id.unwrap_or("(none)").to_string();
+    {
         history::attach(&key, request.session_file);
     }
     let shape = history::shape(&system_prompt, &tools, cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
@@ -1195,7 +1195,7 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     // query, the results it was given, which the next call's message is folded onto (unfold).
     let before = request.in_place.then(|| fold_into_results(request.messages[..request.messages.len().saturating_sub(1)].iter()
         .filter(|message| !matches!(message, Message::System(_)) && history::visible(message)).cloned()).iter().map(fingerprint).collect::<Vec<_>>());
-    let mut forced: Option<String> = one_shot.then(|| "a one-off summary".into());
+    let mut forced: Option<String> = None;
     loop {
         let (reply, answer) = oneshot::channel();
         let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
@@ -1215,18 +1215,10 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
             },
             Err(rewrite) => rewrite,
         };
-        // An idle compaction asks only the query holding the session's cache: a new one would write
-        // the whole context again, the cost the compaction is there to spare.
-        if request.in_place {
-            debug(&format!("idle compaction: no rewrite for it, {reason} (session {key})"));
-            return failed(model, StopReason::Error, &format!("no Claude Code query waits with this session's context: {reason}"));
-        }
         debug(&format!("sync: rewrite, {reason} (session {key})"));
-        if !one_shot {
-            lock(&REWRITES).insert(key.clone(), reason.clone());
-        }
+        lock(&REWRITES).insert(key.clone(), reason.clone());
         let start = Start { key: &key, model, cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
-            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, one_shot, manager: request.manager };
+            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, manager: request.manager };
         if let Err(error) = start_query(start, turn) {
             return failed(model, StopReason::Error, &error);
         }
@@ -1352,9 +1344,6 @@ struct Start<'a> {
     prints: &'a [String],
     shape: &'a Shape,
     cwd: &'a str,
-    // A summary's: it ends with its turn, keeps no records, takes no tools and leaves the waiting
-    // queries alone.
-    one_shot: bool,
     manager: bool,
 }
 
@@ -1387,7 +1376,7 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     args.extend(written.iter().map(|id| format!("--resume={id}")));
     args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--model", start.cli_model,
         "--disable-slash-commands"].map(String::from));
-    if SETTINGS.strict_mcp || start.one_shot {
+    if SETTINGS.strict_mcp {
         args.push("--strict-mcp-config".into());
     }
     // Some models default to omitted thinking text; summarized makes thinking_delta events arrive.
@@ -1425,7 +1414,6 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     let (commands, inbox) = mpsc::unbounded_channel();
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
     let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
-    query.one_shot = start.one_shot;
     query.turn = Some(turn);
     lock(&LIVE).insert(start.key.to_string(), Live { id, state, commands });
     QUERIES.fetch_add(1, Ordering::SeqCst);
@@ -1498,7 +1486,6 @@ struct Query {
     failure: Option<String>,
     result_seen: bool,
     closed: bool,
-    one_shot: bool,
     // An interrupt was sent and its turn hasn't ended yet; and the next message, held back until it
     // has, so nothing more of the stopped answer goes into the next one's turn.
     interrupting: bool,
@@ -1527,7 +1514,7 @@ impl Query {
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
-            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, one_shot: false, interrupting: false, next_prompt: None, unsent: Vec::new(), hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, interrupting: false, next_prompt: None, unsent: Vec::new(), hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
     }
 
     async fn run(mut self, opening: Vec<Value>) {
@@ -1701,7 +1688,7 @@ impl Query {
         if live.get(&self.key).is_some_and(|live| live.id == self.id) {
             live.remove(&self.key);
         }
-        if !self.one_shot && !live.contains_key(&self.key) {
+        if !live.contains_key(&self.key) {
             lock(&ENDED).insert(self.key.clone(), why.to_string());
         }
     }
@@ -1783,11 +1770,6 @@ impl Query {
     // instead rebuilt the whole conversation and wrote all of it to the cache again.
     async fn interrupt(&mut self) {
         debug(&format!("interrupt: session {}", self.key));
-        // A summary stopped is over, as nothing comes after it.
-        if self.one_shot {
-            self.end_open(StopReason::Aborted, "Operation aborted");
-            return self.discard("the summary was stopped").await;
-        }
         // A message still held back behind an earlier interrupt never reached Claude Code. pi keeps
         // it, so it goes in with the next message (prompt).
         self.unsent.extend(self.next_prompt.take().into_iter().flatten());
@@ -2024,7 +2006,7 @@ impl Query {
     // Whether the turn ending now leaves the query waiting: holding is on, and pi's turn ended with
     // an answer, not on tool calls it was handed.
     fn holds(&self) -> bool {
-        !hold_time().is_zero() && !self.one_shot && self.turn.is_some() && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)
+        !hold_time().is_zero() && self.turn.is_some() && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)
             && lock(&self.state).pending.is_none()
     }
 
@@ -2051,7 +2033,7 @@ impl Query {
             let state = lock(&self.state);
             (state.pending.is_some(), state.kept_base.clone())
         };
-        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !parked && !self.one_shot && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)) {
+        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !parked && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)) {
             prints.push(fingerprint(&Message::Assistant(self.out.clone())));
             roles.push("assistant".into());
             history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles);

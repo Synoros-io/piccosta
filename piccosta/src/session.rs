@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 // The session format version this code reads and writes (session-manager.ts:41).
@@ -504,17 +504,11 @@ impl Session {
             session.write_whole_file()?;
             return Ok(session);
         }
-        let session = Session::parse(path, &text)?;
-        // A last line without its newline (a crash mid-write) gets one, so the next append starts
-        // on a fresh line instead of joining the broken one.
-        if !text.is_empty() && !text.ends_with('\n') {
-            OpenOptions::new().append(true).open(path)?.write_all(b"\n")?;
-        }
-        Ok(session)
+        Session::parse(path, &text)
     }
 
-    // A session file as it is, for reading only: nothing is written, not even the repairs `open`
-    // makes, so it's safe on a file another piccosta is appending to.
+    // A session file as it is, for reading only: nothing is written, so it's safe on a file another
+    // piccosta is appending to.
     pub fn read(path: &Path) -> Result<Session, OpenError> {
         Session::parse(path, &String::from_utf8_lossy(&fs::read(path)?))
     }
@@ -668,8 +662,17 @@ impl Session {
             self.flushed = true;
             return Ok(());
         }
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let length = file.metadata()?.len();
+        // A last line without its newline (a crash mid-write) gets one first, so this entry starts
+        // on a fresh line instead of joining the broken one. Only the writer does this: opening a
+        // session to look at it never writes to it, as another piccosta may be mid-append.
+        let mut last = [b'\n'];
+        if length > 0 {
+            file.seek(io::SeekFrom::Start(length - 1))?;
+            file.read_exact(&mut last)?;
+        }
+        let line = if last[0] == b'\n' { line } else { format!("\n{line}") };
         if let Err(error) = file.write_all(line.as_bytes()) {
             if let Err(rollback) = file.set_len(length) {
                 return Err(io::Error::new(error.kind(), format!("{error}; could not remove partial entry: {rollback}")));

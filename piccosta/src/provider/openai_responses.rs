@@ -96,7 +96,7 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     let model = request.model;
     // The id that keys the cache and backend affinity; none for an uncached request
     // (openai-responses.ts:188-189).
-    let cache_session = request.session_id.filter(|_| request.cache);
+    let cache_session = request.session_id;
     let cache_key: Option<String> = cache_session.map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
     let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level);
 

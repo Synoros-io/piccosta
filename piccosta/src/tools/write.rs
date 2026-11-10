@@ -63,7 +63,7 @@ impl Tool for WriteTool {
             if let Some(message) = aborted() {
                 return Err(message);
             }
-            tokio::fs::write(&absolute, arguments.content.as_bytes())
+            paths::replace(&absolute, arguments.content.clone().into_bytes())
                 .await
                 .map_err(|error| paths::fs_error(&error, "open", Some(&absolute)))?;
             if let Some(message) = aborted() {

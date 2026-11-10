@@ -350,17 +350,17 @@ pub fn running(file: &Path) -> bool {
 // (its watcher, reaper.rs), but only when it's the lane run the manager itself started (`ours`):
 // the same pid, start time and boot. A terminal UI or the assistant that took that pid since holds
 // other sessions, as does anyone else's run, and is never killed for one. Output: None when nothing
-// runs it; else whether it answered, or what was done instead.
-pub fn end(file: &Path, what: &str, ours: Option<&Run>) -> Option<Result<(), String>> {
+// runs it; Ok when its run is over (with a note when it had to be killed); else why it still runs.
+pub fn end(file: &Path, what: &str, ours: Option<&Run>) -> Option<Result<Option<String>, String>> {
     let waited = STOP_WAIT.as_secs();
     Some(match ask(file, json!({"do": what}), STOP_WAIT) {
         Asked::Nobody => return None,
-        Asked::Answered(_) => Ok(()),
+        Asked::Answered(_) => Ok(None),
         Asked::Silent(Some(runner)) if ours != Some(&runner) => {
             Err(format!("it didn't answer in {waited} s; the piccosta running it (pid {}) isn't the run you started (not the same pid, start time and boot), so it was left alone", runner.pid))
         }
         Asked::Silent(Some(runner)) if crate::proc::Process::started(runner.pid, runner.start).is_some_and(|process| process.signal(crate::proc::KILL)) => {
-            Err(format!("it didn't answer in {waited} s, so its run (pid {}) was killed, with everything it ran", runner.pid))
+            Ok(Some(format!("it didn't answer in {waited} s, so its run (pid {}) was killed, with everything it ran", runner.pid)))
         }
         Asked::Silent(_) => Err(format!("it didn't answer in {waited} s, and the piccosta running it couldn't be found to kill")),
         Asked::Unread => Err("the piccosta running it isn't taking requests (it's stopped, or stuck), so it couldn't be told, nor known for sure to kill: it was left alone".into()),

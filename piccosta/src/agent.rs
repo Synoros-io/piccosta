@@ -21,7 +21,7 @@
 // again once.
 
 use crate::auth::{self, CredentialPaths};
-use crate::compaction::{self, Reason, RetryNotice};
+use crate::compaction::{self, Reason};
 use crate::config::{CompactionSettings, RetrySettings};
 use crate::message::{
     AgentMessage, AssistantMessage, Content, CustomMessage, StopReason, SystemMessage, TextOrBlocks, ToolDefinition, ToolReference,
@@ -320,8 +320,9 @@ pub struct Agent {
 // placeholder token for ten minutes (sweep, 2026-10-30). Eight thousand bytes of one short unit
 // is far past any table rule or run of digits a real answer has; it's checked each time another
 // LOOP_CHECK_EVERY bytes have streamed. And the same tool call (tool and arguments) made
-// REPEATED_CALL_LIMIT times back to back ends the run: a model that hasn't changed its call after
-// five identical results won't on the sixth.
+// REPEATED_CALL_LIMIT times back to back with the same result ends the run: a model that hasn't
+// changed its call after five identical results won't on the sixth. A call whose result changes
+// (a poll, a queue worked through) is making progress and goes on.
 const LOOP_WINDOW: usize = 8000;
 const LOOP_UNIT_MAX: usize = 50;
 const LOOP_CHECK_EVERY: usize = 500;
@@ -837,18 +838,20 @@ impl Agent {
                     results.push(AgentMessage::ToolResult(message));
                 }
             }
+            // What the calls returned, for the loop guard: a call whose result changes is making progress.
+            let outcome: String = results.iter().filter_map(|message| if let AgentMessage::ToolResult(result) = message { serde_json::to_string(&result.content).ok() } else { None }).collect();
             (self.emit)(&Event::TurnEnd { message: AgentMessage::Assistant(assistant.clone()), tool_results: results });
 
-            // The call loop guard: the same call again and again ends the run, with a note to the
-            // user and the model saying which.
+            // The call loop guard: the same call with the same result again and again ends the run,
+            // with a note to the user and the model saying which.
             for block in &assistant.content {
                 if let Content::ToolCall { name, arguments, .. } = block {
-                    let call = format!("{name} {}", Value::Object(arguments.clone()));
+                    let call = format!("{name} {}\n{outcome}", Value::Object(arguments.clone()));
                     self.repeated_call = if self.repeated_call.0 == call { (call, self.repeated_call.1 + 1) } else { (call, 1) };
                 }
             }
             if self.repeated_call.1 >= REPEATED_CALL_LIMIT {
-                let text = format!("piccosta stopped the run: the same call was made {} times in a row ({}).", self.repeated_call.1, crate::tools::jobs::command_preview(&self.repeated_call.0));
+                let text = format!("piccosta stopped the run: the same call was made {} times in a row ({}).", self.repeated_call.1, crate::tools::jobs::command_preview(self.repeated_call.0.split('\n').next().unwrap_or_default()));
                 let note = CustomMessage { custom_type: LOOP_NOTE_TYPE.into(), content: TextOrBlocks::Text(text), display: true, details: None, timestamp: clock::now_ms() };
                 self.add_message(AgentMessage::Custom(note), &mut new_messages)?;
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
@@ -1003,7 +1006,7 @@ impl Agent {
     // A request on the session's own context, the same for each turn and for idle compaction: its
     // model, level, transport, files and cache key, so the provider keeps the one cached prefix.
     fn request<'a>(config: &'a AgentConfig, session: &'a Session, messages: &'a [crate::message::Message], credential: &'a auth::Credential, cancel: CancellationToken) -> Request<'a> {
-        Request { model: &config.model, messages, credential, session_id: Some(session.id()), cache: true, in_place: false, manager: config.manager_home.is_some(), transport: &config.transport,
+        Request { model: &config.model, messages, credential, session_id: Some(session.id()), in_place: false, manager: config.manager_home.is_some(), transport: &config.transport,
             thinking_level: &config.thinking_level, session_file: session.file(), cwd: &config.cwd, cancel }
     }
 
@@ -1254,31 +1257,19 @@ impl Agent {
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
         let outcome = match credential {
             Err(error) => Err(error),
-            Ok(credential) if reason == Reason::Idle => {
-                let messages = crate::message::to_model_messages(&self.session.context().messages);
-                compaction::summarize_in_place(&preparation, Self::request(&self.config, &self.session, &messages, &credential, cancel.clone())).await
-            }
             Ok(credential) => {
-                let request = compaction::SummaryRequest {
-                    model,
-                    credential: &credential,
-                    thinking_level: &self.config.thinking_level,
-                    retry: self.config.retry,
-                    transport: &self.config.transport,
-                    cwd: &self.config.cwd,
-                    cancel: cancel.clone(),
-                };
-                let emit = &mut self.emit;
-                let mut notify = |notice: RetryNotice| {
-                    emit(&match notice {
-                        RetryNotice::Scheduled { attempt, max_attempts, delay_ms, error_message } => {
-                            Event::SummarizationRetryScheduled { attempt, max_attempts, delay_ms, error_message }
-                        }
-                        RetryNotice::AttemptStart => Event::SummarizationRetryAttemptStart { source: "compaction", reason },
-                        RetryNotice::Finished => Event::SummarizationRetryFinished,
-                    })
-                };
-                compaction::summarize(&preparation, instructions, &request, &mut notify).await
+                // Every compaction asks for its summary at the end of the session's own request, so
+                // the provider reads the context from its cache instead of being sent all of it
+                // again. A context past the model's window (an overflow, or a switch to a smaller
+                // model) is cut to fit first (compaction::fit); the bridge's window already keeps
+                // room for the reply.
+                let mut messages = self.session.context().messages;
+                let reply_room = if model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
+                if model.context_window > 0 {
+                    compaction::fit(&mut messages, model.context_window.saturating_sub(reply_room));
+                }
+                let messages = crate::message::to_model_messages(&messages);
+                compaction::summarize_in_place(&preparation, Self::request(&self.config, &self.session, &messages, &credential, cancel.clone()), instructions).await
             }
         };
 

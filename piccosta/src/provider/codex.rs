@@ -48,7 +48,7 @@ fn verbosity(request: &Request<'_>) -> String {
         let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(request.cwd));
         settings.get("codex.verbosity").and_then(Value::as_str).unwrap_or(DEFAULT_VERBOSITY).to_string()
     };
-    match (request.session_id.filter(|_| request.cache), VERBOSITY.lock()) {
+    match (request.session_id, VERBOSITY.lock()) {
         (Some(session), Ok(mut sessions)) => {
             if sessions.len() >= VERBOSITY_SESSIONS && !sessions.contains_key(session) {
                 sessions.clear();
@@ -271,7 +271,7 @@ async fn run(request: &Request<'_>, state: &mut StreamState<'_>, send: &mut dyn 
     let model = request.model;
     let account_id = request.credential.account_id.as_deref().ok_or("Failed to extract accountId from token")?;
     // An uncached request sends no key and no session headers (openai-codex-responses.ts:280-281).
-    let cache_key: Option<String> = request.session_id.filter(|_| request.cache).map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
+    let cache_key: Option<String> = request.session_id.map(|id| id.chars().take(MAX_PROMPT_CACHE_KEY_CHARS).collect());
     let body = build_body(model, request.messages, cache_key.as_deref(), request.thinking_level, &verbosity(request));
 
     // The websocket first, unless the transport says SSE or this session already fell back

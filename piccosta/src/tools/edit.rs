@@ -172,7 +172,7 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
     if let Some(message) = aborted() {
         return Err(message);
     }
-    tokio::fs::write(absolute, final_content.as_bytes()).await.map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
+    paths::replace(absolute, final_content.clone().into_bytes()).await.map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
     if let Some(message) = aborted() {
         return Err(message);
     }

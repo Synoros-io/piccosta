@@ -9,24 +9,20 @@
 // fires and cuts where pi's does.
 //
 // The flow: `prepare` picks what to summarize from the session (None when there's nothing to),
-// `summarize` asks the model, and the agent writes the entry and says so (agent.rs). Left out:
+// `summarize_in_place` asks the model, and the agent writes the entry and says so (agent.rs). Left out:
 // codemode's nested calls in the file lists (piccosta has no codemode) and extension hooks.
 
-use crate::auth::Credential;
-use crate::config::{CompactionSettings, RetrySettings};
+use crate::config::CompactionSettings;
 use crate::message::{
-    to_model_messages, AgentMessage, AssistantMessage, Content, Message, StopReason, SystemMessage, TextOrBlocks, Usage,
+    to_model_messages, AgentMessage, AssistantMessage, Content, Message, StopReason, TextOrBlocks, Usage,
     UserMessage,
 };
-use crate::model::Model;
 use crate::provider::{self, estimate, transcript, Request};
 use crate::session::{ProjectedEntry, Session, SessionEntry};
-use crate::{clock, js, retry};
+use crate::{clock, js};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 // pi's rule of thumb for compaction, chars / 4, which overestimates tokens (compaction.ts:294-298),
 // and what one image counts as (compaction.ts:276).
@@ -64,51 +60,6 @@ What the user wants done. More than one item if the session covers several thing
 - Paths, names, numbers, error messages and references, exactly as they appeared.
 
 Keep the rest short, but keep paths, names and error messages exact.";
-
-// Updating a checkpoint: the same sections, keeping what still holds.
-const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are new since the checkpoint in <previous-summary> tags. Write the updated checkpoint: keep everything in the old one that still holds, add what's new, move finished work to Done, update Next, and drop only what no longer matters. The user's instructions are never dropped while they still apply. Use this format:
-
-## The user's instructions
-Every instruction, rule or preference the user gave that still applies, each quoted in the user's own words. Never paraphrase or shorten these, and leave none out: they are the user's standing orders for the rest of the session.
-
-## Goal
-What the user wants done. More than one item if the session covers several things.
-
-## Done
-- What's finished, with the exact files, functions and commands.
-
-## In progress
-- What was being worked on when the conversation was cut, and how far it got.
-
-## Blocked
-- What's stopping progress, if anything.
-
-## Decisions
-- Each decision and the reason for it.
-
-## Next
-1. What comes next, in order.
-
-## Facts needed to continue
-- Paths, names, numbers, error messages and references, exactly as they appeared.
-
-Keep the rest short, but keep paths, names and error messages exact.";
-
-const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are the start of a turn whose later messages are kept as they are. Write a short checkpoint of this part only, placed before those later messages:
-
-## The user's instructions
-Every instruction or rule the user gave here, quoted in their own words.
-
-## The request
-What the user asked for.
-
-## Done so far
-- Decisions and work in these messages.
-
-## Needed to continue
-- What from these messages the later ones depend on.
-
-Only what's in the messages above; don't guess at what comes later.";
 
 // Idle compaction's summary is asked for at the end of the session's own request, under the
 // session's system prompt, so the summarizer's role (SUMMARIZATION_SYSTEM_PROMPT) goes in the message.
@@ -542,6 +493,8 @@ fn blocks_text(blocks: &[Content], separator: &str) -> String {
 // The first `max_chars` UTF-16 units of a tool result and a note of how many more there were
 // (utils.ts:100-104). A cut through a surrogate pair leaves half a character; JavaScript sends
 // that half, which providers read as U+FFFD, so U+FFFD is what goes in its place here.
+// The most room the note at the end of a cut text takes.
+const TRUNCATION_NOTE_CHARS: usize = 48;
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let units: Vec<u16> = text.encode_utf16().collect();
     if units.len() <= max_chars {
@@ -600,27 +553,6 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
 // Asking the model
 // ---------------------------------------------------------------------------------------------
 
-// What a summary request runs with: the session's model, credential and thinking level, and the
-// retry settings for transient failures.
-pub struct SummaryRequest<'a> {
-    pub model: &'a Model,
-    pub credential: &'a Credential,
-    pub thinking_level: &'a str,
-    pub retry: RetrySettings,
-    pub transport: &'a str,
-    pub cwd: &'a std::path::Path,
-    pub cancel: CancellationToken,
-}
-
-// What the summary request's retries report, for pi's summarization_retry_* events.
-pub enum RetryNotice {
-    Scheduled { attempt: u32, max_attempts: u32, delay_ms: u64, error_message: String },
-    AttemptStart,
-    Finished,
-}
-
-pub type RetryListener<'a> = dyn FnMut(RetryNotice) + Send + 'a;
-
 // The finished summary and what pi stores with it (pi's CompactionResult).
 #[derive(Debug, Clone)]
 pub struct Summary {
@@ -630,76 +562,6 @@ pub struct Summary {
     pub usage: Usage,
     // {readFiles, modifiedFiles}, which the next compaction reads back.
     pub details: Value,
-}
-
-// One summary request (compaction.ts:595-638, 682-693): pi's system prompt and the prompt as one
-// user message. It goes uncached under a fresh session id: pi's cacheRetention "none", which
-// providers that route by session (opencode) still get the id for. Thinking is the session's level
-// when the model reasons.
-async fn request_once(request: &SummaryRequest<'_>, prompt_text: &str) -> AssistantMessage {
-    let messages = [
-        Message::System(SystemMessage {
-            content: TextOrBlocks::Text(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
-            sections: None,
-            tools_added: None,
-            tools_removed: None,
-            timestamp: 0,
-        }),
-        Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(prompt_text)]), timestamp: clock::now_ms() }),
-    ];
-    let session_id = uuid::Uuid::now_v7().to_string();
-    let thinking_level = if request.model.reasoning && request.thinking_level != "off" { request.thinking_level } else { "off" };
-    // Nobody watches a summary stream; the receiver only has to outlive it.
-    let (sender, _receiver) = mpsc::unbounded_channel();
-    provider::stream(
-        Request {
-            model: request.model,
-            messages: &messages,
-            credential: request.credential,
-            session_id: Some(&session_id),
-            cache: false,
-            in_place: false,
-            manager: false,
-            transport: request.transport,
-            thinking_level,
-            session_file: None,
-            cwd: request.cwd,
-            cancel: request.cancel.child_token(),
-        },
-        sender,
-    )
-    .await
-}
-
-// The request, retried on transient failures the way pi's retryAssistantCall does
-// (ai/src/utils/retry.ts:205-255): up to maxRetries more attempts with the usual backoff. An abort
-// during a wait ends it as an aborted response.
-async fn request_with_retry(request: &SummaryRequest<'_>, prompt_text: &str, notify: &mut RetryListener<'_>) -> AssistantMessage {
-    let max_attempts = if request.retry.enabled { request.retry.max_retries } else { 0 };
-    let mut attempt = 0;
-    let mut retrying = false;
-    loop {
-        let response = request_once(request, prompt_text).await;
-        if response.stop_reason != StopReason::Error || attempt >= max_attempts || !retry::is_retryable(&response) {
-            if retrying {
-                notify(RetryNotice::Finished);
-            }
-            return response;
-        }
-        attempt += 1;
-        retrying = true;
-        let delay_ms = retry::delay_ms(request.retry.base_delay_ms, request.retry.max_delay_ms, attempt);
-        let error_message = response.error_message.clone().filter(|error| !error.is_empty()).unwrap_or_else(|| "Unknown error".into());
-        notify(RetryNotice::Scheduled { attempt, max_attempts, delay_ms, error_message });
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
-            () = request.cancel.cancelled() => {
-                notify(RetryNotice::Finished);
-                return AssistantMessage { stop_reason: StopReason::Aborted, error_message: None, ..response };
-            }
-        }
-        notify(RetryNotice::AttemptStart);
-    }
 }
 
 // The text of a summary response, or why it can't be stored (compaction.ts:585-593, 742-750). A
@@ -720,112 +582,77 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
     Some(blocks_text(&response.content, "\n")).filter(|text| !text.trim().is_empty()).ok_or_else(|| format!("{label} returned empty text"))
 }
 
-// The prompt that summarizes `messages`, updating `previous_summary` when there is one
-// (compaction.ts:696-729).
-pub fn history_prompt(messages: &[AgentMessage], previous_summary: Option<&str>, custom_instructions: Option<&str>) -> String {
-    // pi tests the previous summary for truth, so an empty one counts as none.
-    let previous_summary = previous_summary.filter(|previous| !previous.is_empty());
-    let mut instructions = if previous_summary.is_some() { UPDATE_SUMMARIZATION_PROMPT } else { SUMMARIZATION_PROMPT }.to_string();
-    if let Some(focus) = custom_instructions.filter(|focus| !focus.is_empty()) {
-        instructions = format!("{instructions}\n\nAdditional focus: {focus}");
-    }
-    let conversation = serialize_conversation(&to_model_messages(messages));
-    let mut prompt_text = format!("<conversation>\n{conversation}\n</conversation>\n\n");
-    if let Some(previous) = previous_summary {
-        prompt_text.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
-    }
-    prompt_text.push_str(&instructions);
-    prompt_text
-}
-
-// The prompt that summarizes the start of a turn the cut splits (compaction.ts:1076-1081).
-pub fn turn_prefix_prompt(messages: &[AgentMessage], custom_instructions: Option<&str>) -> String {
-    let conversation = serialize_conversation(&to_model_messages(messages));
-    let mut prompt_text = format!("# Conversation\n{conversation}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}");
-    if let Some(focus) = custom_instructions.filter(|focus| !focus.is_empty()) {
-        prompt_text = format!("{prompt_text}\n\nAdditional focus: {focus}");
-    }
-    prompt_text
-}
-
-// Two requests' usage added up (usage-totals.ts:31-52).
-fn combine_usage(first: &Usage, second: &Usage) -> Usage {
-    let optional_sum = |a: Option<u64>, b: Option<u64>| (a.is_some() || b.is_some()).then(|| a.unwrap_or(0) + b.unwrap_or(0));
-    Usage {
-        input: first.input + second.input,
-        output: first.output + second.output,
-        cache_read: first.cache_read + second.cache_read,
-        cache_write: first.cache_write + second.cache_write,
-        cache_write_1h: optional_sum(first.cache_write_1h, second.cache_write_1h),
-        reasoning: optional_sum(first.reasoning, second.reasoning),
-        total_tokens: first.total_tokens + second.total_tokens,
-        cost: crate::message::Cost {
-            input: first.cost.input + second.cost.input,
-            output: first.cost.output + second.cost.output,
-            cache_read: first.cost.cache_read + second.cost.cache_read,
-            cache_write: first.cost.cache_write + second.cost.cache_write,
-            total: first.cost.total + second.cost.total,
-            plan: first.cost.plan.or(second.cost.plan),
-            state: first.cost.state.max(second.cost.state),
-            settles: first.cost.settles + second.cost.settles,
-        },
-    }
-}
-
-// Write the summary for a prepared compaction with the model (compaction.ts:952-1057).
-pub async fn summarize(
-    preparation: &Preparation,
-    custom_instructions: Option<&str>,
-    request: &SummaryRequest<'_>,
-    notify: &mut RetryListener<'_>,
-) -> Result<Summary, String> {
-    summarize_with(preparation, custom_instructions, &mut async |prompt: &str| request_with_retry(request, prompt, notify).await).await
-}
-
-// Write the summary for a prepared compaction, getting each response from `complete`, which
-// sends one prompt. A split turn gets two requests, the history and the turn's start, joined
-// into one summary. The file lists go last.
-pub async fn summarize_with(
-    preparation: &Preparation,
-    custom_instructions: Option<&str>,
-    complete: &mut impl AsyncFnMut(&str) -> AssistantMessage,
-) -> Result<Summary, String> {
-    let previous = preparation.previous_summary.as_deref();
-    let mut history_summary = async |previous: Option<&str>| -> Result<(String, Usage), String> {
-        let response = complete(&history_prompt(&preparation.messages_to_summarize, previous, custom_instructions)).await;
-        Ok((summary_text(&response, "Summarization")?, response.usage))
-    };
-    let (summary, usage) = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let (history, history_usage) = if preparation.messages_to_summarize.is_empty() {
-            (previous.unwrap_or("No prior history.").to_string(), None)
-        } else {
-            let (text, usage) = history_summary(previous).await?;
-            (text, Some(usage))
-        };
-        let response = complete(&turn_prefix_prompt(&preparation.turn_prefix_messages, custom_instructions)).await;
-        let (prefix, prefix_usage) = (summary_text(&response, "Turn prefix summarization")?, response.usage);
-        let usage = match history_usage {
-            Some(history_usage) => combine_usage(&history_usage, &prefix_usage),
-            None => prefix_usage,
-        };
-        (format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}"), usage)
-    } else {
-        history_summary(previous).await?
-    };
-    Ok(finish(preparation, summary, usage))
-}
-
-// Idle compaction's summary (agent.rs): `request` is the session's own, as its turns send it, and
-// the summary prompt goes after its messages as one more, so the provider reads everything before
-// it from its cache rather than a request of the summarizer's own (request_once) writing it all
-// again. One request: the model sees the whole context, split turn or not. Not retried: a failure
-// leaves the session as it was, for the next turn.
-pub async fn summarize_in_place(preparation: &Preparation, request: Request<'_>) -> Result<Summary, String> {
-    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}");
+// A compaction's summary (agent.rs run_auto_compaction): `request` is the session's own, as its
+// turns send it, and the summary prompt goes after its messages as one more, so the provider reads
+// everything before it from its cache rather than having all of it sent again. One request: the
+// model sees the whole context, split turn or not. Not retried: a failure leaves the session as it
+// was, for the next turn. `instructions` is the user's focus for /compact.
+pub async fn summarize_in_place(preparation: &Preparation, request: Request<'_>, instructions: Option<&str>) -> Result<Summary, String> {
+    let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
+    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}{focus}");
     let messages = [request.messages, &[Message::User(UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms() })]].concat();
     let (sender, _receiver) = mpsc::unbounded_channel();
     let response = provider::stream(Request { messages: &messages, in_place: true, ..request }, sender).await;
     Ok(finish(preparation, summary_text(&response, "Summarization")?, response.usage))
+}
+
+// A context cut to fit `budget` tokens for its summary request (a no-op when it fits). Tool results
+// are shortened first: those after the last answer (what overflowed; everything before them is what
+// the last request sent and the cache holds), then all of them. Past that the oldest turns go, but
+// never a system message or the previous compaction's summary, which the new one has to carry on.
+pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64) {
+    let total = |messages: &[AgentMessage]| messages.iter().map(estimate_tokens).sum::<u64>();
+    let tail = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))).map_or(0, |at| at + 1);
+    let mut cut_before_answer = false;
+    for from in [tail, 0] {
+        let now = total(messages);
+        if now > budget {
+            shorten_results(messages, from, budget, now);
+            cut_before_answer |= from < tail;
+        }
+    }
+    let kept = |message: &AgentMessage| matches!(message, AgentMessage::System(_) | AgentMessage::CompactionSummary(_));
+    while total(messages) > budget {
+        let Some(first) = messages.iter().position(|message| !kept(message)) else { break };
+        let Some(next) = messages[first + 1..].iter().position(|message| matches!(message, AgentMessage::User(_))).map(|at| first + 1 + at) else { break };
+        let cut: Vec<usize> = (first..next).filter(|&at| !kept(&messages[at])).collect();
+        for at in cut.into_iter().rev() {
+            messages.remove(at);
+        }
+        cut_before_answer = true;
+    }
+    // Once anything before the last answer is cut, the token counts the answers carry no longer
+    // describe what's sent, so the request is measured from its text instead.
+    if cut_before_answer {
+        for message in messages.iter_mut() {
+            if let AgentMessage::Assistant(answer) = message {
+                answer.usage = Usage::default();
+            }
+        }
+    }
+}
+
+// The text of each tool result from `from` on cut to one length, so that `messages` (now `total`
+// tokens) comes to `budget`.
+fn shorten_results(messages: &mut [AgentMessage], from: usize, budget: u64, total: u64) {
+    let texts = |message: &AgentMessage| match message {
+        AgentMessage::ToolResult(result) => result.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.chars().count()) } else { None }).collect(),
+        _ => Vec::new(),
+    };
+    let lengths: Vec<usize> = messages[from..].iter().flat_map(texts).collect();
+    let chars: usize = lengths.iter().sum();
+    let room = budget.saturating_sub(total.saturating_sub((chars as f64 / CHARS_PER_TOKEN) as u64));
+    // Each cut text ends with a note of what was cut, which takes room too.
+    let max_chars = ((room as f64 * CHARS_PER_TOKEN) as usize / lengths.len().max(1)).saturating_sub(TRUNCATION_NOTE_CHARS);
+    for message in &mut messages[from..] {
+        if let AgentMessage::ToolResult(result) = message {
+            for block in &mut result.content {
+                if let Content::Text { text, .. } = block {
+                    *text = truncate_for_summary(text, max_chars);
+                }
+            }
+        }
+    }
 }
 
 // The summary with the file lists after it, and what pi stores with it.

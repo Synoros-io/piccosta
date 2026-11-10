@@ -92,15 +92,13 @@ fn build_body(request: &Request<'_>) -> Value {
             .map(|tool| json!({"name":tool.name, "description":tool.description, "input_schema":tool.parameters}))
             .collect();
     // The gateway uses Anthropic's short-lived explicit cache markers, just as pi does.
-    if request.cache {
-        if let Some(last) = system.last_mut() {
-            last["cache_control"] = json!({"type":"ephemeral"});
-        }
-        if let Some(last) =
-            turns.last_mut().filter(|turn| turn["role"] == "user").and_then(|turn| turn["content"].as_array_mut()).and_then(|blocks| blocks.last_mut())
-        {
-            last["cache_control"] = json!({"type":"ephemeral"});
-        }
+    if let Some(last) = system.last_mut() {
+        last["cache_control"] = json!({"type":"ephemeral"});
+    }
+    if let Some(last) =
+        turns.last_mut().filter(|turn| turn["role"] == "user").and_then(|turn| turn["content"].as_array_mut()).and_then(|blocks| blocks.last_mut())
+    {
+        last["cache_control"] = json!({"type":"ephemeral"});
     }
     let max_tokens = estimate::max_output_tokens(model.context_window, model.max_tokens, &resolved);
     let mut body = json!({"model":model.id, "messages":turns, "system":system, "max_tokens":max_tokens, "stream":true});

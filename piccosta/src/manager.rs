@@ -219,6 +219,11 @@ pub fn set_work(session: &mut crate::session::Session, kind: &str) -> std::io::R
 
 // The kind of work a session was last given (the sessions tool's `use`, a subagent's job), if any.
 pub fn work(session: &crate::session::Session) -> Option<String> {
+    // A manager (assistant, project manager, advisor) has every tool a project manager has, whatever
+    // kind an older session recorded for it.
+    if role(session).is_some() {
+        return None;
+    }
     session.entries().iter().rev().find_map(|entry| match entry {
         crate::session::SessionEntry::Custom { custom_type, data, .. } if custom_type == WORK_ENTRY => Some(data.as_ref()?.get("use")?.as_str()?.to_string()),
         _ => None,
@@ -289,7 +294,6 @@ pub fn make(agent_dir: &Path, session: &mut crate::session::Session, role: Role)
     fs::create_dir_all(&home)?;
     if role == Role::Advisor {
         advised(agent_dir, &cwd).ok_or_else(|| std::io::Error::other("there's no manager here to advise: /manager makes one"))?;
-        set_work(session, ADVISOR_KIND)?;
     }
     let (kind, name) = match role {
         Role::Assistant => ("assistant", ASSISTANT_NAME),
@@ -675,7 +679,7 @@ fn duration_ms(text: &str) -> Option<i64> {
         "d" => DAY_MS,
         _ => return None,
     };
-    Some(number.parse::<i64>().ok()? * unit_ms)
+    Some(number.parse::<i64>().ok()? * unit_ms).filter(|ms| *ms > 0)
 }
 
 // An ISO time with its offset ("2026-11-01T09:00-04:00", or Z) as epoch ms.
@@ -705,14 +709,12 @@ fn due_schedules(home: &Path) -> Vec<Schedule> {
     }
     schedules.retain_mut(|schedule| match (schedule.next <= now, schedule.every_ms) {
         (false, _) => true,
-        (true, Some(every)) => {
+        (true, Some(every)) if every > 0 => {
             // A repeat missed while the service was down fires once, then keeps its rhythm.
-            while schedule.next <= now {
-                schedule.next += every;
-            }
+            schedule.next += ((now - schedule.next) / every + 1) * every;
             true
         }
-        (true, None) => false,
+        (true, _) => false,
     });
     let _ = save_schedules(home, &schedules);
     due
@@ -746,7 +748,7 @@ fn find(agent_dir: &Path, wanted: &str) -> Result<crate::host::SessionSummary, S
 
 // Stop or close a session's runtime (runtime.rs end), off this thread, since it answers once its
 // turn has stopped.
-async fn end(home: &Path, file: &Path, what: &'static str) -> Option<Result<(), String>> {
+async fn end(home: &Path, file: &Path, what: &'static str) -> Option<Result<Option<String>, String>> {
     let ours = load_lanes(home).into_iter().find(|lane| lane.file == file).and_then(|lane| lane.launched);
     let file = file.to_path_buf();
     tokio::task::spawn_blocking(move || crate::runtime::end(&file, what, ours.as_ref())).await.ok().flatten()
@@ -1072,9 +1074,9 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     let summary = find(&self.agent_dir, need("session")?)?;
                     let stopped = match end(&self.home, &summary.path, "stop").await {
                         None => "isn't running".to_string(),
-                        Some(Err(why)) => why,
-                        Some(Ok(())) if crate::runtime::running(&summary.path) => "its turn stopped; it's open in a terminal or editor, which keeps it".to_string(),
-                        Some(Ok(())) => "its run stopped, with everything it was running".to_string(),
+                        Some(Err(why) | Ok(Some(why))) => why,
+                        Some(Ok(None)) if crate::runtime::running(&summary.path) => "its turn stopped; it's open in a terminal or editor, which keeps it".to_string(),
+                        Some(Ok(None)) => "its run stopped, with everything it was running".to_string(),
                     };
                     text(format!("\"{}\": {stopped}.", summary.title))
                 }
@@ -1082,10 +1084,12 @@ A session you start or message is one of your lanes: its run carries on in a pro
                 // marked closed for everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
                     let summary = find(&self.agent_dir, need("session")?)?;
+                    // A run that couldn't be stopped stays open and a lane, so it isn't left running unseen.
                     let stopped = match end(&self.home, &summary.path, "close").await {
                         None => String::new(),
-                        Some(Err(why)) => format!("; {why}"),
-                        Some(Ok(())) => ", and its run ended, with everything it was running".to_string(),
+                        Some(Err(why)) => return Err(format!("\"{}\" is still running and stays open: {why}", summary.title)),
+                        Some(Ok(None)) => ", and its run ended, with everything it was running".to_string(),
+                        Some(Ok(Some(killed))) => format!("; {killed}"),
                     };
                     crate::session::set_closed(&self.agent_dir, &summary.path, true);
                     let mut lanes = load_lanes(&self.home);

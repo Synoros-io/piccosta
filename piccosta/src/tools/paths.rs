@@ -164,3 +164,28 @@ pub fn access(path: &Path, writable: bool) -> io::Result<()> {
 pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
+// Write `bytes` as the whole of `path`. The file is written in place, so it keeps its inode, its
+// other hard links, its owner, permissions and attributes, and a symlink stays a link. A write that
+// fails part way (a full disk) puts the old text back, so the file isn't left empty or half written;
+// when even that fails, the old text is kept beside it and the error says where. A file this user
+// may write but not read is written without that safety, as before.
+pub async fn replace(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+    let old = match tokio::fs::read(path).await {
+        Ok(old) => Some(old),
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => None,
+        Err(error) => return Err(error),
+    };
+    let Err(error) = tokio::fs::write(path, &bytes).await else { return Ok(()) };
+    let Some(old) = old else { return Err(error) };
+    if tokio::fs::write(path, &old).await.is_ok() {
+        return Err(error);
+    }
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let backup = path.with_file_name(format!("{name}.before-piccosta"));
+    let kept = match tokio::fs::write(&backup, &old).await {
+        Ok(()) => format!("its old text is in {}", backup.display()),
+        Err(_) => "its old text couldn't be kept anywhere".to_string(),
+    };
+    Err(io::Error::new(error.kind(), format!("{error}; it couldn't be put back as it was, and {kept}")))
+}

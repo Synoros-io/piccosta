@@ -268,7 +268,7 @@ fn convert_assistant(model: &Model, assistant: &AssistantMessage, compat: &Compa
 }
 
 // The request body (openai-completions.ts:806-1016), keys in pi's order.
-pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, cache: bool, thinking_level: &str) -> Value {
+pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, thinking_level: &str) -> Value {
     let compat = compat_of(model);
     let resolved = transcript::resolve_transcript(messages, compat.supports_mid_conversation_system);
     let (request_tools, _) = transcript::request_tools(&resolved, tool_support(&compat));
@@ -278,8 +278,8 @@ pub fn build_body(model: &Model, messages: &[Message], cache_key: Option<&str>, 
     body.insert("model".into(), model.id.clone().into());
     body.insert("messages".into(), Value::Array(converted));
     body.insert("stream".into(), true.into());
-    // OpenAI's own API keys its cache by this; an uncached request (pi's "none") sends none.
-    if let Some(key) = cache_key.filter(|_| cache && model.base_url.contains("api.openai.com")) {
+    // OpenAI's own API keys its cache by this.
+    if let Some(key) = cache_key.filter(|_| model.base_url.contains("api.openai.com")) {
         body.insert("prompt_cache_key".into(), key.chars().take(64).collect::<String>().into());
     }
     body.insert("stream_options".into(), json!({"include_usage": true}));
@@ -523,7 +523,7 @@ pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<Stream
 
 async fn run(request: &Request<'_>, output: &mut AssistantMessage, building: &mut Building, send: &mut dyn FnMut(StreamEvent)) -> Result<(), String> {
     let model = request.model;
-    let body = build_body(model, request.messages, request.session_id, request.cache, request.thinking_level);
+    let body = build_body(model, request.messages, request.session_id, request.thinking_level);
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let response = super::post_openai(model, url, request.credential, request.session_id, Vec::new(), &body).await?;
     send(StreamEvent::Start);

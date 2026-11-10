@@ -399,7 +399,8 @@ impl Jobs {
         let silent = Arc::new(AtomicBool::new(false));
         let running = RunningJob { pid, command: command.to_string(), started, log_path: log_path.clone(), kill, kill_reason: kill_reason.clone(), silent: silent.clone() };
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id, running);
-        Job { id, pid, log_path, log, kill_reason, silent, started }
+        let log_lost = (log.is_none() || log_path == Path::new(NO_LOG)).then(|| "it couldn't be opened".to_string());
+        Job { id, pid, log_path, log, log_lost, kill_reason, silent, started }
     }
 
     // /restart: take the running jobs out of this session, so its end doesn't kill them, and hand
@@ -460,7 +461,10 @@ impl Jobs {
         let lines = [
             format!("Background job {} (pid {}) {status}: {}", job.id, job.pid, command_preview(command)),
             if text.is_empty() { "(no output)".to_string() } else { text.to_string() },
-            format!("[{}Full output: {}]", if cut { "Output above is the tail. " } else { "" }, job.log_path.display()),
+            match &job.log_lost {
+                Some(why) => format!("[{}The full output couldn't be kept in {}: {why}]", if cut { "Output above is the tail. " } else { "" }, job.log_path.display()),
+                None => format!("[{}Full output: {}]", if cut { "Output above is the tail. " } else { "" }, job.log_path.display()),
+            },
         ];
         // Fields longcmd left undefined are absent, not null, as JSON.stringify writes them.
         let mut details = serde_json::Map::new();
@@ -490,6 +494,9 @@ pub struct Job {
     pub pid: u32,
     pub log_path: PathBuf,
     log: Option<std::fs::File>,
+    // Why the log stopped being written (it couldn't be opened, or a write failed): the report says
+    // so instead of pointing at a full output it doesn't have.
+    log_lost: Option<String>,
     kill_reason: Arc<Mutex<Option<String>>>,
     silent: Arc<AtomicBool>,
     // When the command began, for the duration in its message.
@@ -498,8 +505,11 @@ pub struct Job {
 
 impl Job {
     pub fn write(&mut self, data: &[u8]) {
-        if let Some(log) = self.log.as_mut() {
-            let _ = log.write_all(data);
+        if let Some(log) = self.log.as_mut()
+            && let Err(error) = log.write_all(data)
+        {
+            self.log_lost = Some(error.to_string());
+            self.log = None;
         }
     }
 }

@@ -99,9 +99,6 @@ pub struct Request<'a> {
     // The session id, which providers use to keep the prompt cache and route to the same backend.
     // None skips caching.
     pub session_id: Option<&'a str>,
-    // False for pi's cacheRetention "none" (a one-off summary): no cache key and no cache-affinity
-    // headers, though a provider that routes every request by session (opencode) still gets the id.
-    pub cache: bool,
     // Idle compaction's summary, asked for at the end of the session's own context (compaction.rs
     // summarize_in_place): the Claude bridge only puts it to the query already holding that context.
     pub in_place: bool,
