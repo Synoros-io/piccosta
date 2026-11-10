@@ -179,7 +179,7 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. model (provider/id) and thinking, when given, replace the job's own. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. Its answer is a claim: check what it built or found before you rely on it or pass it on. You choose the job; the user chose the models each job runs on, and the first one available is used. model (provider/id) and thinking, when given, replace the job's own. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",

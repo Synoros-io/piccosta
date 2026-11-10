@@ -1,6 +1,6 @@
 [package]
 name = "piccosta"
-version = "0.12.35"
+version = "0.12.36"
 edition.workspace = true
 license.workspace = true
 description = "One agent harness for every model you use"

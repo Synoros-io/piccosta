@@ -102,7 +102,7 @@ impl App {
             // --single has one session: the commands that open others only say so.
             "new" | "manager" | "advisor" | "assistant" if self.one_session() => {}
             // /clear starts this tab over, as Claude Code's does: a new session in the same directory
-            // takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
+            // (a manager's or advisor's in that role) takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
             // /clear <name> names the one left first. A running turn stops first (esc).
             "clear" => {
                 let left = self.panes[self.focus].slot;
@@ -113,7 +113,25 @@ impl App {
                         self.focused().title = argument.to_string();
                         self.tell(Command::Name(argument.to_string()));
                     }
-                    self.new_session().filter(|&slot| slot != left)
+                    // A manager or advisor cleared is that role still, in a fresh session: its home
+                    // points at the new one, and its ledger, lanes and schedules stay with it.
+                    match self.slots[left].path.as_deref().and_then(|path| crate::session::Session::read(path).ok()).and_then(|session| crate::manager::role(&session)) {
+                        Some(role) => {
+                            let left_slot = &self.slots[left];
+                            let (cwd, model, thinking) = (left_slot.cwd.clone(), Some(left_slot.model.clone()).filter(|model| !model.is_empty()), Some(left_slot.thinking.clone()).filter(|level| !level.is_empty()));
+                            self.slots.push(super::Slot { cwd, make: Some(role), ..super::Slot::new(None, super::NEW_TITLE.into()) });
+                            let slot = self.slots.len() - 1;
+                            match self.load(slot, model, thinking, None) {
+                                Ok(()) => Some(slot),
+                                Err(error) => {
+                                    self.slots.pop();
+                                    self.notice = Some(error);
+                                    None
+                                }
+                            }
+                        }
+                        None => self.new_session().filter(|&slot| slot != left),
+                    }
                 } {
                     self.show(slot);
                     if self.close(left)

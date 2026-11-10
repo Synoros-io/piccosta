@@ -1164,12 +1164,15 @@ impl App {
         let eligible = self.persist && !self.single && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
         let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
         let role = match self.slots[slot].make {
-            Some(crate::manager::Role::Advisor) => self.persist.then_some(crate::manager::Role::Advisor),
+            Some(role @ (crate::manager::Role::Advisor | crate::manager::Role::Assistant)) => self.persist.then_some(role),
             make if eligible && (first || make.is_some()) => Some(crate::manager::Role::Project),
             _ => None,
         };
         if let Some(role) = role.filter(|_| crate::manager::role(&session).is_none()) {
             crate::manager::make(agent_dir, &mut session, role).map_err(|error| format!("could not make the {}: {error}", if role == crate::manager::Role::Advisor { "advisor" } else { "project manager" }))?;
+            // Written whole now, so the home points at a file that's there and nothing takes the
+            // old one back for the manager before the first message.
+            session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
         }
         let sender = self.sender.clone();
         let emit: crate::agent::EventSink = Box::new(move |event: &Event| {
