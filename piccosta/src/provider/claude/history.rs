@@ -118,13 +118,11 @@ pub fn shape(system_prompt: &str, tools: &[ToolDefinition], cli_model: &str, eff
 
 // --- The decision ---
 
-// Input: what the live query holds (None when there is none), and this call's messages with their
-// prints and shape. Output: Ok(n) when the call's context is the held one (its first n messages)
-// plus results for exactly the calls the query is parked on, or plus user messages for a query
-// that waits, which are then delivered; otherwise Err with the first reason found, and the call
-// rewrites.
-pub fn decide(live: Option<&super::State>, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
-    let live = live.ok_or("no live query for this session")?;
+// Input: what the live query holds, and this call's messages with their prints and shape. Output:
+// Ok(n) when the call's context is the held one (its first n messages) plus results for exactly the
+// calls the query is parked on, or plus user messages for a query that waits, which are then
+// delivered; otherwise Err with the first reason found, and the call rewrites.
+pub fn decide(live: &super::State, messages: &[Message], prints: &[String], shape: &Shape) -> Result<usize, String> {
     let changed: Vec<&str> = SHAPE_PARTS.into_iter().filter(|part| shape.get(*part) != live.shape.get(*part)).collect();
     if !changed.is_empty() {
         return Err(format!("{} changed", changed.join(", ")));
@@ -847,16 +845,26 @@ fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, proje
         return None;
     }
     let shared = prints.iter().zip(&kept.prints).take_while(|(print, kept)| print == kept).count();
-    let ends = align(kept, history, shared);
     // A cut has to leave every tool call with its results on the same side: a converted result whose
     // call was copied would be dropped as an orphan, a copied call whose results were converted
     // would reach the API unanswered.
-    let mut cut = ends.len().min(shared);
     let has_calls = |message: &Message| matches!(message, Message::Assistant(assistant) if assistant.content.iter().any(|block| matches!(block, Content::ToolCall { .. })));
-    while cut > 0 && (ends[cut - 1].is_none() || matches!(history.get(cut), Some(Message::ToolResult(_))) || has_calls(&history[cut - 1])) {
-        cut -= 1;
-    }
-    let mut last = ends.get(cut.checked_sub(1)?).copied().flatten()?;
+    // Every message the kept query held still opens the history: its records are that opening whole,
+    // as Claude Code sent it, with what pi has no message for (stopped answers, their calls' results,
+    // interrupt notes, the environment it puts after a query's first prompt). Lined up message by
+    // message instead, a stopped answer with a tool call ended the copy there and the rest was
+    // converted into other bytes (Yao's manager, 2026-11-10). Only a history that went another way
+    // is lined up.
+    let (cut, mut last) = if shared > 0 && shared == kept.prints.len() && !has_calls(&history[shared - 1]) {
+        (shared, kept.records.len().checked_sub(1)?)
+    } else {
+        let ends = align(kept, history, shared);
+        let mut cut = ends.len().min(shared);
+        while cut > 0 && (ends[cut - 1].is_none() || matches!(history.get(cut), Some(Message::ToolResult(_))) || has_calls(&history[cut - 1])) {
+            cut -= 1;
+        }
+        (cut, ends.get(cut.checked_sub(1)?).copied().flatten()?)
+    };
     // The chain links after the last copied message, up to the next one (the attachments Claude Code
     // writes after a prompt) go too.
     while last + 1 < kept.records.len() && !is_message(&kept.records[last + 1]) {

@@ -982,7 +982,7 @@ impl Agent {
         let id = self.session.append_message(AgentMessage::Assistant(message.clone())).map_err(|error| format!("Could not write the session: {error}"))?;
         // The cache monitor: a response that had to write most of its context to the cache again
         // is recorded with its cause, and the session's views show it as one line.
-        if let Some(miss) = crate::cache::check(&self.session, &id, provider::claude::take_rewrite(self.session.id())) {
+        if let Some(miss) = crate::cache::check(&self.session, &id, provider::claude::take_rewrite(self.session.id(), &message)) {
             let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: crate::cache::MISS_TYPE.into(), data: Some(miss) };
             self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
             (self.emit)(&Event::EntryAppended { entry });
