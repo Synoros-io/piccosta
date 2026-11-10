@@ -159,7 +159,6 @@ impl Tool for PluginTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition { name: self.offered.name.clone(), description: self.offered.description.clone(), parameters: self.offered.parameters.clone(), constrained_sampling: None }
     }
-    fn prompt_snippet(&self) -> Option<&str> { Some(&self.offered.description) }
     fn read_only(&self) -> bool { self.offered.read_only }
     fn approval(&self, arguments: &Map<String, Value>) -> Option<String> {
         self.offered.asks.as_ref().and_then(|asks| asks.matching(arguments)).map(|ask| ask.question.clone())

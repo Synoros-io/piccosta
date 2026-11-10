@@ -189,8 +189,8 @@ fn is_web_search_call(item: &Value) -> bool {
 }
 
 // parseOpenAIResponse. Input: the response body, a JSON object or server-sent events. Output: the
-// response's output items and whether a web_search call was seen, or the stream's error.
-fn parse_response(text: &str) -> Result<(Vec<Value>, bool), String> {
+// response's output items, whether a web_search call was seen, and its usage; or the stream's error.
+fn parse_response(text: &str) -> Result<(Vec<Value>, bool, Option<Value>), String> {
     let trimmed = text.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         let parsed: Value = serde_json::from_str(trimmed).map_err(|error| format!("OpenAI API returned invalid JSON: {error}"))?;
@@ -199,7 +199,7 @@ fn parse_response(text: &str) -> Result<(Vec<Value>, bool), String> {
             _ => parsed.get("output").and_then(Value::as_array).cloned().unwrap_or_default(),
         };
         let seen = output.iter().any(is_web_search_call);
-        return Ok((output, seen));
+        return Ok((output, seen, parsed.get("usage").cloned()));
     }
 
     let mut output_items = Vec::new();
@@ -255,11 +255,11 @@ fn parse_response(text: &str) -> Result<(Vec<Value>, bool), String> {
     if let Some(response) = completed {
         let output = response.get("output").and_then(Value::as_array).filter(|output| !output.is_empty()).cloned().unwrap_or(output_items);
         let seen = seen || output.iter().any(is_web_search_call);
-        return Ok((output, seen));
+        return Ok((output, seen, response.get("usage").cloned()));
     }
     if !output_items.is_empty() {
         let seen = seen || output_items.iter().any(is_web_search_call);
-        return Ok((output_items, seen));
+        return Ok((output_items, seen, None));
     }
     Err("OpenAI API returned no parseable response output".to_string())
 }
@@ -383,7 +383,14 @@ pub async fn search(targets: &[Target], paths: &CredentialPaths, session_id: &st
         if !(200..300).contains(&status) {
             return Err(format!("OpenAI API error {status}: {}", text.chars().take(300).collect::<String>()));
         }
-        read_response(&text, options)
+        // What it spent goes on the account of the model that ran it.
+        read_response(&text, options).map(|mut found| {
+            if let Some((account, usage)) = found.usage.as_mut() {
+                account.clone_from(&target.model.provider);
+                provider::responses::calculate_cost(&target.model, usage);
+            }
+            found
+        })
     };
     run.await.map_err(redact)
 }
@@ -391,7 +398,7 @@ pub async fn search(targets: &[Target], paths: &CredentialPaths, session_id: &st
 // A successful response's body as web_search's answer and sources. Input: the body and the
 // search's options (for the result count). Output: the answer and results, or why there are none.
 pub fn read_response(text: &str, options: &SearchOptions<'_>) -> Result<SearchResponse, String> {
-    let (output, seen) = parse_response(text)?;
+    let (output, seen, usage) = parse_response(text)?;
     if !seen {
         return Err("OpenAI web_search returned no web_search_call".to_string());
     }
@@ -400,5 +407,6 @@ pub fn read_response(text: &str, options: &SearchOptions<'_>) -> Result<SearchRe
     if answer.is_empty() && results.is_empty() {
         return Err("OpenAI web_search returned no answer or sources".to_string());
     }
-    Ok(SearchResponse { answer, results, provider: "openai" })
+    let usage = usage.filter(|usage| usage.is_object()).map(|usage| (String::new(), provider::responses::usage_from(&usage)));
+    Ok(SearchResponse { answer, results, provider: "openai", usage })
 }

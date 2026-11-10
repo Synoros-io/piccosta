@@ -28,6 +28,8 @@ use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 // Set in a subagent's environment (to its job's name); a session that has it offers no subagent tool.
+// What a model is told when it takes over a subagent's session from one that failed.
+const CARRY_ON: &str = "The previous model stopped with an error before finishing. Carry on with the task from where it got to.";
 pub const CHILD_ENV: &str = "PICCOSTA_SUBAGENT";
 // The tool's name, as the model calls it.
 pub const NAME: &str = "subagent";
@@ -108,24 +110,39 @@ impl SubagentTool {
 
     // Input: the job, the task, the models to try in order and the lines saying which were left
     // out. Output: the shell command that prints those lines, then runs the task on the first
-    // model and, each time a run fails, on the next. Its first line names the job and the task,
-    // which is what a background job's message shows of it.
+    // model and, each time a run fails, goes on in the same session on the next, with what the
+    // failed one did in its context, saying so; a run that saved nothing starts the task afresh.
+    // Its first line names the job and the task, which is what a background job's message shows.
     fn command(&self, job: &Job, task: &str, message: &str, (models, skipped): (Vec<String>, Vec<String>), context: &ToolContext) -> Result<String, String> {
         let exe = std::env::current_exe().map_err(|error| format!("could not find piccosta's own binary: {error}"))?;
         // A binary replaced while it runs (a rebuild) reads as "<path> (deleted)"; the new one at
         // that path is the one to start.
         let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
-        let mut flags = vec![match &context.session_file {
-            Some(file) => format!("--session-dir {}", quote(&file.parent().unwrap_or(Path::new(".")).join("subagents").to_string_lossy())),
+        // The subagent's one session file, which each model after a failure carries on.
+        let file = context.session_file.as_ref().map(|parent| {
+            let stamp = crate::clock::iso_from_ms(crate::clock::now_ms()).replace([':', '.'], "-");
+            parent.parent().unwrap_or(Path::new(".")).join("subagents").join(format!("{stamp}_{}.jsonl", uuid::Uuid::now_v7()))
+        });
+        let mut flags = vec![match &file {
+            Some(file) => format!("--session {}", quote(&file.to_string_lossy())),
             None => "--no-session".to_string(),
         }];
         if !job.prompt.is_empty() {
             flags.push(format!("--append-system-prompt {}", quote(&job.prompt)));
         }
         let flags = flags.join(" ");
-        let runs: Vec<String> = models.iter().map(|model| format!("printf '%s' \"$task\" | {CHILD_ENV}={} {} -p --model {} {flags}", quote(&job.name), quote(&exe), quote(model))).collect();
+        let run = |model: &String| format!("{CHILD_ENV}={} {} -p --model {} {flags}", quote(&job.name), quote(&exe), quote(model));
+        let mut runs = vec![format!("printf '%s' \"$task\" | {}", run(&models[0]))];
+        for pair in models.windows(2) {
+            let note = quote(&format!("[subagent {}: {} failed, so {} carries on]", job.name, pair[0], pair[1]));
+            let input = match &file {
+                Some(file) => format!("{{ [ -s {} ] && printf '%s' \"$carry\" || printf '%s' \"$task\"; }}", quote(&file.to_string_lossy())),
+                None => "printf '%s' \"$task\"".to_string(),
+            };
+            runs.push(format!("{{ printf '%s\\n' {note}; {input} | {}; }}", run(&pair[1])));
+        }
         let notes: String = skipped.iter().map(|line| format!("printf '%s\\n' {}\n", quote(line))).collect();
-        let command = format!("# subagent {}: {}\ntask={}\n{notes}{}", job.name, task.lines().next().unwrap_or_default(), quote(message), runs.join(" ||\n"));
+        let command = format!("# subagent {}: {}\ntask={}\ncarry={}\n{notes}{}", job.name, task.lines().next().unwrap_or_default(), quote(message), quote(CARRY_ON), runs.join(" ||\n"));
         if command.len() > MAX_COMMAND_BYTES {
             return Err(format!("The task is too long to hand over ({} bytes, the limit is about {MAX_COMMAND_BYTES}). Write it to a file and give the subagent the path.", message.len()));
         }

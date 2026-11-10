@@ -41,6 +41,8 @@ pub struct SearchResponse {
     pub answer: String,
     pub results: Vec<SearchResult>,
     pub provider: &'static str,
+    // What a model-backed search spent, and on which provider's account.
+    pub usage: Option<(String, crate::message::Usage)>,
 }
 
 pub struct SearchOptions<'a> {
@@ -168,7 +170,7 @@ async fn search_searxng(base_url: &str, query: &str, options: &SearchOptions<'_>
         .map(str::to_string)
         .collect();
     answer.extend(snippet_answer(&results));
-    Ok(SearchResponse { answer: answer.join("\n\n"), results, provider: "searxng" })
+    Ok(SearchResponse { answer: answer.join("\n\n"), results, provider: "searxng", usage: None })
 }
 
 // The auto route: SearXNG when configured, else the search model. A response with neither results

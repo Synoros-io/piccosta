@@ -48,7 +48,8 @@ const SLUG_ADJECTIVES: &str = "ancient bold bright calm clever cool crimson dari
 const SLUG_NOUNS: &str = "arrow badge beacon blade brook castle cedar cloud comet crest dawn drift eagle ember falcon flame forge gale grove harbor hawk jade kettle lance maple marsh needle oak pearl pine ridge river rune sage shade spark stone thorn tower wave";
 // The kept records' sidecar next to pi's session file (pi lists only *.jsonl, so it's left alone).
 const SIDECAR_FORMAT: &str = "claude-bridge-kept";
-const SIDECAR_VERSION: u64 = 1;
+// Version 2 keeps one snapshot per shape; version 1 held only the session's last query.
+const SIDECAR_VERSION: u64 = 2;
 pub const SIDECAR_SUFFIX: &str = ".claude-bridge";
 // What a query is started with. A change in any part means a running Claude Code holds something
 // pi no longer wants. maxTokens is always unset here (pi passes none); it stays a part so sidecars
@@ -56,6 +57,12 @@ pub const SIDECAR_SUFFIX: &str = ".claude-bridge";
 pub const SHAPE_PARTS: [&str; 6] = ["systemPrompt", "tools", "cliModel", "effort", "maxTokens", "cwd"];
 
 pub type Shape = Map<String, Value>;
+
+// A pair or trio returns to each model with the same shape. Its records and live query belong to
+// that shape, not to whichever model happened to speak last in the session.
+pub fn query_key(session: &str, shape: &Shape) -> (String, String) {
+    (session.to_string(), hash(&Value::Object(shape.clone())))
+}
 
 // --- Fingerprints ---
 
@@ -547,6 +554,7 @@ impl Records {
 
 // What a clean query end leaves for its pi session: Claude Code's chain records and the prints and
 // roles of the pi messages they hold (failed turns left out).
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Kept {
     shape: Shape,
     prints: Vec<String>,
@@ -555,7 +563,7 @@ struct Kept {
 }
 
 // Per pi session: where its sidecar lives (None when pi doesn't save the session), what it kept.
-type KeptSessions = HashMap<String, (Option<PathBuf>, Option<Kept>)>;
+type KeptSessions = HashMap<String, (Option<PathBuf>, HashMap<String, Kept>)>;
 static KEPT: LazyLock<Mutex<KeptSessions>> = LazyLock::new(Default::default);
 
 fn strings(value: &Value) -> Vec<String> {
@@ -572,13 +580,18 @@ pub fn attach(key: &str, session_file: Option<&Path>) {
     let loaded = sidecar.as_ref().and_then(|path| fs::read_to_string(path).ok()).and_then(|text| {
         let mut lines = text.lines().filter(|line| !line.trim().is_empty()).map(serde_json::from_str::<Value>);
         let meta = lines.next()?.ok()?;
-        if meta["format"] != SIDECAR_FORMAT || meta["version"] != SIDECAR_VERSION {
+        if meta["format"] != SIDECAR_FORMAT {
             return None;
         }
-        Some(Kept { shape: meta["shape"].as_object().cloned()?, prints: strings(&meta["prints"]), roles: strings(&meta["roles"]),
-            records: lines.collect::<Result<_, _>>().ok()? })
+        let snapshots: Vec<Kept> = match meta["version"].as_u64()? {
+            1 => vec![Kept { shape: meta["shape"].as_object().cloned()?, prints: strings(&meta["prints"]), roles: strings(&meta["roles"]),
+                records: lines.collect::<Result<_, _>>().ok()? }],
+            SIDECAR_VERSION => lines.map(|line| serde_json::from_value(line?)).collect::<Result<_, _>>().ok()?,
+            _ => return None,
+        };
+        Some(snapshots.into_iter().map(|kept| (query_key(key, &kept.shape).1, kept)).collect())
     });
-    kept.insert(key.to_string(), (sidecar, loaded));
+    kept.insert(key.to_string(), (sidecar, loaded.unwrap_or_default()));
 }
 
 // At a clean query end: keep its session file's chain records for the next rewrite. Input: the pi
@@ -594,18 +607,18 @@ pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape
     };
     let records: Vec<Value> = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["uuid"].is_string()).collect();
     let mut map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = map.entry(key.to_string()).or_insert((None, None));
+    let entry = map.entry(key.to_string()).or_default();
     debug(&format!("kept: {} records of {cc_session_id} for {} piccosta messages", records.len(), prints.len()));
+    entry.1.insert(query_key(key, shape).1, Kept { shape: shape.clone(), prints, roles, records });
     if let Some(sidecar) = &entry.0 {
-        let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd,
-            "shape": shape, "prints": prints, "roles": roles});
-        let text: String = std::iter::once(&meta).chain(&records).map(|record| js::stringify(record) + "\n").collect();
+        let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd});
+        let text: String = std::iter::once(meta).chain(entry.1.values().map(|kept| serde_json::to_value(kept).expect("kept records are JSON")))
+            .map(|record| js::stringify(&record) + "\n").collect();
         let partial = PathBuf::from(format!("{}.partial", sidecar.display()));
         if fs::write(&partial, text).and_then(|()| fs::rename(&partial, sidecar)).is_err() {
             debug(&format!("kept: could not save {}", sidecar.display()));
         }
     }
-    entry.1 = Some(Kept { shape: shape.clone(), prints, roles, records });
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -837,13 +850,7 @@ fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
 #[allow(clippy::too_many_arguments)]
 fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, project_path: &str, served: &[ToolDefinition], cli_model: &str, shape: &Shape) -> Option<Records> {
     let map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let kept = map.get(key)?.1.as_ref()?;
-    // The model and cwd are written into Claude Code's own records ("You are powered by", the
-    // environment block); copied under another they would tell the model something false.
-    if kept.shape.get("cliModel") != shape.get("cliModel") || kept.shape.get("cwd") != shape.get("cwd") {
-        debug("kept: not used, the model or cwd changed");
-        return None;
-    }
+    let kept = map.get(key)?.1.get(&query_key(key, shape).1)?;
     let shared = prints.iter().zip(&kept.prints).take_while(|(print, kept)| print == kept).count();
     // A cut has to leave every tool call with its results on the same side: a converted result whose
     // call was copied would be dropped as an orphan, a copied call whose results were converted

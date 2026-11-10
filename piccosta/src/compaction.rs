@@ -587,12 +587,17 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
 // everything before it from its cache rather than having all of it sent again. One request: the
 // model sees the whole context, split turn or not. Not retried: a failure leaves the session as it
 // was, for the next turn. `instructions` is the user's focus for /compact.
-pub async fn summarize_in_place(preparation: &Preparation, request: Request<'_>, instructions: Option<&str>) -> Result<Summary, String> {
+pub async fn summarize_in_place(request: Request<'_>, instructions: Option<&str>) -> AssistantMessage {
     let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
     let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}{focus}");
     let messages = [request.messages, &[Message::User(UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms() })]].concat();
     let (sender, _receiver) = mpsc::unbounded_channel();
-    let response = provider::stream(Request { messages: &messages, in_place: true, ..request }, sender).await;
+    provider::stream(Request { messages: &messages, in_place: true, ..request }, sender).await
+}
+
+// The agent records the response's usage and checks its cache before deciding whether it is a
+// usable checkpoint. A refused or cancelled summary still spent those tokens.
+pub fn accept_summary(preparation: &Preparation, response: AssistantMessage) -> Result<Summary, String> {
     Ok(finish(preparation, summary_text(&response, "Summarization")?, response.usage))
 }
 

@@ -103,11 +103,13 @@ pub fn command_preview(command: &str) -> String {
     format!("{cut}{}", if more { " ..." } else { "" })
 }
 
-// A rolling window of a command's last raw bytes, and how many there were in all.
+// A rolling window of a command's last raw bytes, how many there were in all, and how many of them
+// the model was already sent (a command moved to the background, with its output so far).
 #[derive(Default)]
 pub struct Tail {
     bytes: Vec<u8>,
     total: usize,
+    shown: usize,
 }
 
 impl Tail {
@@ -120,11 +122,18 @@ impl Tail {
         }
     }
 
+    // Mark what's here as sent to the model: the report at the command's end carries only what
+    // comes after it.
+    pub fn sent(&mut self) {
+        self.shown = self.total;
+        self.bytes.clear();
+    }
+
     // The tail cut to pi's bash limits, and whether anything was left out. When the window
     // already dropped bytes its first line may be partial, so it goes.
     pub fn text(&self) -> (String, bool) {
         let mut window = &self.bytes[self.bytes.len().saturating_sub(TAIL_KEEP_BYTES)..];
-        let dropped = self.total > window.len();
+        let dropped = self.total - self.shown > window.len();
         if dropped && let Some(newline) = window.iter().position(|byte| *byte == b'\n') {
             window = &window[newline + 1..];
         }
@@ -143,7 +152,7 @@ impl Tail {
         let total = log.metadata().map_or(0, |metadata| metadata.len() as usize);
         let mut bytes = Vec::new();
         let _ = log.seek(std::io::SeekFrom::Start(total.saturating_sub(TAIL_KEEP_BYTES) as u64)).and_then(|_| log.read_to_end(&mut bytes));
-        Tail { bytes, total }
+        Tail { bytes, total, shown: 0 }
     }
 }
 
@@ -460,7 +469,11 @@ impl Jobs {
         let text = text.strip_suffix('\n').unwrap_or(&text);
         let lines = [
             format!("Background job {} (pid {}) {status}: {}", job.id, job.pid, command_preview(command)),
-            if text.is_empty() { "(no output)".to_string() } else { text.to_string() },
+            match (text.is_empty(), tail.shown > 0) {
+                (false, _) => text.to_string(),
+                (true, false) => "(no output)".to_string(),
+                (true, true) => "(no output since it moved to the background)".to_string(),
+            },
             match &job.log_lost {
                 Some(why) => format!("[{}The full output couldn't be kept in {}: {why}]", if cut { "Output above is the tail. " } else { "" }, job.log_path.display()),
                 None => format!("[{}Full output: {}]", if cut { "Output above is the tail. " } else { "" }, job.log_path.display()),

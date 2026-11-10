@@ -631,8 +631,8 @@ impl Session {
         })
     }
 
-    // Whether the session has a user or assistant message yet, the point where a new session's
-    // file gets created.
+    // Metadata can stay in memory until the conversation starts. Queued input can't: it must
+    // reach disk even when discovery was interrupted before the first user message.
     fn has_conversation(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(entry, SessionEntry::Message { message: AgentMessage::User(_) | AgentMessage::Assistant(_), .. })
@@ -647,7 +647,10 @@ impl Session {
         let Some(path) = &self.file else { return Ok(()) };
         let line = format!("{}\n", serde_json::to_string(entry).map_err(io::Error::other)?);
         if !self.flushed {
-            if !self.has_conversation() && !matches!(entry, SessionEntry::Message { message: AgentMessage::User(_) | AgentMessage::Assistant(_), .. }) {
+            if !self.has_conversation()
+                && !matches!(entry, SessionEntry::Message { message: AgentMessage::User(_) | AgentMessage::Assistant(_), .. })
+                && !matches!(entry, SessionEntry::Custom { custom_type, .. } if custom_type == QUEUED_TYPE)
+            {
                 return Ok(());
             }
             if let Some(dir) = path.parent() {
@@ -687,18 +690,33 @@ impl Session {
         self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text })))
     }
 
-    // The messages queued at the leaf and not taken yet, oldest first: those after its last message
-    // from the user, since a turn takes them all as user messages before anything else. An entry
-    // holds one (its text), or the several of an old inbox (its texts; runtime.rs claim).
-    pub fn queued(&self) -> Vec<String> {
+    // Keep the whole message: a job report has details, and a prompt can have images.
+    pub fn queue_message(&mut self, message: AgentMessage) -> io::Result<String> {
+        self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": message })))
+    }
+
+    // A delivery keeps its identity after the queue is consumed, so a sender can retry after
+    // losing the acknowledgement without starting another turn for the same occurrence.
+    pub fn queue_delivery(&mut self, id: &str, text: &str) -> io::Result<()> {
+        if !self.entries.iter().any(|entry| matches!(entry, SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE && data["delivery_id"] == id)) {
+            self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text, "delivery_id": id })))?;
+        }
+        Ok(())
+    }
+
+    // A turn takes all queued input before responding. Its last user or custom message marks
+    // what was consumed, including a turn that started with only a job report.
+    pub fn queued(&self) -> Vec<AgentMessage> {
         let path = self.path_to_leaf();
-        let after = path.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::User(_), .. })).map_or(0, |at| at + 1);
-        let queued = path[after..].iter().filter_map(|entry| match entry {
+        let after = path.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::User(_), .. } | SessionEntry::CustomMessage { .. })).map_or(0, |at| at + 1);
+        path[after..].iter().filter_map(|entry| match entry {
             SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => Some(data),
             _ => None,
-        });
-        let texts = queued.flat_map(|data| data.get("text").into_iter().chain(data["texts"].as_array().into_iter().flatten()));
-        texts.filter_map(|text| text.as_str().map(str::to_string)).collect()
+        }).flat_map(|data| {
+            let message = data.get("message").and_then(|message| serde_json::from_value(message.clone()).ok());
+            let texts = data.get("text").into_iter().chain(data["texts"].as_array().into_iter().flatten());
+            message.into_iter().chain(texts.filter_map(|text| text.as_str().map(crate::agent::user_message))).collect::<Vec<_>>()
+        }).collect()
     }
 
     // The header and every entry as file text. Unknown entries are written back as they were read.

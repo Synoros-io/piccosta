@@ -139,6 +139,7 @@ struct QueryData {
     results: Vec<search::SearchResult>,
     error: Option<String>,
     provider: Option<&'static str>,
+    usage: Option<(String, crate::message::Usage)>,
 }
 
 impl QueryData {
@@ -275,14 +276,16 @@ impl Tool for WebSearchTool {
                     let done = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     send_update(context, format!("Completed {done}/{total} searches."), json!({"phase": "search", "progress": done as f64 / total as f64, "currentQuery": query}));
                     match found {
-                        Ok(response) => QueryData { query: query.clone(), answer: response.answer, results: response.results, error: None, provider: Some(response.provider) },
-                        Err(error) => QueryData { query: query.clone(), answer: String::new(), results: Vec::new(), error: Some(error), provider: None },
+                        Ok(response) => QueryData { query: query.clone(), answer: response.answer, results: response.results, error: None, provider: Some(response.provider), usage: response.usage },
+                        Err(error) => QueryData { query: query.clone(), answer: String::new(), results: Vec::new(), error: Some(error), provider: None, usage: None },
                     }
                 }
             });
             let results: Vec<QueryData> = futures_util::future::join_all(jobs).await;
+            // Stopped, it still says what the queries that finished spent, for the usage totals.
+            let aborted = || ToolOutput { content: vec![Content::text("Operation aborted")], details: Some(json!({"usage": spent(&results)})), is_error: true };
             if context.cancel.is_cancelled() {
-                return Err("Operation aborted".to_string());
+                return Ok(aborted());
             }
             let mut all_urls: Vec<String> = Vec::new();
             for result in &results {
@@ -294,11 +297,16 @@ impl Tool for WebSearchTool {
             }
             let inline_content = if include_content && !all_urls.is_empty() { Some(extract::fetch_all(&all_urls, Mode::Readable, false, web, context.image_limits, &context.cancel).await) } else { None };
             if context.cancel.is_cancelled() {
-                return Err("Operation aborted".to_string());
+                return Ok(aborted());
             }
             Ok(build_search_return(web, &query_list, &results, inline_content, include_content))
         })
     }
+}
+
+// What each model-backed query spent, (provider, usage), as the usage totals read it.
+fn spent(results: &[QueryData]) -> Vec<Value> {
+    results.iter().filter_map(|result| result.usage.as_ref()).map(|(provider, usage)| json!({"provider": provider, "usage": usage})).collect()
 }
 
 // The search's text, its stored ids and its details (web-tool-core.ts buildSearchReturn).
@@ -357,6 +365,8 @@ fn build_search_return(web: &WebShared, query_list: &[String], results: &[QueryD
         "originalChars": original,
         "returnedChars": returned,
         "omittedChars": omitted,
+        // What each model-backed query spent (provider, usage), which the usage totals count.
+        "usage": spent(results),
     });
     text_output(text, details, false)
 }

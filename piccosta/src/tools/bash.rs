@@ -573,7 +573,7 @@ fn to_background(
     pid: u32,
     kill: CancellationToken,
     started: Instant,
-    tail: Tail,
+    mut tail: Tail,
     events: mpsc::UnboundedReceiver<Event>,
 ) -> ToolOutput {
     let shared = context.shared.clone();
@@ -593,6 +593,7 @@ fn to_background(
     );
     let reply = format!("{}{status}\n{instruction}", if text.is_empty() { String::new() } else { format!("{text}\n\n") });
 
+    tail.sent();
     tokio::spawn(log_until_done(shared, job, arguments.command.clone(), tail, events));
     ToolOutput { content: vec![Content::text(reply)], details: None, is_error: false }
 }

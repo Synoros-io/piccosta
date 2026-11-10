@@ -425,9 +425,14 @@ struct Lane {
     // heard to end. Not `run`, which held a bare pid before (0.11.4 and older).
     #[serde(default)]
     launched: Option<crate::runtime::Run>,
-    // The time stamp of the last turn end the manager heard about.
+    // The entry id of the last finished turn persisted in the manager's delivery queue.
     #[serde(default)]
     reported: String,
+    // Another manager this one messaged: heard from once, at its next finished turn, then dropped,
+    // and never reminded about or told to close, since it isn't this manager's to run. Two managers
+    // that message each other would otherwise wake each other at every turn.
+    #[serde(default)]
+    once: bool,
 }
 
 fn load_lanes(home: &Path) -> Vec<Lane> {
@@ -444,13 +449,16 @@ fn changed(file: &Path) -> Option<u64> {
 }
 
 // Start answering for a lane, or carry on with one already listed; `run` is the process of a run
-// just started in it, and `heard` the time stamp of its last turn before the manager's message,
+// just started in it, and `heard` the entry id of its last turn before the manager's message,
 // which a new lane's news starts after.
-fn take_lane(home: &Path, file: &Path, title: &str, run: Option<crate::runtime::Run>, heard: String) {
+fn take_lane(home: &Path, file: &Path, title: &str, run: Option<crate::runtime::Run>, heard: String, once: bool) {
     let mut lanes = load_lanes(home);
     match lanes.iter_mut().find(|lane| lane.file == file) {
-        Some(lane) => lane.launched = run.or(lane.launched.take()),
-        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, launched: run, reported: heard }),
+        Some(lane) => {
+            lane.launched = run.or(lane.launched.take());
+            lane.once = once;
+        }
+        None => lanes.push(Lane { file: file.to_path_buf(), title: title.to_string(), quiet_since: 0, reminders: 0, launched: run, reported: heard, once }),
     }
     save_lanes(home, &lanes);
 }
@@ -466,18 +474,24 @@ fn session_id(file: &Path) -> String {
     file.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.rsplit('_').next()).unwrap_or_default().to_string()
 }
 
-// The model's last finished turn in a session file (one that didn't end on tool calls): its entry's
-// time stamp and its text. Read as the model sees it, so an attempt a retry has hidden (agent.rs
-// omit_attempt) isn't taken for the end of a turn that's still going.
-fn last_turn(file: &Path) -> Option<(String, String)> {
-    let session = crate::session::Session::read(file).ok()?;
-    let projection = session.projection();
-    let last = projection.iter().rev().find(|entry| !entry.messages.is_empty() && matches!(entry.source, crate::session::SessionEntry::Message { .. }))?;
-    let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = last.source else { return None };
-    let text: Vec<&str> = reply.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
-    // A turn that failed says why last, where its news keeps it.
-    let failed = reply.error_message.as_ref().map_or(String::new(), |error| format!("\n(Its turn ended in an error: {error})"));
-    (reply.stop_reason != StopReason::ToolUse).then(|| (base.timestamp.clone(), text.join("\n") + &failed))
+// Finished turns after the durable entry cursor, oldest first. Read the whole branch, not just
+// the current context: compaction mustn't hide an answer the manager hasn't heard. Older lane
+// files used a timestamp as their cursor; accept that once, then save an entry id.
+fn turns_after(file: &Path, reported: &str) -> Vec<(String, String)> {
+    let Ok(session) = crate::session::Session::read(file) else { return Vec::new() };
+    let path = session.path_to_leaf();
+    let after = path.iter().rposition(|entry| entry.id() == reported || entry.base().timestamp == reported).map_or(0, |at| at + 1);
+    path[after..].iter().filter_map(|entry| {
+        let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = entry else { return None };
+        let omitted = path.iter().rev().find_map(|edit| match edit {
+            crate::session::SessionEntry::ContextEdit { target_id, replacement, .. } if target_id == &base.id => Some(replacement.is_none()),
+            _ => None,
+        }).unwrap_or(false);
+        if reply.stop_reason == StopReason::ToolUse || omitted { return None; }
+        let text: Vec<&str> = reply.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
+        let failed = reply.error_message.as_ref().map_or(String::new(), |error| format!("\n(Its turn ended in an error: {error})"));
+        Some((base.id.clone(), text.join("\n") + &failed))
+    }).collect()
 }
 
 // A lane's line in a check-in: how long since its last reply, and the end of the last line of text
@@ -500,25 +514,24 @@ fn ending(text: &str) -> String {
     characters[characters.len().saturating_sub(NEWS_CHARS)..].iter().collect()
 }
 
-// News of a lane's last finished turn, when the manager hasn't heard it yet; `still`, that its run
+// News of every finished turn the manager hasn't heard yet; `still`, that the lane's run
 // goes on (a background job, or a partner's turn). `ended` says its run ended, and whether it said
 // so: a run of the manager's that ended without a word or a new turn gets news too, with the end of
 // what it printed.
-fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> Option<String> {
+fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> Vec<(String, String)> {
     let (id, title) = (session_id(&lane.file), lane.title.clone());
-    let news = match last_turn(&lane.file).filter(|(stamp, _)| *stamp != lane.reported) {
-        Some((stamp, said)) => {
-            lane.reported = stamp;
-            let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
-            Some(format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\nTell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next.", now_text(), ending(&said)))
-        }
-        None if ended == Some(false) && lane.launched.is_some() => {
-            let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
-            let pid = lane.launched.as_ref().map_or(0, |run| run.pid);
-            Some(format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {pid}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), ending(&printed)))
-        }
-        None => None,
-    };
+    let mut news = Vec::new();
+    for (entry, said) in turns_after(&lane.file, &lane.reported) {
+        lane.reported = entry.clone();
+        let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
+        let next = if lane.once { "Tell the user what came of it." } else { "Tell the user what came of it. Close the lane (`sessions close`) if its work is done, or message it with what's next." };
+        news.push((format!("lane:{id}:{entry}"), format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\n{next}", now_text(), ending(&said))));
+    }
+    if news.is_empty() && ended == Some(false) && lane.launched.is_some() {
+        let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
+        let pid = lane.launched.as_ref().map_or(0, |run| run.pid);
+        news.push((format!("run:{id}:{}", serde_json::to_string(&lane.launched).unwrap_or_default()), format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {pid}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), ending(&printed))));
+    }
     if ended.is_some() {
         lane.launched = None;
     }
@@ -537,17 +550,22 @@ fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> O
 // An advisor's lanes are the sessions it started: it hears from the user and its manager only when
 // they message it, so a manager an older advisor kept as its lane leaves the list.
 pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSender<Command>, (wait_minutes, check_minutes): (u64, u64), idle: impl Fn() -> bool) {
-    if home.ends_with(ADVISOR_DIR) {
-        let mut lanes = load_lanes(&home);
-        lanes.retain(|lane| crate::session::Session::read(&lane.file).ok().and_then(|session| role(&session)).is_none());
-        save_lanes(&home, &lanes);
-    }
+    // An advisor's lanes are only the sessions it started; another manager a manager kept as a lane
+    // before Lane.once is heard from once, as now.
+    let mut lanes = load_lanes(&home);
+    let advisor = home.ends_with(ADVISOR_DIR);
+    lanes.retain_mut(|lane| {
+        let manager = crate::session::Session::read(&lane.file).ok().and_then(|session| role(&session)).is_some();
+        lane.once |= manager;
+        !(advisor && manager)
+    });
+    save_lanes(&home, &lanes);
     let (heard_sender, mut heard) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, Value)>();
     let mut listening = std::collections::HashSet::new();
     let mut tick = tokio::time::interval(POLL);
     let (mut ticks, mut due) = (0u64, false);
     loop {
-        let news = tokio::select! {
+        let (news, lanes) = tokio::select! {
             _ = tick.tick() => {
                 ticks += 1;
                 // A check-in waits for the manager's turn to end, one at most: a message mid-turn
@@ -576,35 +594,40 @@ pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSende
                         catch_up(&home, lane, false, Some(said["end"] == true))
                     }
                 };
-                save_lanes(&home, &lanes);
-                news.into_iter().collect()
+                if lane.once && !news.is_empty() {
+                    lanes.retain(|lane| lane.file != file);
+                    listening.remove(&file);
+                }
+                (news, lanes)
             }
         };
-        let Some(manager) = manager.upgrade() else { return };
-        for text in news {
-            let _ = manager.send(Command::Message(text));
+        let Some(_manager) = manager.upgrade() else { return };
+        let Some(file) = pointer(&home) else { return };
+        for (id, text) in news {
+            if let Err(error) = crate::runtime::deliver(&file, &id, &text) {
+                eprintln!("piccosta manager: could not keep lane report: {error}");
+                return;
+            }
         }
+        save_lanes(&home, &lanes);
     }
 }
 
 // One look at a manager's lanes (watch), with the lanes at work when they were asked (`at_work`),
-// and whether a check-in goes now (`check`). Output: the news.
-fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: &tokio::sync::mpsc::UnboundedSender<(PathBuf, Value)>, ticks: u64, (wait_minutes, at_work, check): (u64, Option<&std::collections::HashSet<PathBuf>>, bool)) -> Vec<String> {
+// and whether a check-in goes now (`check`). Output: the news and the lanes to save once it's sent.
+fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: &tokio::sync::mpsc::UnboundedSender<(PathBuf, Value)>, ticks: u64, (wait_minutes, at_work, check): (u64, Option<&std::collections::HashSet<PathBuf>>, bool)) -> (Vec<(String, String)>, Vec<Lane>) {
     let mut lanes = load_lanes(home);
     let (remind, first) = (ticks.is_multiple_of(LANE_SCAN_SECONDS), ticks == 1);
     let now = (crate::clock::now_ms() / 1000) as u64;
     let agent_dir = crate::config::agent_dir();
     let (mut news, mut working) = (Vec::new(), Vec::new());
-    let mut save = remind || first;
     lanes.retain_mut(|lane| {
         let Some(last) = changed(&lane.file) else {
-            save = true;
             return false;
         };
         let (id, title) = (session_id(&lane.file), lane.title.clone());
         if crate::session::is_closed(&agent_dir, &lane.file) {
-            save = true;
-            news.push(format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text()));
+            news.push((uuid::Uuid::new_v4().to_string(), format!("[{}, a lane was closed] Session {id} \"{title}\" was closed by the user or another session; it's no longer one of your lanes.", now_text())));
             return false;
         }
         if !listening.contains(&lane.file) {
@@ -618,15 +641,19 @@ fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: 
             } else if first || lane.launched.as_ref().is_some_and(crate::runtime::ended) {
                 // What ended while nobody listened: as this manager starts, and a run it started
                 // that ended before it could be heard (it never started, say).
-                save = true;
-                news.extend(catch_up(home, lane, false, Some(first)));
+                let heard = catch_up(home, lane, false, Some(first));
+                if lane.once && !heard.is_empty() {
+                    news.extend(heard);
+                    return false;
+                }
+                news.extend(heard);
             }
         }
         // A lane at work (a turn, or a run of its own waiting on its jobs) is in the check-in
         // instead (below); one quiet and not at work gets reminders.
         let busy = at_work.is_some_and(|at_work| at_work.contains(&lane.file));
-        working.extend((busy && check).then(|| check_line(lane)));
-        if !remind || busy {
+        working.extend((busy && check && !lane.once).then(|| check_line(lane)));
+        if !remind || busy || lane.once {
             return true;
         }
         if last != lane.quiet_since {
@@ -636,17 +663,14 @@ fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: 
         if quiet_minutes >= wait_minutes << lane.reminders.min(16) {
             lane.reminders += 1;
             let running = if listening.contains(&lane.file) { at_work.map_or("it's open", |_| "it's open, not working") } else { "nothing is running it" };
-            news.push(format!("[{}, a quiet lane] Session {id} \"{title}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text()));
+            news.push((uuid::Uuid::new_v4().to_string(), format!("[{}, a quiet lane] Session {id} \"{title}\" has been inactive for {quiet_minutes} minutes, and {running}. Close it (`sessions close`) if it's done, or update it (`sessions message`), and tell the user if they should know.", now_text())));
         }
         true
     });
     if !working.is_empty() {
-        news.push(format!("[{}, a check-in] Your lanes at work:\n{}\n\nRead any that look stuck, off track or waiting (`sessions read`), act on what you see, and tell the user if they should know.", now_text(), working.join("\n")));
+        news.push((uuid::Uuid::new_v4().to_string(), format!("[{}, a check-in] Your lanes at work:\n{}\n\nRead any that look stuck, off track or waiting (`sessions read`), act on what you see, and tell the user if they should know.", now_text(), working.join("\n"))));
     }
-    if save {
-        save_lanes(home, &lanes);
-    }
-    news
+    (news, lanes)
 }
 
 // --- Schedules ---
@@ -658,7 +682,16 @@ struct Schedule {
     // When it next fires (epoch ms), and how often after that.
     next: i64,
     every_ms: Option<i64>,
+    #[serde(default)]
+    retry_at: i64,
+    #[serde(default)]
+    retry_ms: i64,
 }
+
+// Give a broken target the service's restart interval first, then double up to five minutes:
+// the occurrence stays due without filling the log or repeatedly blocking the service.
+const SCHEDULE_RETRY_MS: i64 = RESTART_SECONDS as i64 * 1_000;
+const SCHEDULE_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
 
 fn load_schedules(home: &Path) -> Vec<Schedule> {
     fs::read_to_string(home.join("schedules.json")).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
@@ -699,25 +732,30 @@ fn time_ms(text: &str) -> Option<i64> {
     Some(crate::clock::ms_from_iso(&format!("{clock}Z"))? - offset_ms)
 }
 
-// The schedules due now, moved on to their next time (or dropped when they don't repeat).
-fn due_schedules(home: &Path) -> Vec<Schedule> {
+// A due schedule stays due until its message is accepted or written to the session's queue.
+fn due_schedules(home: &Path, mut deliver: impl FnMut(&Schedule) -> Result<(), String>) {
     let now = crate::clock::now_ms();
     let mut schedules = load_schedules(home);
-    let due: Vec<Schedule> = schedules.iter().filter(|schedule| schedule.next <= now).cloned().collect();
-    if due.is_empty() {
-        return due;
-    }
-    schedules.retain_mut(|schedule| match (schedule.next <= now, schedule.every_ms) {
-        (false, _) => true,
-        (true, Some(every)) if every > 0 => {
+    schedules.retain_mut(|schedule| {
+        if schedule.next > now || schedule.retry_at > now { return true; }
+        if let Err(error) = deliver(schedule) {
+            schedule.retry_ms = schedule.retry_ms.saturating_mul(2).clamp(SCHEDULE_RETRY_MS, SCHEDULE_RETRY_MAX_MS);
+            schedule.retry_at = now.saturating_add(schedule.retry_ms);
+            eprintln!("piccosta manager: {error}; retry after {}", crate::clock::iso_from_ms(schedule.retry_at));
+            return true;
+        }
+        (schedule.retry_at, schedule.retry_ms) = (0, 0);
+        if let Some(every) = schedule.every_ms.filter(|every| *every > 0) {
             // A repeat missed while the service was down fires once, then keeps its rhythm.
             schedule.next += ((now - schedule.next) / every + 1) * every;
             true
+        } else {
+            false
         }
-        (true, _) => false,
     });
-    let _ = save_schedules(home, &schedules);
-    due
+    if let Err(error) = save_schedules(home, &schedules) {
+        eprintln!("piccosta manager: {error}");
+    }
 }
 
 // --- The manager's tools ---
@@ -835,15 +873,16 @@ impl SessionsTool {
         // took the message, and the watch, looking in between, dropped the lane as closed by
         // someone else, never to hear its turns (newC's and Yao's managers, 2026-11-06).
         crate::session::set_closed(&self.agent_dir, file, false);
-        let heard = last_turn(file).map(|(stamp, _)| stamp).unwrap_or_default();
+        let heard = turns_after(file, "").pop().map(|(entry, _)| entry).unwrap_or_default();
         let (to, cwd, message, log) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file));
         let sent = tokio::task::spawn_blocking(move || crate::runtime::send(&to, &message, Some((&cwd, &log)))).await.map_err(|error| error.to_string())?;
         // An advisor answers its manager by message, so it isn't a lane, and an advisor's lanes are
         // only the sessions it started: a message from it to a manager isn't followed.
-        let lane = match crate::session::Session::read(file).ok().and_then(|session| role(&session)) {
-            Some(Role::Advisor) => false,
-            Some(_) => !self.advising,
-            None => true,
+        // Another manager is heard from once, at its next finished turn (Lane once).
+        let (lane, once) = match crate::session::Session::read(file).ok().and_then(|session| role(&session)) {
+            Some(Role::Advisor) => (false, false),
+            Some(_) => (!self.advising, true),
+            None => (true, false),
         };
         let after = if self.advising && !lane { "its answer doesn't reach you: read it later (`sessions read`)" } else { "when its turn ends you get a message with what it said" };
         let (said, run) = match sent.map_err(|error| format!("Couldn't send it: {error}"))? {
@@ -853,7 +892,7 @@ impl SessionsTool {
             Sent::Queued => ("It's a manager's session, so the message waits in it for the service or a terminal UI to open it; read the session later to see what came of it.".to_string(), None),
         };
         if lane {
-            take_lane(&self.home, file, title, run, heard);
+            take_lane(&self.home, file, title, run, heard, once);
         }
         Ok(said)
     }
@@ -916,18 +955,45 @@ impl SessionsTool {
     fn usage(&self) -> String {
         let now = crate::clock::now_ms();
         type Tallies = std::collections::BTreeMap<String, (crate::provider::responses::Tally, crate::provider::responses::Tally)>;
-        // The day's and the week's, by provider; each session's tallied alone first, so a turn
-        // settles only its own session's pending ones.
+        // The day's and the week's, by provider, from everything each session and subagent session
+        // changed this week spent: its answers, its compactions and its other usage (a cache
+        // warm-up), whether or not they're still in its context. Each session is tallied alone
+        // first, so a turn settles only its own session's pending ones.
         let mut totals = Tallies::new();
-        for summary in crate::host::all_sessions(&self.agent_dir, usize::MAX).iter().filter(|summary| summary.modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128)) {
-            let Ok(session) = crate::session::Session::open(&summary.path, &summary.cwd) else { continue };
-            let mut tallies = Tallies::new();
-            for message in session.context().messages {
-                if let AgentMessage::Assistant(assistant) = message {
-                    let (day, week) = tallies.entry(assistant.provider.clone()).or_default();
-                    week.add(&assistant.usage, &assistant.provider);
-                    if now - assistant.timestamp < DAY_MS {
-                        day.add(&assistant.usage, &assistant.provider);
+        let folders = fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten().map(|folder| folder.path());
+        let files = folders.flat_map(|folder| [folder.join("subagents"), folder]).flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten().map(|file| file.path()));
+        let this_week = |file: &PathBuf| file.extension().is_some_and(|extension| extension == "jsonl")
+            && fs::metadata(file).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128));
+        // A fork copies its parent's entries with their ids and times, so each is counted once.
+        let mut counted = std::collections::HashSet::new();
+        for file in files.filter(this_week) {
+            let Ok(session) = crate::session::Session::read(&file) else { continue };
+            let (mut tallies, mut provider) = (Tallies::new(), String::new());
+            for entry in session.entries() {
+                if !counted.insert((entry.id().to_string(), entry.base().timestamp.clone())) {
+                    continue;
+                }
+                let at = |base: &crate::session::EntryBase| crate::clock::ms_from_iso(&base.timestamp).unwrap_or(now);
+                let spent: Vec<(crate::message::Usage, String, i64)> = match entry {
+                    crate::session::SessionEntry::Message { message: AgentMessage::Assistant(answer), .. } => {
+                        provider.clone_from(&answer.provider);
+                        vec![(answer.usage.clone(), answer.provider.clone(), answer.timestamp)]
+                    }
+                    crate::session::SessionEntry::Usage { base, provider, usage, .. } => vec![(usage.clone(), provider.clone(), at(base))],
+                    // A compaction's summary was asked of the session's model, the last one answering.
+                    crate::session::SessionEntry::Compaction { base, usage: Some(usage), .. } => vec![(usage.clone(), provider.clone(), at(base))],
+                    // A tool that asked a model itself (web_search) keeps what it spent in its details.
+                    crate::session::SessionEntry::Message { message: AgentMessage::ToolResult(result), .. } => result.details.as_ref().and_then(|details| details.get("usage")).and_then(Value::as_array).into_iter().flatten()
+                        .filter_map(|spent| Some((serde_json::from_value(spent.get("usage")?.clone()).ok()?, spent.get("provider")?.as_str()?.to_string(), result.timestamp))).collect(),
+                    _ => continue,
+                };
+                for (usage, spent_by, when) in spent {
+                    let (day, week) = tallies.entry(spent_by.clone()).or_default();
+                    if now - when < 7 * DAY_MS {
+                        week.add(&usage, &spent_by);
+                    }
+                    if now - when < DAY_MS {
+                        day.add(&usage, &spent_by);
                     }
                 }
             }
@@ -1054,7 +1120,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                             text(format!("{started} {}", self.run(&file, &dir, &message, &title).await?))
                         }
                         None => {
-                            take_lane(&self.home, &file, &name, None, String::new());
+                            take_lane(&self.home, &file, &name, None, String::new(), false);
                             text(format!("{started} It has no message, so it waits: the user can open it in piccosta, where it's listed under its project, or you can message it."))
                         }
                     }
@@ -1190,7 +1256,7 @@ impl Tool for ManagerTools {
                     let every_ms = string(&arguments, "every").map(|every| duration_ms(every).ok_or_else(|| format!("Can't read {every:?}"))).transpose()?;
                     let mut schedules = load_schedules(&self.home);
                     let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-                    schedules.push(Schedule { id: id.clone(), text: need("text")?.to_string(), next, every_ms });
+                    schedules.push(Schedule { id: id.clone(), text: need("text")?.to_string(), next, every_ms, retry_at: 0, retry_ms: 0 });
                     save_schedules(&self.home, &schedules).map_err(|error| error.to_string())?;
                     text(format!("Scheduled {id} for {}.", crate::clock::iso_from_ms(next)))
                 }
@@ -1379,23 +1445,16 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     let termination = crate::proc::termination(true);
     tokio::pin!(termination);
     let mut poll = tokio::time::interval(POLL);
-    let scheduled = |schedule: Schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text);
+    let scheduled = |schedule: &Schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text);
     loop {
         tokio::select! {
             _ = &mut termination => break,
             // The schedules that are due: the assistant's, and the project managers', which go to
             // them wherever they run, or wait in their sessions.
             _ = poll.tick() => {
-                for schedule in due_schedules(&home) {
-                    let _ = commands.send(Command::Message(scheduled(schedule)));
-                }
-                for project_home in fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-                    let Some(manager) = pointer(&project_home) else { continue };
-                    for schedule in due_schedules(&project_home) {
-                        if let Err(error) = crate::runtime::send(&manager, &scheduled(schedule), None) {
-                            eprintln!("piccosta manager: {error}");
-                        }
-                    }
+                for home in std::iter::once(home.clone()).chain(fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path())) {
+                    let Some(manager) = pointer(&home) else { continue };
+                    due_schedules(&home, |schedule| crate::runtime::deliver(&manager, &format!("schedule:{}:{}:{}", home.display(), schedule.id, schedule.next), &scheduled(schedule)));
                 }
             }
         }

@@ -40,9 +40,8 @@ fn context(message: &AssistantMessage) -> u64 {
 // changed the request's prefix: a compaction since the turn before, another model, a new system
 // message; on the Claude bridge, a gap longer than a query waits for its next message (the cache
 // had lapsed), else the new query it started, with why; else it's unknown.
-pub fn check(session: &Session, id: &str, bridge: Option<String>) -> Option<Value> {
+pub fn check(session: &Session, id: &str, current: &AssistantMessage, bridge: Option<String>) -> Option<Value> {
     let entry = session.entry(id)?;
-    let SessionEntry::Message { message: AgentMessage::Assistant(current), .. } = entry else { return None };
     let written = context(current) - current.usage.cache_read;
     if written <= MISS_MIN_TOKENS {
         return None;

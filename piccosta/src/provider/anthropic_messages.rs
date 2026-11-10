@@ -6,6 +6,7 @@ use super::{BODY_IDLE_TIMEOUT, Request, StreamEvent, clamp_thinking_level, estim
 use crate::message::{AssistantMessage, Content, Message, StopReason};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::mpsc;
 
 const API: &str = "anthropic-messages";
@@ -16,6 +17,11 @@ const THINKING_BUDGETS: [u64; 4] = [1024, 2048, 8192, 16384];
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 // Anthropic's tool ids accept these characters and at most 64 of them (pi's convertMessages).
 const TOOL_ID_LIMIT: usize = 64;
+
+// Where each session/model's last request ended. Extra user messages can arrive with tool
+// results, so the preceding user turn isn't necessarily that request's breakpoint.
+type BreakpointKey = (String, String, String);
+static BREAKPOINTS: LazyLock<Mutex<HashMap<BreakpointKey, (usize, usize)>>> = LazyLock::new(Default::default);
 
 fn string(value: &Value, key: &str) -> String {
     value.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
@@ -91,14 +97,23 @@ fn build_body(request: &Request<'_>) -> Value {
             .iter()
             .map(|tool| json!({"name":tool.name, "description":tool.description, "input_schema":tool.parameters}))
             .collect();
-    // The gateway uses Anthropic's short-lived explicit cache markers, just as pi does.
+    // Anthropic looks back only 20 blocks from a breakpoint. Keep the previous request's marker:
+    // a parallel batch can put its calls and results farther away than that. With the system this
+    // uses three of the API's four allowed breakpoints.
     if let Some(last) = system.last_mut() {
         last["cache_control"] = json!({"type":"ephemeral"});
     }
-    if let Some(last) =
-        turns.last_mut().filter(|turn| turn["role"] == "user").and_then(|turn| turn["content"].as_array_mut()).and_then(|blocks| blocks.last_mut())
-    {
-        last["cache_control"] = json!({"type":"ephemeral"});
+    let latest = turns.iter().rposition(|turn| turn["role"] == "user").and_then(|turn| {
+        turns[turn]["content"].as_array()?.len().checked_sub(1).map(|block| (turn, block))
+    });
+    let previous = latest.and_then(|latest| request.session_id.and_then(|session| BREAKPOINTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((session.into(), model.provider.clone(), model.id.clone()), latest)));
+    for (turn, block) in previous.into_iter().chain(latest) {
+        if let Some(block) = turns.get_mut(turn).filter(|turn| turn["role"] == "user")
+            .and_then(|turn| turn["content"].as_array_mut()).and_then(|blocks| blocks.get_mut(block))
+        {
+            block["cache_control"] = json!({"type":"ephemeral"});
+        }
     }
     let max_tokens = estimate::max_output_tokens(model.context_window, model.max_tokens, &resolved);
     let mut body = json!({"model":model.id, "messages":turns, "system":system, "max_tokens":max_tokens, "stream":true});

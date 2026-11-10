@@ -641,6 +641,24 @@ const HOUR_WRITE_INPUT_MULTIPLIER: f64 = 2.0;
 // Set a response's cost from its usage and the model's prices, with the tier for its input size
 // (models.ts:1236-1256). A plan's responses cost nothing; one billed by the token at prices nobody
 // gave has an unknown cost, not a zero one.
+// A Responses API `usage` object as piccosta's Usage, its cost not yet reckoned. OpenAI counts
+// cached and cache-write tokens inside input_tokens, so both come off.
+pub fn usage_from(usage: &Value) -> Usage {
+    let number = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    let cached = number("/input_tokens_details/cached_tokens");
+    let cache_write = number("/input_tokens_details/cache_write_tokens");
+    Usage {
+        input: number("/input_tokens").saturating_sub(cached + cache_write),
+        output: number("/output_tokens"),
+        cache_read: cached,
+        cache_write,
+        cache_write_1h: None,
+        reasoning: Some(number("/output_tokens_details/reasoning_tokens")),
+        total_tokens: number("/total_tokens"),
+        cost: Default::default(),
+    }
+}
+
 pub fn calculate_cost(model: &Model, usage: &mut Usage) {
     let plan = plan_billed(&model.provider);
     let state = if plan || model.cost.supplied { CostState::Known } else { CostState::Unknown };
@@ -917,20 +935,7 @@ impl<'a> StreamState<'a> {
             self.output.response_id = Some(id.to_string());
         }
         if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-            let number = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
-            let cached = number("/input_tokens_details/cached_tokens");
-            let cache_write = number("/input_tokens_details/cache_write_tokens");
-            // OpenAI counts cached and cache-write tokens inside input_tokens, so both come off.
-            self.output.usage = Usage {
-                input: number("/input_tokens").saturating_sub(cached + cache_write),
-                output: number("/output_tokens"),
-                cache_read: cached,
-                cache_write,
-                cache_write_1h: None,
-                reasoning: Some(number("/output_tokens_details/reasoning_tokens")),
-                total_tokens: number("/total_tokens"),
-                cost: Default::default(),
-            };
+            self.output.usage = usage_from(usage);
         }
         calculate_cost(self.model, &mut self.output.usage);
         let status = response.get("status").and_then(Value::as_str);

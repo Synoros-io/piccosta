@@ -141,9 +141,10 @@ fn shadowed_context_file(cwd: &Path, reads: &mut Reads) -> Option<PathBuf> {
 // every ancestor directory's, outermost first, ending with the cwd's.
 fn context_files(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<ContextFile> {
     let mut files = Vec::new();
+    // Real paths, so two links to one file load it once.
     let mut seen = Vec::new();
     if let Some(global) = read_context_file(agent_dir, reads) {
-        seen.push(global.path.clone());
+        seen.push(crate::tools::paths::canonical(&global.path));
         files.push(global);
     }
     let shadowed = shadowed_context_file(cwd, reads);
@@ -153,8 +154,9 @@ fn context_files(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<Context
         if let Some(file) = read_context_file(&dir, reads) {
             let real_dir = crate::tools::paths::canonical(&dir);
             let is_shadowed = shadowed.as_ref().is_some_and(|shadowed| file.path.file_name().is_some_and(|name| real_dir.join(name) == *shadowed));
-            if !is_shadowed && !seen.contains(&file.path) {
-                seen.push(file.path.clone());
+            let real = crate::tools::paths::canonical(&file.path);
+            if !is_shadowed && !seen.contains(&real) {
+                seen.push(real);
                 ancestors.push(file);
             }
         }
@@ -174,9 +176,9 @@ fn import_target(raw: &str, importing_file: &Path) -> PathBuf {
 }
 
 // One context file's text with each import line replaced by the file it names (lean.ts:77-101).
-// Input: the file, and the real paths of every context file already in the prompt.
-fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], reads: &mut Reads) -> String {
-    let mut imported_here: Vec<PathBuf> = Vec::new();
+// Input: the file, the real paths of every context file already in the prompt, and of every file
+// already imported (by this file or an earlier one), which isn't imported again.
+fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], imported: &mut Vec<PathBuf>, reads: &mut Reads) -> String {
     let lines: Vec<String> = file
         .content
         .split('\n')
@@ -186,14 +188,14 @@ fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], reads: &mut Reads) 
                 return line.to_string();
             };
             let target = import_target(raw, &file.path);
-            if in_prompt.contains(&target) || imported_here.contains(&target) {
+            if in_prompt.contains(&target) || imported.contains(&target) {
                 return line.to_string();
             }
             if target.is_dir() {
                 return line.to_string();
             }
             let Some(bytes) = reads.read(&target) else { return line.to_string() };
-            imported_here.push(target);
+            imported.push(target);
             let mut text = if bytes.len() > IMPORT_MAX_BYTES {
                 format!("{}\n[{raw} cut at {IMPORT_MAX_BYTES} bytes; read the file for the rest]", String::from_utf8_lossy(&bytes[..IMPORT_MAX_BYTES]))
             } else {
@@ -306,14 +308,15 @@ fn tagged(name: &str, content: &str) -> String {
 fn expanded(cwd: &Path, agent_dir: &Path, reads: &mut Reads) -> Vec<(PathBuf, String)> {
     let files = context_files(cwd, agent_dir, reads);
     let in_prompt: Vec<PathBuf> = files.iter().map(|file| crate::tools::paths::canonical(&file.path)).collect();
-    files.iter().map(|file| (file.path.clone(), expand_imports(file, &in_prompt, reads))).collect()
+    let mut imported = Vec::new();
+    files.iter().map(|file| (file.path.clone(), expand_imports(file, &in_prompt, &mut imported, reads))).collect()
 }
 
 // The project_context section's text for those files, or None when there are none.
 fn project_context(files: &[(PathBuf, String)]) -> Option<String> {
     let mut parts = vec!["The user's instructions for this project, from its AGENTS.md and CLAUDE.md files, outermost first:".to_string()];
     for (path, text) in files {
-        parts.push(format!("<project_instructions path=\"{}\">\n{text}\n</project_instructions>", path.display()));
+        parts.push(format!("<project_instructions path=\"{}\">\n{text}\n{FILE_END}", path.display()));
     }
     (!files.is_empty()).then(|| parts.join("\n\n"))
 }
@@ -326,6 +329,9 @@ pub fn context_now(cwd: &Path, agent_dir: &Path) -> Option<Option<String>> {
     let files = expanded(cwd, agent_dir, &mut reads);
     (reads.failures.is_empty() && !reads.unsettled).then(|| project_context(&files).map(|project| tagged("project_context", &project)))
 }
+
+// How each context file's part of the project_context section ends.
+pub const FILE_END: &str = "</project_instructions>";
 
 // The instructions a project_context section holds: each file's path and text, below the header
 // line, which is piccosta's wording. "" for none.

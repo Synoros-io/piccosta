@@ -59,8 +59,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(15);
 // in its sessions' folders on the thread its own sessions run on (a stopped assistant held each
 // of its turns up by the whole ASK_WAIT, every scan, 2026-11-03).
 const STATUS_WAIT: Duration = Duration::from_millis(250);
-// Where a session's messages waited before runtimes (0.11.3 and older): <session file>.inbox, a
-// JSON line each, {"text": ...}. The runtime that claims the session takes them in (claim).
+// The receiver's durable deliveries: <session file>.inbox, one JSON line each, with a text and
+// delivery_id. Before runtimes (0.11.3 and older) these held bare texts, which are still read.
 const INBOX_SUFFIX: &str = ".inbox";
 // How long a runtime waits for a request's line once a client connects.
 const READ_WAIT: Duration = Duration::from_secs(1);
@@ -195,26 +195,7 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
         let cwd = PathBuf::from(&session.header().cwd);
         *session = Session::open(&file, &cwd).map_err(|error| error.to_string())?;
     }
-    // An old inbox, read whole under its own lock as its senders wrote it, goes into the session as
-    // one queued entry holding its messages and naming it (its size and sha256), and is unlinked
-    // after. That entry is written whole or not at all, so an inbox still there once it's written
-    // (the piccosta taking it died before the unlink) is known by it and only unlinked. One that
-    // can't be locked or read whole, or beside a session not on disk yet, is left where it is.
-    let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
-    let mut old = String::new();
-    if file.exists()
-        && let Ok(Some(handle)) = hold(&inbox)
-        && (&handle).read_to_string(&mut old).is_ok()
-    {
-        let hash: String = sha2::Sha256::digest(&old).iter().map(|byte| format!("{byte:02x}")).collect();
-        let name = json!({"size": old.len(), "sha256": hash});
-        let taken = session.entries().iter().any(|entry| matches!(entry, crate::session::SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == crate::session::QUEUED_TYPE && data["inbox"] == name));
-        let texts: Vec<Value> = old.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()?.get("text").filter(|text| text.is_string()).cloned()).collect();
-        if !taken && !texts.is_empty() {
-            session.append_custom(crate::session::QUEUED_TYPE, Some(json!({"texts": texts, "inbox": name}))).map_err(|error| format!("{}: {error}", file.display()))?;
-        }
-        let _ = std::fs::remove_file(&inbox);
-    }
+    take_inbox(session).map_err(|error| format!("{}: {error}", file.display()))?;
     let (taken_by, taken) = mpsc::unbounded_channel();
     let (gate, watch): (Gate, Arc<Mutex<Watch>>) = (Arc::new(Mutex::new(Some(taken_by))), Arc::default());
     let listening = Some(listen(listener, gate.clone(), watch.clone()));
@@ -414,6 +395,67 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
     }
 }
 
+// A retryable delivery is on disk before its sender advances a cursor. The inbox belongs to the
+// receiver, under the same handoff lock as claim and shutdown. Waking it can lose its answer, or
+// fail altogether: the next turn or runtime still takes the delivery. Its id survives consumption.
+pub fn deliver(file: &Path, id: &str, text: &str) -> Result<(), String> {
+    {
+        let held = hold(file)?;
+        if held.is_none() { return Err(format!("{}: no such session for delivery", file.display())); }
+        let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
+        let mut output = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&inbox).map_err(|error| error.to_string())?;
+        let mut pending = String::new();
+        output.read_to_string(&mut pending).map_err(|error| error.to_string())?;
+        if !pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|line| line["delivery_id"] == id) {
+            let length = output.metadata().map_err(|error| error.to_string())?.len();
+            let line = format!("{}\n", json!({"text": text, "delivery_id": id}));
+            if let Err(error) = output.write_all(line.as_bytes()).and_then(|()| output.sync_all()) {
+                return Err(match output.set_len(length) {
+                    Ok(()) => error.to_string(),
+                    Err(rollback) => format!("{error}; could not remove partial delivery: {rollback}"),
+                });
+            }
+        }
+    }
+    let _ = ask(file, json!({"do": "message", "text": ""}), ASK_WAIT);
+    Ok(())
+}
+
+// Take durable input at a turn or steering boundary. The runtime and the agent both use this;
+// neither can race a sender or a handoff while moving the inbox into the session.
+pub fn receive(session: &mut Session) -> Result<(), String> {
+    let _held = session.file().map(hold).transpose()?;
+    take_inbox(session).map_err(|error| format!("could not take session deliveries: {error}"))
+}
+
+// Move an inbox into the session before deleting it. Called under the session's handoff lock.
+// Older inboxes had no delivery ids: their whole-file hash is the receipt, as before.
+fn take_inbox(session: &mut Session) -> std::io::Result<()> {
+    let Some(file) = session.file().map(Path::to_path_buf) else { return Ok(()) };
+    let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
+    let Some(handle) = hold(&inbox).map_err(std::io::Error::other)? else { return Ok(()) };
+    let mut pending = String::new();
+    (&handle).read_to_string(&mut pending)?;
+    let hash: String = sha2::Sha256::digest(&pending).iter().map(|byte| format!("{byte:02x}")).collect();
+    let name = json!({"size": pending.len(), "sha256": hash});
+    let taken = session.entries().iter().any(|entry| matches!(entry, crate::session::SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == crate::session::QUEUED_TYPE && data["inbox"] == name));
+    let mut texts = Vec::new();
+    for line in pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let Some(text) = line["text"].as_str() else { continue };
+        if let Some(id) = line["delivery_id"].as_str() {
+            session.queue_delivery(id, text)?;
+        } else if !taken {
+            texts.push(text.to_string());
+        }
+    }
+    if !texts.is_empty() {
+        session.append_custom(crate::session::QUEUED_TYPE, Some(json!({"texts": texts, "inbox": name})))?;
+    }
+    std::fs::OpenOptions::new().append(true).open(&file)?.sync_all()?;
+    drop(handle);
+    std::fs::remove_file(inbox)
+}
+
 // The runs launch started that have ended, for a manager watching its lanes.
 static ENDED: Mutex<Vec<Run>> = Mutex::new(Vec::new());
 
@@ -497,11 +539,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     // Each turn the model ends goes to the subscribers, with how many jobs still run.
     let (heard, jobs) = (watch.clone(), shared.clone());
     agent.tap(move |event| {
-        if let Event::AgentEnd { messages, will_retry: false } = event
+        if let Event::AgentEnd { messages, will_retry: false, entry_id } = event
             && let Some(AgentMessage::Assistant(last)) = messages.last()
             && last.stop_reason != StopReason::ToolUse
         {
-            lock(&heard).tell(&json!({"turn_end": {"jobs": jobs.jobs.running_count()}}).to_string());
+            lock(&heard).tell(&json!({"turn_end": {"entry_id": entry_id, "jobs": jobs.jobs.running_count()}}).to_string());
         }
     });
     let minutes = |key: &str, default: u64| host.settings.get(key).and_then(Value::as_u64).unwrap_or(default);
@@ -512,13 +554,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         let handle = agent.handle();
         let mut team = crate::host::team(&agent.session);
         let mut queue: VecDeque<Command> = VecDeque::new();
+        let mut closing: Option<Option<oneshot::Sender<()>>> = None;
         let mut preparing = Box::pin(host.ready(&mut agent));
         let ready = loop {
             tokio::select! {
                 result = &mut preparing => break result,
                 command = next(&mut commands, &mut claim) => match command {
                     Some(Command::Close(answer)) => {
-                        if let Some(answer) = answer { let _ = answer.send(()); }
+                        closing = Some(answer);
                         break Err("Session closed during plugin discovery".into());
                     }
                     Some(command) => queue.push_back(command),
@@ -529,16 +572,12 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         drop(preparing);
         if let Err(error) = ready {
             done(Done { result: Err(error), notice: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
-            if let Some(watcher) = watcher { watcher.abort(); }
-            shared.jobs.shutdown("plugin discovery ended");
-            shared.web.shutdown();
-            return agent;
+            queue.push_front(Command::Close(closing.take().flatten()));
         }
         // What the last runner left queued is taken at once.
         if wake && !agent.session.queued().is_empty() {
             queue.push_back(Command::Message(String::new()));
         }
-        let mut closing: Option<Option<oneshot::Sender<()>>> = None;
         // The session file's lock, while a run of its own lets go.
         let mut held = None;
         // Idle compaction: the time set for the session's last request and that request's (epoch ms),
@@ -617,10 +656,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt.
-                Work::Command(Command::Message(text)) if !wake && !text.is_empty() => {
-                    if let Err(error) = agent.session.queue(&text) {
-                        eprintln!("piccosta: could not queue a message: {error}");
-                    }
+                Work::Command(Command::Message(text)) if !wake => {
+                    let kept = receive(&mut agent.session).and_then(|()| {
+                        if text.is_empty() { Ok(()) } else { agent.session.queue(&text).map(|_| ()).map_err(|error| error.to_string()) }
+                    });
+                    if let Err(error) = kept { eprintln!("piccosta: could not queue a message: {error}"); }
                     continue;
                 }
                 Work::Notice(notice) if crate::tools::jobs::stopped_by_user(&notice) => {
@@ -737,16 +777,23 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             lock(&claim.gate).take();
             left.extend(std::iter::from_fn(|| claim.taken.try_recv().ok()));
         }
-        for command in left.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
-            match command {
-                Command::Message(text) if !text.is_empty() => handle.steer(text),
+        requeue(&mut agent);
+        for command in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok())) {
+            let message = match command {
+                Command::Message(text) if !text.is_empty() => Some(crate::agent::user_message(&text)),
+                Command::Prompt(text, images) => Some(crate::agent::with_images(&text, images)),
                 Command::Stop(Some(answer)) | Command::Close(Some(answer)) => {
                     let _ = answer.send(());
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(message) = message && let Err(error) = agent.session.queue_message(message) {
+                eprintln!("piccosta: could not keep runtime input: {error}");
             }
         }
-        requeue(&mut agent);
+        shared.jobs.shutdown("quit");
+        agent.keep_notices();
         lock(&watch).tell(&json!({"end": true}).to_string());
         drop(claim);
         drop(held);
@@ -755,7 +802,6 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         }
         crate::provider::claude::close(agent.session.id());
         lock(&IDLE_NOTES).remove(agent.session.id());
-        shared.jobs.shutdown("quit");
         shared.web.shutdown();
         if let Some(Some(answer)) = closing {
             let _ = answer.send(());
@@ -789,6 +835,9 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         Work::Notice(notice) => return agent.take_notice(notice).await,
         Work::Idle => return agent.compact_idle().await,
     };
+    if matches!(command, Command::Prompt(..) | Command::Message(_)) {
+        receive(&mut agent.session)?;
+    }
     match command {
         Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,
         Command::Message(text) => host.answer(agent, team, &text, Vec::new()).await,

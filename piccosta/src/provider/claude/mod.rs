@@ -67,7 +67,7 @@ use history::{fingerprint, Shape};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -986,6 +986,9 @@ pub struct Handed {
     notice: Option<String>,
     #[serde(default)]
     manager: bool,
+    // Earlier queries were started without transcript-write acknowledgements.
+    #[serde(default)]
+    session_mirror: bool,
 }
 
 // /restart: each query waiting for its next message gives its Claude Code to the image this process
@@ -1008,13 +1011,18 @@ pub async fn hand_over() -> Vec<Handed> {
 pub fn adopt(handed: Vec<Handed>) {
     for query in handed {
         let [stdin, stdout, stderr] = query.fds.map(crate::tools::reaper::inherited);
-        let Ok(child) = Child::new(query.pid, Some(stdin.into()), Some(stdout.into()), Some(stderr.into()), query.stderr) else {
+        let Ok(mut child) = Child::new(query.pid, Some(stdin.into()), Some(stdout.into()), Some(stderr.into()), query.stderr) else {
             // Its pipes closed with that; reaped here, since nothing else would, and ended only while
             // its pid still names the process the record started (its start time), never another.
             let named = query.start.is_some_and(|start| crate::proc::Process::started(query.pid as i32, start).is_some());
             crate::tools::reaper::reap_inherited(query.pid as i32, named.then_some(TERM_GRACE), Vec::new());
             continue;
         };
+        if !query.session_mirror {
+            debug(&format!("adopt: session {} resumes its kept records; Claude Code {} has no transcript mirror", query.key, query.pid));
+            tokio::spawn(async move { child.close().await; });
+            continue;
+        }
         debug(&format!("adopt: session {} keeps Claude Code {} across the restart", query.key, query.pid));
         if let Some(notice) = query.notice {
             lock(&NOTES).insert(query.key.clone(), notice);
@@ -1028,7 +1036,7 @@ pub fn adopt(handed: Vec<Handed>) {
         (adopted.cost_seen, adopted.pending_turns, adopted.requests) = (query.cost_seen, query.pending_turns, query.requests);
         adopted.model.cost.supplied = query.cost_supplied;
         adopted.hold_until = query.hold_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-        lock(&LIVE).insert(query.key, Live { id, state, commands });
+        lock(&LIVE).insert(history::query_key(&query.key, &adopted.shape), Live { id, state, commands });
         QUERIES.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(adopted.run(Vec::new()));
     }
@@ -1044,12 +1052,13 @@ struct Turn {
     cancel: CancellationToken,
 }
 
-static LIVE: LazyLock<Mutex<HashMap<String, Live>>> = LazyLock::new(Default::default);
+type QueryKey = (String, String);
+static LIVE: LazyLock<Mutex<HashMap<QueryKey, Live>>> = LazyLock::new(Default::default);
 static NEXT_QUERY: AtomicU64 = AtomicU64::new(1);
 // Why each session's latest Claude Code query was started, for the cache monitor (take_rewrite); and
 // why its last query ended, for the reason the next one starts (deliver).
 static REWRITES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
-static ENDED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+static ENDED: LazyLock<Mutex<HashMap<QueryKey, String>>> = LazyLock::new(Default::default);
 
 // A line for each session's user, taken with take_notice.
 static NOTES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
@@ -1075,18 +1084,12 @@ fn let_go(live: Live, reason: &str) {
     let _ = live.commands.send(Command::Discard(reason.to_string()));
 }
 
-fn discard(key: &str, reason: &str) {
-    if let Some(live) = lock(&LIVE).remove(key) {
-        let_go(live, reason);
-    }
-}
-
 // The end of one of pi's runs. The session's query stays. A waiting one (it answered, or was stopped
 // mid-answer) takes the next message; one parked on its calls (the run was stopped while they ran)
 // holds them for the next call, which carries their results (hold_parked). Either ends when its
 // cache would have lapsed, its session closes (close) or piccosta exits (shutdown).
 pub fn end_run(session_id: &str) {
-    if let Some(live) = lock(&LIVE).get(session_id) {
+    for (_, live) in lock(&LIVE).iter().filter(|((session, _), _)| session == session_id) {
         let _ = live.commands.send(Command::Hold);
     }
 }
@@ -1094,7 +1097,12 @@ pub fn end_run(session_id: &str) {
 // A pi session closed, deleted or replaced: its query, waiting or not, ends now rather than when
 // its cache lapses.
 pub fn close(session_id: &str) {
-    discard(session_id, "the session was closed");
+    lock(&LIVE).retain(|(session, _), live| {
+        if session == session_id {
+            let _ = live.commands.send(Command::Discard("the session was closed".into()));
+        }
+        session != session_id
+    });
 }
 
 // Whether the session's query waits for its next message, or for the results of the calls it's
@@ -1103,7 +1111,7 @@ pub fn close(session_id: &str) {
 // the turn ends, not `stopped`, which waits on the query's task taking end_run's Hold, maybe after
 // the session has already asked this.
 pub fn waiting(session_id: &str) -> bool {
-    lock(&LIVE).get(session_id).is_some_and(|live| { let state = lock(&live.state); state.waiting || state.pending.is_some() })
+    lock(&LIVE).iter().any(|((session, _), live)| session == session_id && { let state = lock(&live.state); state.waiting || state.pending.is_some() })
 }
 
 // Keep the waiting queries within CLAUDE_BRIDGE_HOLD_MAX, as each starts waiting, once its context
@@ -1112,7 +1120,7 @@ pub fn waiting(session_id: &str) -> bool {
 // and schedules message.
 fn make_room() {
     let mut all = lock(&LIVE);
-    let mut waiting: Vec<(u64, String, bool)> = all.iter().filter_map(|(key, live)| {
+    let mut waiting: Vec<(u64, QueryKey, bool)> = all.iter().filter_map(|(key, live)| {
         let state = lock(&live.state);
         (state.waiting || state.stopped).then(|| (state.context, key.clone(), state.manager))
     }).collect();
@@ -1129,10 +1137,8 @@ fn make_room() {
 
 // --- One provider call ---
 
-// Input: the request and where its events go. Output: the turn's message. A cacheRetention "none"
-// request (pi's compaction and branch summaries, under a fresh session id) starts a query of its
-// own that ends with its turn and keeps nothing; every other one delivers to the session's query or
-// rewrites, but an idle compaction's (in_place), which only delivers.
+// Input: the request and where its events go. Output: the turn's message, delivered to the
+// session's query of this shape, or resumed from its kept records when the context changed.
 pub async fn stream(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamEvent>) -> AssistantMessage {
     let id = &request.model.id;
     let (cli_model, _) = runtime_model(id);
@@ -1175,10 +1181,8 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     let fast = model.service_tier.as_deref() == Some(super::FAST_TIER);
     let cwd = request.cwd.to_string_lossy().into_owned();
     let key = request.session_id.unwrap_or("(none)").to_string();
-    {
-        history::attach(&key, request.session_file);
-    }
     let shape = history::shape(&system_prompt, &tools, cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
+    history::attach(&key, request.session_file);
     let prints: Vec<String> = messages.iter().map(fingerprint).collect();
     // A run stopped before its call got here leaves the session's query as Esc leaves Claude Code's,
     // and starts nothing. A waiting one waits on; one parked on the calls whose results this call
@@ -1202,7 +1206,7 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
         let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, request.manager, forced.take(), turn) {
             Ok(()) => match answer.await {
                 Ok(message) => {
-                    if let Some(prints) = before && let Some(live) = lock(&LIVE).get(&key) {
+                    if let Some(prints) = before && let Some(live) = lock(&LIVE).get(&history::query_key(&key, &shape)) {
                         lock(&live.state).prints = prints;
                     }
                     return message;
@@ -1256,10 +1260,11 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
 // the rewrite reason and the turn back; the live query, if any, is discarded then.
 #[allow(clippy::too_many_arguments)]
 fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, manager: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
+    let query_key = history::query_key(key, shape);
     let (mut live, mut unfolded) = (lock(&LIVE), None);
-    let decision = match (forced, live.get(key)) {
+    let decision = match (forced, live.get(&query_key)) {
         (Some(reason), _) => Err(reason),
-        (None, None) => Err(lock(&ENDED).get(key).map_or("no live query for this session".into(), |why| format!("no live query for this session; the last one ended: {why}"))),
+        (None, None) => Err(lock(&ENDED).get(&query_key).map_or("no live query for this session and shape".into(), |why| format!("no live query for this session and shape; the last one ended: {why}"))),
         (None, Some(entry)) => {
             let state = lock(&entry.state);
             history::decide(&state, messages, prints, shape).or_else(|reason| { unfolded = unfold(&state, messages, prints, shape); unfolded.as_ref().map(|_| 0).ok_or(reason) })
@@ -1268,13 +1273,13 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
     let start = match decision {
         Ok(start) => start,
         Err(reason) => {
-            if let Some(old) = live.remove(key) {
+            if let Some(old) = live.remove(&query_key) {
                 let_go(old, &format!("the session's context changed: {reason}"));
             }
             return Err((reason, turn));
         }
     };
-    let Some(entry) = live.get(key) else { return Err(("no live query for this session".into(), turn)) };
+    let Some(entry) = live.get(&query_key) else { return Err(("no live query for this session".into(), turn)) };
     // A waiting query takes the user messages that came after its turn as its next message; a
     // parked one, the results of the calls it's parked on.
     let mut state = lock(&entry.state);
@@ -1313,7 +1318,7 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
     (state.prints, state.pending, state.waiting, state.stopped, state.kept_base) = (prints.to_vec(), None, false, false, kept_base(messages));
     drop(state);
     let Err(mpsc::error::SendError(Command::Prompt(_, turn) | Command::Deliver(_, turn))) = entry.commands.send(command) else { return Ok(()) };
-    live.remove(key);
+    live.remove(&query_key);
     Err(("the query is gone".into(), turn))
 }
 
@@ -1374,7 +1379,7 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     }
     let mut args = base_args(start.thinking_off, start.effort);
     args.extend(written.iter().map(|id| format!("--resume={id}")));
-    args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--model", start.cli_model,
+    args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--session-mirror", "--model", start.cli_model,
         "--disable-slash-commands"].map(String::from));
     if SETTINGS.strict_mcp {
         args.push("--strict-mcp-config".into());
@@ -1415,7 +1420,7 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
     let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
     query.turn = Some(turn);
-    lock(&LIVE).insert(start.key.to_string(), Live { id, state, commands });
+    lock(&LIVE).insert(history::query_key(start.key, start.shape), Live { id, state, commands });
     QUERIES.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(query.run(opening));
     Ok(())
@@ -1477,6 +1482,8 @@ struct Query {
     // The tool calls of the current response (kept across a delivery), and every one pi was given.
     tool_ids: Vec<String>,
     handed: HashSet<String>,
+    // The transcript mirror acknowledges these calls only after Claude Code has written them.
+    saved_calls: HashSet<String>,
     // tools/call requests waiting for pi's results, and results that came before their request.
     parked: HashMap<String, Parked>,
     queued: HashMap<String, Value>,
@@ -1513,7 +1520,7 @@ impl Query {
         Query { id, key: key.to_string(), out, model, tools: tools.iter().map(|tool| tool.name.clone()).collect(), manifest: manifest(tools), child, inbox, state,
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
-            requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
+            requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), saved_calls: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
             settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, interrupting: false, next_prompt: None, unsent: Vec::new(), hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
     }
 
@@ -1570,6 +1577,7 @@ impl Query {
         (self.started, self.saw_stream_event, self.saw_tool_call) = (false, false, false);
         (self.stream_id, self.stream_open, self.stream_delta, self.stream_start, self.fallback_id) = (None, false, false, 0, None);
         self.turn_requests.clear();
+        self.saved_calls.clear();
         self.result_seen = false;
         self.result_cost = None;
     }
@@ -1617,11 +1625,17 @@ impl Query {
         }
     }
 
-    // The one way a turn ends on tool calls: pi gets the message, and the query is parked on them.
+    // Parking hands the calls to pi only after the transcript mirror acknowledged their write.
+    // The stream can finish first; its mirror frame then completes this same boundary. Without
+    // that acknowledgement, holdMax could close a brand-new query before its file even exists.
     fn end_turn_on_tool_use(&mut self) {
         self.settle_at = None;
+        if !self.tool_ids.iter().all(|id| self.saved_calls.contains(id)) {
+            return;
+        }
         let Some(turn) = self.turn.take() else { return };
         self.out.stop_reason = StopReason::ToolUse;
+        self.keep_records();
         self.hand_pending(turn);
         self.handed.extend(self.tool_call_ids());
         let mut state = lock(&self.state);
@@ -1675,7 +1689,7 @@ impl Query {
             cwd: self.cwd.clone(), written: self.written.clone(), cc_session: self.cc_session.clone(),
             hold_ms: self.hold_until.map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64), cost_seen: self.cost_seen,
             pending_turns: self.pending_turns, requests: self.requests.clone(), stderr: lock(&self.child.stderr).clone(),
-            cost_supplied: self.model.cost.supplied, fast: (state.fast, self.fast), notice: lock(&NOTES).remove(&self.key), manager: state.manager })
+            cost_supplied: self.model.cost.supplied, fast: (state.fast, self.fast), notice: lock(&NOTES).remove(&self.key), manager: state.manager, session_mirror: true })
     }
 
     #[cfg(windows)]
@@ -1684,12 +1698,13 @@ impl Query {
     // Out of LIVE, unless a later query of the session has taken its place; and if none has, `why` it
     // ended is kept for the next one's reason.
     fn forget(&self, why: &str) {
+        let key = history::query_key(&self.key, &self.shape);
         let mut live = lock(&LIVE);
-        if live.get(&self.key).is_some_and(|live| live.id == self.id) {
-            live.remove(&self.key);
+        if live.get(&key).is_some_and(|live| live.id == self.id) {
+            live.remove(&key);
         }
-        if !live.contains_key(&self.key) {
-            lock(&ENDED).insert(self.key.clone(), why.to_string());
+        if !live.contains_key(&key) {
+            lock(&ENDED).insert(key, why.to_string());
         }
     }
 
@@ -1855,7 +1870,17 @@ impl Query {
             "control_response" if message["response"]["subtype"] == "error" => {
                 self.failure = Some(format!("Claude Code refused the session: {}", message["response"]["error"].as_str().unwrap_or("no reason given")));
             }
-            "control_response" | "control_cancel_request" | "keep_alive" | "transcript_mirror" => {}
+            "transcript_mirror" => {
+                if self.cc_session.as_deref().is_some_and(|id| Path::new(message["filePath"].as_str().unwrap_or_default()) == history::session_path(id, &self.project_path)) {
+                    self.saved_calls.extend(message["entries"].as_array().into_iter().flatten()
+                        .flat_map(|entry| entry["message"]["content"].as_array().into_iter().flatten())
+                        .filter(|block| block["type"] == "tool_use").filter_map(|block| block["id"].as_str().map(String::from)));
+                    if self.saw_tool_call && !self.stream_open && self.settle_at.is_none() {
+                        self.end_turn_on_tool_use();
+                    }
+                }
+            }
+            "control_response" | "control_cancel_request" | "keep_alive" => {}
             _ => {
                 self.message(&message);
                 self.send_next().await;
@@ -2027,13 +2052,11 @@ impl Query {
         self.reply();
     }
 
-    // Keep this query's records, its final answer included, when it ended cleanly with one.
+    // Keep the prefix before handing back an answer or parking on calls. A holdMax eviction can
+    // happen before the tools finish, so their results must not be needed to save this prefix.
     fn keep_records(&self) {
-        let (parked, (mut prints, mut roles)) = {
-            let state = lock(&self.state);
-            (state.pending.is_some(), state.kept_base.clone())
-        };
-        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| !parked && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length)) {
+        let (mut prints, mut roles) = lock(&self.state).kept_base.clone();
+        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length | StopReason::ToolUse)) {
             prints.push(fingerprint(&Message::Assistant(self.out.clone())));
             roles.push("assistant".into());
             history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles);

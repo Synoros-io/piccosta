@@ -58,6 +58,7 @@ pub enum Event {
     AgentEnd {
         messages: Vec<AgentMessage>,
         will_retry: bool,
+        entry_id: String,
     },
     AgentSettled {
         aborted: bool,
@@ -224,12 +225,12 @@ fn dequeue(queue: &mut Vec<String>, all: bool) -> Vec<String> {
     queue.drain(..count).collect()
 }
 
-fn user_message(text: &str) -> AgentMessage {
+pub(crate) fn user_message(text: &str) -> AgentMessage {
     with_images(text, Vec::new())
 }
 
 // The user's text, then any images they attached (pi puts them after the text).
-fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
+pub(crate) fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
     let mut blocks = vec![Content::text(text)];
     blocks.extend(images);
     AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms() })
@@ -308,7 +309,6 @@ pub struct Agent {
     // then fails instead of looping (agent-session.ts _overflowRecoveryAttempted).
     overflow_recovery_attempted: bool,
     // Background job messages kept for the next prompt instead of starting a turn of their own.
-    held: Vec<CustomMessage>,
     // The loop guard's count of the same tool call made back to back: the call, and how many times.
     repeated_call: (String, u32),
     // When the model was last told the machine is overused (machine.rs).
@@ -387,7 +387,7 @@ impl Agent {
         config.model.service_tier = service_tier(&session, &config.model);
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
-        Ok(Agent { session, pending_plugins: None, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, held: Vec::new(), repeated_call: (String::new(), 0), machine_noted: None })
+        Ok(Agent { session, pending_plugins: None, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, repeated_call: (String::new(), 0), machine_noted: None })
     }
 
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
@@ -538,7 +538,14 @@ impl Agent {
         let messages = crate::message::to_model_messages(&self.session.context().messages);
         let held = transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
         let now = if self.config.context_files { crate::prompt::context_now(&self.config.cwd, &crate::config::agent_dir()) } else { Some(None) };
-        let edited = now.as_ref().is_some_and(|project| crate::prompt::instructions(project.as_deref()) != crate::prompt::instructions(held.as_deref()));
+        // An edit is a file whose text the prompt doesn't hold yet. One gone from the list (removed,
+        // or a second link to a file already there) waits for the next compaction, which builds the
+        // prompt again anyway, rather than rewriting the cache now.
+        let edited = now.as_ref().is_some_and(|project| {
+            let held = crate::prompt::instructions(held.as_deref());
+            // Each file's part with its closing tag, so a file cut short isn't found inside the old one.
+            crate::prompt::instructions(project.as_deref()).split_inclusive(crate::prompt::FILE_END).any(|file| !held.contains(file))
+        });
         if !event.is_none_or(|event| event) && !edited {
             return None;
         }
@@ -612,7 +619,7 @@ impl Agent {
     // Releasing an idle runtime must not throw away notices or a prompt it hasn't taken yet.
     pub fn has_pending_work(&self) -> bool {
         let inbox = self.handle.lock();
-        !self.config.notices.is_empty() || !self.held.is_empty() || !self.session.queued().is_empty() || !inbox.steer.is_empty() || !inbox.follow_up.is_empty()
+        !self.config.notices.is_empty() || !self.session.queued().is_empty() || !inbox.steer.is_empty() || !inbox.follow_up.is_empty()
     }
 
     // Run a turn on a background job's finish message, as longcmd does in pi when the session
@@ -624,13 +631,22 @@ impl Agent {
     // Keep a job's message for the next prompt, which it goes in ahead of: a kill the user asked
     // for (/stop) is news for the model, not a reason to answer.
     pub fn hold_notice(&mut self, notice: CustomMessage) {
-        self.held.push(notice);
+        if let Err(error) = self.session.queue_message(AgentMessage::Custom(notice)) {
+            eprintln!("piccosta: could not keep a job report: {error}");
+        }
+    }
+
+    pub fn keep_notices(&mut self) {
+        self.config.notices.close();
+        while let Ok(notice) = self.config.notices.try_recv() {
+            self.hold_notice(notice);
+        }
     }
 
     // A run, starting with the messages queued in the session (sent while nothing ran it, or left
     // by a stop), then `first`.
     async fn run_from(&mut self, first: Option<AgentMessage>) -> Result<(), String> {
-        let queued: Vec<AgentMessage> = self.session.queued().iter().map(|text| user_message(text)).collect();
+        let queued = self.session.queued();
         if queued.is_empty() && first.is_none() {
             return Ok(());
         }
@@ -650,8 +666,7 @@ impl Agent {
         if let Some((assistant, entry_id)) = self.last_projected_assistant() {
             self.check_compaction(&assistant, Some(&entry_id), false).await?;
         }
-        let mut starting: Vec<AgentMessage> = self.held.drain(..).map(AgentMessage::Custom).collect();
-        starting.extend(queued);
+        let mut starting = queued;
         starting.extend(first);
         let mut aborted = false;
         loop {
@@ -691,13 +706,13 @@ impl Agent {
             }
             // What the user queued that no turn took (follow-ups, and steering that came after
             // the last turn) starts the next run.
-            let queued = self.take_queued();
+            let queued = self.take_queued()?;
             if !queued.is_empty() {
                 starting.extend(queued);
                 continue;
             }
             if self.config.hold_for_jobs && self.config.tool_shared.jobs.running_count() > 0 {
-                match self.wait_for_job().await {
+                match self.wait_for_job().await? {
                     Some(messages) => {
                         starting.extend(messages);
                         continue;
@@ -713,8 +728,15 @@ impl Agent {
         Ok(aborted)
     }
 
+    // Durable deliveries are taken where steering is taken, not held until the whole run ends.
+    fn deliveries(&mut self) -> Result<Vec<AgentMessage>, String> {
+        crate::runtime::receive(&mut self.session)?;
+        Ok(self.session.queued())
+    }
+
     // The next of what's queued (steering first, then follow-ups), as user messages, and said.
-    fn take_queued(&mut self) -> Vec<AgentMessage> {
+    fn take_queued(&mut self) -> Result<Vec<AgentMessage>, String> {
+        let mut messages = self.deliveries()?;
         let queued = {
             let mut inbox = self.handle.lock();
             if inbox.steer.is_empty() {
@@ -728,14 +750,15 @@ impl Agent {
         if !queued.is_empty() {
             self.announce_queue();
         }
-        queued.iter().map(|text| user_message(text)).collect()
+        messages.extend(queued.iter().filter(|text| !text.is_empty()).map(|text| user_message(text)));
+        Ok(messages)
     }
 
     // Print and json mode with a job still running after the model's last turn: wait for its
     // finish message (longcmd.ts:533-554), or a message queued meanwhile (one sent to its
     // runtime). PICCOSTA_LONGCMD_HOLD_S caps the wait, then the jobs are killed and
     // their messages say why. Output: what starts the next turn, None when the wait was stopped.
-    async fn wait_for_job(&mut self) -> Option<Vec<AgentMessage>> {
+    async fn wait_for_job(&mut self) -> Result<Option<Vec<AgentMessage>>, String> {
         let shared = self.config.tool_shared.clone();
         let jobs = &shared.jobs;
         let cap = jobs.hold.map(|hold| tokio::time::Instant::now() + hold);
@@ -743,14 +766,14 @@ impl Agent {
         let handle = self.handle.clone();
         loop {
             tokio::select! {
-                notice = self.config.notices.recv() => return notice.map(|notice| vec![AgentMessage::Custom(notice)]),
+                notice = self.config.notices.recv() => return Ok(notice.map(|notice| vec![AgentMessage::Custom(notice)])),
                 () = handle.0.1.notified() => {
-                    let queued = self.take_queued();
+                    let queued = self.take_queued()?;
                     if !queued.is_empty() {
-                        return Some(queued);
+                        return Ok(Some(queued));
                     }
                 }
-                () = self.cancel.cancelled() => return None,
+                () = self.cancel.cancelled() => return Ok(None),
                 () = tokio::time::sleep_until(cap.unwrap_or_else(tokio::time::Instant::now)), if cap.is_some() && !killed => {
                     killed = true;
                     let hold = crate::tools::jobs::seconds_text(jobs.hold.unwrap_or_default());
@@ -804,7 +827,7 @@ impl Agent {
             if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
                 (self.emit)(&Event::TurnEnd { message: AgentMessage::Assistant(assistant.clone()), tool_results: Vec::new() });
                 let will_retry = self.will_retry(&assistant);
-                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry });
+                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry, entry_id: entry_id.clone() });
                 let aborted = assistant.stop_reason == StopReason::Aborted;
                 let retry = will_retry.then(|| FailedResponse {
                     entry_id: entry_id.clone(),
@@ -854,16 +877,16 @@ impl Agent {
                 let text = format!("piccosta stopped the run: the same call was made {} times in a row ({}).", self.repeated_call.1, crate::tools::jobs::command_preview(self.repeated_call.0.split('\n').next().unwrap_or_default()));
                 let note = CustomMessage { custom_type: LOOP_NOTE_TYPE.into(), content: TextOrBlocks::Text(text), display: true, details: None, timestamp: clock::now_ms() };
                 self.add_message(AgentMessage::Custom(note), &mut new_messages)?;
-                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
+                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false, entry_id: entry_id.clone() });
                 return Ok(RunOutcome { aborted: false, retry: None, last_assistant: Some((assistant, entry_id)) });
             }
 
             let aborted = self.cancel.is_cancelled();
             // Background jobs that finished during the turn, and what the user queued to steer,
             // go into the next one.
-            let steering = if aborted { Vec::new() } else { self.steering() };
+            let steering = if aborted { Vec::new() } else { self.steering()? };
             if aborted || (!has_calls && steering.is_empty()) {
-                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false });
+                (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false, entry_id: entry_id.clone() });
                 return Ok(RunOutcome { aborted, retry: None, last_assistant: Some((assistant, entry_id)) });
             }
             (self.emit)(&Event::TurnStart);
@@ -878,15 +901,16 @@ impl Agent {
     }
 
     // What steers the next turn: background jobs' finish messages, then the user's steering.
-    fn steering(&mut self) -> Vec<AgentMessage> {
-        let mut messages: Vec<AgentMessage> = std::iter::from_fn(|| self.config.notices.try_recv().ok()).map(AgentMessage::Custom).collect();
+    fn steering(&mut self) -> Result<Vec<AgentMessage>, String> {
+        let mut messages = self.deliveries()?;
+        messages.extend(std::iter::from_fn(|| self.config.notices.try_recv().ok()).map(AgentMessage::Custom));
         let steer = {
             let mut inbox = self.handle.lock();
             let all = inbox.steering_all;
             dequeue(&mut inbox.steer, all)
         };
-        messages.extend(steer.iter().map(|text| user_message(text)));
-        messages
+        messages.extend(steer.iter().filter(|text| !text.is_empty()).map(|text| user_message(text)));
+        Ok(messages)
     }
 
     fn announce_queue(&mut self) {
@@ -983,13 +1007,7 @@ impl Agent {
         }
         (self.emit)(&Event::MessageEnd { message: AgentMessage::Assistant(message.clone()) });
         let id = self.session.append_message(AgentMessage::Assistant(message.clone())).map_err(|error| format!("Could not write the session: {error}"))?;
-        // The cache monitor: a response that had to write most of its context to the cache again
-        // is recorded with its cause, and the session's views show it as one line.
-        if let Some(miss) = crate::cache::check(&self.session, &id, provider::claude::take_rewrite(self.session.id(), &message)) {
-            let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: crate::cache::MISS_TYPE.into(), data: Some(miss) };
-            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
-            (self.emit)(&Event::EntryAppended { entry });
-        }
+        self.check_cache(&id, &message)?;
         // The bridge's one notice, that Claude Code is newer than the version it was checked against.
         if let Some(text) = provider::claude::take_notice(self.session.id()) {
             let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: provider::claude::NOTICE_TYPE.into(), data: Some(json!({"text": text})) };
@@ -1001,6 +1019,17 @@ impl Agent {
             self.overflow_recovery_attempted = false;
         }
         Ok((message, id))
+    }
+
+    // Both ordinary answers and summary responses can miss the cache, even when the summary
+    // cannot be kept. Its usage entry names the response without putting it in the conversation.
+    fn check_cache(&mut self, id: &str, message: &AssistantMessage) -> Result<(), String> {
+        if let Some(miss) = crate::cache::check(&self.session, id, message, provider::claude::take_rewrite(self.session.id(), message)) {
+            let entry = SessionEntry::Custom { base: self.session.next_base(), custom_type: crate::cache::MISS_TYPE.into(), data: Some(miss) };
+            self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+            (self.emit)(&Event::EntryAppended { entry });
+        }
+        Ok(())
     }
 
     // A request on the session's own context, the same for each turn and for idle compaction: its
@@ -1269,7 +1298,13 @@ impl Agent {
                     compaction::fit(&mut messages, model.context_window.saturating_sub(reply_room));
                 }
                 let messages = crate::message::to_model_messages(&messages);
-                compaction::summarize_in_place(&preparation, Self::request(&self.config, &self.session, &messages, &credential, cancel.clone()), instructions).await
+                let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone()), instructions).await;
+                let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
+                    usage: response.usage.clone(), note: None };
+                let id = self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+                (self.emit)(&Event::EntryAppended { entry });
+                self.check_cache(&id, &response)?;
+                compaction::accept_summary(&preparation, response)
             }
         };
 
@@ -1305,7 +1340,7 @@ impl Agent {
                 summary.tokens_before,
                 Some(summary.details.clone()),
                 Some(false),
-                Some(summary.usage.clone()),
+                None,
             )
             .map_err(write_error)?;
         // The compacted context starts a new cache anyway, so the prompt is brought up to date now,
