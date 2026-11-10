@@ -61,7 +61,7 @@ pub use history::SIDECAR_SUFFIX;
 
 use super::{new_output, transcript, Request, StreamEvent, BODY_IDLE_TIMEOUT};
 use crate::clock;
-use crate::message::{AssistantMessage, Content, Cost, CostState, Message, StopReason, ToolDefinition, Usage};
+use crate::message::{AssistantMessage, Content, Cost, CostState, Message, StopReason, ToolDefinition, ToolResultMessage, Usage};
 use crate::model::Model;
 use history::{fingerprint, Shape};
 use serde_json::{json, Map, Value};
@@ -1097,10 +1097,13 @@ pub fn close(session_id: &str) {
     discard(session_id, "the session was closed");
 }
 
-// Whether the session's query waits for its next message, which is the only one an idle
-// compaction may ask (agent.rs idle_compaction_due).
+// Whether the session's query waits for its next message, or for the results of the calls it's
+// parked on: the only query an idle compaction may ask (agent.rs idle_compaction_due), whose summary
+// request goes in as the next call would, on the end of those results. Parked is `pending`, set as
+// the turn ends, not `stopped`, which waits on the query's task taking end_run's Hold, maybe after
+// the session has already asked this.
 pub fn waiting(session_id: &str) -> bool {
-    lock(&LIVE).get(session_id).is_some_and(|live| lock(&live.state).waiting)
+    lock(&LIVE).get(session_id).is_some_and(|live| { let state = lock(&live.state); state.waiting || state.pending.is_some() })
 }
 
 // Keep the waiting queries within CLAUDE_BRIDGE_HOLD_MAX, as each starts waiting, once its context
@@ -1188,8 +1191,10 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     // An idle compaction that went in leaves the query's continuation as it found it: stopped, or its
     // summary refused, the session's next message goes into the query as if it hadn't run (Claude
     // Code keeps the turn, after the context the cache holds); kept, the context is the summary's, a
-    // new query.
-    let before = request.in_place.then(|| lock(&LIVE).get(&key).map(|live| lock(&live.state).prints.clone())).flatten();
+    // new query. What it holds then is this call's context without the summary prompt: on a parked
+    // query, the results it was given, which the next call's message is folded onto (unfold).
+    let before = request.in_place.then(|| fold_into_results(request.messages[..request.messages.len().saturating_sub(1)].iter()
+        .filter(|message| !matches!(message, Message::System(_)) && history::visible(message)).cloned()).iter().map(fingerprint).collect::<Vec<_>>());
     let mut forced: Option<String> = one_shot.then(|| "a one-off summary".into());
     loop {
         let (reply, answer) = oneshot::channel();
@@ -1259,11 +1264,14 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
 // the rewrite reason and the turn back; the live query, if any, is discarded then.
 #[allow(clippy::too_many_arguments)]
 fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, manager: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
-    let mut live = lock(&LIVE);
+    let (mut live, mut unfolded) = (lock(&LIVE), None);
     let decision = match (forced, live.get(key)) {
         (Some(reason), _) => Err(reason),
         (None, None) => Err(lock(&ENDED).get(key).map_or("no live query for this session".into(), |why| format!("no live query for this session; the last one ended: {why}"))),
-        (None, Some(entry)) => history::decide(&lock(&entry.state), messages, prints, shape),
+        (None, Some(entry)) => {
+            let state = lock(&entry.state);
+            history::decide(&state, messages, prints, shape).or_else(|reason| { unfolded = unfold(&state, messages, prints, shape); unfolded.as_ref().map(|_| 0).ok_or(reason) })
+        }
     };
     let start = match decision {
         Ok(start) => start,
@@ -1286,10 +1294,10 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
         let _ = entry.commands.send(Command::Fast(fast));
     }
     let command = if state.waiting {
-        let content = messages[start..].iter().filter_map(|message| match message {
+        let content = unfolded.unwrap_or_else(|| messages[start..].iter().filter_map(|message| match message {
             Message::User(user) => Some(history::anthropic_blocks(&user.content.clone().into_blocks())),
             _ => None,
-        }).flatten().collect();
+        }).flatten().collect());
         debug(&format!("sync: the waiting query takes the next message (session {key}, {} messages)", prints.len()));
         Command::Prompt(content, turn)
     } else {
@@ -1315,6 +1323,20 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
     let Err(mpsc::error::SendError(Command::Prompt(_, turn) | Command::Deliver(_, turn))) = entry.commands.send(command) else { return Ok(()) };
     live.remove(key);
     Err(("the query is gone".into(), turn))
+}
+
+// A waiting query whose context ends at tool results, as an idle compaction's summary stopped on a
+// parked query leaves it (stream_as): pi's next call carries those results with its message folded
+// on (fold_into_results). Output: that message, what comes after the ARRIVED_NOTE that leaves the
+// results Claude Code holds, when everything before them is held too; else None.
+fn unfold(state: &State, messages: &[Message], prints: &[String], shape: &Shape) -> Option<Vec<Value>> {
+    let held = state.prints.len();
+    let Some(Message::ToolResult(last)) = messages.last().filter(|_| state.waiting && held == messages.len() && *shape == state.shape && prints[..held - 1] == state.prints[..held - 1]) else { return None };
+    let note = |block: &Content| matches!(block, Content::Text { text, .. } if text == ARRIVED_NOTE);
+    let at = (0..last.content.len()).rev().find(|&at| note(&last.content[at])
+        && fingerprint(&Message::ToolResult(ToolResultMessage { content: last.content[..at].to_vec(), ..last.clone() })) == state.prints[held - 1])?;
+    debug("sync: the waiting query holds the results pi's message was folded onto");
+    Some(history::anthropic_blocks(&last.content[at + 1..]))
 }
 
 struct Start<'a> {

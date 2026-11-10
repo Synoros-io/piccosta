@@ -598,8 +598,10 @@ impl App {
         let slot = self.current();
         let file = slot.path.as_ref().map_or("not saved yet".to_string(), |path| path.display().to_string());
         let tex = if self.tex.images() { "typeset images" } else { "Unicode text" };
+        // What idle compaction did last, or why not, while this piccosta runs the session.
+        let idle = crate::runtime::idle_note(&slot.id).map_or(String::new(), |note| format!("\nidle compaction: {note}"));
         format!(
-            "model      {}\nthinking   {}\nsession    {}\nfile       {file}\ncwd        {}\n{}\ncost       {}\nagent dir  {}\nTeX        {tex}",
+            "model      {}\nthinking   {}\nsession    {}\nfile       {file}\ncwd        {}\n{}\ncost       {}\nagent dir  {}\nTeX        {tex}{idle}",
             slot.model, slot.thinking, slot.title, slot.cwd.display(), self.context(), slot.cost.dollars(4), self.host.agent_dir.display()
         )
     }

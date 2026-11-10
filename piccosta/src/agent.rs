@@ -1010,23 +1010,23 @@ impl Agent {
     // When this session compacts while idle (runtime.rs keeps the time), as Claude Code's
     // idleCompaction does: IDLE_SHARE of the way from its last request to the expiry of the prompt
     // cache that request wrote, so the next turn sends the summary rather than writing the whole
-    // context to the cache again. Output: that time and the request's (epoch ms), or why not:
-    // compaction or compaction.idle is off; the last request failed or was stopped, or the context
-    // changed after it (a compaction, another model or level, a new prompt), so its cache isn't what
-    // the next request reads; the provider's cache life isn't known, or ends before a request would get
-    // there; on the Claude bridge, no query of Claude Code's waits with that cache; the context is under
-    // compaction.idleMinTokens; or the model's plan is running low.
+    // context to the cache again. The last request is the newest the provider says it read (its
+    // usage), a stopped or failed one too: what it cached is what the next request reads first, and
+    // one that never got there cached nothing. Output: that time and the request's (epoch ms), or why
+    // not: compaction or compaction.idle is off; the context changed after the request (a compaction,
+    // another model or level, a new prompt), so its cache isn't what the next request reads; the
+    // provider's cache life isn't known, or ends before a request would get there; on the Claude
+    // bridge, no query of Claude Code's holds that cache; the context is under
+    // compaction.idleMinTokens; or the model's plan is running low (Claude Code's near_limit).
     pub fn idle_compaction_due(&self) -> Result<(i64, i64), String> {
         let (settings, model) = (self.config.compaction, &self.config.model);
         if !settings.enabled || !settings.idle {
             return Err("compaction or compaction.idle is off".into());
         }
         let branch = self.session.path_to_leaf();
-        let found = branch.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::Assistant(_), .. }));
+        let found = branch.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::Assistant(last), .. }
+            if last.usage.input + last.usage.cache_read + last.usage.cache_write > 0));
         let Some((at, SessionEntry::Message { message: AgentMessage::Assistant(last), .. })) = found.map(|at| (at, branch[at])) else { return Err("no request yet".into()) };
-        if matches!(last.stop_reason, StopReason::Error | StopReason::Aborted) {
-            return Err("the last request failed or was stopped, so what it cached isn't known".into());
-        }
         let changed = |entry: &&SessionEntry| matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } | SessionEntry::ThinkingLevelChange { .. }
             | SessionEntry::Message { message: AgentMessage::System(_), .. });
         if branch[at + 1..].iter().any(changed) {

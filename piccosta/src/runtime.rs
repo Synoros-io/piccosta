@@ -33,7 +33,7 @@ use crate::session::Session;
 use crate::tools::ToolShared;
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use crate::ipc::{connect, Timed};
 use std::path::{Path, PathBuf};
@@ -64,9 +64,9 @@ const STATUS_WAIT: Duration = Duration::from_millis(250);
 const INBOX_SUFFIX: &str = ".inbox";
 // How long a runtime waits for a request's line once a client connects.
 const READ_WAIT: Duration = Duration::from_secs(1);
-// How late idle compaction's time may come before it's skipped (Claude Code 2.1.319's 60 s): later,
-// the session was opened after it or the computer slept, and the cache may be gone.
-const IDLE_LATE_MS: i64 = 60_000;
+// What each session's idle compaction did last, or why it didn't, for /status: none of it goes into
+// the conversation, and the debug log is off unless claudeBridge.debugPath is set.
+static IDLE_NOTES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 // What a runtime is asked. Message, Stop and Close are taken at once; the rest wait their turn.
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
@@ -113,6 +113,10 @@ impl Watch {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn idle_note(session_id: &str) -> Option<String> {
+    lock(&IDLE_NOTES).get(session_id).cloned()
 }
 
 // --- The socket ---
@@ -539,12 +543,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         let mut held = None;
         // Idle compaction: the time set for the session's last request and that request's (epoch ms),
         // which goes off only while nothing runs, once per request (`spent`), and never in a run of
-        // its own, which ends when it's idle. What it does, or why not, goes to the debug log once.
+        // its own, which ends when it's idle. What it does, or why not, goes to the debug log once,
+        // and is kept for /status (idle_note).
         let (mut idle, mut spent, mut said, id) = (None::<(i64, i64)>, 0, String::new(), agent.session.id().to_string());
         // A release asked for while idle compaction is still to come, done once it has come.
         let mut release = None;
         let mut say = move |line: String| if line != said {
             crate::provider::claude::debug(&format!("idle compaction, session {id}: {line}"));
+            lock(&IDLE_NOTES).insert(id.clone(), line.clone());
             said = line;
         };
         let at = crate::clock::iso_from_ms;
@@ -571,7 +577,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         queue.push_back(Command::ReleaseIfIdle(generation));
                         continue;
                     }
+                    // Work that's there goes first: a message or a job's report starts a turn that
+                    // reads the cache while it's warm, and idle compaction would only hold it up.
                     tokio::select! {
+                        biased;
                         command = next(&mut commands, &mut claim) => match command {
                             Some(command) => Work::Command(command),
                             None => break,
@@ -618,16 +627,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     agent.hold_notice(notice);
                     continue;
                 }
-                // Skipped when work is waiting or a background job runs (its report would come into
-                // the summary's context), when it came late, or when what it was set for no longer
-                // holds (the cache's life can run out first, and the plan's usage can change).
+                // Skipped when what it was set for no longer holds: the cache's life can run out
+                // first (the session opened late, or the computer slept), and the plan's usage can
+                // change. A background job still running doesn't stop it: the job's report waits
+                // in its queue until the summary is in, then starts a turn of its own.
                 Work::Idle => {
-                    let Some((due, request)) = idle.take() else { continue };
+                    let Some((_, request)) = idle.take() else { continue };
                     spent = request;
-                    let waiting = !commands.is_empty() || claim.as_ref().is_some_and(|claim| !claim.taken.is_empty()) || agent.has_pending_work() || shared.jobs.running_count() > 0;
-                    let late = crate::clock::now_ms() - due;
-                    let skip = if waiting { Some("busy, work is waiting or a background job runs".into()) } else if late > IDLE_LATE_MS { Some(format!("{} s late", late / 1000)) } else { agent.idle_compaction_due().err() };
-                    if let Some(why) = skip {
+                    if let Err(why) = agent.idle_compaction_due() {
                         say(format!("skipped for the request at {}: {why}", at(request)));
                         continue;
                     }
@@ -747,6 +754,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             watcher.abort();
         }
         crate::provider::claude::close(agent.session.id());
+        lock(&IDLE_NOTES).remove(agent.session.id());
         shared.jobs.shutdown("quit");
         shared.web.shutdown();
         if let Some(Some(answer)) = closing {
