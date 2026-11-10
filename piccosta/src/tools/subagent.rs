@@ -1,10 +1,10 @@
-// Subagents: a task handed to another agent, on a model the job picks, not the model handing it.
+// Subagents: a task handed to another agent, on a model the job picks unless the call names one.
 //
 // Each job has a list of allowed models, not one model per tier, and the model handing the work
 // over doesn't choose among them. So the
 // model calling `subagent` names a job and a task, and the job's own list says which models may
 // do it: the first one with a login runs it, and when that run fails the next one takes it over.
-// The lists are the user's; nothing the calling model sends can change them.
+// The lists are the user's; a call can name a model and a level for its own task instead.
 //
 // The jobs are the model scale's kinds of work (scale.rs): each says what it's for, its models and
 // levels (in the order usage allows at the time; none means the calling session's own model), its
@@ -162,7 +162,7 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. When the user names a model for the task, pass it as model (provider/id), with thinking if they named a level; otherwise leave both out. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. You choose the job; the user chose the models each job runs on, and the first one available is used. model (provider/id) and thinking, when given, replace the job's own. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",
@@ -171,8 +171,8 @@ impl Tool for SubagentTool {
                     "agent": {"type": "string", "enum": names, "description": "The job"},
                     "task": {"type": "string", "description": "What to do and what you want back; the discussion is copied separately"},
                     "discussed": {"type": "string", "description": "The first words of the user's message where this task was first discussed; piccosta copies the discussion from there, word for word, to the subagent"},
-                    "model": {"type": "string", "description": "provider/id, only when the user named the model; else the job's own"},
-                    "thinking": {"type": "string", "enum": crate::provider::THINKING_LEVELS, "description": "The level, only with a model the user named"}
+                    "model": {"type": "string", "description": "provider/id; else the job's own"},
+                    "thinking": {"type": "string", "enum": crate::provider::THINKING_LEVELS, "description": "The level; else the job's own"}
                 }
             }),
             constrained_sampling: Some(json!({"type": "json_schema", "strict": "prefer"})),
@@ -204,20 +204,23 @@ impl Tool for SubagentTool {
                 let granted = if self.granted { " Your manager granted this session only these: do the rest of the work yourself." } else { "" };
                 return Err(format!("No subagent job \"{name}\". Jobs: {}.{granted}", names.join(", ")));
             };
-            // The model the user named for this task, else the job's own.
-            let models = match arguments.get("model").and_then(Value::as_str).filter(|model| !model.is_empty()) {
+            // The model named for this task, else the job's own, each at the level named, if any.
+            let (models, skipped) = match arguments.get("model").and_then(Value::as_str).filter(|model| !model.is_empty()) {
                 Some(named) => {
                     let registry = ModelRegistry::load(&self.agent_dir.join("models.json"))?;
                     let model = registry.resolve(named).map_err(|_| format!("No connected account serves the model \"{named}\"; /model lists the ones that are"))?;
-                    let level = arguments.get("thinking").and_then(Value::as_str).map_or(String::new(), |level| format!(":{level}"));
-                    (vec![format!("{}/{}{level}", model.provider, model.id)], Vec::new())
+                    (vec![format!("{}/{}", model.provider, model.id)], Vec::new())
                 }
                 None => self.available(job, context).await?,
+            };
+            let models = match arguments.get("thinking").and_then(Value::as_str) {
+                Some(level) => models.iter().map(|model| format!("{}:{level}", crate::scale::split(model).0)).collect(),
+                None => models,
             };
             // Straight to the background: a subagent runs for minutes, and the session stays free
             // to answer meanwhile; its answer comes back as the job's message.
             let message = crate::session::delegation_message(context, arguments.get("discussed").and_then(Value::as_str), task)?;
-            super::bash::run_in_background(self.command(job, task, &message, models, context)?, context).await
+            super::bash::run_in_background(self.command(job, task, &message, (models, skipped), context)?, context).await
         })
     }
 }

@@ -278,9 +278,11 @@ impl Host {
             _ => Vec::new(),
         };
         list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
-        // A manager's own tools stay whatever its kind lists (an advisor's sessions, on advice).
+        // A manager's own tools and the subagent tool stay whatever its kind lists (an advisor's,
+        // on advice).
         let own = role.map(|role| crate::manager::tools(&self.agent_dir, &self.settings, role, cwd)).unwrap_or_default();
-        let own_names: Vec<String> = own.iter().map(|tool| tool.name().to_string()).collect();
+        // A lane granted subagents keeps the tool whatever its kind lists.
+        let own_names: Vec<String> = own.iter().map(|tool| tool.name().to_string()).chain((role.is_some() || granted.is_some()).then(|| tools::subagent::NAME.to_string())).collect();
         list.extend(own);
         let Some(plugins) = plugins else { return Ok(list) };
         list.extend(plugins);
@@ -368,11 +370,17 @@ impl Host {
             (Err(error), None) => fallback().ok_or(error)?.clone(),
         };
         let has_thinking = resumed.messages.iter().any(|message| matches!(message, AgentMessage::Assistant(_)));
-        // The level asked for, else the one this model was last set to by hand (in any session, so
-        // a reopened one follows the latest choice, as Claude Code's effort does), else what the
-        // session last ran at, else the default.
-        let remembered = thinking.map(str::to_string).or_else(|| self.remembered_thinking_level(&model));
-        let thinking_level = remembered.unwrap_or_else(|| if has_thinking { resumed.thinking_level.clone() } else { self.settings.default_thinking_level() });
+        // The level asked for, else one set in the session since its last reply (a manager's
+        // `sessions` call writes it before the run), else, for a session that has run on this
+        // model, the level it ran at: reopening never changes it, since a new level is a new
+        // Claude Code query and a cache written again. A new session, or one put on another model,
+        // takes the level this model was last set to by hand (in any session, as Claude Code's
+        // effort does), else the default.
+        let since_reply = session.path_to_leaf().into_iter().rev().take_while(|entry| !matches!(entry, session::SessionEntry::Message { message: AgentMessage::Assistant(_), .. }));
+        let set = since_reply.filter_map(|entry| if let session::SessionEntry::ThinkingLevelChange { thinking_level, .. } = entry { Some(thinking_level.clone()) } else { None }).next();
+        let same_model = resumed.model.as_ref().is_some_and(|(provider, id)| *provider == model.provider && *id == model.id);
+        let ran = (has_thinking && same_model).then(|| resumed.thinking_level.clone());
+        let thinking_level = thinking.map(str::to_string).or(set).or(ran).or_else(|| self.remembered_thinking_level(&model)).unwrap_or_else(|| self.settings.default_thinking_level());
         let cwd = PathBuf::from(&session.header().cwd);
         let role = crate::manager::role(&session);
         // Managers are the user's: an agent's command (a test, a lane) doesn't run one in the
@@ -444,7 +452,9 @@ impl Host {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
                 let (model, level, note) = crate::scale::pick(&self.agent_dir, name, false)?;
-                Ok((model, args.thinking.clone().or(level), note))
+                // The scale's level is for a new session: one reopened keeps its own.
+                let reopened = args.continue_recent || args.session.is_some() || args.resume.is_some();
+                Ok((model, args.thinking.clone().or(level.filter(|_| !reopened)), note))
             }
             (model, _) => Ok((model, args.thinking.clone(), None)),
         }

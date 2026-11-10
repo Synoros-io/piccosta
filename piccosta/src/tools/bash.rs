@@ -248,8 +248,9 @@ pub fn adopt(shared: Arc<super::ToolShared>, handed: HandedJob) -> std::io::Resu
     Ok(())
 }
 
-// Start the shell. Output: its pid and the read end of the one pipe its stdout and stderr share.
-fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), String> {
+// Start the shell; `own`, a command piccosta wrote itself (a subagent's run, which has its job's
+// own rights). Output: its pid and the read end of the one pipe its stdout and stderr share.
+fn spawn(command: &str, own: bool, context: &ToolContext) -> Result<(u32, Arc<Receiver>), String> {
     let shell = shell_path(context.shared.shell_path.as_deref())?;
     let (reader, writer) = std::io::pipe().map_err(|error| format!("pipe: {error}"))?;
     let error_writer = writer.try_clone().map_err(|error| format!("pipe: {error}"))?;
@@ -276,7 +277,7 @@ fn spawn(command: &str, context: &ToolContext) -> Result<(u32, Arc<Receiver>), S
     // Its own session, as Node's detached spawn does: a process group we can kill as one, and no
     // controlling terminal, so nothing it runs can grab the TUI's keyboard. A read-only job's
     // shell goes in the read-only sandbox too (readonly.rs), on a kernel that can hold it.
-    let read_only = context.shared.read_only;
+    let read_only = context.shared.read_only && !own;
     if read_only {
         super::readonly::check()?;
     }
@@ -462,7 +463,7 @@ async fn run(arguments: &Arguments, context: &ToolContext<'_>) -> Result<Run, St
     if !context.cwd.exists() {
         return Err(format!("Working directory does not exist: {}\nCannot execute bash commands.", context.cwd.display()));
     }
-    let (pid, pipe) = spawn(&command, context)?;
+    let (pid, pipe) = spawn(&command, arguments.own, context)?;
     shared.jobs.shells().push(Shell { pid, own: arguments.own, plugin: None, kill_at: None, pipe: pipe.clone(), handed: false });
     super::reaper::track(pid, true);
     let started = Instant::now();
