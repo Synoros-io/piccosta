@@ -38,7 +38,8 @@ const SAVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 // The constitution is off unless asked for: benchmarks gave mixed results with it, and it is about
 // 2,200 tokens on every request (2026-11-02). PICCOSTA_CONSTITUTION holds the text itself (how the
 // bench passes it into a sandbox), PICCOSTA_CONSTITUTION_FILE a path to it, or "built-in" for
-// prompts/constitution.md, the text this binary was built with.
+// prompts/constitution.md, the text this binary was built with. The `constitution` setting does the
+// same where no variable is set: true for the built-in text, a path for a file.
 const CONSTITUTION_TEXT_ENV: &str = "PICCOSTA_CONSTITUTION";
 const CONSTITUTION_FILE_ENV: &str = "PICCOSTA_CONSTITUTION_FILE";
 const BUILT_IN_CONSTITUTION: &str = include_str!("../prompts/constitution.md");
@@ -212,11 +213,16 @@ fn expand_imports(file: &ContextFile, in_prompt: &[PathBuf], imported: &mut Vec<
 
 // The constitution text with its placeholders filled, or None when it's turned off. A file that
 // can't be read is an error: a run that thinks it has a constitution and doesn't is worse.
-pub fn constitution(model_name: &str) -> Result<Option<String>, String> {
-    let text = match (std::env::var(CONSTITUTION_TEXT_ENV), std::env::var(CONSTITUTION_FILE_ENV)) {
+pub fn constitution(model_name: &str, setting: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    let file = std::env::var(CONSTITUTION_FILE_ENV).ok().filter(|path| !path.is_empty()).or_else(|| match setting {
+        Some(serde_json::Value::Bool(true)) => Some(CONSTITUTION_BUILT_IN.to_string()),
+        Some(serde_json::Value::String(path)) if !path.is_empty() => Some(path.clone()),
+        _ => None,
+    });
+    let text = match (std::env::var(CONSTITUTION_TEXT_ENV), file) {
         (Ok(text), _) if !text.trim().is_empty() => text,
-        (_, Ok(path)) if path == CONSTITUTION_BUILT_IN => BUILT_IN_CONSTITUTION.to_string(),
-        (_, Ok(path)) if !path.is_empty() => std::fs::read_to_string(&path).map_err(|error| format!("{CONSTITUTION_FILE_ENV}={path}: {error}"))?,
+        (_, Some(path)) if path == CONSTITUTION_BUILT_IN => BUILT_IN_CONSTITUTION.to_string(),
+        (_, Some(path)) => std::fs::read_to_string(&path).map_err(|error| format!("constitution {path}: {error}"))?,
         _ => return Ok(None),
     };
     if text.trim().is_empty() {

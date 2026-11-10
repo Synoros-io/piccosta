@@ -319,7 +319,7 @@ impl Host {
         let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
         let messages = crate::message::to_model_messages(&session.context().messages);
         let held_context = crate::provider::transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
-        let constitution = prompt::constitution(&model.name)?;
+        let constitution = prompt::constitution(&model.name, self.settings.get("constitution"))?;
         let (custom_prompt, discovered_append) = prompt::custom_prompts(&self.agent_dir);
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(role, cwd));
