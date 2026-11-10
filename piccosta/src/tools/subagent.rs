@@ -205,7 +205,7 @@ impl Tool for SubagentTool {
     fn prompt_guidelines(&self) -> &'static [&'static str] {
         &[
             "The assistant and the project managers are the user's: the user makes them. Never start or stop one unless the user asks",
-            "Start other agents only with the subagent tool (a manager also has sessions), never through bash: no piccosta, claude, codex or other agent commands",
+            "Start other agents only with the subagent tool (a manager also has sessions), never through bash: no piccosta, claude or codex commands",
             "A subagent does one task with a clear end and answers once; it can't be messaged meanwhile and starts no agents itself. Long work that needs steering is a manager's lane (sessions start), not a subagent",
             "In a subagent's task, say what to do, where to look, what's already settled, what to send back and when to stop",
             "You answer for what you start: read a subagent's answer before you pass it on, and check the claims you repeat",
