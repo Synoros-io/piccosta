@@ -122,9 +122,12 @@ const CHECK_LINE_CHARS: usize = 200;
 const LIST_LIMIT: usize = 40;
 const READ_MESSAGES: usize = 6;
 const READ_CHARS: usize = 3_000;
-// How much of a lane's last turn its news carries: its conclusion, which is what a manager acts on;
-// `sessions read` has the rest. Every character of news is read again with each later turn.
+// How much of what a run printed the news of its ending carries (a run that ended without a
+// turn), and of a finished turn's answer: all of an answer a manager answers for, up to a size that
+// can't crowd a smaller model's context out (64,000 characters, about 16k tokens; the review of
+// 2026-11-10). Past it, the end goes, with a note that `sessions read` has the whole.
 const NEWS_CHARS: usize = 800;
+const NEWS_ANSWER_CHARS: usize = 64_000;
 // The sessions a manager started, one file path a line in its home: the ones it may delete.
 const STARTED_FILE: &str = "started";
 // How much `ledger search` returns.
@@ -508,10 +511,10 @@ fn check_line(lane: &Lane) -> String {
     format!("- Session {} \"{}\": {since}: {}", session_id(&lane.file), lane.title, line[line.len().saturating_sub(CHECK_LINE_CHARS)..].iter().collect::<String>())
 }
 
-// The last `NEWS_CHARS` characters of a text.
-fn ending(text: &str) -> String {
+// The last `limit` characters of a text.
+fn ending(text: &str, limit: usize) -> String {
     let characters: Vec<char> = text.trim().chars().collect();
-    characters[characters.len().saturating_sub(NEWS_CHARS)..].iter().collect()
+    characters[characters.len().saturating_sub(limit)..].iter().collect()
 }
 
 // News of every finished turn the manager hasn't heard yet; `still`, that the lane's run
@@ -525,12 +528,12 @@ fn catch_up(home: &Path, lane: &mut Lane, still: bool, ended: Option<bool>) -> V
         lane.reported = entry.clone();
         let still = if still { " Its run is still going (a background job, or a partner's turn)." } else { "" };
         let next = if lane.once { "Tell the user what came of it." } else { "Its word isn't proof: read what it changed and run it, or start a fresh session to test it, before you tell the user what came of it. Close it (`sessions close`) once its work is done and nothing of it still runs; a new task goes to a fresh session, not this one, unless it needs what this one holds." };
-        news.push((format!("lane:{id}:{entry}"), format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said, the end of it:\n{}\n\n{next}", now_text(), ending(&said))));
+        news.push((format!("lane:{id}:{entry}"), format!("[{}, a lane's turn ended] Session {id} \"{title}\" finished its turn.{still} What it said:\n{}{}\n\n{next}", now_text(), if said.trim().chars().count() > NEWS_ANSWER_CHARS { format!("[Its start is cut; `sessions read {id}` shows it whole.]\n…") } else { String::new() }, ending(&said, NEWS_ANSWER_CHARS))));
     }
     if news.is_empty() && ended == Some(false) && lane.launched.is_some() {
         let printed = fs::read_to_string(run_log(home, &lane.file)).unwrap_or_default();
         let pid = lane.launched.as_ref().map_or(0, |run| run.pid);
-        news.push((format!("run:{id}:{}", serde_json::to_string(&lane.launched).unwrap_or_default()), format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {pid}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), ending(&printed))));
+        news.push((format!("run:{id}:{}", serde_json::to_string(&lane.launched).unwrap_or_default()), format!("[{}, a lane's run ended] Session {id} \"{title}\": its run (pid {pid}) ended without finishing a turn. The end of what it printed:\n{}", now_text(), ending(&printed, NEWS_CHARS))));
     }
     if ended.is_some() {
         lane.launched = None;
@@ -801,9 +804,9 @@ fn ago(modified: std::time::SystemTime) -> String {
     }
 }
 
-// A message as `read` shows it.
-fn message_line(message: &AgentMessage) -> Option<String> {
-    let cut = |text: String| if text.chars().count() > READ_CHARS { format!("{}…", text.chars().take(READ_CHARS).collect::<String>()) } else { text };
+// A message as `read` shows it, each text cut at `limit` characters.
+fn message_line(message: &AgentMessage, limit: usize) -> Option<String> {
+    let cut = |text: String| if text.chars().count() > limit { format!("{}…", text.chars().take(limit).collect::<String>()) } else { text };
     match message {
         AgentMessage::User(user) => Some(format!("user: {}", cut(user.content.text()))),
         AgentMessage::Assistant(assistant) => {
@@ -858,7 +861,10 @@ impl SessionsTool {
     fn read(&self, wanted: &str, count: usize) -> Result<String, String> {
         let summary = find(&self.agent_dir, wanted)?;
         let session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
-        let messages: Vec<String> = session.context().messages.iter().filter_map(message_line).collect();
+        // The last message whole (a lane's report is what the manager answers for), the others cut.
+        let all = session.context().messages;
+        let last = all.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_)));
+        let messages: Vec<String> = all.iter().enumerate().filter_map(|(at, message)| message_line(message, if Some(at) == last { usize::MAX } else { READ_CHARS })).collect();
         let shown = &messages[messages.len().saturating_sub(count)..];
         let running = if crate::runtime::running(&summary.path) { "running now" } else { "not running" };
         Ok(format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n")))
