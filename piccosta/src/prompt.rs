@@ -245,9 +245,12 @@ fn rules(tools: &[Arc<dyn Tool>]) -> String {
     let mut rules: Vec<&str> = Vec::new();
     // People watch a session work: a run of tool calls with no word between them reads as a hang.
     let talk = "Talk to the user as you work: before a run of tool calls say in a sentence what you're doing, after it what you found, and when they write mid-task, answer them first";
+    // What Claude Code's own prompt asks and piccosta sends instead of it: read before changing,
+    // check by running, finish the task, and treat what others report as unchecked.
+    let thorough = "Read the code and files a change touches before you make it, and don't guess at what you haven't read. Check your work by running it (build it, run the command, look at the output), and say what you checked and what you didn't. Finish the task: don't stop at the first answer that looks right, and when something fails, find out why. What a tool, subagent or other session reports is unchecked until you've checked it";
     // Late in long sessions models write notes, reports and plans nobody asked for, and leave them.
     let files = "Don't create documents (notes, reports, plans, summaries) unless the user asked for one; put what you found in your reply. Delete files you made for your own use before you finish";
-    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([talk, files]) {
+    for rule in tools.iter().flat_map(|tool| tool.prompt_guidelines().iter().copied()).chain([thorough, talk, files]) {
         if !rules.contains(&rule) {
             rules.push(rule);
         }

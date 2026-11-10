@@ -8,6 +8,7 @@
 // - {"do": "stop"}: Esc: running commands move to the background and the turn stops; a run of its
 //   own (print mode) then ends;
 // - {"do": "close"}: stop, kill its jobs and end;
+// - {"do": "thinking", "level": ...}: set its thinking level, as /effort does;
 // - {"do": "status"}: whether it's working and since when, and the session whose command started
 //   it and its job, when one did (a subagent);
 // - {"do": "subscribe"}: a line when it's subscribed, one for each turn that ends, then one when it
@@ -226,6 +227,10 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                     json!({"working": since.is_some(), "since": since, "parent": parent, "job": job})
                 }
                 "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string()))}),
+                "thinking" => match request["level"].as_str().filter(|level| crate::provider::THINKING_LEVELS.contains(level)) {
+                    Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
+                    None => json!({"ok": false, "error": "no such level"}),
+                },
                 kind @ ("stop" | "close") => {
                     let (answer, answered) = oneshot::channel();
                     let sent = send(if kind == "stop" { Command::Stop(Some(answer)) } else { Command::Close(Some(answer)) });

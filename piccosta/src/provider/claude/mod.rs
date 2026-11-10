@@ -178,7 +178,7 @@ const HOLD_MAX: usize = 4;
 // The last Claude Code release the bridge was checked against: CHILD_ENV, RESUME_ENV and
 // MCP_RESULT_MAX_CHARS were read in this binary. A newer one gets a notice, since any of them
 // could have been renamed.
-const VERIFIED_VERSION: &str = "2.1.316";
+const VERIFIED_VERSION: &str = "2.1.322";
 // How much of a child's stderr is kept for a failure message: its last lines, where a refused
 // option or a failed login is reported, without carrying a long log into the session.
 const STDERR_TAIL: usize = 4096;
@@ -1018,8 +1018,11 @@ pub fn adopt(handed: Vec<Handed>) {
             crate::tools::reaper::reap_inherited(query.pid as i32, named.then_some(TERM_GRACE), Vec::new());
             continue;
         };
-        if !query.session_mirror {
-            debug(&format!("adopt: session {} resumes its kept records; Claude Code {} has no transcript mirror", query.key, query.pid));
+        // A Claude Code whose binary was updated since it started is let go too: the session's next
+        // turn starts the new one on the records it kept, so every session runs the release it has.
+        let updated = std::fs::read_link(format!("/proc/{}/exe", query.pid)).is_ok_and(|exe| exe.to_string_lossy().ends_with(" (deleted)"));
+        if !query.session_mirror || updated {
+            debug(&format!("adopt: session {} resumes its kept records; Claude Code {} {}", query.key, query.pid, if updated { "was updated since it started" } else { "has no transcript mirror" }));
             tokio::spawn(async move { child.close().await; });
             continue;
         }
