@@ -295,7 +295,7 @@ impl Host {
         let named = |tool: &Arc<dyn tools::Tool>| self.tool_names.as_ref().is_some_and(|names| names.iter().any(|name| name == tool.name()));
         let wanted = |tool: &Arc<dyn tools::Tool>| match &work_tools {
             // A kind's list, narrowed further by an explicit --tools.
-            Some(names) => (names.iter().any(|name| name == tool.name()) || own_names.iter().any(|name| name == tool.name())) && (self.tool_names.is_none() || named(tool)),
+            Some(names) => (tool.name() == "checkin" || names.iter().any(|name| name == tool.name()) || own_names.iter().any(|name| name == tool.name())) && (self.tool_names.is_none() || named(tool)),
             None => (self.tool_names.is_none() && !owned.iter().any(|name| name == tool.name())) || named(tool),
         };
         let writes = |tool: &Arc<dyn tools::Tool>| work_read_only && matches!(tool.name(), "edit" | "write");

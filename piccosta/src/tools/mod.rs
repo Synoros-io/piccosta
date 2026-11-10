@@ -10,6 +10,7 @@
 // and longcmd and path hints into bash.
 
 pub mod bash;
+pub mod checkin;
 pub mod edit;
 pub mod editfix;
 pub mod image;
@@ -181,6 +182,7 @@ pub fn read_only(name: &str) -> bool {
 // The built-in tools, in the order pi lists them, then the web tools.
 pub fn builtin() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(read::ReadTool), Arc::new(bash::BashTool), Arc::new(edit::EditTool), Arc::new(write::WriteTool)];
+    tools.push(Arc::new(checkin::CheckinTool));
     tools.extend(web::tools());
     tools
 }

@@ -446,6 +446,9 @@ pub fn is_closed(agent_dir: &Path, file: &Path) -> bool {
 pub fn set_closed(agent_dir: &Path, file: &Path, closed: bool) {
     let mut all = closed_sessions(agent_dir);
     let file = crate::tools::paths::canonical(file);
+    if closed && let Err(error) = crate::tools::checkin::cancel_all(agent_dir, &file) {
+        eprintln!("piccosta checkin: could not drop closed session's timers: {error}");
+    }
     let changed = if closed { all.insert(file, clock::now_ms()).is_none() } else { all.remove(&file).is_some() };
     if !changed {
         return;

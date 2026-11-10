@@ -355,6 +355,8 @@ struct App {
     scans: u64,
     asks: std::sync::mpsc::Sender<Ask>,
     scanning: bool,
+    // A cleared draft isn't delivered until its asker result has been applied (sent).
+    sending: usize,
     // Managers open here that failed to start on their own: their file's mtime then, and when. Tried
     // again once the file changes or WAKE_RETRY has passed.
     wake_failed: HashMap<PathBuf, (Option<std::time::SystemTime>, Instant)>,
@@ -366,6 +368,8 @@ struct App {
     // asked for, waiting for the sessions' turns to end.
     restart: bool,
     restart_waiting: bool,
+    restart_draining: HashMap<usize, tokio::sync::oneshot::Receiver<()>>,
+    restart_queries: Option<Vec<tokio::sync::oneshot::Receiver<()>>>,
     restart_replies: futures_util::stream::FuturesUnordered<tokio::sync::oneshot::Receiver<()>>,
     // A file to open in the user's editor (/scale edit), with the screen handed over meanwhile.
     edit: Option<PathBuf>,
@@ -538,6 +542,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         frame: 0,
         asks: asker(sender.clone()),
         scanning: false,
+        sending: 0,
         sender,
         updates,
         tasks: Vec::new(),
@@ -554,6 +559,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         active: crate::clock::now_ms() as u64,
         restart: false,
         restart_waiting: false,
+        restart_draining: HashMap::new(),
+        restart_queries: None,
         restart_replies: futures_util::stream::FuturesUnordered::new(),
         edit: None,
         started: std::time::SystemTime::now(),
@@ -643,7 +650,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
             Some(request) = control.requests.recv() => app.control(request),
             Some(_) = app.restart_replies.next(), if !app.restart_replies.is_empty() => {},
             Some((slot, update)) = app.updates.recv() => app.update(slot, update),
-            _ = spinner.tick(), if app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
+            _ = spinner.tick(), if app.restart_waiting || app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
             _ = agent_scan.tick() => app.scan_agents(),
             _ = edge.tick(), if app.edge().is_some() => app.edge_scroll(),
         }
@@ -659,14 +666,20 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 if question.answer.as_ref().is_some_and(|answer| !answer.is_closed()) { app.picker = Some(question); break; }
             }
         }
-        // Wait for turns, unfinished picker/setup input, and the restart's wire acknowledgement.
-        if app.restart_waiting && app.restart_replies.is_empty() && app.picker.is_none() && app.model_add.is_none() && app.model_probe.is_none() && !app.slots.iter().any(Slot::busy) {
+        // A runtime, not the UI's delayed view, knows when its tool loop has finished.
+        app.restart_draining.retain(|_, answer| matches!(answer.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        if app.restart_waiting && app.restart_draining.is_empty() && app.sending == 0 && app.restart_replies.is_empty() && app.picker.is_none() && app.model_add.is_none() && app.model_probe.is_none() {
+            // A stopped runtime can settle before Claude Code returns its interrupt result. Let
+            // each query keep reading until it can hand over; no deadline may throw it away.
+            let queries = app.restart_queries.get_or_insert_with(crate::provider::claude::drain);
+            queries.retain_mut(|answer| matches!(answer.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            if !queries.is_empty() { continue; }
             // Check the launcher and force this UI's snapshot out before letting anything go.
             match restart_launcher().and_then(|exe| {
                 app.save_state().map(|()| exe).map_err(|error| format!("could not save this UI: {error}"))
             }) {
                 Ok(exe) => { restart_exe = Some(exe); (app.restart, app.quit) = (true, true); }
-                Err(error) => { app.notice = Some(format!("Could not restart: {error}")); app.restart_waiting = false; }
+                Err(error) => { app.notice = Some(format!("Could not restart: {error}")); app.drain(false); }
             }
         }
         // A file to edit: the user's editor gets the terminal ($VISUAL, else $EDITOR), and the
@@ -1032,15 +1045,34 @@ impl App {
         self.saved_state.save(&self.state_file, &text)
     }
 
-    // /restart: each saved session's running background jobs, the watcher, and the Claude Code
-    // processes waiting for a next message, for the next image.
+    // Freeze new inputs before yielding to any runtime. Its acknowledgement comes only after
+    // its current run; until shutdown it keeps listening and leaves the queue for the next image.
+    fn drain_slot(&mut self, slot: usize) {
+        if let Some((handle, commands)) = &self.slots[slot].live {
+            handle.set_draining(self.restart_waiting);
+            let (answer, received) = tokio::sync::oneshot::channel();
+            let _ = commands.send(Command::Drain(answer));
+            if self.restart_waiting { self.restart_draining.insert(slot, received); }
+        }
+    }
+
+    fn drain(&mut self, waiting: bool) {
+        self.restart_waiting = waiting;
+        self.restart_draining.clear();
+        self.restart_queries = None;
+        for slot in 0..self.slots.len() { self.drain_slot(slot); }
+    }
+
+    // /restart: each held runtime with its background jobs, the watcher, and the Claude Code
+    // processes waiting for a next message, for the next image. Empty job lists still reopen
+    // off-screen runtimes, so their queued inputs are answered too.
     async fn hand_over(&self) -> state::Handover {
-        let sessions = self.slots.iter().filter_map(|slot| Some((slot.path.clone()?, slot.shared.as_ref()?.jobs.hand_over()))).filter(|(_, jobs)| !jobs.is_empty()).collect();
+        let sessions = self.slots.iter().filter(|slot| slot.live.is_some()).filter_map(|slot| Some((slot.path.clone()?, slot.shared.as_ref()?.jobs.hand_over()))).collect();
         state::Handover { reaper: crate::tools::reaper::hand_over(), sessions, claude: crate::provider::claude::hand_over().await, ..Default::default() }
     }
 
-    // After /restart: open each session that had background jobs, where restore didn't, and give
-    // it its jobs back, so /ps lists them and their messages reach it.
+    // After /restart: reopen each held runtime where restore didn't, and give it its jobs back,
+    // so /ps lists them and their messages reach it.
     fn adopt_jobs(&mut self, sessions: Vec<(PathBuf, Vec<crate::tools::jobs::HandedJob>)>) {
         for (path, jobs) in sessions {
             let slot = match self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)) {
@@ -1225,6 +1257,7 @@ impl App {
         };
         let (commands, task) = crate::runtime::spawn(host, agent, shared, true, false, done);
         self.slots[slot].live = Some((handle, commands));
+        if self.restart_waiting { self.drain_slot(slot); }
         self.tasks.push(task);
         prompts.retain(|prompt| !self.history.contains(prompt));
         self.history.splice(0..0, prompts);
@@ -1410,7 +1443,14 @@ impl App {
             && let Some(path) = self.current().path.clone().filter(|path| path.exists())
         {
             let (slot, sent) = (self.panes[pane].slot, if self.current().manager { crate::manager::from_user(&text) } else { text.clone() });
-            let _ = self.asks.send(Box::new(move || (slot, Update::Sent(crate::runtime::send(&path, &sent, None), text))));
+            let draft = text.clone();
+            match self.asks.send(Box::new(move || (slot, Update::Sent(crate::runtime::send(&path, &sent, None), text)))) {
+                Ok(()) => self.sending += 1,
+                Err(_) => {
+                    self.slots[slot].draft.insert(&draft);
+                    self.notice = Some("Couldn't send it: the delivery thread has stopped".into());
+                }
+            }
             return;
         }
         if !self.ensure_open() {
@@ -1436,6 +1476,7 @@ impl App {
     // the session, the message waits in its file and the session opens here, which answers it
     // first. One not sent goes back into the editor.
     fn sent(&mut self, slot: usize, sent: Result<crate::runtime::Sent, String>, text: String) {
+        self.sending -= 1;
         self.notice = Some(match sent {
             Ok(crate::runtime::Sent::Queued) => {
                 self.slots[slot].elsewhere = false;
@@ -1538,7 +1579,7 @@ impl App {
     // nothing can move (the model is writing), the run stops and the queue is the next prompt. With
     // nothing running it's enter.
     fn send_now(&mut self) {
-        if !self.current().busy() {
+        if self.restart_waiting || !self.current().busy() {
             self.submit();
             return;
         }
@@ -2101,10 +2142,6 @@ impl App {
                     self.notice = Some(format!("{running}{pressed} again quits piccosta (to delete a session: the Delete key)"));
                 }
             }
-            KeyCode::Esc if self.restart_waiting => {
-                self.restart_waiting = false;
-                self.notice = Some("Not restarting.".into());
-            }
             KeyCode::Esc if self.current().busy() => self.interrupt(),
             KeyCode::Esc => self.panes[self.focus].scroll = 0,
             KeyCode::Char('x') if control => {
@@ -2272,7 +2309,11 @@ impl App {
         for (index, rect) in rects.iter().enumerate() {
             self.draw_pane(frame, index, *rect);
         }
-        let line = self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string());
+        let line = if self.restart_waiting {
+            let names: Vec<_> = self.slots.iter().enumerate().filter(|(slot, _)| self.restart_draining.contains_key(slot)).map(|(_, slot)| slot.title.as_str()).collect();
+            if names.is_empty() { "Restarting; waiting for input delivery and Claude Code handover".into() }
+            else { format!("Restart waiting on: {} · esc stops the focused turn", names.join(", ")) }
+        } else { self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string()) };
         let cwd = render::home_relative(&self.current().cwd);
         let room = usize::from(status.width).saturating_sub(cwd.width() + 2);
         let text = format!(" {:<room$} {cwd}", render::fit(&line, room));
@@ -2405,10 +2446,9 @@ impl App {
             };
             let dots = ".".repeat(1 + self.frame / WORKING_DOT_FRAMES % 3);
             let seconds = slot.working_since.map_or(String::new(), |since| format!(" · {}", render::duration(since.elapsed())));
-            let restart = if self.restart_waiting { " · piccosta restarts when every turn has ended (esc cancels)" } else { "" };
             messages.push((slot.messages.len() + 1, 2));
             rows.push(Line::default());
-            rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}{restart}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
+            rows.push(Line::from(Span::styled(format!("{} {what}{dots:<3}{seconds}", render::SPINNER[self.frame % render::SPINNER.len()]), Style::new().fg(theme::ACCENT))));
         }
         let scroll = self.panes[index].scroll.min(rows.len().saturating_sub(height));
         self.panes[index].scroll = scroll;

@@ -74,8 +74,12 @@ static IDLE_NOTES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new())
 pub enum Command {
     Prompt(String, Vec<Content>),
     Message(String),
+    // A durable check-in starts a turn even when a frontend normally starts each one itself.
+    Checkin,
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
+    // Acknowledge only between runs, after the frontend has set Handle::draining.
+    Drain(oneshot::Sender<()>),
     // A weak ticket expires when the frontend shows it again or edits its draft.
     // Only the runtime knows whether it has settled.
     ReleaseIfIdle(std::sync::Weak<()>),
@@ -227,6 +231,7 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                     json!({"working": since.is_some(), "since": since, "parent": parent, "job": job})
                 }
                 "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string()))}),
+                "checkin" => json!({"ok": send(Command::Checkin)}),
                 "thinking" => match request["level"].as_str().filter(|level| crate::provider::THINKING_LEVELS.contains(level)) {
                     Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
                     None => json!({"ok": false, "error": "no such level"}),
@@ -275,9 +280,11 @@ pub struct Run {
 
 impl Run {
     // The live process `pid` names now; None once it's gone.
-    fn of(pid: i32) -> Option<Run> {
+    pub(crate) fn of(pid: i32) -> Option<Run> {
         Some(Run { pid, start: crate::proc::start(pid)?, boot: crate::proc::boot_id() })
     }
+
+    pub(crate) fn alive(&self) -> bool { Self::of(self.pid).as_ref() == Some(self) }
 }
 
 // What came of asking a runtime (ask).
@@ -401,29 +408,49 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
 }
 
 // A retryable delivery is on disk before its sender advances a cursor. The inbox belongs to the
-// receiver, under the same handoff lock as claim and shutdown. Waking it can lose its answer, or
-// fail altogether: the next turn or runtime still takes the delivery. Its id survives consumption.
+// receiver, under the same handoff lock as claim and shutdown. Its id survives consumption, so a
+// check-in can retry a lost wake answer without repeating a message the receiver already took.
 pub fn deliver(file: &Path, id: &str, text: &str) -> Result<(), String> {
-    {
-        let held = hold(file)?;
-        if held.is_none() { return Err(format!("{}: no such session for delivery", file.display())); }
-        let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
-        let mut output = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&inbox).map_err(|error| error.to_string())?;
-        let mut pending = String::new();
-        output.read_to_string(&mut pending).map_err(|error| error.to_string())?;
-        if !pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|line| line["delivery_id"] == id) {
-            let length = output.metadata().map_err(|error| error.to_string())?.len();
-            let line = format!("{}\n", json!({"text": text, "delivery_id": id}));
-            if let Err(error) = output.write_all(line.as_bytes()).and_then(|()| output.sync_all()) {
-                return Err(match output.set_len(length) {
-                    Ok(()) => error.to_string(),
-                    Err(rollback) => format!("{error}; could not remove partial delivery: {rollback}"),
-                });
-            }
+    deliver_to(file, id, text, false, None)
+}
+
+// A check-in uses the same durable inbox, but wakes idle editor sessions too. An unattended lane
+// gets the same run a manager's message would give it; everyone else keeps the message queued.
+pub fn deliver_checkin(file: &Path, id: &str, text: &str, launch: Option<(&Path, &Path)>) -> Result<(), String> {
+    deliver_to(file, id, text, true, launch)
+}
+
+fn deliver_to(file: &Path, id: &str, text: &str, wake: bool, launch: Option<(&Path, &Path)>) -> Result<(), String> {
+    let held = hold(file)?;
+    if held.is_none() { return Err(format!("{}: no such session for delivery", file.display())); }
+    let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
+    let mut output = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&inbox).map_err(|error| error.to_string())?;
+    let mut pending = String::new();
+    output.read_to_string(&mut pending).map_err(|error| error.to_string())?;
+    if !pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|line| line["delivery_id"] == id) {
+        let length = output.metadata().map_err(|error| error.to_string())?.len();
+        let line = format!("{}\n", json!({"text": text, "delivery_id": id}));
+        if let Err(error) = output.write_all(line.as_bytes()).and_then(|()| output.sync_all()) {
+            return Err(match output.set_len(length) {
+                Ok(()) => error.to_string(),
+                Err(rollback) => format!("{error}; could not remove partial delivery: {rollback}"),
+            });
         }
     }
-    let _ = ask(file, json!({"do": "message", "text": ""}), ASK_WAIT);
-    Ok(())
+    // Shutdown takes this same lock. Either the runner takes the wake before it checks for idle,
+    // or it is already gone and we start the next one; EOF is not an acknowledgement.
+    match ask(file, json!({"do": if wake { "checkin" } else { "message" }, "text": ""}), ASK_WAIT) {
+        _ if !wake => Ok(()),
+        Asked::Answered(answer) if answer["ok"] == true => Ok(()),
+        Asked::Nobody => {
+            drop(held);
+            match launch {
+                Some((cwd, log)) => launch_checkin(file, cwd, log),
+                None => Ok(()), // Ordinary sessions and advisors wait until someone opens them.
+            }
+        }
+        _ => Err(format!("{}: check-in wake was not confirmed", file.display())),
+    }
 }
 
 // Take durable input at a turn or steering boundary. The runtime and the agent both use this;
@@ -474,10 +501,124 @@ pub fn ended(run: &Run) -> bool {
 // its file, then whatever it's sent while it runs, and ends when nothing is left. What it prints
 // goes to `log`. Output: the run, by its identity as it started.
 pub fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<Run> {
+    launch_selected(file, cwd, log, None)
+}
+
+// A timer's unattended runs remember their outcomes beside the session, independently of any
+// timer occurrence or service process. Spawning is not success: only a finished run clears the
+// backoff. If its waiter died, a run with no outcome counts as a failure once it is gone.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct CheckinRun {
+    run: Option<Run>,
+    confirmed: bool,
+    success: Option<bool>,
+    retry_at: i64,
+    retry_ms: i64,
+}
+
+impl CheckinRun {
+    fn path(file: &Path) -> PathBuf { PathBuf::from(format!("{}.checkin-run", file.display())) }
+
+    fn read(file: &Path) -> std::io::Result<Self> {
+        match std::fs::read(Self::path(file)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    // Called under the session's handoff lock, including by the run's waiter.
+    fn save(&self, file: &Path) -> std::io::Result<()> {
+        let path = Self::path(file);
+        let partial = path.with_extension("checkin-run.partial");
+        let mut output = std::fs::File::create(&partial)?;
+        output.write_all(&serde_json::to_vec(self)?)?;
+        output.sync_all()?;
+        std::fs::rename(partial, path)
+    }
+
+    fn finish(&mut self, success: bool) {
+        self.success = Some(success);
+        if success { (self.retry_at, self.retry_ms) = (0, 0); } else {
+            // Use the same restart interval and five-minute ceiling as delivery failures.
+            use crate::tools::checkin::{RETRY_MS, RETRY_MAX_MS};
+            self.retry_ms = self.retry_ms.saturating_mul(2).clamp(RETRY_MS, RETRY_MAX_MS);
+            self.retry_at = crate::clock::now_ms().saturating_add(self.retry_ms);
+        }
+    }
+}
+
+// Pin the saved choice before spending anything. Keep the handoff lock through recording the
+// child, then wait outside it for the runtime to open: its socket can appear and disappear between
+// polls, so the runtime's durable confirmation, not a successful spawn, is the receipt.
+fn launch_checkin(file: &Path, cwd: &Path, log: &Path) -> Result<(), String> {
+    let held = hold(file)?;
+    if running(file) {
+        return match ask(file, json!({"do": "checkin"}), ASK_WAIT) {
+            Asked::Answered(answer) if answer["ok"] == true => Ok(()),
+            _ => Err("check-in wake was not confirmed".into()),
+        };
+    }
+    // Nothing queued any more: a run that started late already answered this delivery (its receipt
+    // was queued once and taken), so it's delivered, and launching again would have nothing to do.
+    if Session::read(file).is_ok_and(|session| session.queued().is_empty()) {
+        return Ok(());
+    }
+    let start = || -> std::io::Result<Run> {
+        let mut previous = CheckinRun::read(file)?;
+        if let Some(run) = &previous.run && previous.success.is_none() {
+            if run.alive() {
+                // Two due timers can meet before the child binds its socket. They share its
+                // opening receipt, but not one from a run that already gave the session up.
+                if !previous.confirmed { return Ok(run.clone()); }
+                return Err(std::io::Error::other("check-in run is still ending"));
+            }
+            previous.finish(false);
+            previous.save(file)?;
+        }
+        if previous.retry_at > crate::clock::now_ms() {
+            return Err(std::io::Error::other(format!("check-in run backed off until {}", crate::clock::iso_from_ms(previous.retry_at))));
+        }
+        let session = Session::read(file).map_err(std::io::Error::other)?;
+        let context = session.context();
+        let (provider, model) = context.model.ok_or_else(|| std::io::Error::other("check-in session has no recorded model"))?;
+        let model = format!("{provider}/{model}");
+        Host::at(cwd.to_path_buf()).registry().and_then(|registry| registry.resolve(&model).map(|_| ())).map_err(std::io::Error::other)?;
+        launch_selected(file, cwd, log, Some((model, context.thinking_level)))
+    };
+    let run = start().map_err(|error| format!("couldn't start check-in run: {error}"))?;
+    drop(held);
+    let deadline = Instant::now() + ASK_WAIT;
+    loop {
+        let state = CheckinRun::read(file).map_err(|error| error.to_string())?;
+        if state.run.as_ref() == Some(&run) {
+            if state.confirmed { return Ok(()); }
+            if state.success.is_some() { return Err("check-in run ended before opening the session".into()); }
+        }
+        if Instant::now() >= deadline { return Err("check-in run did not confirm opening the session".into()); }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+// A print runtime confirms only after opening and plugin discovery succeeded. An early model or
+// startup failure leaves its timer unconsumed, with the message queued and the run backed off.
+fn confirm_checkin_run(file: Option<&Path>) -> Result<(), String> {
+    let Some(file) = file else { return Ok(()) };
+    let _held = hold(file)?;
+    let mut state = CheckinRun::read(file).map_err(|error| error.to_string())?;
+    if state.run.is_some() && state.run == Run::of(std::process::id() as i32) {
+        state.confirmed = true;
+        state.save(file).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn launch_selected(file: &Path, cwd: &Path, log: &Path, selection: Option<(String, String)>) -> std::io::Result<Run> {
     std::fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
     let output = std::fs::File::create(log)?;
     let mut command = std::process::Command::new(crate::proc::exe()?);
     command.arg("-p").arg("--session").arg(file).current_dir(cwd);
+    if let Some((model, thinking)) = &selection { command.arg("--model").arg(model).arg("--thinking").arg(thinking); }
     // A lane's run is the manager's, not a command's, even when an agent's `sessions message`
     // starts it (which wakes a project manager's lane, or the manager itself).
     command.env_remove(crate::tools::subagent::SESSION_ENV);
@@ -485,11 +626,33 @@ pub fn launch(file: &Path, cwd: &Path, log: &Path) -> std::io::Result<Run> {
     let mut child = crate::proc::own_session(&mut command).spawn()?;
     // Read before it can be reaped (below), so its pid is still its own.
     let run = Run::of(child.id() as i32);
+    // Record before the child can claim the session; launch_checkin still holds its handoff lock.
+    let tracked = selection.is_some().then(|| file.to_path_buf());
+    if let Some(file) = &tracked {
+        let saved = CheckinRun::read(file).and_then(|previous| CheckinRun { run: run.clone(), confirmed: false, success: None, ..previous }.save(file));
+        if let Err(error) = saved {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
     // Waited for, so it isn't left a zombie while this piccosta runs; if this one ends first, init
-    // takes it over.
+    // takes it over. Keep the actual exit result, not just whether spawn worked.
     let ending = run.clone();
     std::thread::spawn(move || {
-        let _ = child.wait();
+        let success = child.wait().is_ok_and(|status| status.success());
+        if let Some(file) = tracked {
+            let record = || -> Result<(), String> {
+                let _held = hold(&file)?;
+                let mut state = CheckinRun::read(&file).map_err(|error| error.to_string())?;
+                if state.run == ending && state.success.is_none() {
+                    state.finish(success);
+                    state.save(&file).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            };
+            if let Err(error) = record() { eprintln!("piccosta check-in run: {error}"); }
+        }
         lock(&ENDED).extend(ending);
     });
     run.ok_or_else(|| std::io::Error::other("it ended as it started; its log says why"))
@@ -555,6 +718,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     let (wait_minutes, check_minutes) = (minutes("manager.inactiveMinutes", crate::manager::INACTIVE_MINUTES), minutes("manager.checkMinutes", crate::manager::CHECK_MINUTES));
     let busy = watch.clone();
     let watcher = agent.manager_home().map(|home| tokio::task::spawn_local(crate::manager::watch(home, sender.downgrade(), (wait_minutes, check_minutes), move || lock(&busy).since.is_none())));
+    let timer = agent.session.file().map(|file| tokio::task::spawn_local(crate::tools::checkin::watch(host.agent_dir.clone(), Some(file.to_path_buf()))));
     let task = tokio::task::spawn_local(async move {
         let handle = agent.handle();
         let mut team = crate::host::team(&agent.session);
@@ -575,6 +739,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             }
         };
         drop(preparing);
+        let ready = ready.and_then(|()| confirm_checkin_run(agent.session.file()));
         if let Err(error) = ready {
             done(Done { result: Err(error), notice: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
             queue.push_front(Command::Close(closing.take().flatten()));
@@ -600,7 +765,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         let at = crate::clock::iso_from_ms;
         loop {
             // Set before anything queued is taken, a release included, which waits while it's due.
-            match (!until_idle).then(|| agent.idle_compaction_due()) {
+            match (!until_idle && !handle.draining()).then(|| agent.idle_compaction_due()) {
                 Some(Ok((due, request))) if request != spent => {
                     if let Some((_, was)) = idle.filter(|&(_, was)| was != request) {
                         say(format!("skipped for the request at {}: a newer request", at(was)));
@@ -614,10 +779,13 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 _ => {}
             }
-            let work = match queue.pop_front() {
+            // A draining runtime still takes stops and close, but no queued work. The same
+            // flag is set before a newly spawned runtime can run during a waiting restart.
+            let queued = queue.iter().position(|command| !handle.draining() || matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_)));
+            let work = match queued.and_then(|at| queue.remove(at)) {
                 Some(command) => Work::Command(command),
                 None => {
-                    if let Some(generation) = release.take_if(|_| idle.is_none()) {
+                    if let Some(generation) = release.take_if(|_| idle.is_none() && !handle.draining()) {
                         queue.push_back(Command::ReleaseIfIdle(generation));
                         continue;
                     }
@@ -629,8 +797,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             Some(command) => Work::Command(command),
                             None => break,
                         },
-                        Some(notice) = agent.notice(), if wake => Work::Notice(notice),
-                        () = until(idle.map_or(0, |(due, _)| due)), if idle.is_some() => Work::Idle,
+                        Some(notice) = agent.notice(), if wake && !handle.draining() => Work::Notice(notice),
+                        () = until(idle.map_or(0, |(due, _)| due)), if idle.is_some() && !handle.draining() => Work::Idle,
                     }
                 }
             };
@@ -646,6 +814,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     closing = Some(answer);
                     break;
                 }
+                Work::Command(Command::Drain(answer)) => {
+                    let _ = answer.send(());
+                    continue;
+                }
+                Work::Command(command) if handle.draining() => {
+                    queue.push_back(command);
+                    continue;
+                }
                 Work::Command(Command::ReleaseIfIdle(generation)) => {
                     if generation.upgrade().is_none() { continue; }
                     if idle.is_some() {
@@ -659,8 +835,9 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     held = None;
                     continue;
                 }
+                Work::Command(Command::Checkin) => Work::Command(Command::Message(String::new())),
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
-                // its next prompt.
+                // its next prompt. A check-in above explicitly asks for its own turn.
                 Work::Command(Command::Message(text)) if !wake => {
                     let kept = receive(&mut agent.session).and_then(|()| {
                         if text.is_empty() { Ok(()) } else { agent.session.queue(&text).map(|_| ()).map_err(|error| error.to_string()) }
@@ -705,11 +882,15 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         command = next(&mut commands, &mut claim), if closing.is_none() => match command {
                             // A message for a session compacting while idle stops the compaction and
                             // goes next: its turn reads the cache that's still warm.
-                            Some(command @ (Command::Message(_) | Command::Prompt(..))) if compacting => {
+                            Some(command @ (Command::Message(_) | Command::Checkin | Command::Prompt(..))) if compacting && !handle.draining() => {
                                 handle.abort();
                                 queue.push_back(command);
                             }
-                            Some(Command::Message(text)) => {
+                            Some(Command::Checkin) if !handle.draining() => {
+                                handle.steer(String::new());
+                                shared.jobs.detach_all();
+                            }
+                            Some(Command::Message(text)) if !handle.draining() => {
                                 handle.steer(text);
                                 shared.jobs.detach_all();
                             }
@@ -725,7 +906,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             }
                             // Fast mode changes from the run's next request (Agent::respond), unless
                             // commands typed before it wait: then it waits behind them, in order.
-                            Some(Command::Fast(on)) if queue.is_empty() => {
+                            Some(Command::Fast(on)) if queue.is_empty() && !handle.draining() => {
                                 handle.swap_fast(Some(on));
                             }
                             Some(other) => queue.push_back(other),
@@ -805,6 +986,9 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         if let Some(watcher) = watcher {
             watcher.abort();
         }
+        if let Some(timer) = timer {
+            timer.abort();
+        }
         crate::provider::claude::close(agent.session.id());
         lock(&IDLE_NOTES).remove(agent.session.id());
         shared.web.shutdown();
@@ -863,7 +1047,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
             Ok(())
         }
         Command::Model(name) => host.switch_model(agent, &name),
-        Command::Stop(_) | Command::Close(_) | Command::ReleaseIfIdle(_) => Ok(()),
+        Command::Stop(_) | Command::Close(_) | Command::ReleaseIfIdle(_) | Command::Drain(_) | Command::Checkin => Ok(()),
     }
 }
 

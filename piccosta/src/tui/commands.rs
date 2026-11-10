@@ -46,7 +46,7 @@ where even numbers slow.
 // /help's list, in the order people reach for them.
 const COMMANDS: [(&str, &str); 45] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
-    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; waits for running turns (esc cancels)"),
+    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns (esc stops the focused turn)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
     ("/scale", "which model does which kind of work, and how much of each plan is used (--use <kind> picks from it)"),
     ("/manager", "this project's manager: shown, or made (the first session in a directory is one)"),
@@ -433,14 +433,9 @@ impl App {
             "quit" | "exit" => self.quit = true,
             // Start again on the binary as it is now (after a build), with everything as it was and
             // the background jobs carrying on. A turn can't go across, so this waits for the running
-            // ones to end (the main loop restarts then). Repeating it keeps it pending; esc cancels.
-            "restart" => {
-                self.restart_waiting = true;
-                let running = self.slots.iter().filter(|slot| slot.busy()).count();
-                if running > 0 {
-                    self.notice = Some(format!("Restarting when {running} running turn{} end{} (esc cancels).", if running == 1 { "" } else { "s" }, if running == 1 { "s" } else { "" }));
-                }
-            }
+            // ones to end (the main loop restarts then). Esc still stops just the focused turn.
+            "restart" if self.restart_waiting => self.report("A restart is already waiting for the running turns.".into()),
+            "restart" => self.drain(true),
             "descent" => self.report(DESCENT.into()),
             "help" => self.report(COMMANDS.iter().map(|(name, what)| format!("{name:<28} {what}")).collect::<Vec<_>>().join("\n")),
             _ if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') => {

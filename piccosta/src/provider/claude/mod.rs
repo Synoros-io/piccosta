@@ -938,7 +938,8 @@ enum Command {
     Usage,
     // Fast mode on or off from its next request, as the flag setting it started with would.
     Fast(bool),
-    // /restart: give the query to the next image, if it waits for its next message (hand_over).
+    // /restart: acknowledge the safe handover boundary, then give it to the next image.
+    Drain(oneshot::Sender<()>),
     HandOver(oneshot::Sender<Handed>),
 }
 
@@ -989,6 +990,15 @@ pub struct Handed {
     // Earlier queries were started without transcript-write acknowledgements.
     #[serde(default)]
     session_mirror: bool,
+}
+
+// Ask each query to acknowledge only once Claude Code has finished its turn, including the result
+// of an interrupt. The UI keeps taking input and waiting, however long that result takes.
+pub fn drain() -> Vec<oneshot::Receiver<()>> {
+    lock(&LIVE).values().filter_map(|live| {
+        let (reply, answer) = oneshot::channel();
+        live.commands.send(Command::Drain(reply)).ok().map(|()| answer)
+    }).collect()
 }
 
 // /restart: each query waiting for its next message gives its Claude Code to the image this process
@@ -1503,6 +1513,8 @@ struct Query {
     // A held-back message whose own turn was stopped too: it never reached Claude Code, so it goes
     // in with the next one.
     unsent: Vec<Value>,
+    // Restart waits on these until the query can hand over, not merely until pi's turn ends.
+    draining: Vec<oneshot::Sender<()>>,
     // When a waiting query's prompt cache lapses and it ends.
     hold_until: Option<Instant>,
     // Claude Code's running total of what this query cost (total_cost_usd, in dollars) at its last
@@ -1524,7 +1536,7 @@ impl Query {
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), saved_calls: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
-            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, interrupting: false, next_prompt: None, unsent: Vec::new(), hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
+            settle_at: None, last_activity: Instant::now(), rejection: None, failure: None, result_seen: false, closed: false, interrupting: false, next_prompt: None, unsent: Vec::new(), draining: Vec::new(), hold_until: None, cost_seen: 0.0, result_cost: None, pending_turns: 0, fast }
     }
 
     async fn run(mut self, opening: Vec<Value>) {
@@ -1555,6 +1567,7 @@ impl Query {
                 Wake::Command(Some(Command::Hold)) => self.hold_parked(),
                 Wake::Command(Some(Command::Fast(on))) => self.child.send(&json!({"type": "control_request", "request_id": format!("{FAST_REQUEST}{on}-{}", request_id()), "request": {"subtype": "apply_flag_settings", "settings": {"fastMode": on}}})).await,
                 Wake::Command(Some(Command::Usage)) => self.child.send(&json!({"type": "control_request", "request_id": format!("{USAGE_REQUEST}{}", request_id()), "request": {"subtype": "get_usage"}})).await,
+                Wake::Command(Some(Command::Drain(reply))) => self.draining.push(reply),
                 // Taken: its Claude Code goes on in the next image, so nothing here may close it.
                 Wake::Command(Some(Command::HandOver(reply))) => if let Some(handed) = self.hand_over().await && reply.send(handed).is_ok() {
                     self.forget("handed over to the next image");
@@ -1567,6 +1580,9 @@ impl Query {
                 Wake::Lost => self.check_lost().await,
                 Wake::Abort => self.interrupt().await,
                 Wake::Lapsed => self.discard("its prompt cache has lapsed").await,
+            }
+            if self.settled() {
+                for reply in self.draining.drain(..) { let _ = reply.send(()); }
             }
         }
         self.finish().await;
@@ -1665,14 +1681,25 @@ impl Query {
         }
     }
 
-    // /restart: a query waiting for its next message gives its Claude Code to the next image as it
-    // is. Output: its record, with copies of its pipes for the next image; None when it isn't
-    // waiting (a turn runs, or a stopped one hasn't ended yet), or holds output it hasn't handled
-    // yet (a line read in part included), and then it closes as usual.
+    // A runtime's stopped answer precedes Claude Code's interrupt result. Only the query knows
+    // that result has arrived and that no partial output or mid-turn state would be lost: then it
+    // has settled, and a restart may go. One waiting for a message is handed over; one parked on
+    // tool calls closes, its records kept as it parked, so its next turn reads its cache.
+    fn settled(&self) -> bool {
+        self.turn.is_none() && !self.interrupting && self.unsent.is_empty() && self.child.stdout.buffer().is_empty() && self.child.line.is_empty()
+    }
+
+    #[cfg(unix)]
+    fn ready_to_hand_over(&self) -> bool {
+        lock(&self.state).waiting && self.settled()
+    }
+
+
+    // /restart: a ready query gives its Claude Code and copies of its pipes to the next image.
     #[cfg(unix)]
     async fn hand_over(&mut self) -> Option<Handed> {
         use std::os::fd::AsRawFd;
-        if !lock(&self.state).waiting || self.interrupting || !self.unsent.is_empty() || !self.child.stdout.buffer().is_empty() || !self.child.line.is_empty() {
+        if !self.ready_to_hand_over() {
             return None;
         }
         let fds = [self.child.stdin.as_ref()?.as_raw_fd(), self.child.stdout.get_ref().as_raw_fd(), self.child.stderr_fd.as_raw_fd()];

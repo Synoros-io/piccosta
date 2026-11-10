@@ -173,11 +173,21 @@ struct Inbox {
     follow_up_all: bool,
     // A /fast that came during the run, for its next request.
     fast: Option<bool>,
+    // A restart lets the tool loop finish, but leaves new inputs for the next runtime.
+    draining: bool,
 }
 
 impl Handle {
     pub fn abort(&self) {
         self.lock().cancel.cancel();
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.lock().draining = draining;
+    }
+
+    pub fn draining(&self) -> bool {
+        self.lock().draining
     }
 
     pub fn steer(&self, text: String) {
@@ -673,9 +683,11 @@ impl Agent {
             if let Some(system) = self.prompt_update() {
                 starting.insert(0, AgentMessage::System(system));
             }
-            let outcome = self.run(std::mem::take(&mut starting)).await?;
-            // The end of a run, which a Claude query still parked on tool calls doesn't outlive.
+            // The end of a run, failed or not, which a Claude query still parked on tool calls
+            // doesn't outlive: parked, it lapses with its cache, and a restart can hand it over.
+            let outcome = self.run(std::mem::take(&mut starting)).await;
             provider::claude::end_run(self.session.id());
+            let outcome = outcome?;
             crate::scale::after_turn();
             if outcome.aborted {
                 aborted = true;
@@ -687,6 +699,9 @@ impl Agent {
                     break;
                 }
                 continue;
+            }
+            if self.handle.draining() {
+                break;
             }
             // After the run: compact when the context filled up, and after an overflow ask again
             // on the compacted context (agent-session.ts _handlePostAgentRun).
@@ -902,6 +917,9 @@ impl Agent {
 
     // What steers the next turn: background jobs' finish messages, then the user's steering.
     fn steering(&mut self) -> Result<Vec<AgentMessage>, String> {
+        if self.handle.draining() {
+            return Ok(Vec::new());
+        }
         let mut messages = self.deliveries()?;
         messages.extend(std::iter::from_fn(|| self.config.notices.try_recv().ok()).map(AgentMessage::Custom));
         let steer = {

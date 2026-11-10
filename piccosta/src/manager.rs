@@ -26,7 +26,7 @@
 // - `memory.md`, the assistant's only, since it looks after everything for the long run: what
 //   should hold from one day to the next, a line each, edited by `remember` and `forget` and kept
 //   under MEMORY_CHARS; all of it is in the assistant's prompt and carried through compactions;
-// - `schedules.json`: messages for it at set times or on a repeat;
+// Timed messages live with every session's check-ins in the agent dir, not in its ledger.
 // - `lanes.json`: the sessions it started or messaged, which it answers for (below), and `runs/`,
 //   what each lane's latest run printed;
 // - `name`, the assistant's only: what the user calls it, when they've named it.
@@ -101,7 +101,7 @@ const LEDGER_VIEW_CHARS: usize = 16_000;
 const MEMORY_CHARS: usize = 8_000;
 // The ledger file's size past which its older half moves to the archive.
 const LEDGER_ROLL_BYTES: u64 = 256 * 1024;
-// How often the service looks at the schedules, and a manager at its lanes; and how many looks go
+// How often the service looks at check-ins, and a manager at its lanes; and how many looks go
 // between looks for quiet ones.
 const POLL: Duration = Duration::from_secs(1);
 const LANE_SCAN_SECONDS: u64 = 60;
@@ -264,8 +264,22 @@ pub fn home_for(agent_dir: &Path, role: Role, cwd: &Path) -> PathBuf {
     }
 }
 
+// All manager homes, advisors included, for migrating timers and finding a lane's run log.
+pub fn homes(agent_dir: &Path) -> impl Iterator<Item = PathBuf> {
+    std::iter::once(home(agent_dir)).chain(fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path()))
+        .flat_map(|home| [home.clone(), home.join(ADVISOR_DIR)])
+}
+
+// Only a manager's lane gets an unattended run; ordinary sessions wait until someone opens them.
+pub fn checkin_launch(agent_dir: &Path, file: &Path) -> Option<(PathBuf, PathBuf)> {
+    let session = crate::session::Session::read(file).ok()?;
+    if role(&session).is_some() { return None; }
+    let home = homes(agent_dir).find(|home| load_lanes(home).iter().any(|lane| lane.file == file))?;
+    Some((PathBuf::from(&session.header().cwd), run_log(&home, file)))
+}
+
 // A manager's session file, read from its home, while the file is there.
-fn pointer(home: &Path) -> Option<PathBuf> {
+pub(crate) fn pointer(home: &Path) -> Option<PathBuf> {
     let path = PathBuf::from(fs::read_to_string(home.join("session")).ok()?.trim());
     path.exists().then_some(path)
 }
@@ -676,91 +690,6 @@ fn look(home: &Path, listening: &mut std::collections::HashSet<PathBuf>, heard: 
     (news, lanes)
 }
 
-// --- Schedules ---
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Schedule {
-    id: String,
-    text: String,
-    // When it next fires (epoch ms), and how often after that.
-    next: i64,
-    every_ms: Option<i64>,
-    #[serde(default)]
-    retry_at: i64,
-    #[serde(default)]
-    retry_ms: i64,
-}
-
-// Give a broken target the service's restart interval first, then double up to five minutes:
-// the occurrence stays due without filling the log or repeatedly blocking the service.
-const SCHEDULE_RETRY_MS: i64 = RESTART_SECONDS as i64 * 1_000;
-const SCHEDULE_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
-
-fn load_schedules(home: &Path) -> Vec<Schedule> {
-    fs::read_to_string(home.join("schedules.json")).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
-}
-
-fn save_schedules(home: &Path, schedules: &[Schedule]) -> std::io::Result<()> {
-    fs::write(home.join("schedules.json"), serde_json::to_string_pretty(schedules).unwrap_or_default())
-}
-
-// "30m", "2h", "1d", "45s" as milliseconds.
-fn duration_ms(text: &str) -> Option<i64> {
-    let text = text.trim();
-    let (number, unit) = text.split_at(text.find(|character: char| !character.is_ascii_digit())?);
-    let unit_ms = match unit.trim() {
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => DAY_MS,
-        _ => return None,
-    };
-    Some(number.parse::<i64>().ok()? * unit_ms).filter(|ms| *ms > 0)
-}
-
-// An ISO time with its offset ("2026-11-01T09:00-04:00", or Z) as epoch ms.
-fn time_ms(text: &str) -> Option<i64> {
-    let text = text.trim();
-    if let Some(utc) = text.strip_suffix('Z') {
-        return crate::clock::ms_from_iso(&format!("{}Z", if utc.len() == 16 { format!("{utc}:00") } else { utc.to_string() }));
-    }
-    let (clock, offset) = text.split_at(text.len().checked_sub(6)?);
-    let sign = match offset.chars().next()? {
-        '+' => 1,
-        '-' => -1,
-        _ => return None,
-    };
-    let offset_ms = sign * (offset[1..3].parse::<i64>().ok()? * 3_600_000 + offset[4..6].parse::<i64>().ok()? * 60_000);
-    let clock = if clock.len() == 16 { format!("{clock}:00") } else { clock.to_string() };
-    Some(crate::clock::ms_from_iso(&format!("{clock}Z"))? - offset_ms)
-}
-
-// A due schedule stays due until its message is accepted or written to the session's queue.
-fn due_schedules(home: &Path, mut deliver: impl FnMut(&Schedule) -> Result<(), String>) {
-    let now = crate::clock::now_ms();
-    let mut schedules = load_schedules(home);
-    schedules.retain_mut(|schedule| {
-        if schedule.next > now || schedule.retry_at > now { return true; }
-        if let Err(error) = deliver(schedule) {
-            schedule.retry_ms = schedule.retry_ms.saturating_mul(2).clamp(SCHEDULE_RETRY_MS, SCHEDULE_RETRY_MAX_MS);
-            schedule.retry_at = now.saturating_add(schedule.retry_ms);
-            eprintln!("piccosta manager: {error}; retry after {}", crate::clock::iso_from_ms(schedule.retry_at));
-            return true;
-        }
-        (schedule.retry_at, schedule.retry_ms) = (0, 0);
-        if let Some(every) = schedule.every_ms.filter(|every| *every > 0) {
-            // A repeat missed while the service was down fires once, then keeps its rhythm.
-            schedule.next += ((now - schedule.next) / every + 1) * every;
-            true
-        } else {
-            false
-        }
-    });
-    if let Err(error) = save_schedules(home, &schedules) {
-        eprintln!("piccosta manager: {error}");
-    }
-}
-
 // --- The manager's tools ---
 
 fn text(output: impl Into<String>) -> Result<ToolOutput, String> {
@@ -1040,7 +969,7 @@ impl Tool for SessionsTool {
         crate::message::ToolDefinition {
             name: "sessions".into(),
             description: format!("The sessions on this computer. action list: the latest, with their id, directory, model, whether they're running and what they've cost. projects: the directories that have sessions, with their managers. read: a session's latest messages (session, count). start: a new session in a directory (dir; optional: message, its first message, which it starts on at once in a run of its own, else it waits for the user or you; use: the kind of work, from the model scale, or model; thinking, pair or trio, name; subagents: the subagent jobs it may use, or true for all; discussed: the first words of the user's message where this task began, to copy the discussion word for word before the first message, which should say what to do, not retell it). message: a message for an existing session, to correct or carry on its own task (a new task gets a fresh session unless it needs what this one holds) (session, message; use, model, thinking, pair, trio or name change it first), which it runs the same way. close: the session is done (session): its background run stops, it's marked closed and leaves the list, and a later message opens it again. stop: end a lane's background run now and keep it open (session). delete: move a session you started to the trash, once it isn't running (session). usage: what sessions cost in the last day and week, and the model scale with each plan's usage now.
-A session you start or message is one of your lanes: its run carries on in a process of its own, and you get a message with what it said when its turn ends. Messages reach you from the user, your lanes, your schedules, the assistant and your advisor, each saying which, with the time; an advisor's advice is advice, the user's word decides. A turn that ended isn't proof the work was done: read it before you tell the user what happened and which session to open (`ledger notify` when they'd want to know now). Report what was asked; suggest next steps only when asked, or when something needs their decision. Check in on lanes while they work, not only when they end (read them; `ledger schedule` your next look), and act on one stuck, off track, repeating itself or waiting: message or stop it, and tell the user. Close a lane once its work is done: one left quiet keeps reminding you. A lane carries out its task itself: subagents flatten research and lose the structure the user gave it, and spend usage the user didn't start. Grant a lane subagents (which jobs) only when its task truly needs handing parts on; search is always there. When the user asks for a session and not for work in it, start it without a message; don't make up a first task. A project with its own manager (projects shows which) gets its work through that manager, not sessions you start there. Choose models with use, the kind of work from the model scale (usage shows it): piccosta picks the model and moves on when a plan runs low. Say which use and why, and consider a second model for long or important lanes (trio: it checks each answer once; pair: the two work it through together). When something you read disagrees with the scale, ask the user. {}", self.quota),
+A session you start or message is one of your lanes: its run carries on in a process of its own, and you get a message with what it said when its turn ends. Messages reach you from the user, your lanes, your schedules, the assistant and your advisor, each saying which, with the time; an advisor's advice is advice, the user's word decides. A turn that ended isn't proof the work was done: read it before you tell the user what happened and which session to open (`ledger notify` when they'd want to know now). Report what was asked; suggest next steps only when asked, or when something needs their decision. Check in on lanes while they work, not only when they end (read them; `checkin` your next look), and act on one stuck, off track, repeating itself or waiting: message or stop it, and tell the user. Close a lane once its work is done: one left quiet keeps reminding you. A lane carries out its task itself: subagents flatten research and lose the structure the user gave it, and spend usage the user didn't start. Grant a lane subagents (which jobs) only when its task truly needs handing parts on; search is always there. When the user asks for a session and not for work in it, start it without a message; don't make up a first task. A project with its own manager (projects shows which) gets its work through that manager, not sessions you start there. Choose models with use, the kind of work from the model scale (usage shows it): piccosta picks the model and moves on when a plan runs low. Say which use and why, and consider a second model for long or important lanes (trio: it checks each answer once; pair: the two work it through together). When something you read disagrees with the scale, ask the user. {}", self.quota),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -1206,11 +1135,11 @@ impl Tool for ManagerTools {
     }
 
     fn prompt_snippet(&self) -> Option<&str> {
-        Some(if self.memory { "your ledger, memory, schedules and desktop notifications" } else { "your ledger, schedules and desktop notifications" })
+        Some(if self.memory { "your ledger, memory and desktop notifications" } else { "your ledger and desktop notifications" })
     }
 
     fn definition(&self) -> crate::message::ToolDefinition {
-        let mut actions = vec!["append", "search", "notify", "schedule", "schedules", "unschedule"];
+        let mut actions = vec!["append", "search", "notify"];
         let memory = if self.memory { " remember: add a line to your memory (text): what should hold from one day to the next, what the user wants done and how, the projects and machines you look after, who to hand what; all of it is in your prompt, through every compaction. forget: take out the lines of your memory that hold a phrase (text). name: take the name the user gives you (text). Never a credential, key or password in your memory or your ledger." } else { " Never a credential, key or password in your ledger." };
         let scope = if self.memory { "across the projects" } else { "in the project" };
         if self.memory {
@@ -1218,17 +1147,13 @@ impl Tool for ManagerTools {
         }
         crate::message::ToolDefinition {
             name: "ledger".into(),
-            description: format!("Your ledger, your schedules and your notes to the user. Your ledger is your running record of what's going on {scope}: its newest entries ride through your compactions, and search finds the rest. A project's own files (AGENTS.md, direction.md, ledger.md, its feature list) are kept as its AGENTS.md says: write the ledger entries and record the user's requests it asks for, and change its AGENTS.md only when the user says so. action append: add an entry to your ledger, a line or two: the lanes you started and why (session ids, models), what came of each, what the user decided and what's next (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text). schedule: a message to yourself at a time (text, at: an ISO time with its offset, or in: \"30m\"/\"2h\"/\"1d\"), optionally repeating (every: \"1d\"). schedules: list them. unschedule: remove one (id).{memory}"),
+            description: format!("Your ledger and your notes to the user. Your ledger is your running record of what's going on {scope}: its newest entries ride through your compactions, and search finds the rest. A project's own files (AGENTS.md, direction.md, ledger.md, its feature list) are kept as its AGENTS.md says: write the ledger entries and record the user's requests it asks for, and change its AGENTS.md only when the user says so. action append: add an entry to your ledger, a line or two: the lanes you started and why (session ids, models), what came of each, what the user decided and what's next (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text).{memory}"),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum": actions},
-                    "text": {"type": "string"},
-                    "at": {"type": "string"},
-                    "in": {"type": "string"},
-                    "every": {"type": "string"},
-                    "id": {"type": "string"}
+                    "text": {"type": "string"}
                 }
             }),
             constrained_sampling: None,
@@ -1251,32 +1176,6 @@ impl Tool for ManagerTools {
                         Ok(status) => Err(format!("{} exited with {status}", self.notify[0])),
                         Err(error) => Err(format!("{}: {error}", self.notify[0])),
                     }
-                }
-                "schedule" => {
-                    let now = crate::clock::now_ms();
-                    let next = match (string(&arguments, "at"), string(&arguments, "in")) {
-                        (Some(at), _) => time_ms(at).ok_or_else(|| format!("Can't read the time {at:?}: give it like 2026-11-01T09:00-04:00"))?,
-                        (None, Some(after)) => now + duration_ms(after).ok_or_else(|| format!("Can't read {after:?}: give it like 30m, 2h or 1d"))?,
-                        (None, None) => return Err("at or in is needed".into()),
-                    };
-                    let every_ms = string(&arguments, "every").map(|every| duration_ms(every).ok_or_else(|| format!("Can't read {every:?}"))).transpose()?;
-                    let mut schedules = load_schedules(&self.home);
-                    let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-                    schedules.push(Schedule { id: id.clone(), text: need("text")?.to_string(), next, every_ms, retry_at: 0, retry_ms: 0 });
-                    save_schedules(&self.home, &schedules).map_err(|error| error.to_string())?;
-                    text(format!("Scheduled {id} for {}.", crate::clock::iso_from_ms(next)))
-                }
-                "schedules" => {
-                    let lines: Vec<String> = load_schedules(&self.home).iter().map(|schedule| format!("{} · next {} · every {} · {}", schedule.id, crate::clock::iso_from_ms(schedule.next), schedule.every_ms.map_or("once".into(), |every| format!("{} min", every / 60_000)), schedule.text)).collect();
-                    text(if lines.is_empty() { "No schedules.".into() } else { lines.join("\n") })
-                }
-                "unschedule" => {
-                    let id = need("id")?;
-                    let mut schedules = load_schedules(&self.home);
-                    let before = schedules.len();
-                    schedules.retain(|schedule| schedule.id != id);
-                    save_schedules(&self.home, &schedules).map_err(|error| error.to_string())?;
-                    text(if schedules.len() < before { format!("Removed {id}.") } else { format!("No schedule {id}.") })
                 }
                 other => Err(format!("No action \"{other}\"")),
             }
@@ -1322,7 +1221,7 @@ pub fn from_user(text: &str) -> String {
 // The systemd user unit the assistant runs under, by name, and how long systemd waits before
 // starting it again after it fails (a missing login would otherwise restart it in a tight loop).
 const UNIT: &str = "piccosta-assistant.service";
-const RESTART_SECONDS: u32 = 30;
+pub(crate) const RESTART_SECONDS: u32 = 30;
 // The environment the unit carries over from the terminal that wrote it: the paths piccosta and the
 // tools it runs find their files by, where set. Never a key: keys go in ENV_FILE, which the user
 // writes and the unit only names.
@@ -1404,7 +1303,7 @@ pub fn ensure_running(settings: &crate::config::Settings, asked: bool) -> Option
 
 // `piccosta assistant`: run the assistant until SIGTERM. Messages come through its runtime (the
 // TUI, `piccosta tell`), from its lanes as their turns end, and from its schedules; each goes in
-// with the time and where it came from. It also fires the project managers' schedules.
+// with the time and where it came from. It also fires unattended sessions' check-ins.
 pub async fn run(args: crate::cli::Args) -> Result<std::process::ExitCode, String> {
     tokio::task::LocalSet::new().run_until(serve(args)).await
 }
@@ -1448,23 +1347,10 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
             eprintln!("piccosta manager: {error}");
         }
     });
-    let termination = crate::proc::termination(true);
-    tokio::pin!(termination);
-    let mut poll = tokio::time::interval(POLL);
-    let scheduled = |schedule: &Schedule| format!("[{}, schedule {}]\n{}", now_text(), schedule.id, schedule.text);
-    loop {
-        tokio::select! {
-            _ = &mut termination => break,
-            // The schedules that are due: the assistant's, and the project managers', which go to
-            // them wherever they run, or wait in their sessions.
-            _ = poll.tick() => {
-                for home in std::iter::once(home.clone()).chain(fs::read_dir(agent_dir.join("projects")).into_iter().flatten().flatten().map(|entry| entry.path())) {
-                    let Some(manager) = pointer(&home) else { continue };
-                    due_schedules(&home, |schedule| crate::runtime::deliver(&manager, &format!("schedule:{}:{}:{}", home.display(), schedule.id, schedule.next), &scheduled(schedule)));
-                }
-            }
-        }
-    }
+    // Cover unattended sessions too, including advisors and lanes whose print run ended.
+    let timers = tokio::task::spawn_local(crate::tools::checkin::watch(agent_dir, None));
+    crate::proc::termination(true).await;
+    timers.abort();
     drop(commands);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     crate::provider::claude::shutdown().await;
