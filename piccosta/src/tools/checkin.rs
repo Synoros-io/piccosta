@@ -23,6 +23,13 @@ struct Checkin {
     text: String,
     next: i64,
     every_ms: Option<i64>,
+    // Missing ownership is an old agent check-in, never one of the user's replay prompts.
+    #[serde(default)]
+    user: bool,
+    #[serde(default)]
+    created: i64,
+    #[serde(default)]
+    outcome: Option<(i64, crate::runtime::TimerOutcome)>,
     #[serde(default)]
     retry_at: i64,
     #[serde(default)]
@@ -168,10 +175,13 @@ fn fire(agent_dir: &Path, only: &[Option<PathBuf>]) -> Result<(), String> {
         if timers.is_empty() { return Ok(Vec::new()); }
         let now = crate::clock::now_ms();
         let closed = crate::session::closed_sessions(agent_dir);
-        timers.retain(|timer| !closed.contains_key(&crate::tools::paths::canonical(&timer.file)) && timer.file.exists());
+        timers.retain(|timer| timer.user || !closed.contains_key(&crate::tools::paths::canonical(&timer.file)) && timer.file.exists());
         let mut due = Vec::new();
         for timer in timers {
-            if !(only.contains(&None) || only.iter().any(|file| file.as_ref() == Some(&timer.file))) || timer.next > now || timer.retry_at > now || timer.claimed.as_ref().is_some_and(|(owner, until)| *until > now && owner.alive()) { continue; }
+            // User timers never launch sessions. Any dispatcher can record an offline skip;
+            // an agent-closed session keeps its user's timers paused until it opens again.
+            if timer.user && closed.contains_key(&crate::tools::paths::canonical(&timer.file)) { continue; }
+            if !(timer.user || only.contains(&None) || only.iter().any(|file| file.as_ref() == Some(&timer.file))) || timer.next > now || timer.retry_at > now || timer.claimed.as_ref().is_some_and(|(owner, until)| *until > now && owner.alive()) { continue; }
             timer.claimed = Some((owner.clone(), now.saturating_add(CLAIM_MS)));
             due.push(timer.clone());
         }
@@ -193,9 +203,20 @@ fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
         Some(home) => format!("schedule:{}:{}:{}", home.display(), claimed.id, claimed.next),
         None => format!("checkin:{}:{}", claimed.id, claimed.next),
     };
-    let text = format!("[{}, checkin {}]\n{}", crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.id, claimed.text);
-    let launch = crate::manager::checkin_launch(agent_dir, &claimed.file);
-    let sent = crate::runtime::deliver_checkin(&claimed.file, &id, &text, launch.as_ref().map(|(cwd, log)| (cwd.as_path(), log.as_path())));
+    let sent = if claimed.user {
+        let text = format!("[user timer, set {}, fired {}]\n{}\n\n[Latest known usage — cached readings, not current]\n{}",
+            crate::clock::iso_from_ms(claimed.created), crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.text, crate::scale::latest_usage(agent_dir));
+        // Cancellation and admission have one order: off either removes this occurrence before
+        // we ask, or waits for its admission answer. The owner never needs this store lock.
+        store(agent_dir, |timers| {
+            if !timers.iter().any(|timer| timer == &claimed) || crate::session::is_closed(agent_dir, &claimed.file) { return Ok(crate::runtime::TimerOutcome::SkippedBusy); }
+            crate::runtime::deliver_timer(&claimed.file, &id, &text, &crate::host::title_text(&claimed.text))
+        })
+    } else {
+        let text = format!("[{}, checkin {}]\n{}", crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.id, claimed.text);
+        let launch = crate::manager::checkin_launch(agent_dir, &claimed.file);
+        crate::runtime::deliver_checkin(&claimed.file, &id, &text, launch.as_ref().map(|(cwd, log)| (cwd.as_path(), log.as_path()))).map(|()| crate::runtime::TimerOutcome::Delivered)
+    };
     store(agent_dir, |timers| {
         let now = crate::clock::now_ms();
         timers.retain_mut(|timer| {
@@ -207,6 +228,7 @@ fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
                 eprintln!("piccosta checkin: {error}; retry after {}", crate::clock::iso_from_ms(timer.retry_at));
                 return true;
             }
+            if timer.user { timer.outcome = sent.as_ref().ok().map(|outcome| (now, *outcome)); }
             (timer.retry_at, timer.retry_ms) = (0, 0);
             if let Some(every) = timer.every_ms.filter(|every| *every > 0) {
                 // A repeat missed while nothing ran fires once, then keeps its rhythm.
@@ -218,8 +240,39 @@ fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
     })
 }
 
-pub fn cancel_all(agent_dir: &Path, file: &Path) -> Result<(), String> {
-    store(agent_dir, |timers| { timers.retain(|timer| crate::tools::paths::canonical(&timer.file) != file); Ok(()) })
+pub fn cancel_all(agent_dir: &Path, file: &Path, by_user: bool) -> Result<(), String> {
+    store(agent_dir, |timers| { timers.retain(|timer| timer.user && !by_user || crate::tools::paths::canonical(&timer.file) != file); Ok(()) })
+}
+
+// /timer works on the shown session, even when another process owns it. Called on the TUI's
+// disk worker: neither a store lock nor a list of paused sessions belongs on the input thread.
+pub fn user_timer(agent_dir: &Path, file: &Path, argument: &str) -> Result<String, String> {
+    let file = crate::tools::paths::canonical(file);
+    store(agent_dir, |timers| {
+        let ours = |timer: &Checkin| timer.user && crate::tools::paths::canonical(&timer.file) == file;
+        if argument.is_empty() {
+            let paused = crate::session::is_closed(agent_dir, &file);
+            let lines: Vec<_> = timers.iter().filter(|timer| ours(timer)).map(|timer| {
+                let last = timer.outcome.map_or("not fired".into(), |(when, outcome)| format!("{} at {}", outcome.label(), crate::clock::iso_from_ms(when)));
+                format!("{} · next {}{} · last {last}\n{}", timer.id, crate::clock::iso_from_ms(timer.next), if paused { " · paused while closed" } else { "" }, timer.text)
+            }).collect();
+            return Ok(if lines.is_empty() { "No user timers.".into() } else { lines.join("\n") });
+        }
+        let (interval, prompt) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(word, rest)| (word, rest));
+        if interval == "off" {
+            let prompt = prompt.trim();
+            let before = timers.len();
+            timers.retain(|timer| !ours(timer) || !prompt.is_empty() && timer.id != prompt);
+            return Ok(format!("Cancelled {} user timer(s). An admitted turn is not revoked; Esc stops it.", before - timers.len()));
+        }
+        let every = duration_ms(interval).ok_or("/timer <interval> <prompt> (like 30m, 2h or 5s), /timer, or /timer off [id]")?;
+        if prompt.trim().is_empty() { return Err("/timer needs the prompt to replay.".into()); }
+        let created = crate::clock::now_ms();
+        let next = created.checked_add(every).ok_or("duration is too large")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        timers.push(Checkin { id: id.clone(), text: prompt.to_string(), next, every_ms: Some(every), user: true, created, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
+        Ok(format!("User timer {id} · next {} · every {interval}. Busy or not running: skipped, never queued.", crate::clock::iso_from_ms(next)))
+    })
 }
 
 pub struct CheckinTool;
@@ -253,17 +306,17 @@ impl Tool for CheckinTool {
                         };
                         let every_ms = arguments.get("every").and_then(Value::as_str).map(|every| duration_ms(every).ok_or("every needs a duration like 20m, 2h or 5s")).transpose()?;
                         let id = uuid::Uuid::new_v4().to_string();
-                        timers.push(Checkin { id: id.clone(), text: need("text")?.to_string(), next, every_ms, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
+                        timers.push(Checkin { id: id.clone(), text: need("text")?.to_string(), next, every_ms, user: false, created: now, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
                         Ok(format!("Check-in {id} set for {}.", crate::clock::iso_from_ms(next)))
                     }
                     "list" => {
-                        let lines: Vec<_> = timers.iter().filter(|timer| timer.file == file).map(|timer| format!("{} · next {} · every {} · {}", timer.id, crate::clock::iso_from_ms(timer.next), timer.every_ms.map_or("once".into(), |every| format!("{}s", every / 1_000)), timer.text)).collect();
+                        let lines: Vec<_> = timers.iter().filter(|timer| !timer.user && timer.file == file).map(|timer| format!("{} · next {} · every {} · {}", timer.id, crate::clock::iso_from_ms(timer.next), timer.every_ms.map_or("once".into(), |every| format!("{}s", every / 1_000)), timer.text)).collect();
                         Ok(if lines.is_empty() { "No check-ins.".into() } else { lines.join("\n") })
                     }
                     "cancel" => {
                         let id = need("id")?;
                         let before = timers.len();
-                        timers.retain(|timer| timer.file != file || timer.id != id);
+                        timers.retain(|timer| timer.user || timer.file != file || timer.id != id);
                         Ok(if timers.len() < before { format!("Cancelled {id}.") } else { format!("No check-in {id}.") })
                     }
                     other => Err(format!("No action {other:?}")),

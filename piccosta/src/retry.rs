@@ -5,7 +5,7 @@
 // The patterns are pi's, matched case-insensitively anywhere in the error text. pi's status-code
 // pattern needs a lookaround the regex crate doesn't have, so that one check is written out.
 
-use crate::message::{AssistantMessage, StopReason};
+use crate::message::{AssistantErrorKind, AssistantMessage, StopReason};
 use regex::{Regex, RegexBuilder};
 use std::sync::LazyLock;
 
@@ -114,7 +114,7 @@ fn has_status_code(text: &str) -> bool {
 // Whether a response failed in a way worth retrying (retry.ts:266-271).
 pub fn is_retryable(message: &AssistantMessage) -> bool {
     let Some(error) = message.error_message.as_deref().filter(|error| !error.is_empty()) else { return false };
-    if message.stop_reason != StopReason::Error || NON_RETRYABLE.is_match(error) {
+    if message.error_kind == Some(AssistantErrorKind::LoopGuard) || message.stop_reason != StopReason::Error || NON_RETRYABLE.is_match(error) {
         return false;
     }
     RETRYABLE.is_match(error) || has_status_code(error)
@@ -166,6 +166,7 @@ static NOT_OVERFLOW: LazyLock<Regex> = LazyLock::new(|| any_of(&[r"^(?:Throttlin
 // overflow error, a "successful" response whose input already exceeds the window, or a length
 // stop with no output and a full window.
 pub fn is_context_overflow(message: &AssistantMessage, context_window: u64) -> bool {
+    if message.error_kind == Some(AssistantErrorKind::LoopGuard) { return false; }
     if message.stop_reason == StopReason::Error
         && let Some(error) = message.error_message.as_deref().filter(|error| !error.is_empty())
         && !NOT_OVERFLOW.is_match(error)

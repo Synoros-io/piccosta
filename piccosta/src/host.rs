@@ -537,7 +537,7 @@ impl Host {
     // turns until one ends its reply with the done line, or the round limit. Each turn is the
     // speaker's model on the session for one run, opened by its note; the session model takes it
     // back for the user's next message. A failed or stopped turn ends the exchange.
-    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>) -> Result<(), String> {
+    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>, timer: Option<crate::message::UserTimer>) -> Result<(), String> {
         if text.is_empty() && images.is_empty() && agent.session.queued().is_empty() {
             return Ok(());
         }
@@ -556,7 +556,7 @@ impl Host {
             }
             agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
-        agent.prompt_with_images(text, images).await?;
+        agent.prompt_with_images(text, images, timer).await?;
         let mut result = Ok(());
         for turn in 1..turns {
             if agent.aborted() || exchange_over(&agent.session, team.pair && turn > 1) {
@@ -609,11 +609,15 @@ pub fn title(session: &Session) -> String {
     let named = name(session);
     let first_prompt = || {
         session.entries().iter().find_map(|entry| match entry {
-            session::SessionEntry::Message { message: AgentMessage::User(user), .. } => Some(user.content.text()),
+            session::SessionEntry::Message { message: AgentMessage::User(user), .. } => Some(prompt_title(user)),
             _ => None,
         })
     };
     title_text(&named.or_else(first_prompt).unwrap_or_else(|| "new session".into()))
+}
+
+pub(crate) fn prompt_title(user: &crate::message::UserMessage) -> String {
+    user.timer.as_ref().map_or_else(|| title_text(&user.content.text()), |timer| timer.title.clone())
 }
 
 pub(crate) fn title_text(text: &str) -> String {

@@ -46,7 +46,7 @@ impl Catalog {
         match entry {
             SessionEntry::SessionInfo { name: Some(name), .. } => self.name = Some(crate::host::title_text(name)),
             SessionEntry::Message { message: AgentMessage::User(user), .. } if self.prompt.is_none() => {
-                self.prompt = Some(crate::host::title_text(&user.content.text()))
+                self.prompt = Some(crate::host::prompt_title(user))
             }
             _ => {}
         }

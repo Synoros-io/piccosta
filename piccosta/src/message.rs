@@ -204,6 +204,14 @@ pub enum StopReason {
     Deferred,
 }
 
+// A local failure keeps its kind apart from its diagnostic. Quoted model text can say
+// "timeout" or "prompt too long" without making a stopped loop retryable or an overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssistantErrorKind {
+    LoopGuard,
+}
+
 // A tool as the model is told about it: name, description and JSON Schema for its arguments.
 // `constrainedSampling` (provider-side schema enforcement) is kept as raw JSON; only the request
 // builders look inside it.
@@ -249,10 +257,20 @@ pub enum SystemSnapshot {
     System(SystemMessage),
 }
 
+// A timer's receipt is part of its prompt, not a second queued entry. This metadata stays out of
+// the model request; it names an accepted occurrence and its title when the session is reopened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserTimer {
+    pub id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub content: TextOrBlocks,
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer: Option<UserTimer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -280,6 +298,8 @@ pub struct AssistantMessage {
     pub thinking_level: Option<String>,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<AssistantErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -417,7 +437,7 @@ pub fn bash_execution_text(execution: &BashExecutionMessage) -> String {
 
 // A user message holding one text block, the form all of pi's own roles take for the model.
 fn user_text(text: String, timestamp: i64) -> Message {
-    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp })
+    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp, timer: None })
 }
 
 // What the model sees of a conversation (core/messages.ts:148-196). Input: the session's messages
@@ -428,7 +448,7 @@ pub fn to_model_messages(messages: &[AgentMessage]) -> Vec<Message> {
     for message in messages {
         let converted = match message {
             AgentMessage::System(system) => Message::System(system.clone()),
-            AgentMessage::User(user) => Message::User(user.clone()),
+            AgentMessage::User(user) => Message::User(UserMessage { timer: None, ..user.clone() }),
             AgentMessage::Assistant(assistant) => Message::Assistant(assistant.clone()),
             AgentMessage::ToolResult(result) => Message::ToolResult(result.clone()),
             AgentMessage::BashExecution(execution) => {
@@ -440,6 +460,7 @@ pub fn to_model_messages(messages: &[AgentMessage]) -> Vec<Message> {
             AgentMessage::Custom(custom) => Message::User(UserMessage {
                 content: TextOrBlocks::Blocks(custom.content.clone().into_blocks()),
                 timestamp: custom.timestamp,
+                timer: None,
             }),
             AgentMessage::BranchSummary(branch) => user_text(
                 format!("{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}", branch.summary),

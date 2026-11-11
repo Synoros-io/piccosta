@@ -19,7 +19,7 @@ pub mod index;
 use crate::clock;
 use crate::message::{
     to_model_messages, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, Content, CustomMessage, SystemSnapshot,
-    TextOrBlocks, Usage,
+    TextOrBlocks, Usage, UserMessage,
 };
 use crate::provider::transcript::current_system_message;
 use serde::{Deserialize, Serialize};
@@ -36,10 +36,44 @@ pub const CURRENT_SESSION_VERSION: u32 = 3;
 // About 6k tokens at four characters a token, enough discussion without filling a delegate.
 const DISCUSSION_CHARS: usize = 24_000;
 
-// Only the user's text, not images or custom messages (pintask's pinned task uses this too).
-pub(crate) fn user_text(entry: &SessionEntry) -> Option<String> {
-    let SessionEntry::Message { message: AgentMessage::User(user), .. } = entry else { return None };
-    Some(user.content.text())
+pub(crate) struct UserSource<'a> {
+    pub id: &'a str,
+    pub message: &'a UserMessage,
+    pub kind: &'static str,
+    // The input time for a user, or the receipt time for a delivery; not a replay's original date.
+    pub recorded_at: i64,
+}
+
+// Associate each receipt with the first later matching user message, then consume it. A future
+// replay must not relabel an earlier user statement, or another input after that replay.
+pub(crate) fn user_sources<'a>(branch: &[&'a SessionEntry]) -> Vec<UserSource<'a>> {
+    let mut pending = Vec::new();
+    let mut sources = Vec::new();
+    for entry in branch {
+        match *entry {
+            SessionEntry::Custom { base, custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => {
+                if let (Some(text), Some(id)) = (data["text"].as_str(), data["delivery_id"].as_str()) {
+                    let kind = if id.starts_with("checkin:") || id.starts_with("schedule:") { "check-in replay" }
+                        else if id.starts_with("lane:") || id.starts_with("run:") { "lane report" } else { "session delivery" };
+                    pending.push((text, kind, clock::ms_from_iso(&base.timestamp).unwrap_or(0)));
+                }
+            }
+            SessionEntry::Message { message: AgentMessage::User(user), .. } => {
+                let text = user.content.text();
+                // A native timer already has its source; it mustn't consume an older queued receipt.
+                let (kind, recorded_at) = match &user.timer {
+                    Some(_) => ("user timer replay", user.timestamp),
+                    None => match pending.iter().position(|(queued, _, _)| *queued == text) {
+                        Some(at) => { let (_, kind, time) = pending.remove(at); (kind, time) }
+                        None => ("user", user.timestamp),
+                    },
+                };
+                sources.push(UserSource { id: entry.id(), message: user, kind, recorded_at });
+            }
+            _ => {}
+        }
+    }
+    sources
 }
 
 // Input: the live branch and the first words of the task's user turn. Output: its words before
@@ -608,9 +642,18 @@ pub fn is_closed(agent_dir: &Path, file: &Path) -> bool {
 // Close a session, or open it again. Entries for files that are gone are dropped as it's written,
 // whole through a temporary file so a reader never sees half of one.
 pub fn set_closed(agent_dir: &Path, file: &Path, closed: bool) {
+    mark_closed(agent_dir, file, closed, false);
+}
+
+// Only an explicit close from the user's terminal removes their replay schedules.
+pub fn set_closed_by_user(agent_dir: &Path, file: &Path) {
+    mark_closed(agent_dir, file, true, true);
+}
+
+fn mark_closed(agent_dir: &Path, file: &Path, closed: bool, by_user: bool) {
     let mut all = closed_sessions(agent_dir);
     let file = crate::tools::paths::canonical(file);
-    if closed && let Err(error) = crate::tools::checkin::cancel_all(agent_dir, &file) {
+    if closed && let Err(error) = crate::tools::checkin::cancel_all(agent_dir, &file, by_user) {
         eprintln!("piccosta checkin: could not drop closed session's timers: {error}");
     }
     let changed = if closed { all.insert(file, clock::now_ms()).is_none() } else { all.remove(&file).is_some() };
@@ -869,10 +912,28 @@ impl Session {
         self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": message })))
     }
 
+    // Timer receipts live on their user message. Older durable check-ins keep their custom
+    // receipt, so both still deduplicate after a reopen or a lost admission answer.
+    fn delivery_id(entry: &SessionEntry) -> Option<&str> {
+        match entry {
+            SessionEntry::Message { message: AgentMessage::User(user), .. } => user.timer.as_ref().map(|timer| timer.id.as_str()),
+            SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => data["delivery_id"].as_str(),
+            _ => None,
+        }
+    }
+
+    pub fn delivery_ids(&self) -> std::collections::HashSet<String> {
+        self.entries.iter().filter_map(Self::delivery_id).map(str::to_string).collect()
+    }
+
+    pub fn has_delivery(&self, id: &str) -> bool {
+        self.entries.iter().any(|entry| Self::delivery_id(entry) == Some(id))
+    }
+
     // A delivery keeps its identity after the queue is consumed, so a sender can retry after
     // losing the acknowledgement without starting another turn for the same occurrence.
     pub fn queue_delivery(&mut self, id: &str, text: &str) -> io::Result<()> {
-        if !self.entries.iter().any(|entry| matches!(entry, SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE && data["delivery_id"] == id)) {
+        if !self.has_delivery(id) {
             self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text, "delivery_id": id })))?;
         }
         Ok(())

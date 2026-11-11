@@ -105,6 +105,8 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    // A delayed timer report belongs to the captured session, not whichever pane has focus now.
+    TimerReport(PathBuf, String),
     Deleted(PathBuf, Result<(), String>),
     // /assistant's start, done: what it did, if anything; the assistant is shown when it's there.
     Assistant(Option<String>),
@@ -1159,6 +1161,16 @@ impl App {
             }
             None => self.host.session(self.slots[slot].path.as_deref(), false, self.persist)?,
         };
+        // A live session stays with its owner. Startup follows it just like a sidebar selection,
+        // so typing goes through delivery instead of trying to claim a second runtime.
+        if let Some(path) = session.file().filter(|path| crate::runtime::running(path)) {
+            let view = &mut self.slots[slot];
+            view.path = Some(path.to_path_buf());
+            view.opened = true;
+            view.saved = true;
+            view.elsewhere = true;
+            return self.follow(slot);
+        }
         // The first session ever in a directory is its project's manager, and so is one /manager
         // asked for; one /advisor asked for is its manager's advisor. Not a session kept in memory,
         // a subagent's, the assistant's, or one in home; and not the first one on its own in a
@@ -1446,7 +1458,7 @@ impl App {
         // A command is its name right after the slash; "/ something" is a message like any other.
         if let Some(command) = text.strip_prefix('/')
             && command.starts_with(|character: char| !character.is_whitespace())
-            && self.command(command.trim())
+            && self.command(command)
         {
             return;
         }
@@ -1485,7 +1497,7 @@ impl App {
         // left waiting on them; else it starts a turn (runtime.rs).
         // ACP has no steering method. A user's message is an explicit prompt, queued behind the
         // current one, not the unattended runtime-message path used by timers and other agents.
-        let command = if interactive_only { Command::Prompt(text.clone(), Vec::new()) } else { Command::Message(text.clone()) };
+        let command = if interactive_only { Command::Prompt(text.clone(), Vec::new(), None) } else { Command::Message(text.clone()) };
         let _ = commands.send(command);
         if slot.busy() {
             return;
@@ -1598,7 +1610,7 @@ impl App {
         let _ = commands.send(Command::Stop(None));
         let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
         if !queued.is_empty() {
-            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new()));
+            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new(), None));
         }
     }
 
@@ -1880,6 +1892,9 @@ impl App {
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
             Update::Report(text) => self.report(text),
+            Update::TimerReport(file, text) => {
+                if view.path.as_ref() == Some(&file) { view.messages.push(commands::report_message(text)); }
+            }
             Update::Deleted(path, result) => match result {
                 Ok(()) => {
                     if view.path.as_ref() == Some(&path) { view.path = None; }
@@ -1942,6 +1957,7 @@ impl App {
             }
             Update::Sent(sent, text) => self.sent(slot, sent, text),
             Update::Done(done) => {
+                if view.title == NEW_TITLE && let Some(title) = done.title { view.title = title; }
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
                 view.context_window = done.model.context_window;
                 view.thinking = done.thinking;

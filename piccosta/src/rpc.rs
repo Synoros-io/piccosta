@@ -321,7 +321,7 @@ impl Rpc {
                 respond(id, "prompt", Ok(Some(json!({"disposition": "started"}))));
                 live.streaming = true;
                 live.pending_prompt = Some((live.owed.len(), live.model.api.clone()));
-                self.send(Command::Prompt(message, images), None);
+                self.send(Command::Prompt(message, images, None), None);
                 return Ok(Reply::Later);
             }
             "steer" | "follow_up" => {

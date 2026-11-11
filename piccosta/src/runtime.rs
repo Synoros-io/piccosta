@@ -72,10 +72,12 @@ static IDLE_NOTES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new())
 // What a runtime is asked. Message, Stop and Close are taken at once; the rest wait their turn.
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
 pub enum Command {
-    Prompt(String, Vec<Content>),
+    Prompt(String, Vec<Content>, Option<crate::message::UserTimer>),
     Message(String),
     // A durable check-in starts a turn even when a frontend normally starts each one itself.
     Checkin,
+    // Only the owning runtime admits a user timer. It must never enter the durable inbox first.
+    Timer(crate::message::UserTimer, String, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
     // Acknowledge only between runs, after the frontend has set Handle::draining.
@@ -94,6 +96,17 @@ pub enum Command {
     Team(Team),
 }
 
+// A user timer advances on a delivery or an idle-only skip, never by steering active work.
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerOutcome { Delivered, SkippedBusy, SkippedNotRunning }
+
+impl TimerOutcome {
+    pub fn label(self) -> &'static str {
+        match self { Self::Delivered => "delivered", Self::SkippedBusy => "skipped busy", Self::SkippedNotRunning => "skipped not running" }
+    }
+}
+
 // What the runtime reports after each piece of work: how it went (`notice`: work no frontend asked
 // for, a message or a job's end), and the model and level the session has now. Only `frontend`
 // completions consume a frontend's command slot; socket work can finish without owning one.
@@ -101,6 +114,7 @@ pub struct Done {
     pub result: Result<(), String>,
     pub notice: bool,
     pub frontend: bool,
+    pub title: Option<String>,
     pub model: Model,
     pub thinking: String,
 }
@@ -109,10 +123,19 @@ pub struct Done {
 #[derive(Default)]
 struct Watch {
     since: Option<i64>,
+    closing: bool,
+    receipts: std::collections::HashSet<String>,
+    timer_answer: Option<(String, oneshot::Sender<Result<TimerOutcome, String>>)>,
     subscribers: Vec<mpsc::UnboundedSender<String>>,
 }
 
 impl Watch {
+    // Answer the one timer prompt being appended, if this is its occurrence. Nothing else owns
+    // that admission answer; ordinary message ordering and persistence remain the agent's job.
+    fn timer_done(&mut self, id: &str, result: Result<TimerOutcome, String>) {
+        if let Some((_, answer)) = self.timer_answer.take_if(|(wanted, _)| wanted == id) { let _ = answer.send(result); }
+    }
+
     fn tell(&mut self, line: &str) {
         self.subscribers.retain(|subscriber| subscriber.send(line.to_string()).is_ok());
     }
@@ -292,6 +315,23 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                     Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
                     None => json!({"ok": false, "error": "no such level"}),
                 },
+                "timer" if lock(&watch).receipts.contains(request["id"].as_str().unwrap_or_default()) => json!({"outcome": TimerOutcome::Delivered}),
+                "timer" if lock(&watch).closing => json!({"outcome": TimerOutcome::SkippedBusy}),
+                "timer" => {
+                    let (answer, answered) = oneshot::channel();
+                    let timer = crate::message::UserTimer { id: request["id"].as_str().unwrap_or_default().to_string(), title: request["title"].as_str().unwrap_or_default().to_string() };
+                    let sent = send(Command::Timer(timer, request["text"].as_str().unwrap_or_default().to_string(), Instant::now() + ASK_WAIT, answer));
+                    tokio::spawn(async move {
+                        let result = if sent { tokio::time::timeout(ASK_WAIT, answered).await.ok().and_then(Result::ok) } else { None };
+                        let reply = match result {
+                            Some(Ok(outcome)) => json!({"outcome": outcome}),
+                            Some(Err(error)) => json!({"error": error}),
+                            None => json!({"error": "timer admission was not confirmed"}),
+                        };
+                        let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                    });
+                    continue;
+                }
                 kind @ ("stop" | "close") => {
                     let (answer, answered) = oneshot::channel();
                     let sent = send(if kind == "stop" { Command::Stop(Some(answer)) } else { Command::Close(Some(answer)) });
@@ -474,6 +514,16 @@ pub fn deliver(file: &Path, id: &str, text: &str) -> Result<(), String> {
 // gets the same run a manager's message would give it; everyone else keeps the message queued.
 pub fn deliver_checkin(file: &Path, id: &str, text: &str, launch: Option<(&Path, &Path)>) -> Result<(), String> {
     deliver_to(file, id, text, true, launch)
+}
+
+// Ask the owner to admit an ordinary prompt, without holding the session file. Its user entry
+// carries the occurrence id; a retry is acknowledged without starting that prompt again.
+pub fn deliver_timer(file: &Path, id: &str, text: &str, title: &str) -> Result<TimerOutcome, String> {
+    match ask(file, json!({"do": "timer", "id": id, "text": text, "title": title}), ASK_WAIT) {
+        Asked::Nobody => Ok(TimerOutcome::SkippedNotRunning),
+        Asked::Answered(answer) => serde_json::from_value(answer["outcome"].clone()).map_err(|_| answer["error"].as_str().unwrap_or("timer admission was not confirmed").to_string()),
+        _ => Err("timer admission was not confirmed".into()),
+    }
 }
 
 fn deliver_to(file: &Path, id: &str, text: &str, wake: bool, launch: Option<(&Path, &Path)>) -> Result<(), String> {
@@ -760,9 +810,15 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     }
     let mut claim = agent.take_claim();
     let watch = claim.as_ref().map_or_else(Arc::default, |claim| claim.watch.clone());
+    lock(&watch).receipts = agent.session.delivery_ids();
     // Each turn the model ends goes to the subscribers, with how many jobs still run.
     let (heard, jobs) = (watch.clone(), shared.clone());
     agent.tap(move |event| {
+        if let Event::MessageEnd { message: AgentMessage::User(user) } = event && let Some(timer) = &user.timer {
+            let mut watched = lock(&heard);
+            watched.receipts.insert(timer.id.clone());
+            watched.timer_done(&timer.id, Ok(TimerOutcome::Delivered));
+        }
         if let Event::AgentEnd { messages, will_retry: false, entry_id } = event
             && let Some(AgentMessage::Assistant(last)) = messages.last()
             && last.stop_reason != StopReason::ToolUse
@@ -786,8 +842,13 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 result = &mut preparing => break result,
                 command = next(&mut commands, &mut claim) => match command {
                     Some((Command::Close(answer), _)) => {
+                        lock(&watch).closing = true;
                         closing = Some(answer);
                         break Err("Session closed during plugin discovery".into());
+                    }
+                    Some((Command::Timer(timer, _, _, answer), _)) => {
+                        let outcome = if lock(&watch).receipts.contains(&timer.id) { TimerOutcome::Delivered } else { TimerOutcome::SkippedBusy };
+                        let _ = answer.send(Ok(outcome));
                     }
                     Some(command) => queue.push_back(command),
                     None => break Err("Session closed during plugin discovery".into()),
@@ -801,10 +862,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             // closing instead of letting one unsolicited failure consume an arbitrary slot.
             commands.close();
             queue.extend(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true)));
-            done(Done { result: Err(error.clone()), notice: false, frontend: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+            done(Done { result: Err(error.clone()), notice: false, frontend: false, title: None, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
             for (command, frontend) in &queue {
-                if *frontend && !matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_) | Command::ReleaseIfIdle(_) | Command::Message(_) | Command::Checkin) {
-                    done(Done { result: Err(error.clone()), notice: false, frontend: true, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+                if *frontend && !matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_) | Command::ReleaseIfIdle(_) | Command::Message(_) | Command::Checkin | Command::Timer(..)) {
+                    done(Done { result: Err(error.clone()), notice: false, frontend: true, title: None, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
                 }
             }
             queue.push_front((Command::Close(closing.take().flatten()), false));
@@ -876,12 +937,28 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     continue;
                 }
                 Work::Command(Command::Close(answer), _) => {
+                    lock(&watch).closing = true;
                     closing = Some(answer);
                     break;
                 }
                 Work::Command(Command::Drain(answer), _) => {
                     let _ = answer.send(());
                     continue;
+                }
+                Work::Command(Command::Timer(timer, text, expires, answer), _) => {
+                    if answer.is_closed() || Instant::now() >= expires { continue; }
+                    // Accepted occurrences count while their prompt is running too. Admission and
+                    // starting use one command, so later messages follow the ordinary prompt order.
+                    if lock(&watch).receipts.contains(&timer.id) {
+                        let _ = answer.send(Ok(TimerOutcome::Delivered));
+                        continue;
+                    }
+                    if handle.draining() || !queue.is_empty() || !commands.is_empty() || agent.has_pending_work() || agent.unattended_allowed().is_err() {
+                        let _ = answer.send(Ok(TimerOutcome::SkippedBusy));
+                        continue;
+                    }
+                    lock(&watch).timer_answer = Some((timer.id.clone(), answer));
+                    Work::Command(Command::Prompt(text, Vec::new(), Some(timer)), false)
                 }
                 Work::Command(command, frontend) if handle.draining() => {
                     queue.push_back((command, frontend));
@@ -930,13 +1007,15 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 work => work,
             };
-            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_), _));
+            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_) | Command::Prompt(_, _, Some(_)), _));
             let frontend = !notice && matches!(work, Work::Command(_, true));
             let mut fast_frontend = false;
             let compacting = matches!(work, Work::Idle);
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
+            let mut receiving = true;
             let attended = agent.unattended_allowed().is_ok();
+            let occurrence = match &work { Work::Command(Command::Prompt(_, _, Some(timer)), _) => Some(timer.id.clone()), _ => None };
             let result = {
                 let run = perform(&host, &mut agent, &mut team, work);
                 tokio::pin!(run);
@@ -947,7 +1026,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             spent = request;
                             say(format!("skipped for the request at {}: busy, the session was working", at(request)));
                         },
-                        command = next(&mut commands, &mut claim), if closing.is_none() => match command {
+                        command = next(&mut commands, &mut claim), if receiving => match command {
+                            Some((Command::Timer(timer, _, _, answer), _)) => {
+                                let result = if lock(&watch).receipts.contains(&timer.id) { Ok(TimerOutcome::Delivered) }
+                                    else if occurrence.as_deref() == Some(timer.id.as_str()) { Err("timer prompt append was not confirmed".into()) }
+                                    else { Ok(TimerOutcome::SkippedBusy) };
+                                let _ = answer.send(result);
+                            }
+                            Some(other) if closing.is_some() => queue.push_back(other),
                             // A message for a session compacting while idle stops the compaction and
                             // goes next: its turn reads the cache that's still warm.
                             Some((command @ (Command::Message(_) | Command::Checkin | Command::Prompt(..)), frontend)) if compacting && !handle.draining() => {
@@ -968,6 +1054,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                                 stops.push(answer);
                             }
                             Some((Command::Close(answer), _)) => {
+                                lock(&watch).closing = true;
                                 shared.jobs.detach_all();
                                 handle.abort();
                                 closing = Some(answer);
@@ -980,14 +1067,21 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             }
                             Some(other) => queue.push_back(other),
                             None => {
+                                receiving = false;
+                                lock(&watch).closing = true;
                                 handle.abort();
-                                closing = Some(None);
+                                closing.get_or_insert(None);
                             }
                         },
                     }
                 }
             };
             lock(&watch).since = None;
+            // Only the normal user-message append acknowledges delivery. If it never happened,
+            // the sender retries; there is no separate queued receipt to strand at the idle gate.
+            if let Some(id) = &occurrence {
+                lock(&watch).timer_done(id, Err(result.as_ref().err().cloned().unwrap_or_else(|| "timer prompt was not appended".into())));
+            }
             // A /fast no request took is done as a command of its own, before what came after it.
             if let Some(on) = handle.swap_fast(None) {
                 queue.push_front((Command::Fast(on), fast_frontend));
@@ -1002,7 +1096,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             match result {
                 Err(error) if compacting => say(format!("failed: {error}")),
                 _ if compacting => {}
-                result => done(Done { result, notice, frontend, model: agent.model().clone(), thinking: agent.thinking_level().to_string() }),
+                result => done(Done { result, notice, frontend, title: occurrence.as_ref().map(|_| crate::host::title(&agent.session)), model: agent.model().clone(), thinking: agent.thinking_level().to_string() }),
             }
             if closing.is_some() || (until_idle && stopped) {
                 break;
@@ -1019,6 +1113,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 held = None;
             }
         }
+        lock(&watch).closing = true;
         // The end, under the file's lock: the socket stops taking requests and the gate shuts, what's
         // unread goes into the file, the socket goes, then the jobs.
         let held = held.or_else(|| agent.session.file().map(hold));
@@ -1036,7 +1131,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         for (command, _) in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true))) {
             let message = match command {
                 Command::Message(text) if !text.is_empty() => Some(crate::agent::user_message(&text)),
-                Command::Prompt(text, images) => Some(crate::agent::with_images(&text, images)),
+                Command::Prompt(text, images, _) => Some(crate::agent::with_images(&text, images)),
+                Command::Timer(_, _, _, answer) => {
+                    let _ = answer.send(Ok(TimerOutcome::SkippedBusy));
+                    None
+                }
                 Command::Stop(Some(answer)) | Command::Close(Some(answer)) => {
                     let _ = answer.send(());
                     None
@@ -1099,10 +1198,10 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         receive(&mut agent.session)?;
     }
     match command {
-        Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,
+        Command::Prompt(text, images, timer) => host.answer(agent, team, &text, images, timer).await,
         Command::Message(text) => {
             agent.unattended_allowed()?;
-            host.answer(agent, team, &text, Vec::new()).await
+            host.answer(agent, team, &text, Vec::new(), None).await
         }
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;
@@ -1121,7 +1220,7 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
             Ok(())
         }
         Command::Model(name) => host.switch_model(agent, &name),
-        Command::Stop(_) | Command::Close(_) | Command::ReleaseIfIdle(_) | Command::Drain(_) | Command::Checkin => Ok(()),
+        Command::Stop(_) | Command::Close(_) | Command::ReleaseIfIdle(_) | Command::Drain(_) | Command::Checkin | Command::Timer(..) => Ok(()),
     }
 }
 

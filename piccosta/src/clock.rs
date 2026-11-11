@@ -45,6 +45,40 @@ pub fn local_now() -> (String, i64) {
     (local.trim_end_matches('Z').to_string(), offset_seconds)
 }
 
+// An original message time in the machine's local zone, with the offset at that time, not today's
+// (daylight saving may have changed). Missing session times are zero; don't give them a date.
+pub fn dated(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 { return "date unknown".into(); }
+    #[cfg(unix)]
+    let offset = unsafe {
+        let seconds: libc::time_t = epoch_ms.div_euclid(MILLISECONDS_PER_SECOND) as _;
+        let mut local: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&seconds, &mut local).is_null() { return "date unknown".into(); }
+        local.tm_gmtoff
+    };
+    #[cfg(windows)]
+    let offset = unsafe {
+        use windows_sys::Win32::{Foundation::{FILETIME, SYSTEMTIME}, System::Time::*};
+        // Windows FILETIME counts 100 ns ticks since 1601; Unix counts milliseconds since 1970.
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        const TICKS_PER_MILLISECOND: u64 = 10_000;
+        let ticks = epoch_ms as u64 * TICKS_PER_MILLISECOND + UNIX_EPOCH_TICKS;
+        let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let mut universal: SYSTEMTIME = std::mem::zeroed();
+        let mut local: SYSTEMTIME = std::mem::zeroed();
+        let mut shifted: FILETIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&utc, &mut universal) == 0
+            || SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &universal, &mut local) == 0
+            || SystemTimeToFileTime(&local, &mut shifted) == 0 { return "date unknown".into(); }
+        let shifted = (u64::from(shifted.dwHighDateTime) << 32) | u64::from(shifted.dwLowDateTime);
+        (i128::from(shifted) - i128::from(ticks)) as i64 / (TICKS_PER_MILLISECOND as i64 * MILLISECONDS_PER_SECOND)
+    };
+    let offset = offset as i64;
+    let local = iso_from_ms(epoch_ms + offset * MILLISECONDS_PER_SECOND);
+    let minutes = offset.unsigned_abs() / 60;
+    format!("{}{sign}{:02}:{:02}", local.trim_end_matches('Z'), minutes / 60, minutes % 60, sign = if offset < 0 { '-' } else { '+' })
+}
+
 // Calendar date of a day count since 1970-01-01. Output: (year, month 1-12, day 1-31).
 fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let days = days_since_epoch + DAYS_FROM_YEAR_ZERO_TO_EPOCH;

@@ -24,7 +24,7 @@ use crate::auth::{self, CredentialPaths};
 use crate::compaction::{self, Reason};
 use crate::config::{CompactionSettings, RetrySettings};
 use crate::message::{
-    AgentMessage, AssistantMessage, Content, CustomMessage, StopReason, SystemMessage, TextOrBlocks, ToolDefinition, ToolReference,
+    AgentMessage, AssistantErrorKind, AssistantMessage, Content, CustomMessage, StopReason, SystemMessage, TextOrBlocks, ToolDefinition, ToolReference,
     ToolResultMessage, Usage, UserMessage,
 };
 use crate::model::{Model, ModelRegistry};
@@ -248,7 +248,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
 pub(crate) fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
     let mut blocks = vec![Content::text(text)];
     blocks.extend(images);
-    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms() })
+    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms(), timer: None })
 }
 
 // A stream event in pi's json form (json-event.ts:16-35): its type and content index, the delta or
@@ -608,13 +608,15 @@ impl Agent {
         if matches!(message, AgentMessage::User(_)) {
             self.overflow_recovery_attempted = false;
         }
-        (self.emit)(&Event::MessageStart { message: message.clone() });
-        (self.emit)(&Event::MessageEnd { message: message.clone() });
         let id = match &message {
             AgentMessage::Custom(custom) => self.session.append_custom_message(custom),
             _ => self.session.append_message(message.clone()),
         }
         .map_err(|error| format!("Could not write the session: {error}"))?;
+        // Announce only an entry that was saved. A timer's delivery answer uses this same point,
+        // so a failed ordinary append cannot leave a phantom receipt or a queued timer behind.
+        (self.emit)(&Event::MessageStart { message: message.clone() });
+        (self.emit)(&Event::MessageEnd { message: message.clone() });
         new_messages.push(message);
         Ok(id)
     }
@@ -623,12 +625,13 @@ impl Agent {
     // done (and any retry or background job it waits on). An empty one with none answers only
     // what's queued in the session. Output: an error only when the session can't be written; model
     // failures end up in the session as failed assistant messages, as in pi.
-    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>) -> Result<(), String> {
+    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>, timer: Option<crate::message::UserTimer>) -> Result<(), String> {
         // A prompt in a closed session opens it again.
         if let Some(file) = self.session.file() {
             crate::session::set_closed(&crate::config::agent_dir(), file, false);
         }
-        let first = (!text.is_empty() || !images.is_empty()).then(|| with_images(text, images));
+        let mut first = (!text.is_empty() || !images.is_empty()).then(|| with_images(text, images));
+        if let Some(AgentMessage::User(user)) = &mut first { user.timer = timer; }
         self.run_from(first).await
     }
 
@@ -1012,38 +1015,38 @@ impl Agent {
                 let mut started = false;
                 // pi sends the partial message's usage, which these APIs fill in only at the end:
                 // zeros while streaming.
-                let mut handle = |event: StreamEvent, emit: &mut EventSink, started: &mut bool| match event {
-                    StreamEvent::ExternalStart { id, name, arguments } => emit(&Event::ToolExecutionStart { tool_call_id: id, tool_name: name, args: arguments }),
-                    StreamEvent::ExternalUpdate { id, name, arguments, result } => emit(&Event::ToolExecutionUpdate { tool_call_id: id, tool_name: name, args: arguments, partial_result: result }),
-                    StreamEvent::ExternalEnd(result) => {
-                        emit(&Event::ToolExecutionEnd { tool_call_id: result.tool_call_id.clone(), tool_name: result.tool_name.clone(), result: result_json(&result.content, &result.details), is_error: result.is_error, duration_ms: None });
-                        external.push(result);
-                    }
-                    StreamEvent::Start => {
-                        *started = true;
-                        let mut partial = provider::new_output(model, &model.api);
-                        partial.stop_reason = StopReason::Stop;
-                        emit(&Event::MessageStart { message: AgentMessage::Assistant(partial) });
-                    }
-                    other => if let Some(json) = stream_event_json(&other) { emit(&Event::MessageUpdate { usage: Usage::default(), assistant_message_event: json }); },
-                };
                 let (mut streamed, mut checked_at, mut looped) = (String::new(), 0, None);
+                // The provider can finish with deltas still buffered. Check those on the same path
+                // as deltas received while it runs, before handing either to the frontend.
+                let mut handle = |event: StreamEvent, emit: &mut EventSink, started: &mut bool| {
+                    if let StreamEvent::TextDelta { delta, .. } | StreamEvent::ThinkingDelta { delta, .. } = &event {
+                        streamed.push_str(delta);
+                        if looped.is_none() && streamed.len() >= checked_at + LOOP_CHECK_EVERY {
+                            checked_at = streamed.len();
+                            looped = looping(&streamed);
+                            if looped.is_some() { guard.cancel(); }
+                        }
+                    }
+                    match event {
+                        StreamEvent::ExternalStart { id, name, arguments } => emit(&Event::ToolExecutionStart { tool_call_id: id, tool_name: name, args: arguments }),
+                        StreamEvent::ExternalUpdate { id, name, arguments, result } => emit(&Event::ToolExecutionUpdate { tool_call_id: id, tool_name: name, args: arguments, partial_result: result }),
+                        StreamEvent::ExternalEnd(result) => {
+                            emit(&Event::ToolExecutionEnd { tool_call_id: result.tool_call_id.clone(), tool_name: result.tool_name.clone(), result: result_json(&result.content, &result.details), is_error: result.is_error, duration_ms: None });
+                            external.push(result);
+                        }
+                        StreamEvent::Start => {
+                            *started = true;
+                            let mut partial = provider::new_output(model, &model.api);
+                            partial.stop_reason = StopReason::Stop;
+                            emit(&Event::MessageStart { message: AgentMessage::Assistant(partial) });
+                        }
+                        other => if let Some(json) = stream_event_json(&other) { emit(&Event::MessageUpdate { usage: Usage::default(), assistant_message_event: json }); },
+                    }
+                };
                 let mut message = loop {
                     tokio::select! {
                         biased;
-                        Some(event) = events.recv() => {
-                            if let StreamEvent::TextDelta { delta, .. } | StreamEvent::ThinkingDelta { delta, .. } = &event {
-                                streamed.push_str(delta);
-                                if looped.is_none() && streamed.len() >= checked_at + LOOP_CHECK_EVERY {
-                                    checked_at = streamed.len();
-                                    looped = looping(&streamed);
-                                    if looped.is_some() {
-                                        guard.cancel();
-                                    }
-                                }
-                            }
-                            handle(event, emit, &mut started)
-                        }
+                        Some(event) = events.recv() => handle(event, emit, &mut started),
                         message = &mut response => break message,
                     }
                 };
@@ -1056,6 +1059,7 @@ impl Agent {
                 // A stopped loop is the model's failure, not the user's abort, and not one to retry.
                 if let Some(unit) = looped.filter(|_| !self.cancel.is_cancelled()) {
                     message.stop_reason = StopReason::Error;
+                    message.error_kind = Some(AssistantErrorKind::LoopGuard);
                     message.error_message = Some(format!("Stopped a looping response: the model kept repeating {:?}", unit.trim()));
                 }
                 message
@@ -1381,8 +1385,9 @@ impl Agent {
                 if model.context_window > 0 {
                     compaction::fit(&mut messages, model.context_window.saturating_sub(reply_room));
                 }
+                let source_dates = compaction::source_dates(&self.session, &messages);
                 let messages = crate::message::to_model_messages(&messages);
-                let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone(), self.ownership.clone()), instructions).await;
+                let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone(), self.ownership.clone()), instructions, &source_dates).await;
                 let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
                     usage: response.usage.clone(), note: None };
                 let id = self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;

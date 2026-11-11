@@ -308,6 +308,28 @@ pub fn report(agent_dir: &Path) -> String {
     lines.join("\n")
 }
 
+// A timer reports observations, not a fresh account fetch. Keep expired windows visible: a reset
+// without a later reading says nothing about how much of the new window has been used.
+pub fn latest_usage(agent_dir: &Path) -> String {
+    let now = crate::clock::now_ms() as f64 / 1000.0;
+    let at = |seconds: f64| crate::clock::iso_from_ms((seconds * 1000.0) as i64);
+    let mut lines = Vec::new();
+    for (plan, windows) in readings(agent_dir) {
+        for (name, window) in windows.as_object().into_iter().flatten() {
+            let seen = window["seenAt"].as_f64();
+            let when = seen.map_or("unknown time".into(), at);
+            let used = window["usedPercent"].as_f64().map_or("usage unknown".into(), |used| format!("{used}% used"));
+            let reset = window["resetsAt"].as_f64().map_or("reset time unknown".into(), |reset| {
+                let when = at(reset);
+                if reset <= now && seen.is_none_or(|seen| seen < reset) { format!("reset at {when}, not read since") } else { format!("resets at {when}") }
+            });
+            let note = window["note"].as_str().map_or(String::new(), |note| format!("; {note}"));
+            lines.push(format!("{plan} / {name}: {used}; seen at {when}; {reset}{note}"));
+        }
+    }
+    if lines.is_empty() { "No usage readings known.".into() } else { lines.join("\n") }
+}
+
 // Whether this process asks the plans (watch), and when it last did.
 static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_ASKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);

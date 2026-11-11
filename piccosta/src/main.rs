@@ -104,6 +104,9 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         listing.await;
     }
     let (mut agent, tool_shared) = host.open(session, model.as_deref(), thinking.as_deref(), emit, true)?;
+    if let Some(level) = thinking.as_deref().filter(|level| *level != agent.thinking_level()) {
+        eprintln!("{}/{} doesn't take {level}; it runs at {}", agent.model().provider, agent.model().id, agent.thinking_level());
+    }
     if let Some(note) = note {
         eprintln!("{}", piccosta::scale::fell_back(&note, &format!("{}/{}", agent.model().provider, agent.model().id)));
     }
@@ -141,7 +144,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         }
     });
     for prompt in prompts {
-        let _ = commands.send(piccosta::runtime::Command::Prompt(prompt, Vec::new()));
+        let _ = commands.send(piccosta::runtime::Command::Prompt(prompt, Vec::new(), None));
     }
     // SIGTERM and SIGHUP close the runtime, which stops the run, keeps what it hadn't read in the
     // session and kills its jobs with their process groups. SIGINT goes the SIGTERM way (exit 143),

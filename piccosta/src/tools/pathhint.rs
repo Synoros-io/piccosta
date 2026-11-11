@@ -21,7 +21,7 @@ const MAX_MISSING_PATHS: usize = 3;
 // extension (config.yml vs config.yaml is 1) without proposing unrelated names.
 const MIN_ALLOWED_DISTANCE: usize = 2;
 const NAME_CHARS_PER_DISTANCE: usize = 3;
-// The name search under cwd stops at this depth and after this many directory entries. Six
+// Each sibling scan and the name search under cwd stop after this many directory entries. Six
 // levels reaches src/a/b/c/d/file in an ordinary repo; 20k entries is a medium monorepo and lists
 // in well under 100 ms on local disk.
 const SEARCH_MAX_DEPTH: usize = 6;
@@ -107,7 +107,9 @@ fn missing_paths_in(output: &str) -> Vec<String> {
 fn close_entries_in(directory: &Path, name: &str) -> Vec<(usize, PathBuf)> {
     let limit = allowed_distance(name);
     let Ok(entries) = std::fs::read_dir(directory) else { return Vec::new() };
+    // Count entries before filtering: a huge directory stays bounded even with no close names.
     entries
+        .take(SEARCH_MAX_ENTRIES)
         .flatten()
         .filter_map(|entry| {
             let entry_name = entry.file_name().to_string_lossy().to_lowercase();
@@ -186,6 +188,20 @@ fn suggestions_for(missing: &str, command: &str, cwd: &Path) -> Vec<String> {
         }
     }
     shown
+}
+
+// Keep the filesystem error, then suggest nearby paths only when the file was missing. Read
+// already has the path, so it needn't turn its error back into shell output for the parser.
+// Input: the failed syscall, its path and cwd. Output: the error with any path hint appended.
+pub fn file_error(error: &std::io::Error, syscall: &str, path: &Path, cwd: &Path) -> String {
+    let mut message = super::paths::fs_error(error, syscall, Some(path));
+    if error.kind() == std::io::ErrorKind::NotFound {
+        let suggestions = suggestions_for(&path.to_string_lossy(), "", cwd);
+        if !suggestions.is_empty() {
+            message.push_str(&format!("\n\n{} does not exist; did you mean: {}", path.display(), suggestions.join(", ")));
+        }
+    }
+    message
 }
 
 // Input: the text a command produced, the command and the cwd. Output: hint lines to append (maybe

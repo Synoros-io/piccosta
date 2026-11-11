@@ -377,6 +377,7 @@ pub fn new_output(model: &Model, api: &str) -> AssistantMessage {
         thinking_level: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
+        error_kind: None,
         error_message: None,
         raw_stop_reason: None,
         end_turn: None,

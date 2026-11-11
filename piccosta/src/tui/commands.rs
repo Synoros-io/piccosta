@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 45] = [
+const COMMANDS: [(&str, &str); 46] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns (esc stops the focused turn)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -69,6 +69,7 @@ const COMMANDS: [(&str, &str); 45] = [
     ("/status", "model, session, context and cost"),
     ("/context", "how full the context is"),
     ("/usage, /cost", "tokens and cost of this session"),
+    ("/timer [interval prompt|off [id]]", "replay your prompt when idle, repeating at the interval (30m, 2h, 5s); alone: next fire and last outcome; off: cancel this session's timers"),
     ("/diff", "git diff against HEAD, new files included"),
     ("/pwd", "the working directory"),
     ("/copy [n]", "copy the last (or nth last) response"),
@@ -97,7 +98,8 @@ impl App {
     // A slash command, without its slash. Output: false when it isn't a command, so it goes to the
     // model as text (a path such as /etc/hosts); a mistyped command word is answered here.
     pub(super) fn command(&mut self, line: &str) -> bool {
-        let (name, argument) = line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()));
+        let (name, raw_argument) = line.split_once(' ').map_or((line.trim(), ""), |(name, rest)| (name, rest));
+        let argument = raw_argument.trim();
         match name {
             // --single has one session: the commands that open others only say so.
             "new" | "manager" | "advisor" | "assistant" if self.one_session() => {}
@@ -137,8 +139,7 @@ impl App {
                     if self.close(left)
                         && let Some(path) = self.slots[left].path.take()
                     {
-                        crate::session::set_closed(&self.host.agent_dir, &path, true);
-                        self.closed.insert(path, crate::clock::now_ms());
+                        self.user_closed(path);
                     }
                 }
             }
@@ -368,6 +369,18 @@ impl App {
             "status" => self.report(self.status()),
             "context" => self.report(self.context()),
             "usage" | "cost" => self.report(self.usage()),
+            "timer" => {
+                let slot = self.panes[self.focus].slot;
+                let Some(file) = self.slots[slot].path.clone() else {
+                    self.notice = Some("User timers need a saved session (not --no-session).".into());
+                    return true;
+                };
+                let (agent_dir, argument) = (self.host.agent_dir.clone(), raw_argument.trim_start().to_string());
+                if self.asks.send(Box::new(move |_| {
+                    let report = crate::tools::checkin::user_timer(&agent_dir, &file, &argument).unwrap_or_else(|error| error);
+                    (slot, Update::TimerReport(file, report))
+                })).is_err() { self.notice = Some("The timer disk worker stopped.".into()); }
+            }
             "diff" => self.diff(),
             "pwd" | "cwd" => self.notice = Some(self.current().cwd.display().to_string()),
             "copy" => self.copy(argument),
@@ -402,8 +415,7 @@ impl App {
                 if self.close(slot)
                     && let Some(path) = self.slots[slot].path.take()
                 {
-                    crate::session::set_closed(&self.host.agent_dir, &path, true);
-                    self.closed.insert(path, crate::clock::now_ms());
+                    self.user_closed(path);
                 }
             }
             "delete" => self.delete_shown(),
@@ -421,6 +433,17 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    // The user's close cancels their timers too. Keep that locked store work on the disk worker,
+    // counted through completion so a restart cannot strand the close halfway through.
+    fn user_closed(&mut self, path: std::path::PathBuf) {
+        self.closed.insert(path.clone(), crate::clock::now_ms());
+        let agent_dir = self.host.agent_dir.clone();
+        if self.asks.send(Box::new(move |_| {
+            crate::session::set_closed_by_user(&agent_dir, &path);
+            (0, Update::Nothing)
+        })).is_err() { self.notice = Some("The disk worker stopped before the close was saved.".into()); }
     }
 
     // The sessions, open ones first, numbered as the sidebar lists them, with the one shown here
@@ -924,6 +947,7 @@ fn markdown(messages: &[AgentMessage]) -> String {
 // back; nothing is ever deleted outright. Output: Ok when they all went, else what happened, naming
 // any file that couldn't come back and where it is.
 pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
+    let target = crate::tools::paths::canonical(path);
     let _ownership = crate::runtime::deletion_guard(path)?;
     crate::ipc::remove(path);
     let [sidecar, journal_lock] = crate::provider::claude::sidecars(path);
@@ -943,7 +967,10 @@ pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
         };
         moved.push((file, went));
     }
-    Ok(())
+    // Only a completed deletion loses its schedules. A failed move leaves them available in the
+    // session that stayed put; a deleted session has nowhere left for the user to run /timer off.
+    crate::tools::checkin::cancel_all(&crate::config::agent_dir(), &target, true)
+        .map_err(|error| format!("Moved {} to the trash, but could not cancel its timers: {error}", path.display()))
 }
 
 // Move a file to the user's trash the way the freedesktop spec has it ($XDG_DATA_HOME/Trash), so a
