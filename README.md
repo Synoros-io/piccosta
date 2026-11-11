@@ -136,11 +136,6 @@ Measured on piccosta 0.2.0.
 | Terminal UI, idle: CPU | 0.3 ms per second | 0.0 ms per second | 3.3 ms per second |
 | On disk | one 32 MB static binary | 154 MB, plus Node.js | 314 MB |
 
-- **What each harness was:** each ran in a fresh config folder, so none read the user's own settings. piccosta was the static release binary.
-- **How CPU and memory were measured:** CPU counts each harness and the commands it ran. Peak memory comes from GNU time (largest process) and from sampling /proc every 50 ms (all its processes).
-- **Idle numbers:** taken over 30 seconds, after a 5-second settle, with nothing typed. Claude Code's idle figure is on its first-run welcome screen.
-- **Not measured:** the Codex CLI.
-
 ## Install
 
 Linux (any distribution): one static x86-64 binary, tried on Arch, Alpine 3.24, Debian 12 and Ubuntu 24.04. It needs the `ca-certificates` bundle. Read-only scale kinds run commands in a Landlock sandbox (Linux 6.12 or newer, else set `"readOnly": false` on the kind in `scale.json`).
