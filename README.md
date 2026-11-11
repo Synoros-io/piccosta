@@ -9,7 +9,7 @@ piccosta is one agent harness for every model you use:
 - the opencode and opencode go models
 - BYO or connect
 
-It stores no credentials of its own: it uses each account's existing login, and reads those files without writing them. The one exception is a login already in piccosta's own `login/auth.json` (the TypeScript piccosta kept them there), which it reads first, refreshing a Codex login there and saving it back. It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). The idea is to allow the user to customize the frontend with any pre-existing one, or with a custom one their agents build, on top of the existing minimal tui or otherwise. It is written in Rust, initially based on the [pi coding agent](https://github.com/earendil-works/pi) and then tested, substantially improved, rewritten and repackaged.
+It stores no credentials of its own: it uses each account's existing login, and reads those files without writing them. It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). The idea is to allow the user to customize the frontend with any pre-existing one, or with a custom one their agents build, on top of the existing minimal tui or otherwise. It is written in Rust, initially based on the [pi coding agent](https://github.com/earendil-works/pi) and then tested, substantially improved, rewritten and repackaged.
 
 *To install see below, or paste this to your coding agent:*
 
@@ -19,14 +19,14 @@ It stores no credentials of its own: it uses each account's existing login, and 
 
 ### Models
 
-- Claude through your Claude Code login: piccosta's own prompt and tools, kept open between turns so the prompt cache carries; session records are appended per turn, not rewritten.
+- Claude through your Claude Code login: piccosta's own prompt and tools
 - GPT through your Codex login, over the Responses API, with a websocket that falls back to HTTP streaming.
-- opencode-go models over OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google generateContent; thinking carries across turns.
+- opencode-go models over OpenAI chat completions, OpenAI Responses, Anthropic Messages and Google generateContent
 - ACP agents as models: a provider with `"api": "acp"` and a `command` in `models.json` (Antigravity through `agy acp`); `interactiveOnly` keeps one to user-picked interactive sessions.
 - Your own endpoints: `/models add` or `piccosta models add <url>` (see [Your own models](#your-own-models)).
 - New models show up on their own: each account's model list is fetched at start and with `/models refresh`; per-model overrides go in `models.json` (`modelOverrides`, pi's format).
 - `"serviceTier": "priority"` asks a Codex model for its fast mode.
-- One thinking scale, `off` to `max`, mapped to what each model takes.
+- One thinking scale, `off` to `max`
 - More will be added with time.
 
 ### Model scale
@@ -48,7 +48,7 @@ Sliding scale : critical, general, review, reading code, bug hunting, web search
 - Slow commands always go to the background.
 - Each manager has an append-only ledger (older halves archived monthly, `ledger search`); the assistant also keeps a short memory (`ledger remember`, `forget`).
 - Managers are told to keep to their project and to ask before spending your Claude or Codex plan; these are instructions to the model, not enforced limits.
-- `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both.
+- `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both. Great for a Fable/Astra type research advisor
 
 ### Pairs and trios
 
