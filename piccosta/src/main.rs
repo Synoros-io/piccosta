@@ -27,7 +27,7 @@ async fn auth_status() -> Result<ExitCode, String> {
     let paths = auth::CredentialPaths::from_environment(&agent_dir);
     let registry = model::ModelRegistry::load(&agent_dir.join("models.json"))?;
     let accounts = auth::ACCOUNTS.iter().map(|account| (account.provider, account.plan));
-    let serves = |provider: &str| registry.provider_config(provider).is_some_and(|config| config.base_url.is_some() || !config.models.is_empty());
+    let serves = |provider: &str| registry.provider_config(provider).is_some_and(|config| config.base_url.is_some() || !config.command.is_empty() || !config.models.is_empty());
     let configured = registry.configured().filter(|provider| auth::account(provider).is_none() && serves(provider)).map(|provider| (provider, provider));
     let mut any = false;
     for (provider, name) in accounts.chain(configured).collect::<Vec<_>>() {
@@ -158,7 +158,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     drop(commands);
     let agent = task.await.map_err(|error| error.to_string())?;
     // The last answer's Claude query waits for a next message that won't come here.
-    piccosta::provider::claude::shutdown().await;
+    piccosta::provider::shutdown().await;
     if let Some(code) = signalled.get() {
         return Ok(ExitCode::from(code));
     }
@@ -190,7 +190,9 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     // The last message, when it's the model's (print-mode.ts:139-159). A run that ended in an
     // error exits 1 in json mode too, so a script checking $? sees it (pi's json mode exits 0).
     let messages = agent.session.context().messages;
-    let Some(AgentMessage::Assistant(answer)) = messages.last() else { return Ok(ExitCode::SUCCESS) };
+    // An external agent may leave tool results after its failed assistant message. Those results
+    // must be kept, but must not hide the failure from the command's exit status.
+    let Some(answer) = messages.iter().rev().find_map(|message| if let AgentMessage::Assistant(answer) = message { Some(answer) } else { None }) else { return Ok(ExitCode::SUCCESS) };
     if matches!(answer.stop_reason, StopReason::Error | StopReason::Aborted) {
         if !json {
             let reason = if answer.stop_reason == StopReason::Error { "error" } else { "aborted" };

@@ -14,6 +14,7 @@ const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
 // The context size a response reported: its total, or the sum of its parts when there's no total.
 pub fn context_tokens(usage: &Usage) -> u64 {
+    if let Some(used) = usage.reported.as_ref().and_then(|reported| reported["used"].as_u64()) { return used; }
     if usage.total_tokens > 0 {
         usage.total_tokens
     } else {

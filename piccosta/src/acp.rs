@@ -31,6 +31,7 @@ use crate::runtime::{Command, Done};
 use crate::message::{AgentMessage, Content, StopReason, TextOrBlocks};
 use crate::model::Model;
 use crate::rpc::write_line;
+use crate::provider::{acp_wire as wire, Interaction};
 use crate::session::Session;
 use serde_json::{json, Map, Value};
 use std::cell::{Cell, RefCell};
@@ -103,8 +104,11 @@ enum Input {
     Done(String, u64, Box<Done>),
     // A tool call waiting for the user's yes.
     Ask { session: String, serial: u64, call_id: String, question: Option<String>, reply: oneshot::Sender<Answer> },
+    ExternalAsk { session: String, serial: u64, request: Interaction, reply: oneshot::Sender<Result<Value, String>> },
     // A cancelled prompt's time to stop is up; the number is which prompt of the session it was.
     CancelDeadline(String, u64, u64),
+    Listed(Value, Value),
+    Loaded(Value, Value, Arc<Host>, Arc<()>, Box<Result<Session, String>>),
 }
 
 // A tool call announced and not finished: its name, arguments, the file it works on, and (for edit
@@ -183,6 +187,7 @@ struct Acp {
     args: crate::cli::Args,
     inputs: UnboundedSender<Input>,
     sessions: HashMap<String, Live>,
+    loads: HashMap<String, Arc<()>>,
     hosts: HashMap<PathBuf, Arc<Host>>,
     initialized: bool,
     // Whether the client takes `notice` updates.
@@ -194,6 +199,8 @@ struct Acp {
     models: Option<Vec<Model>>,
     next_request: u64,
     next_session: u64,
+    elicitation: bool,
+    forwarded: HashMap<u64, (String, oneshot::Sender<Result<Value, String>>)>,
     asks: HashMap<u64, (String, String, oneshot::Sender<Answer>)>,
     // Updates that go out after the response being written (a new session's commands).
     after: Vec<(String, Value)>,
@@ -211,19 +218,15 @@ fn unknown_session(id: &str) -> Failure {
 }
 
 fn reply(id: Value, result: Value) {
-    write_line(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
+    write_line(&wire::reply(id, result));
 }
 
 fn fail(id: Value, Failure(code, message, data): Failure) {
-    let mut error = json!({"code": code, "message": message});
-    if let Some(data) = data {
-        error["data"] = data;
-    }
-    write_line(&json!({"jsonrpc": "2.0", "id": id, "error": error}));
+    write_line(&wire::error(id, code, message, data));
 }
 
 fn update(session: &str, update: Value) {
-    write_line(&json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session, "update": update}}));
+    write_line(&wire::notification("session/update", json!({"sessionId": session, "update": update})));
 }
 
 fn text_block(text: &str) -> Value {
@@ -248,7 +251,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         }
         let _ = lines.send(Input::Closed);
     });
-    let mut acp = Acp { args, inputs, sessions: HashMap::new(), hosts: HashMap::new(), initialized: false, notices: false, terminals: false, models: None, next_request: 0, next_session: 0, asks: HashMap::new(), after: Vec::new() };
+    let mut acp = Acp { args, inputs, sessions: HashMap::new(), loads: HashMap::new(), hosts: HashMap::new(), initialized: false, notices: false, terminals: false, models: None, next_request: 0, next_session: 0, elicitation: false, forwarded: HashMap::new(), asks: HashMap::new(), after: Vec::new() };
     let termination = crate::proc::termination(false);
     tokio::pin!(termination);
     let code = loop {
@@ -261,7 +264,10 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             Some(Input::Event(session, serial, event)) if acp.current(&session, serial) => acp.event(&session, *event),
             Some(Input::Done(session, serial, done)) if acp.current(&session, serial) => acp.done(&session, *done),
             Some(Input::Ask { session, serial, call_id, question, reply }) if acp.current(&session, serial) => acp.ask(session, call_id, question, reply),
+            Some(Input::ExternalAsk { session, serial, request, reply }) if acp.current(&session, serial) => acp.forward(session, request, reply),
             Some(Input::CancelDeadline(session, serial, prompt)) if acp.current(&session, serial) => acp.cancel_deadline(&session, prompt),
+            Some(Input::Listed(id, sessions)) => reply(id, sessions),
+            Some(Input::Loaded(id, params, host, ticket, session)) => acp.loaded(id, params, host, ticket, *session).await,
             Some(Input::Closed) | None => break 0,
             _ => {}
         }
@@ -269,7 +275,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     // Each runtime ends as its commands' channel goes.
     let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| live.task).collect();
     let _ = tokio::time::timeout(STOP_WAIT, futures_util::future::join_all(tasks)).await;
-    crate::provider::claude::shutdown().await;
+    crate::provider::shutdown().await;
     Ok(ExitCode::from(code))
 }
 
@@ -286,11 +292,7 @@ impl Acp {
             Ok(message) => message,
             Err(error) => return fail(Value::Null, Failure(PARSE_ERROR, format!("Parse error: {error}"), None)),
         };
-        if !message.is_object() || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-            || message.get("id").is_some_and(|id| !id.is_null() && !id.is_string() && !id.is_number())
-            || message.get("method").is_some_and(|method| !method.is_string())
-            || (message.get("method").is_none() && (message.get("id").is_none() || (message.get("result").is_none() && message.get("error").is_none())))
-        {
+        if !wire::valid(&message) {
             return fail(Value::Null, Failure(INVALID_REQUEST, "Invalid Request".into(), None));
         }
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -324,6 +326,7 @@ impl Acp {
         match method {
             "initialize" => {
                 self.initialized = true;
+                self.elicitation = params.pointer("/clientCapabilities/elicitation/form").is_some_and(Value::is_object);
                 self.notices = params.pointer("/clientCapabilities/session/notices").is_some_and(Value::is_object);
                 self.terminals = params.pointer("/clientCapabilities/_meta/terminal_output") == Some(&Value::Bool(true));
                 Ok(Some(json!({
@@ -358,49 +361,46 @@ impl Acp {
                 Ok(Some(json!({"sessionId": id, "modes": state.0, "configOptions": state.1})))
             }
             "session/load" => {
-                let host = self.host(params)?;
-                let file = host.sessions(usize::MAX).into_iter().find(|summary| summary.id == session_id).map(|summary| summary.path).ok_or_else(|| unknown_session(&session_id))?;
-                let session = Session::open(&file, &host.cwd).map_err(|error| Failure(INTERNAL_ERROR, error.to_string(), None))?;
-                if Path::new(&session.header().cwd) != host.cwd {
-                    return Err(invalid("cwd does not match the session"));
-                }
-                if let Some(listing) = host.listing(Some(&session), None).filter(|_| !self.sessions.contains_key(&session_id)) {
-                    return Ok(self.later(listing, method, params, id));
-                }
-                replay(&session_id, &session, &host.cwd, self.terminals);
-                if !self.sessions.contains_key(&session_id) {
-                    self.start(host.clone(), session, None, None)?;
-                }
-                let state = self.state(&session_id).await;
-                self.after.push((session_id.clone(), commands()));
-                self.session_notices(params, &session_id, &host);
-                Ok(Some(json!({"modes": state.0, "configOptions": state.1})))
+                let (host, inputs, params) = (self.host(params)?, self.inputs.clone(), params.clone());
+                let ticket = Arc::new(());
+                self.loads.insert(session_id.clone(), ticket.clone());
+                tokio::task::spawn_blocking(move || {
+                    let session = (|| {
+                        let files = crate::session::index::in_folder(&host.session_dir);
+                        let (file, _) = crate::session::index::exact(&files, &session_id, Some(&host.cwd)).ok_or_else(|| "Resource not found".to_string())?;
+                        let mut index = crate::session::index::Index::open(&host.agent_dir);
+                        let session = index.read(&file).map_err(|error| error.to_string())?;
+                        index.save();
+                        Ok(session)
+                    })();
+                    let _ = inputs.send(Input::Loaded(id, params, host, ticket, Box::new(session)));
+                });
+                Ok(None)
             }
             "session/list" => {
-                let mut listed = if params.get("cwd").and_then(Value::as_str).is_some() {
-                    self.host(params)?.sessions(usize::MAX)
-                } else if let Some(dir) = &self.args.session_dir {
-                    crate::host::sessions_in(Path::new(dir), None, usize::MAX)
-                } else {
-                    crate::host::all_sessions(&crate::config::agent_dir(), usize::MAX)
-                };
-                listed.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
-                let sessions: Vec<Value> = listed
-                    .into_iter()
-                    .map(|summary| {
+                let host = params.get("cwd").and_then(Value::as_str).map(|_| self.host(params)).transpose()?;
+                let (dir, agent_dir, inputs) = (self.args.session_dir.clone(), crate::config::agent_dir(), self.inputs.clone());
+                tokio::task::spawn_blocking(move || {
+                    let listed = if let Some(host) = host { host.sessions(usize::MAX) }
+                        else if let Some(dir) = dir { crate::host::indexed_sessions(&agent_dir, crate::session::index::in_folder(Path::new(&dir)), None, usize::MAX) }
+                        else { crate::host::all_sessions(&agent_dir, usize::MAX) };
+                    let sessions: Vec<Value> = listed.into_iter().map(|summary| {
                         let updated = summary.modified.duration_since(std::time::UNIX_EPOCH).map(|since| crate::clock::iso_from_ms(since.as_millis() as i64)).ok();
                         json!({"sessionId": summary.id, "cwd": summary.cwd, "title": summary.title, "updatedAt": updated})
-                    })
-                    .collect();
-                Ok(Some(json!({"sessions": sessions})))
+                    }).collect();
+                    let _ = inputs.send(Input::Listed(id, json!({"sessions": sessions})));
+                });
+                Ok(None)
             }
             "session/close" => {
+                self.loads.remove(&session_id);
                 self.asks.retain(|_, (session, ..)| session != &session_id);
+                self.forwarded.retain(|_, (session, ..)| session != &session_id);
                 if let Some(mut live) = self.sessions.remove(&session_id) {
                     drop(live.commands);
                     if tokio::time::timeout(STOP_WAIT, &mut live.task).await.is_err() {
-                        live.task.abort();
-                        let _ = live.task.await;
+                        // Detach rather than abort the runtime's close. Saves own their leases
+                        // independently too, in case EOF drops this LocalSet before they finish.
                         live.shared.jobs.shutdown("quit");
                         live.shared.web.shutdown();
                     }
@@ -459,6 +459,37 @@ impl Acp {
         }
     }
 
+    // Disk enumeration and parsing finish through the input queue, never by awaiting a worker
+    // in request dispatch. Runtime events and cancellation keep flowing during cold loads/lists.
+    async fn loaded(&mut self, id: Value, params: Value, host: Arc<Host>, ticket: Arc<()>, session: Result<Session, String>) {
+        let session_id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+        // Close or another load retires the ticket, including while model discovery is pending.
+        // The old request still gets its answer, but must not replay or reclaim the session.
+        if !self.loads.get(&session_id).is_some_and(|current| Arc::ptr_eq(current, &ticket)) {
+            fail(id, Failure(INVALID_REQUEST, "Session load was cancelled".into(), None));
+            return;
+        }
+        self.loads.remove(&session_id);
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => { fail(id, if error == "Resource not found" { unknown_session(&session_id) } else { Failure(INTERNAL_ERROR, error, None) }); return; }
+        };
+        if Path::new(&session.header().cwd) != host.cwd { fail(id, invalid("cwd does not match the session")); return; }
+        if let Some(listing) = host.listing(Some(&session), None).filter(|_| !self.sessions.contains_key(&session_id)) {
+            let inputs = self.inputs.clone();
+            self.loads.insert(session_id, ticket.clone());
+            tokio::task::spawn_local(async move { listing.await; let _ = inputs.send(Input::Loaded(id, params, host, ticket, Box::new(Ok(session)))); });
+            return;
+        }
+        replay(&session_id, &session, &host.cwd, self.terminals);
+        if !self.sessions.contains_key(&session_id) && let Err(error) = self.start(host.clone(), session, None, None) { fail(id, error); return; }
+        let state = self.state(&session_id).await;
+        reply(id, json!({"modes":state.0,"configOptions":state.1}));
+        update(&session_id, commands());
+        self.session_notices(&params, &session_id, &host);
+        for (session, after) in std::mem::take(&mut self.after) { update(&session, after); }
+    }
+
     // A request opening a session on a model whose list is still coming: this loop is asked it
     // again once the lists are in, and serves the other sessions meanwhile. Output: None, since
     // it's answered then.
@@ -495,6 +526,11 @@ impl Acp {
 
     // The client's answer to a permission request: allow once or always, else no.
     fn answered(&mut self, id: &Value, message: &Value) {
+        if let Some((_, reply)) = id.as_u64().and_then(|id| self.forwarded.remove(&id)) {
+            let result = message.get("result").cloned().ok_or_else(|| format!("Editor refused request: {}", message["error"]));
+            let _ = reply.send(result);
+            return;
+        }
         let Some((session, call_id, reply)) = id.as_u64().and_then(|id| self.asks.remove(&id)) else { return };
         if !self.sessions.get(&session).is_some_and(|live| live.open.contains_key(&call_id)) {
             return;
@@ -528,6 +564,25 @@ impl Acp {
         self.asks.insert(id, (session, call_id, reply));
     }
 
+    // Preserve the external agent's offered IDs, tool card and form. Only the session identity
+    // belongs to this server. An editor without form support gets an explicit unsupported error.
+    fn forward(&mut self, session: String, mut request: Interaction, reply: oneshot::Sender<Result<Value, String>>) {
+        if reply.is_closed() { return; }
+        self.forwarded.retain(|_, (_, reply)| !reply.is_closed());
+        let automatic = self.sessions.get(&session).is_some_and(|live| live.mode.get() == Mode::Auto
+            || (live.mode.get() == Mode::Edits && request.params.pointer("/toolCall/kind").and_then(Value::as_str) == Some("edit")));
+        if let Some(answer) = request.auto_allow(automatic) { let _ = reply.send(Ok(answer)); return; }
+        if request.method == "elicitation/create" && !self.elicitation {
+            let _ = reply.send(Err("Editor does not support elicitation forms".into()));
+            return;
+        }
+        let id = self.next_request;
+        self.next_request += 1;
+        request.params["sessionId"] = session.clone().into();
+        write_line(&wire::request(id.into(), &request.method, request.params));
+        self.forwarded.insert(id, (session, reply));
+    }
+
     fn event(&mut self, session: &str, event: Event) {
         let Some(live) = self.sessions.get_mut(session) else { return };
         if live.muted > 0 {
@@ -548,9 +603,13 @@ impl Acp {
             }
             Event::MessageEnd { message: AgentMessage::Assistant(assistant), .. } => {
                 let usage = &assistant.usage;
-                let used = usage.input + usage.output + usage.cache_read + usage.cache_write;
+                let used = crate::provider::estimate::context_tokens(usage);
                 live.cost.add(usage, &assistant.provider);
-                if used > 0 {
+                if let Some(reported) = &usage.reported {
+                    // Session context and cumulative cost belong to the reporting agent. Forward
+                    // that reading, not a fabricated per-turn tally or a zero catalog limit.
+                    update(session, reported.clone());
+                } else if used > 0 {
                     live.used = used;
                     usage_update(session, live);
                 }
@@ -588,6 +647,12 @@ impl Acp {
                 live.open.insert(tool_call_id, OpenCall { name: tool_name, arguments: args, path, before, shown: String::new() });
             }
             Event::ToolExecutionUpdate { tool_call_id, partial_result, .. } if live.open.contains_key(&tool_call_id) => {
+                if let Some(raw) = partial_result.pointer("/details/acp") {
+                    let mut raw = raw.clone();
+                    raw["sessionUpdate"] = "tool_call_update".into();
+                    update(session, raw);
+                    return;
+                }
                 let text = output_text(&partial_result);
                 let mut message = json!({"sessionUpdate": "tool_call_update", "toolCallId": tool_call_id, "status": "in_progress"});
                 match live.open.get_mut(&tool_call_id).filter(|call| self.terminals && call.name == "bash") {
@@ -599,6 +664,12 @@ impl Acp {
             Event::ToolExecutionEnd { tool_call_id, result, is_error, .. } => {
                 self.asks.retain(|_, (asked_session, call_id, _)| asked_session != session || call_id != &tool_call_id);
                 let call = live.open.remove(&tool_call_id);
+                if let Some(raw) = result.pointer("/details/acp") {
+                    let mut raw = raw.clone();
+                    raw["sessionUpdate"] = "tool_call_update".into();
+                    update(session, raw);
+                    return;
+                }
                 let after = call.as_ref().filter(|call| !is_error && call.before.is_some()).and_then(|call| call.path.as_deref()).and_then(read_small);
                 let content = match (call.as_ref(), after) {
                     (Some(OpenCall { path: Some(path), before: Some(before), .. }), Some(after)) => json!([{"type": "diff", "path": path, "oldText": before, "newText": after}]),
@@ -637,9 +708,9 @@ impl Acp {
         let Some(live) = self.sessions.get_mut(session) else { return };
         live.model = done.model;
         live.thinking = done.thinking;
-        // A check-in or job report has no frontend command slot, even when a client prompt is
-        // waiting behind it. Its stop reason must not become that prompt's outcome either.
-        if done.notice {
+        // A notice or socket command has no frontend slot, even with a client prompt behind it.
+        // Neither its completion nor its stop reason belongs to that waiting prompt.
+        if !done.frontend {
             live.stop = None;
             live.error = None;
             return;
@@ -661,6 +732,7 @@ impl Acp {
         }
         live.prompt = None;
         self.asks.retain(|_, (asked_session, ..)| asked_session != session);
+        self.forwarded.retain(|_, (asked_session, ..)| asked_session != session);
         live.prompts += 1;
         for (call_id, _) in live.open.drain() {
             update(session, json!({"sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": "failed", "content": [{"type": "content", "content": text_block("Cancelled.")}]}));
@@ -742,6 +814,16 @@ impl Acp {
         let first_mode = if self.args.yolo { Mode::Auto } else { Mode::Ask };
         let (mode, always) = (Rc::new(Cell::new(first_mode)), Rc::new(RefCell::new(HashSet::new())));
         agent.set_gate(gate(self.inputs.clone(), id.clone(), serial, mode.clone(), always.clone()));
+        agent.set_elicitation_support(self.elicitation);
+        let (inputs, session) = (self.inputs.clone(), id.clone());
+        agent.set_interaction(Arc::new(move |request| {
+            let (inputs, session) = (inputs.clone(), session.clone());
+            Box::pin(async move {
+                let (reply, answer) = oneshot::channel();
+                inputs.send(Input::ExternalAsk { session, serial, request, reply }).map_err(|_| "Editor disconnected")?;
+                answer.await.map_err(|_| "Editor cancelled the request")?
+            })
+        }));
         let titled = crate::host::name(&agent.session).is_some() || agent.session.context().messages.iter().any(|message| matches!(message, AgentMessage::User(_)));
         let mut cost = crate::provider::responses::Tally::default();
         for message in agent.session.context().messages {
@@ -755,9 +837,8 @@ impl Acp {
         let reports = (self.inputs.clone(), id.clone());
         let finishes = runs.clone();
         let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
-            // sent counts frontend commands only; notice turns must not advance cancellation
-            // past a queued client prompt that has not run yet.
-            if !done.notice { finishes.lock().unwrap().finished += 1; }
+            // sent counts frontend commands only, not notices or commands from the socket.
+            if done.frontend { finishes.lock().unwrap().finished += 1; }
             let _ = reports.0.send(Input::Done(reports.1.clone(), serial, Box::new(done)));
         });
         let live = Live {

@@ -111,7 +111,7 @@ fn list_copy(agent_dir: &Path, provider: &str) -> PathBuf {
 // provider with a baseUrl and no models of its own.
 fn listed_providers(file: &ModelsFile) -> Vec<String> {
     let known = crate::auth::ACCOUNTS.iter().map(|account| account.provider.to_string());
-    let configured = file.providers.iter().filter(|(id, config)| crate::auth::account(id).is_none() && config.base_url.is_some() && config.models.is_empty());
+    let configured = file.providers.iter().filter(|(id, config)| crate::auth::account(id).is_none() && (config.base_url.is_some() || config.api.as_deref() == Some(crate::provider::acp_client::API)) && config.models.is_empty());
     known.chain(configured.map(|(id, _)| id.clone())).collect()
 }
 
@@ -219,6 +219,10 @@ fn keep_list(copy: &Path, models: &[Value]) -> std::io::Result<()> {
 async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&ProviderConfig>, paths: &crate::auth::CredentialPaths, settings: &crate::config::Settings) -> Result<(Vec<Value>, Vec<String>), String> {
     type Convert = Box<dyn Fn(&Value) -> Option<Value> + Send>;
     use crate::auth::Owner;
+    if let Some(config) = config.filter(|config| config.api.as_deref() == Some(crate::provider::acp_client::API)) {
+        let models = tokio::time::timeout(list_seconds(settings, "models.timeoutSeconds", LIST_TIMEOUT_S), crate::provider::acp_client::offered_models(config)).await.map_err(|_| "ACP discovery timed out")??;
+        return checked(provider, models.into_iter(), None);
+    }
     let credential = crate::auth::credential_for(provider, config, paths).await;
     let owner = crate::auth::account(provider).map(|account| &account.owner);
     // Claude counts as connected only with Claude Code found and logged in (auth.rs), and its
@@ -277,6 +281,7 @@ async fn fetch_list(client: &reqwest::Client, provider: &str, config: Option<&Pr
 // run through the bridge.
 fn home(provider: &str, config: Option<&ProviderConfig>) -> Result<Option<url::Origin>, String> {
     use crate::auth::Owner;
+    if config.is_some_and(|config| config.api.as_deref() == Some(crate::provider::acp_client::API)) { return Ok(None); }
     let base = config.and_then(|config| config.base_url.as_deref());
     let base = match crate::auth::account(provider).map(|account| &account.owner) {
         Some(Owner::ClaudeCode) => return Ok(None),
@@ -464,7 +469,11 @@ pub struct Model {
     pub name: String,
     pub api: String,
     pub provider: String,
+    #[serde(default)]
     pub base_url: String,
+    // Configured per provider, not intrinsic to ACP: some agents permit interactive use only.
+    #[serde(default)]
+    pub interactive_only: bool,
     #[serde(default)]
     pub reasoning: bool,
     // "text", and "image" when it takes images.
@@ -530,6 +539,20 @@ struct ModelsFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
+    // ACP: executable and argv, without a shell. Authentication stays with that executable.
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub interactive_only: bool,
+    // Extra select values, validated against the agent's current configOptions before sending.
+    #[serde(default)]
+    pub config_options: IndexMap<String, String>,
+    // Optional provider-owned model restriction (a regex); discovery still supplies the IDs.
+    pub model_filter: Option<String>,
+    // An agent-specific system-prompt extension, with {systemPrompt} replaced by our sections.
+    // Omitted by default; an ACP agent without an append capability gets labelled instructions
+    // as the first prompt's context instead.
+    pub session_meta: Option<Value>,
     pub base_url: Option<String>,
     // The key, or `$VAR`, or `!command` whose output is the key. See auth.rs.
     pub api_key: Option<String>,
@@ -541,6 +564,12 @@ pub struct ProviderConfig {
     // Per-model field overrides, applied last.
     #[serde(default)]
     pub model_overrides: IndexMap<String, Map<String, Value>>,
+}
+
+impl ProviderConfig {
+    pub fn accepts_model(&self, id: &str) -> Result<bool, String> {
+        self.model_filter.as_deref().map_or(Ok(true), |filter| regex::Regex::new(filter).map(|filter| filter.is_match(id)).map_err(|error| format!("modelFilter: {error}")))
+    }
 }
 
 // Every model piccosta knows, and each provider's models.json settings.
@@ -652,6 +681,9 @@ impl ModelRegistry {
         for (provider, list) in models_by_provider {
             for mut raw in list {
                 raw.entry("provider").or_insert(Value::String(provider.clone()));
+                if let Some(config) = file.providers.get(&provider) && !config.accepts_model(raw.get("id").and_then(Value::as_str).unwrap_or_default())? { continue; }
+                let interactive = file.providers.get(&provider).is_some_and(|config| config.interactive_only);
+                raw.insert("interactiveOnly".into(), interactive.into());
                 let id = raw.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
                 let model: Model = serde_json::from_value(Value::Object(raw))
                     .map_err(|error| format!("model {provider}/{id}: {error}"))?;

@@ -100,12 +100,13 @@ pub fn transform_messages(
                             keep.then(|| block.clone())
                         }
                         Content::Text { text, .. } if !same_model => Some(Content::text(text.clone())),
-                        Content::ToolCall { id, name, arguments, namespace, arguments_error, .. } if !same_model => {
+                        Content::ToolCall { external, id, name, arguments, namespace, arguments_error, .. } if !same_model => {
                             let new_id = normalize_tool_call_id(id, assistant);
                             if &new_id != id {
                                 renamed_ids.insert(id.clone(), new_id.clone());
                             }
                             Some(Content::ToolCall {
+                                external: *external,
                                 id: new_id,
                                 name: name.clone(),
                                 arguments: arguments.clone(),

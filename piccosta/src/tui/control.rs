@@ -136,8 +136,10 @@ pub fn cli(arguments: &[String]) -> Result<(), String> {
 }
 
 impl App {
-    pub(super) fn control(&mut self, mut request: Request) {
-        if request.answer.is_closed() { self.retire(request); return; }
+    // Output: whether the request could change the screen. Reading status must not repaint it.
+    pub(super) fn control(&mut self, mut request: Request) -> bool {
+        if request.answer.is_closed() { self.retire(request); return false; }
+        let redraw = request.value["do"] != "status";
         let restart = request.value["do"] == "restart";
         let result = match request.value["do"].as_str() {
             Some("status") => Ok(json!({
@@ -160,6 +162,7 @@ impl App {
         // Only exec needs the wire acknowledgement. The event loop still takes input and updates
         // while a slow client reads; ordinary replies never hold up another request.
         if restart { self.restart_replies.push(request.written); }
+        redraw
     }
 
     fn open_background(&mut self, reader: crate::session::Follower) -> Result<(), String> {

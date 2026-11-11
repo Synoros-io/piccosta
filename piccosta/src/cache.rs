@@ -92,21 +92,12 @@ pub fn line(miss: &Value) -> String {
 pub fn report(agent_dir: &Path, hours: Option<&str>) -> String {
     let hours = hours.and_then(|hours| hours.parse().ok()).unwrap_or(DEFAULT_REPORT_HOURS);
     let since = crate::clock::now_ms() - hours * 60 * 60 * 1000;
-    let listing = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()).collect::<Vec<_>>();
-    let folders = listing(&agent_dir.join("sessions"));
-    let files = folders.iter().flat_map(|dir| [listing(dir), listing(&dir.join("subagents"))]).flatten().filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"));
     let changed_since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(since.max(0) as u64);
-    let mut misses: Vec<(i64, String, Value)> = Vec::new();
-    for path in files.filter(|path| path.metadata().and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= changed_since)) {
-        let Ok(session) = Session::read(&path) else { continue };
-        let project = Path::new(&session.header().cwd).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-        for entry in session.entries() {
-            let SessionEntry::Custom { custom_type, data: Some(miss), .. } = entry else { continue };
-            if let Some(time) = crate::clock::ms_from_iso(&entry.base().timestamp).filter(|time| custom_type == MISS_TYPE && *time >= since) {
-                misses.push((time, project.clone(), miss.clone()));
-            }
-        }
-    }
+    let files = crate::session::index::folders(agent_dir).into_iter().flat_map(|folder| [crate::session::index::in_folder(&folder), crate::session::index::in_folder(&folder.join("subagents"))]).flatten()
+        .filter(|path| path.metadata().and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= changed_since)).collect::<Vec<_>>();
+    let mut index = crate::session::index::Index::open(agent_dir);
+    let mut misses = index.misses(&files, since);
+    index.save();
     misses.sort_by_key(|(time, ..)| *time);
     let written = |miss: &Value| miss["written"].as_u64().unwrap_or(0);
     let mut causes: Vec<(&str, u64, usize)> = Vec::new();

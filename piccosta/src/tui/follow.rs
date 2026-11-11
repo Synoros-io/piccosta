@@ -31,7 +31,8 @@ impl Transcript {
                 }
                 if let Some(before) = self.messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))) { self.cache.remove(&before); }
                 let usage = &reply.usage;
-                if usage.total_tokens > 0 { self.context_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write; }
+                let used = crate::provider::estimate::context_tokens(usage);
+                if used > 0 { self.context_tokens = used; }
                 self.cost.add(usage, &reply.provider);
             }
             AgentMessage::ToolResult(result) => {
@@ -172,10 +173,11 @@ impl Worker {
             }
         }
         let mut models = HashMap::new();
+        let mut index = None;
         let statuses = files.iter().map(|file| {
             let status = crate::runtime::status(file);
             if status.is_some() && !known.contains(file) {
-                let model = Session::read(file).ok().and_then(|session| session.state().0).map_or(String::new(), |(_, id)| id);
+                let model = index.get_or_insert_with(|| crate::session::index::Index::open(&host.agent_dir)).metadata(file).ok().and_then(|metadata| metadata.1).map_or(String::new(), |(_, id)| id);
                 models.insert(file.clone(), model);
             }
             (file.clone(), status)
@@ -188,15 +190,18 @@ impl Worker {
                 let folder = entry.path();
                 let Some(modified) = entry.metadata().ok().and_then(|metadata| metadata.modified().ok()) else { continue };
                 if self.folder_times.get(&folder) == Some(&modified) { continue; }
-                summaries.extend(crate::host::sessions_matching(&folder, None, usize::MAX, |path, modified| {
-                    modified >= started && !known.contains(&crate::tools::paths::canonical(path)) && !closed.contains_key(&crate::tools::paths::canonical(path))
-                }).into_iter().filter(|summary| summary.cwd.is_dir()));
+                for (modified, path) in crate::session::index::newest(crate::session::index::in_folder(&folder)) {
+                    let canonical = crate::tools::paths::canonical(&path);
+                    if modified < started || known.contains(&canonical) || closed.contains_key(&canonical) { continue; }
+                    if let Ok(summary) = index.get_or_insert_with(|| crate::session::index::Index::open(&host.agent_dir)).summary(&path, modified, false)
+                        && summary.cwd.is_dir() { summaries.push(summary); }
+                }
                 self.folder_times.insert(folder, modified);
             }
         }
         projects.extend(summaries.iter().map(|summary| summary.cwd.clone()));
         let managers = if discover || !projects.is_empty() { managers(&host, projects) } else { Vec::new() };
-        Scan { statuses, models, modified, tickets, closed, closed_before, summaries, managers, agents }
+        Scan { statuses, models, modified, tickets, closed, closed_before, summaries, managers, agents, index }
     }
 }
 
@@ -233,4 +238,5 @@ pub(super) struct Scan {
     pub summaries: Vec<crate::host::SessionSummary>,
     pub managers: Managers,
     pub agents: bool,
+    pub index: Option<crate::session::index::Index>,
 }

@@ -41,6 +41,9 @@
 //   CLAUDE_BRIDGE_HOLD_SECONDS, holdSeconds     how long a query whose turn is over waits for the
 //                                  next message (default the login's cache life, hold_time; 0 ends
 //                                  it with each turn)
+//   CLAUDE_BRIDGE_PERSISTENCE_SECONDS, persistenceSeconds   max wait for persistence, locks and
+//                                  close fences (default the SDK shutdown grace, 9 s). Timeout
+//                                  fails the turn; a started worker keeps ownership until it ends.
 //   CLAUDE_BRIDGE_HOLD_MAX, holdMax         how many such queries may wait at once in this piccosta
 //                                  process (default HOLD_MAX); past it the one with the smallest
 //                                  context closes, never a manager's
@@ -68,18 +71,28 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
+use super::child::{Child, CLOSE_GRACE};
+pub(crate) use super::child::TERM_GRACE;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const PROVIDER: &str = "claude-bridge";
+
+pub(crate) fn persistence_timeout() -> Duration { SETTINGS.persistence }
+pub(crate) fn sidecars(file: &Path) -> [PathBuf; 2] {
+    let sidecar = PathBuf::from(format!("{}{SIDECAR_SUFFIX}", file.display()));
+    let lock = history::lock_path(&sidecar);
+    [sidecar, lock]
+}
+pub(crate) fn deletion_lock(file: &Path) -> std::io::Result<std::fs::File> {
+    history::lock_sidecar(&sidecars(file)[0], &AtomicBool::new(false))
+}
 const MCP_SERVER: &str = "custom-tools";
 pub const MCP_TOOL_PREFIX: &str = "mcp__custom-tools__";
 // Claude Code keeps a tool result over 50,000 characters out of the conversation (a preview and a
@@ -158,9 +171,6 @@ const STOPPED_CALL: &str = "Not run: the user stopped this turn. Wait for their 
 // How long a non-streamed answer's last tool call waits for another block before the turn ends:
 // Claude Code writes all of a message's blocks at once (pi-claude-bridge #225).
 const FALLBACK_SETTLE: Duration = Duration::from_millis(100);
-// Closing a child: stdin ends, then SIGTERM after 2 s, then SIGKILL after 5 more (the SDK's close).
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
-pub(crate) const TERM_GRACE: Duration = Duration::from_secs(5);
 // The longest shutdown waits for the queries' tasks to close their children that way.
 const SHUTDOWN_WAIT: Duration = CLOSE_GRACE.saturating_add(TERM_GRACE).saturating_add(CLOSE_GRACE);
 // How long a query that answered stays open for the next message: the life of the prompt cache it
@@ -179,9 +189,6 @@ const HOLD_MAX: usize = 4;
 // MCP_RESULT_MAX_CHARS were read in this binary. A newer one gets a notice, since any of them
 // could have been renamed.
 const VERIFIED_VERSION: &str = "2.1.322";
-// How much of a child's stderr is kept for a failure message: its last lines, where a refused
-// option or a failed login is reported, without carrying a long log into the session.
-const STDERR_TAIL: usize = 4096;
 // How long `claude auth status` or `claude --version` gets before it's killed and taken as no
 // answer: a normal one is done well inside it, and a hung one holds up registry loading or a turn
 // for no longer. PROBE_OUTPUT_MAX is how much of its output is kept, far more than a version or a
@@ -202,6 +209,7 @@ pub struct Settings {
     // None: the login's cache life (hold_time).
     hold: Option<Duration>,
     hold_max: usize,
+    persistence: Duration,
     strict_mcp: bool,
     no_thinking_off: Vec<String>,
     extra_usage: bool,
@@ -242,6 +250,7 @@ pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
         keep: setting("KEEP_SESSIONS", "keepSessions").is_none_or(|keep| is_on(&keep)),
         hold: if hold_max == 0 { Some(Duration::ZERO) } else { hold },
         hold_max,
+        persistence: setting("PERSISTENCE_SECONDS", "persistenceSeconds").and_then(|seconds| seconds.parse().ok()).map(Duration::from_secs).unwrap_or(SHUTDOWN_WAIT),
         strict_mcp: setting("STRICT_MCP", "strictMcp").is_none_or(|strict| is_on(&strict)),
         no_thinking_off: list("NO_THINKING_OFF", "noThinkingOff", &NO_THINKING_OFF),
         extra_usage: setting("LONG_CONTEXT_EXTRA_USAGE", "longContextExtraUsage").is_some_and(|extra| is_on(&extra)),
@@ -443,7 +452,7 @@ async fn ask_alone(subtype: &str) -> Result<Value, String> {
     let id = request_id();
     child.send(&json!({"type": "control_request", "request_id": id, "request": {"subtype": subtype}})).await;
     let answer = timeout(OFFERED_WAIT, async {
-        while let Some(line) = child.next_line().await {
+        while let Some(line) = child.next_line(None).await {
             let message: Value = serde_json::from_str(&line).unwrap_or_default();
             if message["type"] == "control_response" && message["response"]["request_id"] == id.as_str() {
                 return Some(message);
@@ -535,26 +544,6 @@ fn effort(model: &Model, level: &str) -> Option<String> {
 
 // --- The child process ---
 
-// A claude: its pid and its three pipes. It's waited for and reaped by hand (wait), not by tokio,
-// so one waiting for its session's next message can go to the image /restart execs, where it's
-// still this process's child (hand_over, adopt).
-struct Child {
-    pid: u32,
-    // How it exited, once it has and was reaped here; from then on its pid may be another process's.
-    status: Option<ExitStatus>,
-    stdin: Option<ChildStdin>,
-    // Its stdout, and the line being read from it: a read stopped midway leaves its part there.
-    stdout: BufReader<ChildStdout>,
-    line: Vec<u8>,
-    // The last STDERR_TAIL bytes of its stderr, and the task keeping them, stopped by stderr_tail or
-    // when the child is dropped, so a descendant holding stderr open can't keep it alive; and a copy
-    // of that pipe's descriptor, held for its life (the reader's goes with the reader), for a handover.
-    stderr: Arc<Mutex<Vec<u8>>>,
-    stderr_reader: Option<tokio::task::JoinHandle<()>>,
-    #[cfg(unix)]
-    stderr_fd: std::os::fd::OwnedFd,
-}
-
 fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String> {
     version();
     let mut command = claude_command();
@@ -570,144 +559,9 @@ fn spawn(args: &[String], cwd: &str, resumes_turn: bool) -> Result<Child, String
     start(command)
 }
 
-// Start a claude. It's killed when its Child is dropped unreaped, and ends with this piccosta
-// however that ends: the kernel sends it SIGKILL as the thread that started it ends (bash.rs spawn
-// says when that is), which is after every query has had its chance to close it (shutdown).
-fn start(mut command: std::process::Command) -> Result<Child, String> {
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    crate::proc::parent_death(&mut command);
-    let mut process = command.spawn().map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))?;
-    let child = Child::new(process.id(), process.stdin.take(), process.stdout.take(), process.stderr.take(), Vec::new()).map_err(|error| {
-        let _ = process.kill().and_then(|()| process.wait());
-        format!("Claude Code's pipes: {error}")
-    })?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        crate::proc::attach(child.pid).map_err(|error| format!("Claude Code job: {error}"))?;
-        crate::tools::reaper::track(child.pid, true);
-    }
-    Ok(child)
-}
-
-// However a child ends, its stderr reader goes when it's dropped. One never reaped here is killed,
-// and a thread reaps it.
-impl Drop for Child {
-    fn drop(&mut self) {
-        #[cfg(not(target_os = "linux"))]
-        {
-            crate::proc::signal_group(self.pid, crate::proc::KILL);
-            crate::proc::release(self.pid);
-            crate::tools::reaper::track(self.pid, false);
-        }
-        if self.status.is_none() {
-            self.signal(crate::proc::KILL);
-            #[cfg(unix)]
-            {
-                let pid = self.pid as libc::pid_t;
-                // SAFETY: waitpid on this process's own child, which nothing else reaps.
-                std::thread::spawn(move || unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) });
-            }
-        }
-        if let Some(reader) = &self.stderr_reader {
-            reader.abort();
-        }
-    }
-}
-
-impl Child {
-    // A claude from its pid and pipes: one this image started, or one the image before handed over
-    // (with the stderr tail it had read).
-    fn new(pid: u32, stdin: Option<std::process::ChildStdin>, stdout: Option<std::process::ChildStdout>, stderr: Option<std::process::ChildStderr>, tail: Vec<u8>) -> std::io::Result<Child> {
-        let missing = || std::io::Error::other("a pipe is missing");
-        let (stdin, stdout, stderr) = (ChildStdin::from_std(stdin.ok_or_else(missing)?)?, ChildStdout::from_std(stdout.ok_or_else(missing)?)?, stderr.ok_or_else(missing)?);
-        #[cfg(unix)]
-        let stderr_fd = std::os::fd::AsFd::as_fd(&stderr).try_clone_to_owned()?;
-        let mut pipe = tokio::process::ChildStderr::from_std(stderr)?;
-        let stderr = Arc::new(Mutex::new(tail));
-        let tail = stderr.clone();
-        let stderr_reader = Some(tokio::spawn(async move {
-            let mut chunk = [0u8; STDERR_TAIL];
-            while let Ok(read) = pipe.read(&mut chunk).await && read > 0 {
-                let mut tail = lock(&tail);
-                tail.extend_from_slice(&chunk[..read]);
-                let excess = tail.len().saturating_sub(STDERR_TAIL);
-                tail.drain(..excess);
-            }
-        }));
-        Ok(Child { pid, status: None, stdin: Some(stdin), stdout: BufReader::new(stdout), line: Vec::new(), stderr, stderr_reader,
-            #[cfg(unix)]
-            stderr_fd,
-        })
-    }
-
-    // Wait for it to exit and reap it, once.
-    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        if let Some(status) = self.status {
-            return Ok(status);
-        }
-        let status = crate::proc::wait(self.pid).await?;
-        self.status = Some(status);
-        Ok(status)
-    }
-
-    // A signal, only while it's unreaped and its pid still its own.
-    fn signal(&self, signal: i32) {
-        if self.status.is_none() && let Some(process) = crate::proc::Process::open(self.pid as i32) {
-            process.signal(signal);
-        }
-    }
-
-    // The next line it writes, None at the end of its output. A call dropped midway (another branch
-    // of a select won) leaves what it read in `line`, and the next goes on from there.
-    async fn next_line(&mut self) -> Option<String> {
-        if self.stdout.read_until(b'\n', &mut self.line).await.ok()? == 0 { return None; }
-        Some(String::from_utf8_lossy(std::mem::take(&mut self.line).trim_ascii_end()).into_owned())
-    }
-
-    // One protocol message, one line. A child that stopped reading just loses the rest.
-    async fn send(&mut self, message: &Value) {
-        if let Some(stdin) = &mut self.stdin
-            && stdin.write_all(format!("{message}\n").as_bytes()).await.is_err()
-        {
-            self.stdin = None;
-        }
-    }
-
-    // End its input, then SIGTERM and SIGKILL if it doesn't go. Output: how it exited.
-    async fn close(&mut self) -> Option<ExitStatus> {
-        self.stdin = None;
-        let mut status = timeout(CLOSE_GRACE, self.wait()).await.ok().and_then(Result::ok);
-        if status.is_none() {
-            self.signal(crate::proc::TERM);
-            status = timeout(TERM_GRACE, self.wait()).await.ok().and_then(Result::ok);
-        }
-        if status.is_none() {
-            self.signal(crate::proc::KILL);
-            let _ = self.wait().await;
-        }
-        status
-    }
-
-    // What it last wrote to stderr, once it has exited, for a failure message and the debug log:
-    // empty when it wrote nothing. Something it started that keeps stderr open past CLOSE_GRACE gets
-    // its reader stopped, and what was read by then is the tail.
-    async fn stderr_tail(&mut self) -> String {
-        if let Some(reader) = &mut self.stderr_reader {
-            let _ = timeout(CLOSE_GRACE, &mut *reader).await;
-            reader.abort();
-            self.stderr_reader = None;
-        }
-        let tail = self.stderr_so_far();
-        if !tail.is_empty() {
-            debug(&format!("Claude Code's stderr: {tail}"));
-        }
-        tail
-    }
-
-    // What it has written to stderr so far, without waiting for more.
-    fn stderr_so_far(&self) -> String {
-        String::from_utf8_lossy(&lock(&self.stderr)).trim().to_string()
-    }
+// The pipes and process ownership are shared with ACP; Claude's environment and handshake aren't.
+fn start(command: std::process::Command) -> Result<Child, String> {
+    Child::start(command).map_err(|error| format!("Claude Code could not be started ({}): {error}", SETTINGS.claude))
 }
 
 // A failure with the child's stderr after it, when it wrote any.
@@ -825,7 +679,7 @@ fn usage_of<'a>(requests: impl Iterator<Item = &'a Counters>) -> Usage {
         sum.cache_write_1h += request.cache_write_1h;
         sum.reasoning = request.reasoning.map(|reasoning| sum.reasoning.unwrap_or(0) + reasoning).or(sum.reasoning);
     }
-    Usage { input: sum.input, output: sum.output, cache_read: sum.cache_read, cache_write: sum.cache_write, cache_write_1h: Some(sum.cache_write_1h),
+    Usage { tokens_unknown: false, reported: None, input: sum.input, output: sum.output, cache_read: sum.cache_read, cache_write: sum.cache_write, cache_write_1h: Some(sum.cache_write_1h),
         reasoning: sum.reasoning, total_tokens: sum.input + sum.output + sum.cache_read + sum.cache_write, cost: Default::default() }
 }
 
@@ -916,6 +770,9 @@ struct State {
     context: u64,
     manager: bool,
     kept_base: (Vec<String>, Vec<String>),
+    // Bound to this query's attachment, never looked up again by a late worker after close.
+    kept: Option<history::Handle>,
+    ownership: Option<std::sync::Weak<crate::runtime::Ownership>>,
     // Whether Claude Code was told fast mode is on (/fast).
     fast: bool,
 }
@@ -1041,7 +898,7 @@ pub fn adopt(handed: Vec<Handed>) {
             lock(&NOTES).insert(query.key.clone(), notice);
         }
         let state = Arc::new(Mutex::new(State { shape: query.shape.clone(), prints: query.prints, pending: None, waiting: true, stopped: false,
-            context: context(&query.requests), manager: query.manager, kept_base: Default::default(), fast: query.fast.0 }));
+            context: context(&query.requests), manager: query.manager, kept_base: Default::default(), kept: None, ownership: None, fast: query.fast.0 }));
         let (commands, inbox) = mpsc::unbounded_channel();
         let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
         let mut adopted = Query::new(id, &query.key, query.model, &[], child, inbox, state.clone(), query.project_path, &query.cwd, query.shape, query.written);
@@ -1109,13 +966,14 @@ pub fn end_run(session_id: &str) {
 
 // A pi session closed, deleted or replaced: its query, waiting or not, ends now rather than when
 // its cache lapses.
-pub fn close(session_id: &str) {
+pub async fn close(session_id: &str) -> Result<(), String> {
     lock(&LIVE).retain(|(session, _), live| {
         if session == session_id {
             let _ = live.commands.send(Command::Discard("the session was closed".into()));
         }
         session != session_id
     });
+    history::close(session_id).await.map_err(|error| error.to_string())
 }
 
 // Whether the session's query waits for its next message, or for the results of the calls it's
@@ -1195,7 +1053,13 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     let cwd = request.cwd.to_string_lossy().into_owned();
     let key = request.session_id.unwrap_or("(none)").to_string();
     let shape = history::shape(&system_prompt, &tools, cli_model, if thinking_off { Some("off") } else { effort.as_deref() }, &cwd);
-    history::attach(&key, request.session_file);
+    let ownership = match request.ownership.as_ref().map(crate::runtime::Ownership::retain).transpose() {
+        Ok(ownership) => ownership,
+        Err(error) => return failed(model, StopReason::Error, &error.to_string()),
+    };
+    if let Err(error) = history::attach(&key, request.session_file, ownership).await {
+        return failed(model, StopReason::Error, &error.to_string());
+    }
     let prints: Vec<String> = messages.iter().map(fingerprint).collect();
     // A run stopped before its call got here leaves the session's query as Esc leaves Claude Code's,
     // and starts nothing. A waiting one waits on; one parked on the calls whose results this call
@@ -1216,7 +1080,7 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
     loop {
         let (reply, answer) = oneshot::channel();
         let turn = Turn { events: events.clone(), reply, cancel: request.cancel.clone() };
-        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, request.manager, forced.take(), turn) {
+        let (reason, turn) = match deliver(&key, &messages, &prints, &shape, fast, request.manager, forced.take(), turn, &request.ownership) {
             Ok(()) => match answer.await {
                 Ok(message) => {
                     if let Some(prints) = before && let Some(live) = lock(&LIVE).get(&history::query_key(&key, &shape)) {
@@ -1235,9 +1099,9 @@ async fn stream_as(request: &Request<'_>, events: &mpsc::UnboundedSender<StreamE
         debug(&format!("sync: rewrite, {reason} (session {key})"));
         lock(&REWRITES).insert(key.clone(), reason.clone());
         let start = Start { key: &key, model, cli_model, effort: effort.as_deref(), thinking_off, fast, system_prompt: &system_prompt,
-            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, manager: request.manager };
-        if let Err(error) = start_query(start, turn) {
-            return failed(model, StopReason::Error, &error);
+            tools: &tools, messages: &messages, prints: &prints, shape: &shape, cwd: &cwd, manager: request.manager, ownership: &request.ownership };
+        if let Err(error) = start_query(start, turn).await {
+            return failed(model, if request.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error }, &error);
         }
         return answer.await.unwrap_or_else(|_| failed(model, StopReason::Error, "Claude Code ended the query without answering"));
     }
@@ -1272,7 +1136,7 @@ fn fold_into_results(messages: impl Iterator<Item = Message>) -> Vec<Message> {
 // the sync check allows it. Output: Ok once they're sent (the next turn streams into `turn`), else
 // the rewrite reason and the turn back; the live query, if any, is discarded then.
 #[allow(clippy::too_many_arguments)]
-fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, manager: bool, forced: Option<String>, turn: Turn) -> Result<(), (String, Turn)> {
+fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fast: bool, manager: bool, forced: Option<String>, turn: Turn, ownership: &Option<std::sync::Weak<crate::runtime::Ownership>>) -> Result<(), (String, Turn)> {
     let query_key = history::query_key(key, shape);
     let (mut live, mut unfolded) = (lock(&LIVE), None);
     let decision = match (forced, live.get(&query_key)) {
@@ -1299,6 +1163,8 @@ fn deliver(key: &str, messages: &[Message], prints: &[String], shape: &Shape, fa
     // Fast mode is a request field, not part of the prompt, so a running query takes it as it is.
     // Whether it's a manager's, from the session each turn (a query adopted from an older piccosta lacks it).
     state.manager = manager;
+    if state.kept.is_none() { state.kept = history::handle(key); }
+    if state.ownership.is_none() { state.ownership = ownership.clone(); }
     if state.fast != fast {
         state.fast = fast;
         let _ = entry.commands.send(Command::Fast(fast));
@@ -1363,12 +1229,13 @@ struct Start<'a> {
     shape: &'a Shape,
     cwd: &'a str,
     manager: bool,
+    ownership: &'a Option<std::sync::Weak<crate::runtime::Ownership>>,
 }
 
 // Start a query holding exactly pi's context: the history in a fresh session file it resumes, the
 // trailing user turn as its opening prompt; or, when the turn starts at tool results, all of it in
 // the history, for Claude Code to answer on resume.
-fn start_query(start: Start, turn: Turn) -> Result<(), String> {
+async fn start_query(start: Start<'_>, turn: Turn) -> Result<(), String> {
     let visible: Vec<Message> = start.messages.iter().filter(history::visible).cloned().collect();
     let (history_end, prompt, continued) = history::split(&visible);
     // A context whose last turn starts at tool results goes into the history whole, and Claude Code
@@ -1377,21 +1244,28 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     let history_end = if resumes_turn { visible.len() } else { history_end };
     let project_path = history::real_or(start.cwd);
     let written = if history_end > 0 {
-        let history = &visible[..history_end];
-        let prints: Vec<String> = history.iter().map(fingerprint).collect();
-        let id = history::write_session(start.key, history, &prints, start.cwd, &project_path, start.tools, start.cli_model, start.shape)
-            .map_err(|error| format!("Could not write Claude Code's session file: {error}"))?;
-        Some(id)
+        let history = visible[..history_end].to_vec();
+        let (key, cwd, project, tools, model, shape) = (start.key.to_string(), start.cwd.to_string(), project_path.clone(), start.tools.to_vec(), start.cli_model.to_string(), start.shape.clone());
+        let ownership = start.ownership.as_ref().map(crate::runtime::Ownership::retain).transpose().map_err(|error| error.to_string())?;
+        let file = timeout(SETTINGS.persistence, tokio::task::spawn_blocking(move || {
+            let prints: Vec<String> = history.iter().map(fingerprint).collect();
+            history::write_session(&key, &history, &prints, &cwd, &project, &tools, &model, &shape, ownership)
+        })).await.map_err(|_| "Claude history resume timed out; pending work retains ownership until it exits".to_string())?
+            .map_err(|error| error.to_string())?.map_err(|error| format!("Could not write Claude Code's session file: {error}"))?;
+        Some(file)
     } else {
         None
     };
+    // Writing a large resume file yields to the UI. A close or stop during that write must not
+    // start a child after its session has already let go of the query.
+    if turn.cancel.is_cancelled() { return Err("Operation aborted".into()); }
     if resumes_turn {
         debug("start: the turn starts at tool results; Claude Code answers it on resume");
     } else if continued {
         debug("start: context ends at an assistant message, opening with the continue note");
     }
     let mut args = base_args(start.thinking_off, start.effort);
-    args.extend(written.iter().map(|id| format!("--resume={id}")));
+    args.extend(written.iter().map(|file| format!("--resume={}", file.session_id())));
     args.extend(["--tools=", "--setting-sources=", "--permission-mode=bypassPermissions", "--include-partial-messages", "--session-mirror", "--model", start.cli_model,
         "--disable-slash-commands"].map(String::from));
     if SETTINGS.strict_mcp {
@@ -1409,29 +1283,24 @@ fn start_query(start: Start, turn: Turn) -> Result<(), String> {
     // prompt cache miss on everything, and the model told it may answer "No response requested."
     // (2.1.316 against a stand-in API). It goes in a file, since a prompt of 128 KiB or more can't
     // be one argument (Linux's MAX_ARG_STRLEN).
-    if let Some(id) = written.as_ref().filter(|_| resumes_turn) {
-        let dir = history::session_path(id, &project_path).with_extension("");
+    if let Some(resume) = written.as_ref().filter(|_| resumes_turn) {
+        let dir = history::session_path(resume.session_id(), &project_path).with_extension("");
         let file = dir.join(SYSTEM_PROMPT_FILE);
         if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, start.system_prompt)) {
-            history::delete_session(id, &project_path);
             return Err(format!("Could not write the prompt for Claude Code: {error}"));
         }
         args.extend(["--system-prompt-file".to_string(), file.to_string_lossy().into_owned()]);
     }
-    let child = spawn(&args, start.cwd, resumes_turn).inspect_err(|_| {
-        if let Some(id) = &written {
-            history::delete_session(id, &project_path);
-        }
-    })?;
+    let child = spawn(&args, start.cwd, resumes_turn)?;
     let mut opening = vec![initialize(start.system_prompt, start.tools)];
     if !resumes_turn {
         opening.push(json!({"type": "user", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null}));
     }
     let state = Arc::new(Mutex::new(State { shape: start.shape.clone(), prints: start.prints.to_vec(), pending: None, waiting: false, stopped: false,
-        context: 0, manager: start.manager, kept_base: kept_base(&visible), fast: start.fast }));
+        context: 0, manager: start.manager, kept_base: kept_base(&visible), kept: history::handle(start.key), ownership: start.ownership.clone(), fast: start.fast }));
     let (commands, inbox) = mpsc::unbounded_channel();
     let id = NEXT_QUERY.fetch_add(1, Ordering::Relaxed);
-    let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written);
+    let mut query = Query::new(id, start.key, start.model.clone(), start.tools, child, inbox, state.clone(), project_path, start.cwd, start.shape.clone(), written.map(history::ResumeFile::take));
     query.turn = Some(turn);
     lock(&LIVE).insert(history::query_key(start.key, start.shape), Live { id, state, commands });
     QUERIES.fetch_add(1, Ordering::SeqCst);
@@ -1462,6 +1331,7 @@ enum Wake {
 // block, the stream index it came under (None once it stopped) and its tool-call JSON so far.
 struct Query {
     id: u64,
+    writer: Option<(u64, u32, u64)>,
     key: String,
     model: Model,
     tools: Vec<String>,
@@ -1532,7 +1402,8 @@ impl Query {
     fn new(id: u64, key: &str, model: Model, tools: &[ToolDefinition], child: Child, inbox: mpsc::UnboundedReceiver<Command>, state: Arc<Mutex<State>>,
         project_path: String, cwd: &str, shape: Shape, written: Option<String>) -> Query {
         let (out, fast) = (new_output(&model, PROVIDER), lock(&state).fast);
-        Query { id, key: key.to_string(), out, model, tools: tools.iter().map(|tool| tool.name.clone()).collect(), manifest: manifest(tools), child, inbox, state,
+        let writer = crate::proc::start(child.pid as i32).map(|start| (id, child.pid, start));
+        Query { id, writer, key: key.to_string(), out, model, tools: tools.iter().map(|tool| tool.name.clone()).collect(), manifest: manifest(tools), child, inbox, state,
             project_path, cwd: cwd.to_string(), shape, written, cc_session: None, turn: None, open: Vec::new(), partial: Vec::new(), started: false,
             saw_stream_event: false, saw_tool_call: false, stream_id: None, stream_open: false, stream_delta: false, stream_start: 0, fallback_id: None,
             requests: Vec::new(), turn_requests: HashMap::new(), tool_ids: Vec::new(), handed: HashSet::new(), saved_calls: HashSet::new(), parked: HashMap::new(), queued: HashMap::new(),
@@ -1550,7 +1421,7 @@ impl Query {
             let cancel = self.turn.as_ref().map_or_else(CancellationToken::new, |turn| turn.cancel.clone());
             let lost = self.parked.values().map(|call| call.check_at).min();
             let wake = tokio::select! {
-                line = self.child.next_line() => Wake::Line(line),
+                line = self.child.next_line(None) => Wake::Line(line),
                 command = self.inbox.recv() => Wake::Command(command),
                 () = sleep_until(self.last_activity + BODY_IDLE_TIMEOUT), if streaming => Wake::Idle,
                 () = sleep_until(self.settle_at.unwrap_or(far)), if self.settle_at.is_some() => Wake::Settle,
@@ -1576,7 +1447,7 @@ impl Query {
                 },
                 Wake::Command(None) => self.discard("the bridge let go of it").await,
                 Wake::Idle => self.idle().await,
-                Wake::Settle => self.end_turn_on_tool_use(),
+                Wake::Settle => self.end_turn_on_tool_use().await,
                 Wake::Lost => self.check_lost().await,
                 Wake::Abort => self.interrupt().await,
                 Wake::Lapsed => self.discard("its prompt cache has lapsed").await,
@@ -1647,14 +1518,14 @@ impl Query {
     // Parking hands the calls to pi only after the transcript mirror acknowledged their write.
     // The stream can finish first; its mirror frame then completes this same boundary. Without
     // that acknowledgement, holdMax could close a brand-new query before its file even exists.
-    fn end_turn_on_tool_use(&mut self) {
+    async fn end_turn_on_tool_use(&mut self) {
         self.settle_at = None;
-        if !self.tool_ids.iter().all(|id| self.saved_calls.contains(id)) {
+        if self.turn.is_none() || !self.tool_ids.iter().all(|id| self.saved_calls.contains(id)) {
             return;
         }
-        let Some(turn) = self.turn.take() else { return };
         self.out.stop_reason = StopReason::ToolUse;
-        self.keep_records();
+        if !self.keep_records().await { return; }
+        let Some(turn) = self.turn.take() else { return };
         self.hand_pending(turn);
         self.handed.extend(self.tool_call_ids());
         let mut state = lock(&self.state);
@@ -1675,9 +1546,9 @@ impl Query {
         let _ = turn.reply.send(self.out.clone());
     }
 
-    fn flush_settle(&mut self) {
+    async fn flush_settle(&mut self) {
         if self.settle_at.is_some() {
-            self.end_turn_on_tool_use();
+            self.end_turn_on_tool_use().await;
         }
     }
 
@@ -1906,13 +1777,13 @@ impl Query {
                         .flat_map(|entry| entry["message"]["content"].as_array().into_iter().flatten())
                         .filter(|block| block["type"] == "tool_use").filter_map(|block| block["id"].as_str().map(String::from)));
                     if self.saw_tool_call && !self.stream_open && self.settle_at.is_none() {
-                        self.end_turn_on_tool_use();
+                        self.end_turn_on_tool_use().await;
                     }
                 }
             }
             "control_response" | "control_cancel_request" | "keep_alive" => {}
             _ => {
-                self.message(&message);
+                self.message(&message).await;
                 self.send_next().await;
             }
         }
@@ -1983,14 +1854,15 @@ impl Query {
     // One message from Claude Code's stream. Lifecycle first (the end of input at the result, a
     // failure, rate limits, the session id), then content, which has nowhere to go once a turn has
     // ended on tool calls.
-    fn message(&mut self, message: &Value) {
+    async fn message(&mut self, message: &Value) {
         let kind = message["type"].as_str().unwrap_or_default();
         let error = if kind == "result" { result_error(message) } else { None };
         // A non-streamed answer still settling ends when Claude Code moves on, unless it failed.
         if kind == "result" && error.is_some() {
             self.settle_at = None;
         } else if matches!(kind, "stream_event" | "user" | "result") {
-            self.flush_settle();
+            self.flush_settle().await;
+            if self.failure.is_some() { return; }
         }
         // The stopped turn's end, after an interrupt: the query stays, waiting for the next message
         // (or already taking it).
@@ -2037,7 +1909,7 @@ impl Query {
             return;
         }
         match kind {
-            "stream_event" => self.stream_event(&message["event"]),
+            "stream_event" => self.stream_event(&message["event"]).await,
             "assistant" => self.assistant(&message["message"]),
             "result" => {
                 self.add_unstreamed_usage(&message["usage"]);
@@ -2054,7 +1926,7 @@ impl Query {
             _ => {}
         }
         if kind == "result" && self.child.stdin.is_some() {
-            self.hold();
+            self.hold().await;
         }
     }
 
@@ -2068,8 +1940,8 @@ impl Query {
     // A turn that answered: its records are kept for a later rewrite, the query waits for the next
     // message (decide) until its prompt cache lapses, and pi gets the answer. The next turn then
     // goes out as Claude Code's own continuation, the bytes the cache already holds.
-    fn hold(&mut self) {
-        self.keep_records();
+    async fn hold(&mut self) {
+        if !self.keep_records().await { return; }
         {
             let mut state = lock(&self.state);
             state.prints.push(fingerprint(&Message::Assistant(self.out.clone())));
@@ -2084,13 +1956,43 @@ impl Query {
 
     // Keep the prefix before handing back an answer or parking on calls. A holdMax eviction can
     // happen before the tools finish, so their results must not be needed to save this prefix.
-    fn keep_records(&self) {
+    async fn keep_records(&mut self) -> bool {
         let (mut prints, mut roles) = lock(&self.state).kept_base.clone();
-        if let Some(cc_session) = self.cc_session.as_deref().filter(|_| matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length | StopReason::ToolUse)) {
+        let kept = lock(&self.state).kept.clone();
+        let ownership = lock(&self.state).ownership.clone();
+        if let Some(cc_session) = self.cc_session.clone().filter(|_| SETTINGS.keep && matches!(self.out.stop_reason, StopReason::Stop | StopReason::Length | StopReason::ToolUse)) {
             prints.push(fingerprint(&Message::Assistant(self.out.clone())));
             roles.push("assistant".into());
-            history::keep(&self.key, cc_session, &self.project_path, &self.cwd, &self.shape, prints, roles);
+            let (key, project, cwd, shape) = (self.key.clone(), self.project_path.clone(), self.cwd.clone(), self.shape.clone());
+            // Await the save, not merely its scheduling: holdMax or /restart may close the query as
+            // soon as pi gets these calls, and that must never lose the prefix it just acknowledged.
+            let ownership = match ownership.as_ref().map(crate::runtime::Ownership::retain).transpose() {
+                Ok(ownership) => ownership,
+                Err(error) => { self.failure = Some(error.to_string()); return false; }
+            };
+            let writer = self.writer;
+            let fenced = kept.clone();
+            let saved = timeout(SETTINGS.persistence, tokio::task::spawn_blocking(move || {
+                // This strong lease belongs to the worker, not its cancelled JoinHandle or LocalSet.
+                let _ownership = ownership;
+                let kept = kept.ok_or_else(|| std::io::Error::other("the Claude history session was closed"))?;
+                history::keep(kept, &key, &cc_session, &project, &cwd, &shape, prints, roles, writer)
+            })).await;
+            let error = match saved {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(error.to_string()),
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => {
+                    if let Some(cache) = fenced { history::fence(&cache); }
+                    Some("Claude history save timed out; pending save retains ownership until it exits".into())
+                }
+            };
+            if let Some(error) = error {
+                self.failure = Some(format!("Could not keep Claude Code's records: {error}"));
+                return false;
+            }
         }
+        true
     }
 
     // Hand pi the turn's message, if a turn is open.
@@ -2159,7 +2061,7 @@ impl Query {
         self.stream_open = false;
     }
 
-    fn stream_event(&mut self, event: &Value) {
+    async fn stream_event(&mut self, event: &Value) {
         self.saw_stream_event = true;
         let stream_index = event["index"].as_u64();
         let position = self.open.iter().position(|open| open.is_some() && *open == stream_index);
@@ -2194,7 +2096,7 @@ impl Query {
                         let id = block["id"].as_str().unwrap_or_default().to_string();
                         self.tool_ids.push(id.clone());
                         let arguments = block["input"].as_object().cloned().unwrap_or_default();
-                        let index = self.push(Content::ToolCall { id: id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, stream_index);
+                        let index = self.push(Content::ToolCall { external: false, id: id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, stream_index);
                         self.emit(StreamEvent::ToolCallStart { index, id, name });
                     }
                     _ => {}
@@ -2264,7 +2166,7 @@ impl Query {
                 self.drop_unfinished();
                 self.stream_open = false;
                 if self.saw_tool_call {
-                    self.end_turn_on_tool_use();
+                    self.end_turn_on_tool_use().await;
                 }
             }
             _ => {}
@@ -2324,7 +2226,7 @@ impl Query {
                     let call_id = block["id"].as_str().unwrap_or_default().to_string();
                     self.tool_ids.push(call_id.clone());
                     let arguments = pi_arguments(&name, block["input"].as_object().cloned().unwrap_or_default());
-                    let index = self.push(Content::ToolCall { id: call_id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, None);
+                    let index = self.push(Content::ToolCall { external: false, id: call_id.clone(), name: name.clone(), arguments, namespace: None, arguments_error: None, thought_signature: None }, None);
                     self.emit(StreamEvent::ToolCallStart { index, id: call_id, name });
                     self.emit(StreamEvent::ToolCallEnd { index, tool_call: self.out.content[index].clone() });
                 }
@@ -2348,10 +2250,11 @@ impl Query {
         if self.failure.is_some() {
             self.settle_at = None;
         } else {
-            self.flush_settle();
+            self.flush_settle().await;
         }
         let status = self.child.close().await;
         let stderr = self.child.stderr_tail().await;
+        if !stderr.is_empty() { debug(&format!("Claude Code's stderr: {stderr}")); }
         // A child that ended before the open turn's result, or failed, failed that turn: what it
         // streamed is a partial answer, not one (result_seen is per turn, so an earlier turn's
         // result doesn't vouch for this one).
@@ -2374,8 +2277,11 @@ impl Query {
                 self.end_open(StopReason::Error, &failure);
             }
         } else if !self.closed {
-            self.keep_records();
-            self.reply();
+            if self.keep_records().await {
+                self.reply();
+            } else {
+                self.end_open(StopReason::Error, &self.failure.clone().unwrap_or_default());
+            }
         }
         let ids: HashSet<&String> = self.written.iter().chain(&self.cc_session).collect();
         for id in ids {

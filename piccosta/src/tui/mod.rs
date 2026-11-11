@@ -12,6 +12,7 @@ mod state;
 mod model_add;
 mod tex;
 mod follow;
+mod listing;
 
 use crate::agent::{Event, Handle};
 use crate::host::Host;
@@ -104,20 +105,34 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    Deleted(PathBuf, Result<(), String>),
     // /assistant's start, done: what it did, if anything; the assistant is shown when it's there.
     Assistant(Option<String>),
     // A tool's per-call question. Dropping its answer (Esc, quit) refuses it.
-    Ask(String, tokio::sync::oneshot::Sender<bool>),
+    Ask(String, Vec<String>, tokio::sync::oneshot::Sender<String>, bool),
     ModelProbe(u64, Result<(crate::model_add::Addition, crate::model_add::Probe), String>),
     // What a scan's runtimes said (asker): each one's status, None when nothing runs it; and
     // whether it was a look for agents.
     Scanned(Box<follow::Scan>),
+    Listed(Box<listing::Listing>),
     Followed(std::sync::Weak<()>, Box<Result<Option<follow::Followed>, String>>),
     Awoken(std::sync::Weak<()>, Box<Result<(crate::host::Prepared, follow::Followed), String>>),
     Nothing,
     Asked(bool, Box<Update>),
     // How a message from the slot's editor to a session not run here went, and its text as typed.
     Sent(Result<crate::runtime::Sent, String>, String),
+}
+
+impl Update {
+    // Intermediate catalog steps only do bookkeeping. They still get handled promptly, but
+    // repainting the unchanged loading picker for each file burns the UI thread.
+    fn needs_draw(&self) -> bool {
+        match self {
+            Self::Asked(_, update) => update.needs_draw(),
+            Self::Listed(listing) => listing.done,
+            _ => true,
+        }
+    }
 }
 
 // Asking runtimes, which waits on their sockets (a stopped one's, up to its wait), so it's done off
@@ -343,6 +358,7 @@ struct App {
     deliveries: Asker,
     scanning: bool,
     runtime_scan_due: bool,
+    listing_tickets: [Arc<()>; 2],
     // A cleared draft isn't delivered until its asker result has been applied (sent).
     sending: usize,
     // Managers open here that failed to start on their own: their file's mtime then, and when. Tried
@@ -437,7 +453,8 @@ struct Picker {
     // In a picker of directories, the directory typed paths start from: what's typed can then be
     // the choice itself (a path, or anything when no item matches).
     free: Option<PathBuf>,
-    answer: Option<tokio::sync::oneshot::Sender<bool>>,
+    answer: Option<tokio::sync::oneshot::Sender<String>>,
+    cancel: Option<Handle>,
     text: bool,
     masked: bool,
 }
@@ -531,6 +548,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         deliveries: asker(sender.clone(), true),
         scanning: false,
         runtime_scan_due: false,
+        listing_tickets: [Arc::new(()), Arc::new(())],
         sending: 0,
         sender,
         updates,
@@ -624,35 +642,39 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut stdout = std::io::stdout();
     let mut exit_code = 0;
     let mut restart_exe = None;
+    let mut redraw = true;
     while !app.quit {
-        if let Err(error) = inline::draw(&mut terminal, &mut app, inline.as_mut()).and_then(|()| app.tex.flush(&mut stdout)) {
+        let drawn = if redraw { inline::draw(&mut terminal, &mut app, inline.as_mut()) } else { Ok(()) };
+        if let Err(error) = drawn.and_then(|()| app.tex.flush(&mut stdout)) {
             restore();
             app.shutdown("error").await;
             return Err(format!("could not draw: {error}"));
         }
+        redraw = true;
         tokio::select! {
             code = &mut termination => { exit_code = code; app.quit = true; },
             event = input.next() => match event {
                 Some(Ok(event)) => app.input(event),
                 _ => app.quit = true,
             },
-            Some(request) = control.requests.recv() => app.control(request),
+            Some(request) = control.requests.recv() => redraw = app.control(request),
             Some(_) = app.restart_replies.next(), if !app.restart_replies.is_empty() => {},
-            Some((slot, update)) = app.updates.recv() => app.update(slot, update),
+            Some((slot, update)) = app.updates.recv() => { redraw = update.needs_draw(); app.update(slot, update); },
             _ = spinner.tick(), if app.restart_waiting || app.slots.iter().any(|slot| slot.busy() || slot.working_elsewhere) => app.frame += 1,
             _ = agent_scan.tick() => app.scan_agents(),
             _ = edge.tick(), if app.edge().is_some() => app.edge_scroll(),
         }
         // Everything else already waiting goes in before the next frame.
         while let Ok((slot, update)) = app.updates.try_recv() {
+            redraw |= update.needs_draw();
             app.update(slot, update);
         }
         // Cancelled calls no longer need an answer. Questions wait behind an open picker, not
         // over it, and default to No so an unrelated Enter never grants desktop access.
-        if app.picker.as_ref().is_some_and(|picker| picker.answer.as_ref().is_some_and(|answer| answer.is_closed())) { app.picker = None; }
+        if app.picker.as_ref().is_some_and(|picker| picker.answer.as_ref().is_some_and(|answer| answer.is_closed())) { app.picker = None; redraw = true; }
         if app.picker.is_none() {
             while let Some(question) = app.questions.pop_front() {
-                if question.answer.as_ref().is_some_and(|answer| !answer.is_closed()) { app.picker = Some(question); break; }
+                if question.answer.as_ref().is_some_and(|answer| !answer.is_closed()) { app.picker = Some(question); redraw = true; break; }
             }
         }
         // A runtime, not the UI's delayed view, knows when its tool loop has finished.
@@ -668,12 +690,13 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
                 app.save_state().map(|()| exe).map_err(|error| format!("could not save this UI: {error}"))
             }) {
                 Ok(exe) => { restart_exe = Some(exe); (app.restart, app.quit) = (true, true); }
-                Err(error) => { app.notice = Some(format!("Could not restart: {error}")); app.drain(false); }
+                Err(error) => { app.notice = Some(format!("Could not restart: {error}")); app.drain(false); redraw = true; }
             }
         }
         // A file to edit: the user's editor gets the terminal ($VISUAL, else $EDITOR), and the
         // screen comes back when it exits. Sessions carry on meanwhile; their updates wait.
         if let Some(path) = app.edit.take() {
+            redraw = true;
             match std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) {
                 None => app.notice = Some(format!("Set $EDITOR to edit it here; the file is {}", path.display())),
                 Some(editor) => {
@@ -926,29 +949,7 @@ impl App {
         }
         // This directory's earlier sessions, then the latest few of the projects used most recently,
         // so the sidebar can group them by project. --single has no sidebar, so none.
-        if !self.single {
-            let mut folders: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(self.host.agent_dir.join("sessions"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|folder| folder.path() != self.host.session_dir)
-                .filter_map(|folder| Some((folder.metadata().ok()?.modified().ok()?, folder.path())))
-                .collect();
-            folders.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-            // A project whose directory is gone (a deleted scratch run) has nothing to come back to.
-            let known: BTreeSet<_> = self.slots.iter().filter_map(|slot| slot.path.clone()).collect();
-            let include = |path: &Path, _| { let path = crate::tools::paths::canonical(path); !known.contains(&path) && !self.closed.contains_key(&path) };
-            let others = folders
-                .iter()
-                .map(|(_, folder)| crate::host::sessions_matching(folder, None, RECENT_PER_OTHER_PROJECT, include))
-                .filter(|sessions| sessions.first().is_some_and(|summary| summary.cwd.is_dir()))
-                .take(OTHER_PROJECTS)
-                .flatten();
-            let others = crate::host::sessions_matching(&self.host.session_dir, Some(&self.host.cwd), RECENT_SESSIONS, include).into_iter().chain(others).collect();
-            self.list_sessions(others);
-            let projects = std::iter::once(self.host.cwd.clone()).chain(self.slots.iter().map(|slot| slot.cwd.clone())).collect();
-            self.list_managers(follow::managers(&self.host, projects));
-        }
+        if !self.single { self.request_listing(listing::Kind::Sidebar, ""); }
         // -r with no session named: the picker, over the new session it opened on. A restart
         // doesn't ask again, or send the opening message again.
         if args.resume.as_deref() == Some("") && !args.restore {
@@ -1051,6 +1052,12 @@ impl App {
 
     fn drain(&mut self, waiting: bool) {
         self.restart_waiting = waiting;
+        if waiting {
+            self.listing_tickets = [Arc::new(()), Arc::new(())];
+            // A cancelled listing cannot finish its loading picker. Leave actual questions
+            // alone, but don't let this placeholder hold the restart waiting for itself.
+            if self.picker.as_ref().is_some_and(|picker| picker.title == listing::LOADING_TITLE) { self.picker = None; }
+        }
         self.restart_draining.clear();
         self.restart_queries = None;
         for slot in 0..self.slots.len() { self.drain_slot(slot); }
@@ -1157,15 +1164,20 @@ impl App {
         // a subagent's, the assistant's, or one in home; and not the first one on its own in a
         // piccosta an agent's command started or on a scratch agent dir, since managers are the user's (/manager still makes one there).
         let mut session = session;
+        let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
+        let registry = host.registry()?;
+        let selected = model.clone().or_else(|| session.context().model.map(|(provider, id)| format!("{provider}/{id}"))).or_else(|| host.settings.default_model());
+        let interactive_only = selected.as_deref().and_then(|name| registry.resolve(name).ok()).is_some_and(|model| model.interactive_only);
+        if interactive_only && self.slots[slot].make.is_some() { return Err("Interactive-only providers cannot run managers or advisors; pick another model first.".into()); }
         let dir = PathBuf::from(&session.header().cwd);
         let agent_dir = &self.host.agent_dir;
         let first = session.entries().is_empty()
             && crate::manager::project_manager(agent_dir, &dir).is_none()
-            && crate::host::sessions_in(&crate::session::default_session_dir(agent_dir, &dir), Some(&dir), 1).is_empty();
+            && !crate::session::index::in_folder(&crate::session::default_session_dir(agent_dir, &dir)).iter().any(|path| crate::session::index::header(path).is_ok_and(|header| Path::new(&header.cwd) == dir));
         // Home isn't a project: a session started there (outside every project) is a plain one.
         let home = Some(crate::config::home());
         let eligible = self.persist && !self.single && std::env::var_os(crate::tools::subagent::CHILD_ENV).is_none() && dir != crate::manager::home(agent_dir) && Some(&dir) != home.as_ref();
-        let first = first && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
+        let first = first && !interactive_only && !crate::manager::started_by_agent() && !crate::manager::own_agent_dir();
         let role = match self.slots[slot].make {
             Some(role @ (crate::manager::Role::Advisor | crate::manager::Role::Assistant)) => self.persist.then_some(role),
             make if eligible && (first || make.is_some()) => Some(crate::manager::Role::Project),
@@ -1177,7 +1189,6 @@ impl App {
             // old one back for the manager before the first message.
             session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
         }
-        let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
         let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), self.emitter(slot), false)?;
         self.attach(slot, agent, shared, None);
         Ok(())
@@ -1186,6 +1197,17 @@ impl App {
     fn emitter(&self, slot: usize) -> crate::agent::EventSink {
         let sender = self.sender.clone();
         Box::new(move |event| { let _ = sender.send((slot, Update::Event(Box::new(event.clone())))); })
+    }
+
+    // Publication can copy a large accounting snapshot even for a small catalog change. Keep
+    // it off the serial asker, but counted until completion so exec cannot strand a partial file.
+    fn persist_index(&mut self, mut index: crate::session::index::Index) {
+        self.asks.pending += 1;
+        let sender = self.sender.clone();
+        tokio::task::spawn_blocking(move || {
+            index.save();
+            let _ = sender.send((0, Update::Asked(false, Box::new(Update::Nothing))));
+        });
     }
 
     fn retire(&mut self, value: impl Send + 'static) {
@@ -1207,8 +1229,21 @@ impl App {
             Box::pin(async move {
                 let Some(question) = question else { return Ok(()) };
                 let (reply, answer) = tokio::sync::oneshot::channel();
-                let _ = questions.send((slot, Update::Ask(format!("{name}: {question}"), reply)));
-                if answer.await == Ok(true) { Ok(()) } else { Err(format!("The user declined this {name} call.")) }
+                let _ = questions.send((slot, Update::Ask(format!("{name}: {question}"), vec!["No".into(), "Yes".into()], reply, false)));
+                if answer.await.as_deref() == Ok("Yes") { Ok(()) } else { Err(format!("The user declined this {name} call.")) }
+            })
+        }));
+        let questions = self.sender.clone();
+        let automatic = host.yolo;
+        agent.set_interaction(Arc::new(move |request| {
+            let questions = questions.clone();
+            Box::pin(async move {
+                if let Some(answer) = request.auto_allow(automatic) { return Ok(answer); }
+                let items = request.labels();
+                if items.is_empty() { return Err("This frontend does not support elicitation forms".into()); }
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = questions.send((slot, Update::Ask(request.title(), items, reply, true)));
+                Ok(request.answer_label(answer.await.ok().as_deref()))
             })
         }));
         let view = &mut self.slots[slot];
@@ -1442,12 +1477,16 @@ impl App {
             self.focused().draft.insert(&text);
             return;
         }
+        let interactive_only = self.host.registry().is_ok_and(|registry| registry.resolve(&self.current().model).is_ok_and(|model| model.interactive_only));
         let slot = self.focused();
         let Some((_, commands)) = &slot.live else { return };
         // While the model works, a message waits for the step it's on, and the commands that step
         // is running move to the background (they carry on and report when they end), so it isn't
         // left waiting on them; else it starts a turn (runtime.rs).
-        let _ = commands.send(Command::Message(text.clone()));
+        // ACP has no steering method. A user's message is an explicit prompt, queued behind the
+        // current one, not the unattended runtime-message path used by timers and other agents.
+        let command = if interactive_only { Command::Prompt(text.clone(), Vec::new()) } else { Command::Message(text.clone()) };
+        let _ = commands.send(command);
         if slot.busy() {
             return;
         }
@@ -1505,7 +1544,8 @@ impl App {
 
     // Choose from a list; an argument that matches one item picks it at once.
     fn pick(&mut self, title: &'static str, items: Vec<String>, filter: &str, apply: fn(&mut App, String)) {
-        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None, text: false, masked: false };
+        self.listing_tickets[1] = Arc::new(());
+        let picker = Picker { title: title.to_string(), items, filter: filter.to_string(), selected: 0, apply, delete: None, confirming: false, free: None, answer: None, cancel: None, text: false, masked: false };
         let shown = picker.shown();
         if !filter.is_empty() && (shown.len() == 1 || shown.iter().any(|item| item.as_str() == filter)) {
             let choice = shown.iter().find(|item| item.as_str() == filter).unwrap_or(&shown[0]).to_string();
@@ -1648,7 +1688,8 @@ impl App {
     // is saved.
     fn scanned(&mut self, scan: follow::Scan) {
         self.scanning = false;
-        let follow::Scan { statuses, models, modified, tickets, mut closed, closed_before, summaries, managers, agents } = scan;
+        let follow::Scan { statuses, models, modified, tickets, mut closed, closed_before, summaries, managers, agents, index } = scan;
+        if let Some(index) = index { self.persist_index(index); }
         // A close or /resume done since the ask was queued wins over its older snapshot.
         for path in self.closed.keys().chain(closed_before.keys()) {
             if self.closed.get(path) != closed_before.get(path) {
@@ -1834,10 +1875,18 @@ impl App {
         let visible = self.panes.iter().any(|pane| pane.slot == slot);
         let view = &mut self.slots[slot];
         match update {
-            Update::Ask(question, answer) => {
-                self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items: vec!["No".into(), "Yes".into()], filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), text: false, masked: false });
+            Update::Ask(question, items, answer, external) => {
+                let cancel = view.live.as_ref().filter(|_| external).map(|(handle, _)| handle.clone());
+                self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
             Update::Report(text) => self.report(text),
+            Update::Deleted(path, result) => match result {
+                Ok(()) => {
+                    if view.path.as_ref() == Some(&path) { view.path = None; }
+                    self.notice = Some(format!("Moved “{}” to the trash.", view.title));
+                }
+                Err(error) => self.report(error),
+            },
             Update::Assistant(started) => {
                 // Said only when it started something: a newer notice isn't cleared for nothing.
                 if started.is_some() {
@@ -1861,6 +1910,7 @@ impl App {
                 self.update(slot, *update);
             }
             Update::Scanned(scan) => self.scanned(*scan),
+            Update::Listed(listing) => self.listed_result(listing),
             Update::Followed(ticket, result) => {
                 if !ticket.ptr_eq(&Arc::downgrade(&view.incarnation)) || view.live.is_some() { self.retire(result); return; }
                 view.follow_pending = false;
@@ -2208,6 +2258,7 @@ impl App {
     }
 
     fn picker_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) { self.listing_tickets[1] = Arc::new(()); }
         // While probing, even Enter stays here. Only Esc can close it; pastes are dropped too.
         if self.model_probe.is_some() && key.code != KeyCode::Esc { return; }
         if self.model_add.is_some() && self.picker.as_ref().is_some_and(|picker| !picker.text)
@@ -2237,6 +2288,7 @@ impl App {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && picker.delete.is_some() => picker.confirming = true,
             KeyCode::Delete if picker.delete.is_some() => picker.confirming = true,
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(cancel) = &picker.cancel { cancel.abort(); }
                 self.picker = None;
                 self.model_add = None;
                 if let Some(probe) = self.model_probe.take() { probe.abort(); }
@@ -2256,7 +2308,7 @@ impl App {
             KeyCode::Enter => {
                 let (choice, apply, answer) = (picker.chosen(), picker.apply, picker.answer.take());
                 self.picker = None;
-                if let Some(answer) = answer { let _ = answer.send(choice.as_deref() == Some("Yes")); }
+                if let Some(answer) = answer { if let Some(choice) = choice { let _ = answer.send(choice); } }
                 else if let Some(choice) = choice { apply(self, choice); }
             }
             _ => {}
@@ -2284,7 +2336,7 @@ impl App {
         }
         let tasks = std::mem::take(&mut self.tasks);
         let _ = tokio::time::timeout(SHUTDOWN_WAIT, futures_util::future::join_all(tasks)).await;
-        crate::provider::claude::shutdown().await;
+        crate::provider::shutdown().await;
     }
 
     fn draw(&mut self, frame: &mut Frame) {

@@ -7,6 +7,9 @@
 // - openai_completions: Chat Completions, most of opencode-go's models and local servers.
 // - claude: Claude through Claude Code on a Claude plan ("claude-bridge").
 
+pub mod acp_client;
+pub(crate) mod acp_wire;
+mod child;
 pub mod anthropic_messages;
 pub mod google;
 pub mod claude;
@@ -88,11 +91,80 @@ pub enum StreamEvent {
     ToolCallStart { index: usize, id: String, name: String },
     ToolCallDelta { index: usize, delta: String },
     ToolCallEnd { index: usize, tool_call: Content },
+    // These tools ran in an external agent. The ordinary call/result records still belong to
+    // piccosta's session, but none of them may enter our local executor.
+    ExternalStart { id: String, name: String, arguments: serde_json::Map<String, Value> },
+    ExternalUpdate { id: String, name: String, arguments: serde_json::Map<String, Value>, result: Value },
+    ExternalEnd(crate::message::ToolResultMessage),
+}
+
+// A frontend-neutral offered choice. Keep the agent's opaque IDs, never translate them to bool.
+#[derive(Clone, Debug)]
+pub struct Interaction {
+    pub method: String,
+    pub params: Value,
+}
+impl Interaction {
+    pub fn choices(&self) -> Vec<(String, String)> {
+        if self.method == "session/request_permission" {
+            return self.params["options"].as_array().into_iter().flatten().filter_map(|option| {
+                Some((option["optionId"].as_str()?.into(), option["name"].as_str()?.into()))
+            }).collect();
+        }
+        Vec::new()
+    }
+    // Both terminal frontends show the same labels and decode only an offered choice. Forms go
+    // whole to capable editors; a terminal must not pretend its picker implements a form schema.
+    pub fn labels(&self) -> Vec<String> {
+        let choices = self.choices();
+        if choices.is_empty() { Vec::new() }
+        else { std::iter::once("Cancel".into()).chain(choices.iter().map(|(id, name)| format!("{name} [{id}]"))).collect() }
+    }
+    pub fn answer_label(&self, label: Option<&str>) -> Value {
+        let selected = self.choices().into_iter().find(|(id, name)| label == Some(format!("{name} [{id}]").as_str())).map(|(id, _)| id);
+        self.answer(selected.as_deref())
+    }
+    pub fn answer(&self, choice: Option<&str>) -> Value {
+        if self.method == "session/request_permission" { permission_answer(choice) }
+        else { serde_json::json!({"action": "cancel"}) }
+    }
+    pub fn auto_allow(&self, automatic: bool) -> Option<Value> {
+        (automatic && self.method == "session/request_permission").then(|| self.answer(self.allow().as_deref()))
+    }
+    pub fn title(&self) -> String {
+        self.params["message"].as_str().or_else(|| self.params.pointer("/toolCall/title").and_then(Value::as_str)).unwrap_or("Agent permission").into()
+    }
+    pub fn allow(&self) -> Option<String> {
+        self.params["options"].as_array()?.iter().find(|option| matches!(option["kind"].as_str(), Some("allow_once" | "allow_always")))?["optionId"].as_str().map(str::to_string)
+    }
+}
+pub type Interact = std::sync::Arc<dyn Fn(Interaction) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
+
+pub fn permission_answer(choice: Option<&str>) -> Value {
+    match choice {
+        Some(id) => serde_json::json!({"outcome": {"outcome": "selected", "optionId": id}}),
+        None => serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
+
+// Close providers together: frontends must not need to know which one owns a session's child.
+pub async fn close(session: &str) -> Result<(), String> {
+    acp_client::close(session);
+    claude::close(session).await
+}
+pub async fn shutdown() {
+    acp_client::shutdown().await;
+    claude::shutdown().await;
 }
 
 // One request to a model.
 pub struct Request<'a> {
     pub model: &'a Model,
+    pub provider_config: Option<&'a crate::model::ProviderConfig>,
+    pub interaction: Option<Interact>,
+    pub interactive: bool,
+    pub elicitation: bool,
+    pub yolo: bool,
     // The conversation, leading with the system message that holds the prompt and tools.
     pub messages: &'a [Message],
     pub credential: &'a Credential,
@@ -113,6 +185,12 @@ pub struct Request<'a> {
     pub thinking_level: &'a str,
     // The session's file, when it is saved; the Claude bridge keeps its records next to it.
     pub session_file: Option<&'a std::path::Path>,
+    // No assistant or rewritten history in the raw branch yet. A compacted/imported context can
+    // project to user messages only; that does not make it a fresh external-agent conversation.
+    pub fresh_conversation: bool,
+    // Only a submitted persistence job upgrades this weak lease; a parked query cannot keep a
+    // closed runtime alive, while a started blocking save cannot lose its ownership on cancellation.
+    pub ownership: Option<std::sync::Weak<crate::runtime::Ownership>>,
     // The directory the session works in, which the Claude bridge starts Claude Code in (it tells
     // the model that directory, and keys its records by it).
     pub cwd: &'a std::path::Path,
@@ -294,6 +372,7 @@ pub fn new_output(model: &Model, api: &str) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        request_not_sent: false,
         provider_thinking_level: None,
         thinking_level: None,
         usage: Usage::default(),
@@ -323,6 +402,7 @@ pub async fn stream(request: Request<'_>, events: mpsc::UnboundedSender<StreamEv
         "anthropic-messages" => anthropic_messages::stream(&request, &events).await,
         "google-generative-ai" => google::stream(&request, &events).await,
         claude::PROVIDER => claude::stream(&request, &events).await,
+        acp_client::API => acp_client::stream(&request, &events).await,
         other => {
             let mut output = new_output(request.model, other);
             output.stop_reason = StopReason::Error;

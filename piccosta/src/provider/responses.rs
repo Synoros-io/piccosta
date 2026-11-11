@@ -600,7 +600,7 @@ pub fn dollars(known: f64, unknown: bool, places: usize) -> String {
 // add nothing: by their record, or for one saved before responses kept it, by the provider (the
 // accounts piccosta knows and Claude were plans then). A cost nobody knew, or a pending one no later
 // turn paid for, leaves the total partly unknown. One per session: a turn settles its own query's.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Tally {
     pub total: f64,
     unknown: bool,
@@ -648,6 +648,8 @@ pub fn usage_from(usage: &Value) -> Usage {
     let cached = number("/input_tokens_details/cached_tokens");
     let cache_write = number("/input_tokens_details/cache_write_tokens");
     Usage {
+        tokens_unknown: false,
+        reported: None,
         input: number("/input_tokens").saturating_sub(cached + cache_write),
         output: number("/output_tokens"),
         cache_read: cached,
@@ -731,6 +733,7 @@ impl<'a> StreamState<'a> {
                 let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
                 self.output.content.push(Content::ToolCall {
+                    external: false,
                     id: format!("{call_id}|{item_id}"),
                     name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                     arguments: Map::new(),

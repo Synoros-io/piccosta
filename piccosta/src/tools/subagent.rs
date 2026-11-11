@@ -96,6 +96,10 @@ impl SubagentTool {
                 skipped.push(format!("[subagent {}: skipped {name}, which no connected account serves]", job.name));
                 continue;
             };
+            if model.interactive_only {
+                skipped.push(format!("[subagent {}: skipped {name}, interactive-only provider]", job.name));
+                continue;
+            }
             match credential_for(&model.provider, registry.provider_config(&model.provider), &paths).await {
                 Ok(_) => found.push(format!("{}/{}{level}", model.provider, model.id)),
                 Err(_) => skipped.push(format!("[subagent {}: skipped {name}, which has no login]", job.name)),
@@ -230,6 +234,12 @@ impl Tool for SubagentTool {
                 }
                 None => self.available(job, context).await?,
             };
+            let registry = ModelRegistry::load(&self.agent_dir.join("models.json"))?;
+            for name in &models {
+                if registry.resolve(crate::scale::split(name).0)?.interactive_only {
+                    return Err("Interactive-only providers cannot run subagents, including inherited and fallback models (interactiveOnly in models.json).".into());
+                }
+            }
             let models = match arguments.get("thinking").and_then(Value::as_str) {
                 Some(level) => models.iter().map(|model| format!("{}:{level}", crate::scale::split(model).0)).collect(),
                 None => models,

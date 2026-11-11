@@ -236,6 +236,8 @@ pub struct PromptInputs<'a> {
     pub cwd: &'a Path,
     pub agent_dir: &'a Path,
     pub tools: &'a [Arc<dyn Tool>],
+    // Another agent owns its tools. Keep our instructions, not descriptions of tools it can't call.
+    pub external_tools: bool,
     // The agent dir's SYSTEM.md (replaces the preamble, tool list and rules) and APPEND_SYSTEM.md.
     pub custom_prompt: Option<String>,
     pub append_prompt: Option<String>,
@@ -276,8 +278,8 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
             let listed: Vec<String> =
                 inputs.tools.iter().filter_map(|tool| tool.prompt_snippet().map(|snippet| format!("- {}: {snippet}", tool.name()))).collect();
             let list = if listed.is_empty() { "(none)".to_string() } else { listed.join("\n") };
-            raw.insert("tools".into(), list);
-            raw.insert("rules".into(), rules(inputs.tools));
+            if !inputs.external_tools { raw.insert("tools".into(), list); }
+            raw.insert("rules".into(), rules(if inputs.external_tools { &[] } else { inputs.tools }));
         }
     }
     if let Some(append) = inputs.append_prompt.as_ref().filter(|text| !text.is_empty()) {

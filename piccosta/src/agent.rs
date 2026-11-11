@@ -167,6 +167,8 @@ struct Inbox {
     // The token of the run in progress; each prompt puts in a fresh one, so a handle taken before
     // the prompt still aborts it.
     cancel: CancellationToken,
+    // The turn executing now, independent of a frontend's model selection for its next turn.
+    running_api: Option<String>,
     steer: Vec<String>,
     follow_up: Vec<String>,
     steering_all: bool,
@@ -189,6 +191,9 @@ impl Handle {
     pub fn draining(&self) -> bool {
         self.lock().draining
     }
+
+    // The running turn's API, or None before it starts and after it settles.
+    pub fn running_api(&self) -> Option<String> { self.lock().running_api.clone() }
 
     pub fn steer(&self, text: String) {
         self.lock().steer.push(text);
@@ -250,7 +255,7 @@ pub(crate) fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
 // finished block, and a tool call's id and name on its start.
 fn stream_event_json(event: &StreamEvent) -> Option<Value> {
     Some(match event {
-        StreamEvent::Start => return None,
+        StreamEvent::Start | StreamEvent::ExternalStart { .. } | StreamEvent::ExternalUpdate { .. } | StreamEvent::ExternalEnd(_) => return None,
         StreamEvent::TextStart { index } => json!({"type": "text_start", "contentIndex": index}),
         StreamEvent::TextDelta { index, delta } => json!({"type": "text_delta", "contentIndex": index, "delta": delta}),
         StreamEvent::TextEnd { index, content } => json!({"type": "text_end", "contentIndex": index, "content": content}),
@@ -294,6 +299,10 @@ pub struct AgentConfig {
     pub transport: String,
     // Background jobs' finish messages.
     pub notices: mpsc::UnboundedReceiver<CustomMessage>,
+    pub interaction: Option<provider::Interact>,
+    pub interactive: bool,
+    pub elicitation: bool,
+    pub yolo: bool,
     // Print and json mode: hold the run open while a background job runs, so its finish message
     // becomes a turn before the process exits.
     pub hold_for_jobs: bool,
@@ -308,6 +317,7 @@ pub struct Agent {
     pub session: Session,
     pub(crate) pending_plugins: Option<tools::plugin::Discovery>,
     config: AgentConfig,
+    ownership: Option<std::sync::Weak<crate::runtime::Ownership>>,
     emit: EventSink,
     gate: Option<Gate>,
     // Cancelled when the user aborts; each run gets a fresh one, which the handle then holds.
@@ -397,7 +407,8 @@ impl Agent {
         config.model.service_tier = service_tier(&session, &config.model);
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
-        Ok(Agent { session, pending_plugins: None, config, emit, gate: None, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, repeated_call: (String::new(), 0), machine_noted: None })
+        let ownership = config.claim.as_ref().map(crate::runtime::Claim::ownership);
+        Ok(Agent { session, pending_plugins: None, config, ownership, emit, gate: None, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, repeated_call: (String::new(), 0), machine_noted: None })
     }
 
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
@@ -491,7 +502,7 @@ impl Agent {
     }
 
     pub fn auto_compaction(&self) -> bool {
-        self.config.compaction.enabled
+        self.config.model.api != provider::acp_client::API && self.config.compaction.enabled
     }
 
     // Turn automatic compaction or retries on or off for this session (pi's set_auto_compaction,
@@ -520,6 +531,11 @@ impl Agent {
     // written; the outcome is in the compaction_end event.
     pub async fn compact(&mut self, instructions: Option<&str>) -> Result<(), String> {
         self.fresh_cancel();
+        if self.config.model.api == provider::acp_client::API {
+            (self.emit)(&Event::CompactionStart { reason: Reason::Manual });
+            (self.emit)(&Event::CompactionEnd { reason: Reason::Manual, result: None, aborted: false, will_retry: false, error_message: Some(provider::acp_client::NO_COMPACTION.into()) });
+            return Ok(());
+        }
         if compaction::prepare(&self.session, self.config.compaction).is_none() {
             let already = matches!(self.session.path_to_leaf().last(), Some(SessionEntry::Compaction { .. }));
             let why = if already { "Already compacted" } else { "Nothing to compact (session too small)" };
@@ -572,7 +588,7 @@ impl Agent {
         let current = transcript::current_system_message(&crate::message::to_model_messages(&self.session.context().messages));
         let held: IndexMap<String, Option<String>> = current.as_ref().and_then(|system| system.sections.clone()).unwrap_or_default();
         let held_tools = current.and_then(|system| system.tools_added).unwrap_or_default();
-        let tools: Vec<ToolDefinition> = self.config.tools.iter().map(|tool| tool.definition()).collect();
+        let tools: Vec<ToolDefinition> = self.config.tools.iter().filter(|_| self.config.model.api != provider::acp_client::API).map(|tool| tool.definition()).collect();
         let mut patch: IndexMap<String, Option<String>> = self.config.sections.iter().filter(|(name, text)| held.get(*name) != Some(&Some((*text).clone()))).map(|(name, text)| (name.clone(), Some(text.clone()))).collect();
         patch.extend(held.keys().filter(|name| !self.config.sections.contains_key(*name)).map(|name| (name.clone(), None)));
         let added: Vec<ToolDefinition> = tools.iter().filter(|tool| !held_tools.contains(tool)).cloned().collect();
@@ -620,6 +636,17 @@ impl Agent {
         self.gate = Some(gate);
     }
 
+    pub fn set_interaction(&mut self, interaction: provider::Interact) {
+        self.config.interaction = Some(interaction);
+        self.config.interactive = true;
+    }
+
+    pub fn set_elicitation_support(&mut self, supported: bool) { self.config.elicitation = supported; }
+
+    pub fn unattended_allowed(&self) -> Result<(), String> {
+        if self.config.model.interactive_only { Err("This provider permits user-picked interactive sessions only; unattended turns are disabled by interactiveOnly in models.json.".into()) } else { Ok(()) }
+    }
+
     // A background job's finish message, when one comes while nothing runs. A frontend waits on
     // this between prompts and hands what arrives to `take_notice`.
     pub async fn notice(&mut self) -> Option<CustomMessage> {
@@ -635,6 +662,7 @@ impl Agent {
     // Run a turn on a background job's finish message, as longcmd does in pi when the session
     // is idle.
     pub async fn take_notice(&mut self, notice: CustomMessage) -> Result<(), String> {
+        if self.config.model.interactive_only { self.hold_notice(notice); return self.unattended_allowed(); }
         self.run_from(Some(AgentMessage::Custom(notice))).await
     }
 
@@ -657,13 +685,19 @@ impl Agent {
     // by a stop), then `first`.
     async fn run_from(&mut self, first: Option<AgentMessage>) -> Result<(), String> {
         let queued = self.session.queued();
+        // Passive news may join the user's next prompt, but cannot start a turn of its own.
+        if self.config.model.interactive_only && (!self.config.interactive || !matches!(first, Some(AgentMessage::User(_)))) {
+            return Err("This provider permits user-picked interactive sessions only; unattended and print turns are refused (interactiveOnly in models.json).".into());
+        }
         if queued.is_empty() && first.is_none() {
             return Ok(());
         }
         self.fresh_cancel();
         // However the run ends, an error included, it ends settled, so nothing waits on it after it's
         // over (a frontend's working state).
+        self.handle.lock().running_api = Some(self.config.model.api.clone());
         let ran = self.turns(queued, first).await;
+        self.handle.lock().running_api = None;
         (self.emit)(&Event::AgentSettled { aborted: ran.as_ref().is_ok_and(|aborted| *aborted) });
         ran.map(drop)
     }
@@ -714,6 +748,7 @@ impl Agent {
                 }
                 continue;
             }
+            if self.config.model.interactive_only { break; }
             // A background job's message that came after the last turn starts a turn of its own.
             if let Ok(notice) = self.config.notices.try_recv() {
                 starting.push(AgentMessage::Custom(notice));
@@ -836,11 +871,22 @@ impl Agent {
             // steering, job notices): compact if it wouldn't fit (agent-session.ts
             // _compactBeforeNextAssistantResponse).
             self.compact_before_next_response().await?;
-            let (assistant, entry_id) = self.respond().await?;
+            let (assistant, entry_id, external) = self.respond().await?;
             new_messages.push(AgentMessage::Assistant(assistant.clone()));
+            let mut results = Vec::new();
+            // Even a failed or cancelled remote prompt may already have changed files. Keep its
+            // call/result pairs before the early exit, and never feed them to our executor.
+            for result in external {
+                let result = AgentMessage::ToolResult(result);
+                self.add_message(result.clone(), &mut new_messages)?;
+                results.push(result);
+            }
+            if self.config.model.api == provider::acp_client::API {
+                provider::acp_client::checkpoint(&self.session, &assistant)?;
+            }
 
             if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
-                (self.emit)(&Event::TurnEnd { message: AgentMessage::Assistant(assistant.clone()), tool_results: Vec::new() });
+                (self.emit)(&Event::TurnEnd { message: AgentMessage::Assistant(assistant.clone()), tool_results: results });
                 let will_retry = self.will_retry(&assistant);
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry, entry_id: entry_id.clone() });
                 let aborted = assistant.stop_reason == StopReason::Aborted;
@@ -860,8 +906,7 @@ impl Agent {
                 self.retry_attempt = 0;
             }
 
-            let has_calls = assistant.content.iter().any(|block| matches!(block, Content::ToolCall { .. }));
-            let mut results = Vec::new();
+            let has_calls = assistant.content.iter().any(|block| matches!(block, Content::ToolCall { external: false, .. }));
             if has_calls {
                 let mut runs = if assistant.stop_reason == StopReason::Length { self.refuse_truncated_calls(&assistant) } else { self.execute_tools(&assistant).await };
                 self.append_web_results()?;
@@ -883,7 +928,7 @@ impl Agent {
             // The call loop guard: the same call with the same result again and again ends the run,
             // with a note to the user and the model saying which.
             for block in &assistant.content {
-                if let Content::ToolCall { name, arguments, .. } = block {
+                if let Content::ToolCall { external: false, name, arguments, .. } = block {
                     let call = format!("{name} {}\n{outcome}", Value::Object(arguments.clone()));
                     self.repeated_call = if self.repeated_call.0 == call { (call, self.repeated_call.1 + 1) } else { (call, 1) };
                 }
@@ -917,7 +962,7 @@ impl Agent {
 
     // What steers the next turn: background jobs' finish messages, then the user's steering.
     fn steering(&mut self) -> Result<Vec<AgentMessage>, String> {
-        if self.handle.draining() {
+        if self.handle.draining() || self.config.model.interactive_only {
             return Ok(Vec::new());
         }
         let mut messages = self.deliveries()?;
@@ -938,7 +983,7 @@ impl Agent {
 
     fn will_retry(&self, assistant: &AssistantMessage) -> bool {
         let retry = self.config.retry;
-        retry.enabled
+        self.config.model.api != provider::acp_client::API && retry.enabled
             && retry::is_retryable(assistant)
             && !retry::is_context_overflow(assistant, self.config.model.context_window)
             && self.retry_attempt < retry.max_retries
@@ -946,7 +991,8 @@ impl Agent {
 
     // Ask the model for one response and stream it out as events. Output: the response, already
     // in the session, and its entry id.
-    async fn respond(&mut self) -> Result<(AssistantMessage, String), String> {
+    async fn respond(&mut self) -> Result<(AssistantMessage, String, Vec<ToolResultMessage>), String> {
+        let mut external = Vec::new();
         // A /fast from during the run applies here; one this model doesn't take waits for the run's end.
         if let Some(on) = self.handle.swap_fast(None) && self.set_fast(on).is_err() {
             self.handle.swap_fast(Some(on));
@@ -960,20 +1006,26 @@ impl Agent {
                 // The stream loop guard stops the request through its own token, so a stopped loop
                 // isn't taken for the user's abort.
                 let guard = self.cancel.child_token();
-                let response = provider::stream(Self::request(&self.config, &self.session, &messages, &credential, guard.clone()), sender);
+                let response = provider::stream(Self::request(&self.config, &self.session, &messages, &credential, guard.clone(), self.ownership.clone()), sender);
                 tokio::pin!(response);
                 let emit = &mut self.emit;
                 let mut started = false;
                 // pi sends the partial message's usage, which these APIs fill in only at the end:
                 // zeros while streaming.
-                let handle = |event: StreamEvent, emit: &mut EventSink, started: &mut bool| match stream_event_json(&event) {
-                    None => {
+                let mut handle = |event: StreamEvent, emit: &mut EventSink, started: &mut bool| match event {
+                    StreamEvent::ExternalStart { id, name, arguments } => emit(&Event::ToolExecutionStart { tool_call_id: id, tool_name: name, args: arguments }),
+                    StreamEvent::ExternalUpdate { id, name, arguments, result } => emit(&Event::ToolExecutionUpdate { tool_call_id: id, tool_name: name, args: arguments, partial_result: result }),
+                    StreamEvent::ExternalEnd(result) => {
+                        emit(&Event::ToolExecutionEnd { tool_call_id: result.tool_call_id.clone(), tool_name: result.tool_name.clone(), result: result_json(&result.content, &result.details), is_error: result.is_error, duration_ms: None });
+                        external.push(result);
+                    }
+                    StreamEvent::Start => {
                         *started = true;
                         let mut partial = provider::new_output(model, &model.api);
                         partial.stop_reason = StopReason::Stop;
                         emit(&Event::MessageStart { message: AgentMessage::Assistant(partial) });
                     }
-                    Some(json) => emit(&Event::MessageUpdate { usage: Usage::default(), assistant_message_event: json }),
+                    other => if let Some(json) = stream_event_json(&other) { emit(&Event::MessageUpdate { usage: Usage::default(), assistant_message_event: json }); },
                 };
                 let (mut streamed, mut checked_at, mut looped) = (String::new(), 0, None);
                 let mut message = loop {
@@ -1011,6 +1063,7 @@ impl Agent {
             Err(error) => {
                 let mut failed = provider::new_output(model, &model.api);
                 failed.stop_reason = StopReason::Error;
+                failed.request_not_sent = model.api == provider::acp_client::API;
                 failed.error_message = Some(error);
                 failed.thinking_level = Some(self.config.thinking_level.clone());
                 (self.emit)(&Event::MessageStart { message: AgentMessage::Assistant(failed.clone()) });
@@ -1022,6 +1075,9 @@ impl Agent {
         let model = &mut self.config.model;
         if model.provider == provider::claude::PROVIDER {
             model.context_window = model.context_window.min(provider::claude::context_window(&model.id, model.max_tokens));
+        }
+        if model.api == provider::acp_client::API && let Some(size) = message.usage.reported.as_ref().and_then(|usage| usage["size"].as_u64()).filter(|size| *size > 0) {
+            model.context_window = size;
         }
         (self.emit)(&Event::MessageEnd { message: AgentMessage::Assistant(message.clone()) });
         let id = self.session.append_message(AgentMessage::Assistant(message.clone())).map_err(|error| format!("Could not write the session: {error}"))?;
@@ -1036,7 +1092,7 @@ impl Agent {
         if !matches!(message.stop_reason, StopReason::Error | StopReason::Length) {
             self.overflow_recovery_attempted = false;
         }
-        Ok((message, id))
+        Ok((message, id, external))
     }
 
     // Both ordinary answers and summary responses can miss the cache, even when the summary
@@ -1052,9 +1108,15 @@ impl Agent {
 
     // A request on the session's own context, the same for each turn and for idle compaction: its
     // model, level, transport, files and cache key, so the provider keeps the one cached prefix.
-    fn request<'a>(config: &'a AgentConfig, session: &'a Session, messages: &'a [crate::message::Message], credential: &'a auth::Credential, cancel: CancellationToken) -> Request<'a> {
-        Request { model: &config.model, messages, credential, session_id: Some(session.id()), in_place: false, manager: config.manager_home.is_some(), transport: &config.transport,
-            thinking_level: &config.thinking_level, session_file: session.file(), cwd: &config.cwd, cancel }
+    fn request<'a>(config: &'a AgentConfig, session: &'a Session, messages: &'a [crate::message::Message], credential: &'a auth::Credential, cancel: CancellationToken, ownership: Option<std::sync::Weak<crate::runtime::Ownership>>) -> Request<'a> {
+        Request { model: &config.model, provider_config: config.registry.provider_config(&config.model.provider), interaction: config.interaction.clone(), interactive: config.interactive, elicitation: config.elicitation, yolo: config.yolo, messages, credential, session_id: Some(session.id()), in_place: false, manager: config.manager_home.is_some(), transport: &config.transport,
+            thinking_level: &config.thinking_level, session_file: session.file(), ownership,
+            fresh_conversation: !session.path_to_leaf().iter().any(|entry| match entry {
+                SessionEntry::Compaction { .. } | SessionEntry::BranchSummary { .. } | SessionEntry::ContextEdit { .. } => true,
+                SessionEntry::Message { message: AgentMessage::Assistant(assistant), .. } => !assistant.request_not_sent,
+                _ => false,
+            }),
+            cwd: &config.cwd, cancel }
     }
 
     // When this session compacts while idle (runtime.rs keeps the time), as Claude Code's
@@ -1070,6 +1132,7 @@ impl Agent {
     // compaction.idleMinTokens; or the model's plan is running low (Claude Code's near_limit).
     pub fn idle_compaction_due(&self) -> Result<(i64, i64), String> {
         let (settings, model) = (self.config.compaction, &self.config.model);
+        if self.config.model.api == provider::acp_client::API { return Err(provider::acp_client::NO_COMPACTION.into()); }
         if !settings.enabled || !settings.idle {
             return Err("compaction or compaction.idle is off".into());
         }
@@ -1162,6 +1225,7 @@ impl Agent {
     // Output: whether the caller should ask the model again.
     async fn check_compaction(&mut self, assistant: &AssistantMessage, entry_id: Option<&str>, skip_aborted: bool) -> Result<bool, String> {
         let settings = self.config.compaction;
+        if self.config.model.api == provider::acp_client::API { return Ok(false); }
         if !settings.enabled || (skip_aborted && assistant.stop_reason == StopReason::Aborted) {
             return Ok(false);
         }
@@ -1272,6 +1336,7 @@ impl Agent {
     // is reserveTokens, except on the bridge, whose window already keeps it (claude context_window).
     // An estimate that falls short still gets the overflow's compact-and-retry after the run.
     async fn compact_before_next_response(&mut self) -> Result<(), String> {
+        if self.config.model.api == provider::acp_client::API { return Ok(()); }
         let context_window = self.config.model.context_window;
         if context_window == 0 {
             return Ok(());
@@ -1294,6 +1359,7 @@ impl Agent {
     // report it. A failure is reported and leaves the session as it was. Output: whether to ask the
     // model again, which only an overflow recovery does.
     async fn run_auto_compaction(&mut self, reason: Reason, will_retry: bool, instructions: Option<&str>) -> Result<bool, String> {
+        if self.config.model.api == provider::acp_client::API { return Err(provider::acp_client::NO_COMPACTION.into()); }
         let Some(mut preparation) = compaction::prepare(&self.session, self.config.compaction) else { return Ok(false) };
         (self.emit)(&Event::CompactionStart { reason });
         let pinning = pintask::enabled() || self.config.manager_home.is_some();
@@ -1316,7 +1382,7 @@ impl Agent {
                     compaction::fit(&mut messages, model.context_window.saturating_sub(reply_room));
                 }
                 let messages = crate::message::to_model_messages(&messages);
-                let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone()), instructions).await;
+                let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone(), self.ownership.clone()), instructions).await;
                 let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
                     usage: response.usage.clone(), note: None };
                 let id = self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
@@ -1422,7 +1488,7 @@ impl Agent {
     fn refuse_truncated_calls(&mut self, assistant: &AssistantMessage) -> Vec<ToolRun> {
         let mut runs = Vec::new();
         for (index, block) in assistant.content.iter().enumerate() {
-            let Content::ToolCall { id, name, arguments, .. } = block else { continue };
+            let Content::ToolCall { external: false, id, name, arguments, .. } = block else { continue };
             (self.emit)(&Event::ToolExecutionStart { tool_call_id: id.clone(), tool_name: name.clone(), args: arguments.clone() });
             let run = ToolRun { index, call_id: id.clone(), name: name.clone(), output: Err(truncated_call_text(name)), duration_ms: None };
             Self::emit_tool_end(&mut self.emit, &run);
@@ -1454,7 +1520,7 @@ impl Agent {
         let (update_sender, mut updates) = mpsc::unbounded_channel::<(usize, ToolUpdate)>();
         let mut calls: Vec<(String, String, Map<String, Value>)> = Vec::new();
         for block in &assistant.content {
-            let Content::ToolCall { id, name, arguments, arguments_error, .. } = block else { continue };
+            let Content::ToolCall { external: false, id, name, arguments, arguments_error, .. } = block else { continue };
             let slot = finished.len();
             finished.push(None);
             calls.push((id.clone(), name.clone(), arguments.clone()));

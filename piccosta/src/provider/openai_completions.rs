@@ -435,6 +435,7 @@ fn handle_chunk(chunk: &Value, model: &Model, output: &mut AssistantMessage, bui
             Some(index) => index,
             None => {
                 output.content.push(Content::ToolCall {
+                    external: false,
                     id: id.unwrap_or_default().to_string(),
                     name: name.to_string(),
                     arguments: Map::new(),

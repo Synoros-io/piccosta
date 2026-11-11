@@ -141,6 +141,7 @@ fn handle(chunk: Value, output: &mut AssistantMessage, model: &crate::model::Mod
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("{name}_{}_{}", crate::clock::now_ms(), index));
                 Content::ToolCall {
+                    external: false,
                     id,
                     name,
                     arguments: call["args"].as_object().cloned().unwrap_or_default(),

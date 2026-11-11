@@ -39,7 +39,8 @@
 // Messages for it, and for the sessions it manages, go through their runtimes (runtime.rs send).
 
 use crate::host::Host;
-use crate::message::{AgentMessage, Content, StopReason};
+use crate::message::{AgentMessage, AssistantMessage, Content, StopReason};
+use crate::session::{EntryBase, Session, SessionEntry};
 use crate::runtime::{Command, Sent};
 use crate::tools::{Tool, ToolContext, ToolFuture, ToolOutput};
 use serde::{Deserialize, Serialize};
@@ -136,7 +137,7 @@ const DAY_MS: i64 = 86_400_000;
 
 // --- The kinds of manager, their homes and their files ---
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     Assistant,
     Project,
@@ -204,7 +205,11 @@ pub fn title(agent_dir: &Path, session: &crate::session::Session) -> String {
 
 // The kind a session was made, if it's a manager.
 pub fn role(session: &crate::session::Session) -> Option<Role> {
-    session.entries().iter().find_map(|entry| match entry {
+    session.entries().iter().find_map(entry_role)
+}
+
+pub(crate) fn entry_role(entry: &crate::session::SessionEntry) -> Option<Role> {
+    match entry {
         crate::session::SessionEntry::Custom { custom_type, data, .. } if custom_type == ROLE_ENTRY => match data.as_ref()?.get("role")?.as_str()? {
             "assistant" => Some(Role::Assistant),
             "project" => Some(Role::Project),
@@ -212,7 +217,7 @@ pub fn role(session: &crate::session::Session) -> Option<Role> {
             _ => None,
         },
         _ => None,
-    })
+    }
 }
 
 // Record the kind of work a session is for, whose tools and readOnly it gets wherever it's opened.
@@ -494,21 +499,31 @@ fn session_id(file: &Path) -> String {
 // Finished turns after the durable entry cursor, oldest first. Read the whole branch, not just
 // the current context: compaction mustn't hide an answer the manager hasn't heard. Older lane
 // files used a timestamp as their cursor; accept that once, then save an entry id.
-fn turns_after(file: &Path, reported: &str) -> Vec<(String, String)> {
-    let Ok(session) = crate::session::Session::read(file) else { return Vec::new() };
+fn finished_turns<'a>(session: &'a Session, reported: Option<&str>) -> impl DoubleEndedIterator<Item=(&'a EntryBase, &'a AssistantMessage)> {
     let path = session.path_to_leaf();
-    let after = path.iter().rposition(|entry| entry.id() == reported || entry.base().timestamp == reported).map_or(0, |at| at + 1);
-    path[after..].iter().filter_map(|entry| {
-        let crate::session::SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } = entry else { return None };
-        let omitted = path.iter().rev().find_map(|edit| match edit {
-            crate::session::SessionEntry::ContextEdit { target_id, replacement, .. } if target_id == &base.id => Some(replacement.is_none()),
-            _ => None,
-        }).unwrap_or(false);
-        if reply.stop_reason == StopReason::ToolUse || omitted { return None; }
+    let after = reported.and_then(|reported| path.iter().rposition(|entry| entry.id() == reported || entry.base().timestamp == reported)).map_or(0, |at| at + 1);
+    let edits: std::collections::HashMap<_, _> = path.iter().filter_map(|entry| match entry {
+        SessionEntry::ContextEdit { target_id, replacement, .. } => Some((target_id.as_str(), replacement.is_none())),
+        _ => None,
+    }).collect();
+    path.into_iter().skip(after).filter_map(move |entry| match entry {
+        SessionEntry::Message { base, message: AgentMessage::Assistant(reply) } if reply.stop_reason != StopReason::ToolUse && !edits.get(base.id.as_str()).copied().unwrap_or(false) => Some((base, reply)),
+        _ => None,
+    })
+}
+
+fn turns_after(file: &Path, reported: &str) -> Vec<(String, String)> {
+    let Ok(session) = Session::read(file) else { return Vec::new() };
+    finished_turns(&session, Some(reported)).map(|(base, reply)| {
         let text: Vec<&str> = reply.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.as_str()) } else { None }).collect();
         let failed = reply.error_message.as_ref().map_or(String::new(), |error| format!("\n(Its turn ended in an error: {error})"));
-        Some((base.id.clone(), text.join("\n") + &failed))
+        (base.id.clone(), text.join("\n") + &failed)
     }).collect()
+}
+
+// A send needs only the last finished entry id, so leave every answer's text alone.
+fn last_turn(session: &Session) -> Option<String> {
+    finished_turns(session, None).next_back().map(|(base, _)| base.id.clone())
 }
 
 // A lane's line in a check-in: how long since its last reply, and the end of the last line of text
@@ -704,8 +719,15 @@ fn string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 // The one session an id, the start of one, or a name picks. An exact id wins; otherwise more than
 // one match is refused with the candidates named, since stopping or closing the wrong session (two
 // made in the same minute share their first characters) can't be undone.
-fn find(agent_dir: &Path, wanted: &str) -> Result<crate::host::SessionSummary, String> {
-    let mut found: Vec<_> = crate::host::all_sessions(agent_dir, usize::MAX).into_iter().filter(|summary| summary.id.starts_with(wanted) || summary.title == wanted).collect();
+fn find(agent_dir: &Path, wanted: &str, index: &mut crate::session::index::Index, titles: bool) -> Result<crate::host::SessionSummary, String> {
+    let files = crate::session::index::files(agent_dir, false);
+    if uuid::Uuid::try_parse(wanted).is_ok() && let Some((path, header)) = crate::session::index::exact(&files, wanted, None) {
+        let modified = path.metadata().and_then(|metadata| metadata.modified()).map_err(|error| error.to_string())?;
+        return if titles { index.summary(&path, modified, crate::session::is_closed(agent_dir, &path)).map_err(|error| error.to_string()) }
+            else { Ok(crate::host::SessionSummary { path, id: header.id, cwd: header.cwd.into(), title: String::new(), modified, closed: false }) };
+    }
+    let closed = crate::session::closed_sessions(agent_dir);
+    let mut found: Vec<_> = crate::session::index::newest(files).into_iter().filter_map(|(modified, path)| index.summary(&path, modified, closed.contains_key(&crate::tools::paths::canonical(&path))).ok()).filter(|summary| summary.id.starts_with(wanted) || summary.title == wanted).collect();
     if let Some(exact) = found.iter().position(|summary| summary.id == wanted) {
         return Ok(found.swap_remove(exact));
     }
@@ -755,6 +777,7 @@ fn message_line(message: &AgentMessage, limit: usize) -> Option<String> {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionsTool {
     agent_dir: PathBuf,
     // The manager's home, where the lanes it answers for are listed.
@@ -767,36 +790,51 @@ pub struct SessionsTool {
 
 impl SessionsTool {
     fn list(&self) -> String {
-        let lines: Vec<String> = crate::host::all_sessions(&self.agent_dir, LIST_LIMIT)
-            .iter()
-            .map(|summary| {
+        let mut index = crate::session::index::Index::open(&self.agent_dir);
+        let closed = crate::session::closed_sessions(&self.agent_dir);
+        let lines: Vec<String> = crate::session::index::newest(crate::session::index::files(&self.agent_dir, false)).into_iter().filter_map(|(modified, path)| {
+                let metadata = index.metadata(&path).ok()?;
+                let summary = index.summary(&path, modified, closed.contains_key(&crate::tools::paths::canonical(&path))).ok()?;
+                Some((summary, metadata))
+            }).take(LIST_LIMIT).map(|(summary, metadata)| {
                 let running = if crate::runtime::running(&summary.path) { " · running" } else if summary.closed { " · closed" } else { "" };
-                let session = crate::session::Session::open(&summary.path, &summary.cwd).ok();
-                let kind = match session.as_ref().and_then(role) {
+                let kind = match metadata.0 {
                     Some(Role::Assistant) => " · the assistant (you)",
                     Some(Role::Project) => " · this project's manager",
                     Some(Role::Advisor) => " · a manager's advisor",
                     None => "",
                 };
-                let model = session.as_ref().and_then(|session| session.context().model).map_or(String::new(), |(provider, id)| format!(" · {provider}/{id}"));
-                let cost = session.as_ref().and_then(|session| crate::rpc::session_stats(session).get("cost").and_then(Value::as_f64)).unwrap_or(0.0);
+                let model = metadata.1.as_ref().map_or(String::new(), |(provider, id)| format!(" · {provider}/{id}"));
+                let cost = metadata.2.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
                 let id = &summary.id;
                 format!("{id} · {} · {}{kind}{model}{running} · {} · ${cost:.2}", crate::tools::jobs::command_preview(&summary.title), summary.cwd.display(), ago(summary.modified))
             })
             .collect();
+        index.save();
         if lines.is_empty() { "No sessions yet.".into() } else { lines.join("\n") }
     }
 
-    fn read(&self, wanted: &str, count: usize) -> Result<String, String> {
-        let summary = find(&self.agent_dir, wanted)?;
-        let session = crate::session::Session::open(&summary.path, &summary.cwd).map_err(|error| error.to_string())?;
+    fn resolve(&self, wanted: &str, count: Option<usize>) -> Result<(crate::host::SessionSummary, Option<Role>, Option<String>), String> {
+        let mut index = crate::session::index::Index::open(&self.agent_dir);
+        let mut summary = find(&self.agent_dir, wanted, &mut index, count.is_none())?;
+        let (role, read) = if let Some(count) = count {
+            let session = index.read(&summary.path).map_err(|error| error.to_string())?;
+            summary.title = crate::host::title(&session);
+            summary.cwd = session.header().cwd.clone().into();
+            (role(&session), Some(self.read(&summary, &session, count)))
+        } else { (index.role(&summary.path).map_err(|error| error.to_string())?, None) };
+        index.save();
+        Ok((summary, role, read))
+    }
+
+    fn read(&self, summary: &crate::host::SessionSummary, session: &crate::session::Session, count: usize) -> String {
         // The last message whole (a lane's report is what the manager answers for), the others cut.
         let all = session.context().messages;
         let last = all.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_)));
         let messages: Vec<String> = all.iter().enumerate().filter_map(|(at, message)| message_line(message, if Some(at) == last { usize::MAX } else { READ_CHARS })).collect();
         let shown = &messages[messages.len().saturating_sub(count)..];
         let running = if crate::runtime::running(&summary.path) { "running now" } else { "not running" };
-        Ok(format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n")))
+        format!("{} · {} · {running} · {} messages\n\n{}", summary.title, summary.cwd.display(), messages.len(), shown.join("\n\n"))
     }
 
     // Send a message to a session (runtime.rs send): to whatever runs it, which reads it at its next
@@ -807,14 +845,21 @@ impl SessionsTool {
         // A message opens a closed session again, from now: the lane's own run did it only as it
         // took the message, and the watch, looking in between, dropped the lane as closed by
         // someone else, never to hear its turns (newC's and Yao's managers, 2026-11-06).
-        crate::session::set_closed(&self.agent_dir, file, false);
-        let heard = turns_after(file, "").pop().map(|(entry, _)| entry).unwrap_or_default();
-        let (to, cwd, message, log) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file));
-        let sent = tokio::task::spawn_blocking(move || crate::runtime::send(&to, &message, Some((&cwd, &log)))).await.map_err(|error| error.to_string())?;
+        let (to, cwd, message, log, agent_dir) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file), self.agent_dir.clone());
+        let (sent, heard, role) = tokio::task::spawn_blocking(move || {
+            crate::session::set_closed(&agent_dir, &to, false);
+            let mut index = crate::session::index::Index::open(&agent_dir);
+            let session = index.read(&to).ok();
+            let heard = session.as_ref().and_then(last_turn).unwrap_or_default();
+            let role = session.as_ref().and_then(role);
+            drop(session);
+            index.save();
+            (crate::runtime::send(&to, &message, Some((&cwd, &log))), heard, role)
+        }).await.map_err(|error| error.to_string())?;
         // An advisor answers its manager by message, so it isn't a lane, and an advisor's lanes are
         // only the sessions it started: a message from it to a manager isn't followed.
         // Another manager is heard from once, at its next finished turn (Lane once).
-        let (lane, once) = match crate::session::Session::read(file).ok().and_then(|session| role(&session)) {
+        let (lane, once) = match role {
             Some(Role::Advisor) => (false, false),
             Some(_) => (!self.advising, true),
             None => (true, false),
@@ -874,13 +919,14 @@ impl SessionsTool {
     fn projects(&self) -> String {
         let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
         for folder in fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-            let Some(newest) = crate::host::sessions_in(&folder, None, 1).into_iter().next() else { continue };
-            if !newest.cwd.is_dir() || newest.cwd == home(&self.agent_dir) {
+            let Some((modified, header)) = crate::session::index::newest(crate::session::index::in_folder(&folder)).into_iter().find_map(|(modified, path)| Some((modified, crate::session::index::header(&path).ok()?))) else { continue };
+            let cwd = PathBuf::from(header.cwd);
+            if !cwd.is_dir() || cwd == home(&self.agent_dir) {
                 continue;
             }
             let count = fs::read_dir(&folder).into_iter().flatten().flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jsonl")).count();
-            let manager = project_manager(&self.agent_dir, &newest.cwd).map_or(String::new(), |file| format!(" · manager {}", session_id(&file)));
-            found.push((newest.modified, format!("{} · {count} sessions · last used {}{manager}", newest.cwd.display(), ago(newest.modified))));
+            let manager = project_manager(&self.agent_dir, &cwd).map_or(String::new(), |file| format!(" · manager {}", session_id(&file)));
+            found.push((modified, format!("{} · {count} sessions · last used {}{manager}", cwd.display(), ago(modified))));
         }
         found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         if found.is_empty() { "No projects yet.".into() } else { found.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n") }
@@ -889,55 +935,17 @@ impl SessionsTool {
     // What the sessions of the last day and week cost, by provider, from their own records.
     fn usage(&self) -> String {
         let now = crate::clock::now_ms();
-        type Tallies = std::collections::BTreeMap<String, (crate::provider::responses::Tally, crate::provider::responses::Tally)>;
+        let mut index = crate::session::index::Index::open(&self.agent_dir);
         // The day's and the week's, by provider, from everything each session and subagent session
         // changed this week spent: its answers, its compactions and its other usage (a cache
         // warm-up), whether or not they're still in its context. Each session is tallied alone
         // first, so a turn settles only its own session's pending ones.
-        let mut totals = Tallies::new();
-        let folders = fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten().map(|folder| folder.path());
-        let files = folders.flat_map(|folder| [folder.join("subagents"), folder]).flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten().map(|file| file.path()));
+        let files = crate::session::index::files(&self.agent_dir, true);
         let this_week = |file: &PathBuf| file.extension().is_some_and(|extension| extension == "jsonl")
             && fs::metadata(file).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age.as_millis() < 7 * DAY_MS as u128));
-        // A fork copies its parent's entries with their ids and times, so each is counted once.
-        let mut counted = std::collections::HashSet::new();
-        for file in files.filter(this_week) {
-            let Ok(session) = crate::session::Session::read(&file) else { continue };
-            let (mut tallies, mut provider) = (Tallies::new(), String::new());
-            for entry in session.entries() {
-                if !counted.insert((entry.id().to_string(), entry.base().timestamp.clone())) {
-                    continue;
-                }
-                let at = |base: &crate::session::EntryBase| crate::clock::ms_from_iso(&base.timestamp).unwrap_or(now);
-                let spent: Vec<(crate::message::Usage, String, i64)> = match entry {
-                    crate::session::SessionEntry::Message { message: AgentMessage::Assistant(answer), .. } => {
-                        provider.clone_from(&answer.provider);
-                        vec![(answer.usage.clone(), answer.provider.clone(), answer.timestamp)]
-                    }
-                    crate::session::SessionEntry::Usage { base, provider, usage, .. } => vec![(usage.clone(), provider.clone(), at(base))],
-                    // A compaction's summary was asked of the session's model, the last one answering.
-                    crate::session::SessionEntry::Compaction { base, usage: Some(usage), .. } => vec![(usage.clone(), provider.clone(), at(base))],
-                    // A tool that asked a model itself (web_search) keeps what it spent in its details.
-                    crate::session::SessionEntry::Message { message: AgentMessage::ToolResult(result), .. } => result.details.as_ref().and_then(|details| details.get("usage")).and_then(Value::as_array).into_iter().flatten()
-                        .filter_map(|spent| Some((serde_json::from_value(spent.get("usage")?.clone()).ok()?, spent.get("provider")?.as_str()?.to_string(), result.timestamp))).collect(),
-                    _ => continue,
-                };
-                for (usage, spent_by, when) in spent {
-                    let (day, week) = tallies.entry(spent_by.clone()).or_default();
-                    if now - when < 7 * DAY_MS {
-                        week.add(&usage, &spent_by);
-                    }
-                    if now - when < DAY_MS {
-                        day.add(&usage, &spent_by);
-                    }
-                }
-            }
-            for (provider, (day, week)) in tallies {
-                let total = totals.entry(provider).or_default();
-                total.0.merge(day);
-                total.1.merge(week);
-            }
-        }
+        let files = files.into_iter().filter(this_week).collect::<Vec<_>>();
+        let totals = index.usage(&files, now, DAY_MS);
+        index.save();
         let spent = totals.iter().filter(|(_, (_, week))| week.total > 0.0 || week.unknown());
         let mut lines: Vec<String> = spent.map(|(provider, (day, week))| format!("{provider}: {} in the last day, {} in the last week (the model's prices, or Claude Code's reckoning, for keys billed by the token; plans bill by quota, below)", day.dollars(2), week.dollars(2))).collect();
         if lines.is_empty() {
@@ -997,29 +1005,37 @@ A session you start or message is one of your lanes: its run carries on in a pro
         Box::pin(async move {
             let need = |key: &str| string(&arguments, key).ok_or_else(|| format!("{key} is needed"));
             let count = arguments.get("count").and_then(Value::as_u64).map_or(READ_MESSAGES, |count| count as usize);
-            // An advisor's session, left out, is its manager. It messages managers, its own or
-            // another's, and the sessions it started, which it may close; the rest goes on below.
+            let action = string(&arguments, "action").unwrap_or_default();
+            let targeted = matches!(action, "read" | "message" | "stop" | "close" | "delete");
+            let manager = if self.advising && targeted {
+                let path = self.home.parent().and_then(pointer).ok_or("Your manager's session isn't there.")?;
+                Some(tokio::task::spawn_blocking(move || crate::session::index::header(&path).map(|header| (path, header))).await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?)
+            } else { None };
+            let mut resolved = if targeted {
+                let wanted = string(&arguments, "session").or_else(|| manager.as_ref().map(|(_, header)| header.id.as_str())).ok_or("session is needed")?.to_string();
+                let (this, read) = (self.clone(), (action == "read").then_some(count));
+                Some(tokio::task::spawn_blocking(move || this.resolve(&wanted, read)).await.map_err(|error| error.to_string())??)
+            } else { None };
             if self.advising {
-                let manager = find(&self.agent_dir, &session_id(&self.home.parent().and_then(pointer).ok_or("Your manager's session isn't there.")?))?;
-                let summary = string(&arguments, "session").map_or(Ok(manager.clone()), |wanted| find(&self.agent_dir, wanted))?;
-                let from = if summary.path == manager.path { FROM_ADVISOR.to_string() } else if manager.cwd == home(&self.agent_dir) { "the assistant's advisor".to_string() } else { format!("the advisor of the manager in {}", manager.cwd.display()) };
-                let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default().lines().any(|line| Path::new(line) == summary.path);
-                match string(&arguments, "action").unwrap_or_default() {
-                    "read" => return text(self.read(&summary.id, count)?),
-                    "message" if crate::session::Session::read(&summary.path).ok().and_then(|session| role(&session)).is_some_and(|role| role != Role::Advisor) => {
-                        return text(self.run(&summary.path, &summary.cwd, &format!("[{}, from {from}]\n{}", now_text(), need("message")?), &summary.title).await?);
+                if let Some((summary, role, _)) = &resolved {
+                    let (manager_path, manager) = manager.as_ref().unwrap();
+                    let from = if summary.path == *manager_path { FROM_ADVISOR.to_string() } else if Path::new(&manager.cwd) == home(&self.agent_dir) { "the assistant's advisor".to_string() } else { format!("the advisor of the manager in {}", manager.cwd) };
+                    let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default().lines().any(|line| Path::new(line) == summary.path);
+                    match action {
+                        "read" => {},
+                        "message" if role.is_some_and(|role| role != Role::Advisor) => return text(self.run(&summary.path, &summary.cwd, &format!("[{}, from {from}]\n{}", now_text(), need("message")?), &summary.title).await?),
+                        "message" | "close" if started => {},
+                        "message" | "close" => return Err(format!("\"{}\" isn't a manager or a session you started.", summary.title)),
+                        action => return Err(format!("No action \"{action}\" for an advisor: list, projects, read, start, message or close.")),
                     }
-                    "list" | "projects" | "start" => {}
-                    "message" | "close" if started => {}
-                    "message" | "close" => return Err(format!("\"{}\" isn't a manager or a session you started.", summary.title)),
-                    action => return Err(format!("No action \"{action}\" for an advisor: list, projects, read, start, message or close.")),
-                }
+                } else if !matches!(action, "list" | "projects" | "start") { return Err(format!("No action \"{action}\" for an advisor")); }
             }
-            match string(&arguments, "action").unwrap_or_default() {
-                "list" => text(self.list()),
-                "projects" => text(self.projects()),
-                "read" => text(self.read(need("session")?, count)?),
-                "usage" => text(self.usage()),
+            match action {
+                "list" | "projects" | "usage" => {
+                    let (this, action) = (self.clone(), action.to_string());
+                    text(tokio::task::spawn_blocking(move || match action.as_str() { "list" => this.list(), "projects" => this.projects(), _ => this.usage() }).await.map_err(|error| error.to_string())?)
+                }
+                "read" => text(resolved.as_mut().unwrap().2.take().unwrap()),
                 "start" => {
                     let dir = PathBuf::from(need("dir")?);
                     let dir = dir.canonicalize().map_err(|error| format!("{}: {error}", dir.display()))?;
@@ -1061,7 +1077,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     }
                 }
                 "message" => {
-                    let summary = find(&self.agent_dir, need("session")?)?;
+                    let summary = &resolved.as_ref().unwrap().0;
                     let changes = ["use", "model", "thinking", "pair", "trio", "name"].iter().any(|key| arguments.contains_key(*key));
                     // Changes go in only while nothing runs it, before the message starts a run.
                     let configured = if changes { crate::runtime::when_idle(&summary.path, |session| self.configure(session, &arguments, false))? } else { None };
@@ -1072,7 +1088,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                 // turn stops; a run of its own then ends, and everything it started with it. One
                 // open in a terminal or editor stays open there.
                 "stop" => {
-                    let summary = find(&self.agent_dir, need("session")?)?;
+                    let summary = &resolved.as_ref().unwrap().0;
                     let stopped = match end(&self.home, &summary.path, "stop").await {
                         None => "isn't running".to_string(),
                         Some(Err(why) | Ok(Some(why))) => why,
@@ -1084,7 +1100,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                 // Close a session: it's done. Whatever runs it stops and ends, with its jobs; it's
                 // marked closed for everyone (it leaves the sidebar), and it's no longer a lane.
                 "close" => {
-                    let summary = find(&self.agent_dir, need("session")?)?;
+                    let summary = &resolved.as_ref().unwrap().0;
                     // A run that couldn't be stopped stays open and a lane, so it isn't left running unseen.
                     let stopped = match end(&self.home, &summary.path, "close").await {
                         None => String::new(),
@@ -1101,7 +1117,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                 // Delete a session this manager started: to the trash, with the Claude bridge's
                 // record. A session still running is left alone.
                 "delete" => {
-                    let summary = find(&self.agent_dir, need("session")?)?;
+                    let summary = &resolved.as_ref().unwrap().0;
                     let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default();
                     if !started.lines().any(|line| Path::new(line) == summary.path) {
                         return Err(format!("\"{}\" wasn't started by you, and you delete only sessions you started; close it instead (`sessions close`).", summary.title));
@@ -1110,7 +1126,8 @@ A session you start or message is one of your lanes: its run carries on in a pro
                         return Err(format!("\"{}\" is running; stop it (`sessions stop`) or close it first, then delete it.", summary.title));
                     }
                     // The lane goes only once its session is in the trash, so a failed delete keeps it.
-                    crate::tui::commands::trash_session(&summary.path)?;
+                    let path = summary.path.clone();
+                    tokio::task::spawn_blocking(move || crate::tui::commands::trash_session(&path)).await.map_err(|error| error.to_string())??;
                     let mut lanes = load_lanes(&self.home);
                     lanes.retain(|lane| lane.file != summary.path);
                     save_lanes(&self.home, &lanes);
@@ -1353,6 +1370,6 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     timers.abort();
     drop(commands);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    crate::provider::claude::shutdown().await;
+    crate::provider::shutdown().await;
     Ok(std::process::ExitCode::SUCCESS)
 }

@@ -182,7 +182,7 @@ fn plan(model: &str) -> &str {
 // invalid every model counts, and the run that uses one says what's wrong.
 fn connected(agent_dir: &Path) -> impl Fn(&str) -> bool {
     let registry = crate::model::ModelRegistry::load(&agent_dir.join("models.json")).ok();
-    move |model| registry.as_ref().is_none_or(|registry| registry.resolve(split(model).0).is_ok())
+    move |model| registry.as_ref().is_none_or(|registry| registry.resolve(split(model).0).is_ok_and(|model| !model.interactive_only))
 }
 
 fn usage_path(agent_dir: &Path) -> std::path::PathBuf {

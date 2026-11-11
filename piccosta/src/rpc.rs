@@ -32,6 +32,7 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 const RUNTIME_MODE_ENV: &str = "T3_PI_RUNTIME_MODE";
 const APPROVAL_ARGUMENT_CHARS: usize = 4000;
 const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+const ACP_QUEUE_UNSUPPORTED: &str = "ACP agents do not support RPC steering or follow-ups. Submit a new prompt after the current turn finishes.";
 
 enum Input {
     Line(String),
@@ -41,6 +42,7 @@ enum Input {
     Done(u64, Box<Done>),
     // A tool call waiting for the user's approval.
     Ask { title: String, message: String, reply: tokio::sync::oneshot::Sender<bool> },
+    Choose(crate::provider::Interaction, tokio::sync::oneshot::Sender<Result<Value, String>>),
 }
 
 // The session being served, and what this loop knows of it while its task has the agent.
@@ -62,6 +64,8 @@ struct Live {
     thinking: String,
     auto_compaction: bool,
     streaming: bool,
+    // Owned completions ahead of the accepted prompt, and its API until it starts.
+    pending_prompt: Option<(usize, String)>,
     compacting: bool,
     // One per command sent to the task, oldest first: the response it still owes, if any.
     owed: VecDeque<Option<(Option<Value>, &'static str)>>,
@@ -69,6 +73,21 @@ struct Live {
     compaction: Option<Result<Value, String>>,
     // abort commands waiting for the run to stop.
     aborts: Vec<Option<Value>>,
+}
+
+impl Live {
+    // The executing turn wins, then its pre-start snapshot; only idle controls use the picker.
+    fn acp_turn(&self) -> bool {
+        self.handle.running_api().as_deref().or(self.pending_prompt.as_ref().map(|(_, api)| api.as_str())).unwrap_or(&self.model.api) == crate::provider::acp_client::API
+    }
+
+    // One owned FIFO slot just completed. Older commands advance the position; only this
+    // prompt's own slot settles it when no agent_start/agent_settled events were emitted.
+    fn command_finished(&mut self) {
+        let Some((commands_ahead, _)) = &mut self.pending_prompt else { return };
+        if *commands_ahead > 0 { *commands_ahead -= 1; }
+        else { self.pending_prompt = None; self.streaming = false; }
+    }
 }
 
 struct Rpc {
@@ -82,6 +101,7 @@ struct Rpc {
     asks: HashMap<String, tokio::sync::oneshot::Sender<bool>>,
     // False under --no-session: new sessions stay in memory too.
     persist: bool,
+    choices: HashMap<String, (crate::provider::Interaction, tokio::sync::oneshot::Sender<Result<Value, String>>)>,
 }
 
 enum Reply {
@@ -121,7 +141,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
         let note = crate::scale::fell_back(&note, &format!("{}/{}", live.model.provider, live.model.id));
         write_line(&json!({"type": "extension_ui_request", "id": uuid::Uuid::new_v4().to_string(), "method": "notify", "message": note, "notifyType": "warning"}));
     }
-    let mut rpc = Rpc { host, inputs, live, generations: 1, steering_mode: "one-at-a-time".into(), follow_up_mode: "one-at-a-time".into(), asks: HashMap::new(), persist: !args.no_session };
+    let mut rpc = Rpc { host, inputs, live, generations: 1, steering_mode: "one-at-a-time".into(), follow_up_mode: "one-at-a-time".into(), asks: HashMap::new(), persist: !args.no_session, choices: HashMap::new() };
     if let Some(name) = args.name.clone().filter(|name| !name.trim().is_empty()) {
         rpc.live.name = Some(name.clone());
         rpc.send(Command::Name(name), None);
@@ -138,6 +158,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
             Some(Input::Event(generation, event)) if generation == rpc.live.generation => rpc.event(*event),
             Some(Input::Done(generation, done)) if generation == rpc.live.generation => rpc.done(*done),
             Some(Input::Ask { title, message, reply }) => rpc.ask(title, message, reply),
+            Some(Input::Choose(request, reply)) => rpc.choose(request, reply),
             Some(Input::Closed) | None => break 0,
             Some(_) => {}
         }
@@ -147,7 +168,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     if let Some(task) = live.task {
         let _ = tokio::time::timeout(STOP_WAIT, task).await;
     }
-    crate::provider::claude::shutdown().await;
+    crate::provider::shutdown().await;
     Ok(ExitCode::from(code))
 }
 
@@ -164,6 +185,15 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     // other processes before the first prompt.
     agent.session.persist_now().map_err(|error| format!("could not write the session: {error}"))?;
     agent.set_gate(approval_gate(inputs, host.yolo));
+    let questions = inputs.clone();
+    agent.set_interaction(Arc::new(move |request| {
+        let questions = questions.clone();
+        Box::pin(async move {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            questions.send(Input::Choose(request, reply)).map_err(|_| "Frontend disconnected")?;
+            answer.await.map_err(|_| "Frontend cancelled the question")?
+        })
+    }));
     let reports = inputs.clone();
     let (handle, id, file, name) = (agent.handle(), agent.session.id().to_string(), agent.session.file().map(PathBuf::from), crate::host::name(&agent.session));
     let (memory, model, thinking, auto_compaction) = (agent.session.file().is_none().then(|| agent.session.clone()), agent.model().clone(), agent.thinking_level().to_string(), agent.auto_compaction());
@@ -172,14 +202,17 @@ fn start(host: &Arc<Host>, inputs: &UnboundedSender<Input>, generation: u64, ses
     });
     let task = Some(task);
     let (streaming, compacting, owed, compaction, aborts) = (false, false, VecDeque::new(), None, Vec::new());
-    Ok(Live { generation, handle, shared, commands, task, id, file, memory, name, model, thinking, auto_compaction, streaming, compacting, owed, compaction, aborts })
+    Ok(Live { generation, handle, shared, commands, task, id, file, memory, name, model, thinking, auto_compaction, streaming, pending_prompt: None, compacting, owed, compaction, aborts })
 }
 
 // Ordinary tools follow T3 Code's mode. A plugin's own question still needs this call's yes.
-fn approval_gate(inputs: &UnboundedSender<Input>, yolo: bool) -> Gate {
+fn approval_policy(yolo: bool) -> (bool, bool) {
     let mode = std::env::var(RUNTIME_MODE_ENV).ok();
-    let full = yolo || mode.as_deref().is_none_or(|mode| mode == "full-access");
-    let edits_free = mode.as_deref() == Some("auto-accept-edits");
+    (yolo || mode.as_deref().is_none_or(|mode| mode == "full-access"), mode.as_deref() == Some("auto-accept-edits"))
+}
+
+fn approval_gate(inputs: &UnboundedSender<Input>, yolo: bool) -> Gate {
+    let (full, edits_free) = approval_policy(yolo);
     let inputs = inputs.clone();
     std::rc::Rc::new(move |_call_id: String, name: String, arguments: Map<String, Value>, question: Option<String>, read_only: bool| {
         let inputs = inputs.clone();
@@ -237,6 +270,10 @@ impl Rpc {
         let id = command.get("id").cloned();
         let kind = command.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         if kind == "extension_ui_response" {
+            if let Some((request, reply)) = command.get("id").and_then(Value::as_str).and_then(|id| self.choices.remove(id)) {
+                let _ = reply.send(Ok(request.answer_label(command["value"].as_str())));
+                return;
+            }
             // An approval's answer: confirmed true allows the call; false or cancelled refuses it.
             if let Some(reply) = command.get("id").and_then(Value::as_str).and_then(|id| self.asks.remove(id)) {
                 let _ = reply.send(command.get("confirmed").and_then(Value::as_bool).unwrap_or(false));
@@ -267,6 +304,7 @@ impl Rpc {
                 let message = text("message");
                 let message = crate::prompt::command_prompt(&message).unwrap_or(message);
                 if live.streaming {
+                    if live.acp_turn() && matches!(command["streamingBehavior"].as_str(), Some("steer" | "followUp")) { return Err(ACP_QUEUE_UNSUPPORTED.into()); }
                     match command.get("streamingBehavior").and_then(Value::as_str) {
                         Some("steer") => {
                             live.handle.steer(message);
@@ -282,10 +320,12 @@ impl Rpc {
                 // The response goes before the run's first event, as pi's preflight answers.
                 respond(id, "prompt", Ok(Some(json!({"disposition": "started"}))));
                 live.streaming = true;
+                live.pending_prompt = Some((live.owed.len(), live.model.api.clone()));
                 self.send(Command::Prompt(message, images), None);
                 return Ok(Reply::Later);
             }
             "steer" | "follow_up" => {
+                if live.acp_turn() { return Err(ACP_QUEUE_UNSUPPORTED.into()); }
                 let message = text("message");
                 if kind == "steer" { live.handle.steer(message) } else { live.handle.follow_up(message) }
                 self.announce_queue();
@@ -506,9 +546,10 @@ impl Rpc {
     fn event(&mut self, event: Event) {
         let live = &mut self.live;
         match &event {
-            Event::AgentStart => live.streaming = true,
+            Event::AgentStart => { live.streaming = true; live.pending_prompt = None; }
             Event::AgentSettled { .. } => {
                 live.streaming = false;
+                live.pending_prompt = None;
                 // An approval still open when the run ended refuses its call.
                 self.asks.clear();
             }
@@ -540,10 +581,12 @@ impl Rpc {
     fn done(&mut self, done: Done) {
         self.live.model = done.model;
         self.live.thinking = done.thinking;
-        if done.notice {
+        if !done.frontend {
             return;
         }
-        let Some(Some((id, name))) = self.live.owed.pop_front() else { return };
+        let Some(owed) = self.live.owed.pop_front() else { return };
+        self.live.command_finished();
+        let Some((id, name)) = owed else { return };
         let result = match done.result {
             Err(error) => Err(error),
             Ok(()) if name == "compact" => self.live.compaction.take().unwrap_or_else(|| Err("Nothing to compact".into())).map(Some),
@@ -606,6 +649,19 @@ impl Rpc {
         self.asks.insert(id, reply);
     }
 
+    fn choose(&mut self, request: crate::provider::Interaction, reply: tokio::sync::oneshot::Sender<Result<Value, String>>) {
+        if reply.is_closed() { return; }
+        self.choices.retain(|_, (_, reply)| !reply.is_closed());
+        let (full, edits_free) = approval_policy(self.host.yolo);
+        let automatic = full || (edits_free && request.params.pointer("/toolCall/kind").and_then(Value::as_str) == Some("edit"));
+        if let Some(answer) = request.auto_allow(automatic) { let _ = reply.send(Ok(answer)); return; }
+        let options = request.labels();
+        if options.is_empty() { let _ = reply.send(Err("This frontend does not support elicitation forms".into())); return; }
+        let id = uuid::Uuid::new_v4().to_string();
+        write_line(&json!({"type": "extension_ui_request", "id": id, "method": "select", "title": request.title(), "options": options}));
+        self.choices.insert(id, (request, reply));
+    }
+
     // The session as its file holds it now (the task has the agent), or as this loop has seen it
     // when there is no file; a file not written yet is empty.
     fn read(&self) -> Result<Session, String> {
@@ -658,64 +714,9 @@ impl Rpc {
 // entry, and tokens and cost summed from responses, tool results, usage entries and compactions.
 // The TUI's /usage shows the same numbers.
 pub fn session_stats(session: &Session) -> serde_json::Map<String, Value> {
-    let (mut users, mut assistants, mut calls, mut results, mut messages) = (0, 0, 0, 0, 0);
-    let mut totals = [0u64; 5];
-    let mut cost = crate::provider::responses::Tally::default();
-    // A plan's tokens count, its cost doesn't (the Tally knows which are a plan's).
-    let mut add = |usage: &crate::message::Usage, provider: &str| {
-        for (total, part) in totals.iter_mut().zip([usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens]) {
-            *total += part;
-        }
-        cost.add(usage, provider);
-    };
-    // A compaction's or branch summary's usage names no provider: it was made with the session's
-    // model at the time, which the latest model change says.
-    let mut provider = String::new();
-    for entry in session.entries() {
-        if let SessionEntry::ModelChange { provider: changed, .. } = entry {
-            provider = changed.clone();
-        }
-        let SessionEntry::Message { message, .. } = entry else {
-            let value = entry_json(entry);
-            let usage = value.get("usage").filter(|_| matches!(entry, SessionEntry::Usage { .. } | SessionEntry::Compaction { .. } | SessionEntry::BranchSummary { .. }));
-            if let Some(usage) = usage.and_then(|usage| serde_json::from_value(usage.clone()).ok()) {
-                add(&usage, value.get("provider").and_then(Value::as_str).unwrap_or(&provider));
-            }
-            continue;
-        };
-        messages += 1;
-        match message {
-            AgentMessage::User(_) => users += 1,
-            AgentMessage::ToolResult(result) => {
-                results += 1;
-                if let Some(usage) = &result.usage {
-                    add(usage, "");
-                }
-            }
-            AgentMessage::Assistant(assistant) => {
-                assistants += 1;
-                calls += assistant.content.iter().filter(|block| matches!(block, Content::ToolCall { .. })).count();
-                add(&assistant.usage, &assistant.provider);
-            }
-            _ => {}
-        }
-    }
-    let [input, output, cache_read, cache_write, total] = totals;
-    let stats = json!({
-        "userMessages": users,
-        "assistantMessages": assistants,
-        "toolCalls": calls,
-        "toolResults": results,
-        "totalMessages": messages,
-        "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write, "total": total},
-        "cost": cost.total,
-    });
-    let mut stats = stats.as_object().cloned().unwrap_or_default();
-    // Beyond pi's fields: some responses' cost isn't known, so `cost` leaves them out.
-    if cost.unknown() {
-        stats.insert("costUnknown".into(), true.into());
-    }
-    stats
+    let mut stats = crate::session::index::Statistics::default();
+    for entry in session.entries() { stats.add(entry); }
+    stats.value()
 }
 
 // pi's ContextUsage (agent-session.ts getContextUsage): the projected context's size, or null

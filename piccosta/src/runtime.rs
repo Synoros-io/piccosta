@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use crate::ipc::{connect, Timed};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -95,10 +95,12 @@ pub enum Command {
 }
 
 // What the runtime reports after each piece of work: how it went (`notice`: work no frontend asked
-// for, a message or a job's end), and the model and level the session has now.
+// for, a message or a job's end), and the model and level the session has now. Only `frontend`
+// completions consume a frontend's command slot; socket work can finish without owning one.
 pub struct Done {
     pub result: Result<(), String>,
     pub notice: bool,
+    pub frontend: bool,
     pub model: Model,
     pub thinking: String,
 }
@@ -128,6 +130,49 @@ pub fn idle_note(session_id: &str) -> Option<String> {
 
 // The socket: the session file's name with SOCKET_SUFFIX after it.
 pub const SOCKET_SUFFIX: &str = ".sock";
+// Unlike the inbox lock, this lease lives through a runtime and each of its submitted saves.
+// A cancelled LocalSet may drop the runtime, but the last save still owns this kernel lock.
+pub const OWNERSHIP_SUFFIX: &str = ".owner";
+
+pub struct Ownership {
+    _file: std::fs::File,
+    accepting: AtomicBool,
+}
+
+impl Ownership {
+    pub fn retain(lease: &Weak<Self>) -> std::io::Result<Arc<Self>> {
+        lease.upgrade().filter(|lease| lease.accepting.load(Ordering::Acquire))
+            .ok_or_else(|| std::io::Error::other("the session ownership was released"))
+    }
+}
+
+// Input: a saved session's path. Output: an exclusive lease, or a busy/error result. Claims take
+// it under the inbox lock; deletion takes it first, then rechecks the file under that lock.
+pub(crate) fn ownership(file: &Path) -> Result<Arc<Ownership>, std::fs::TryLockError> {
+    let path = PathBuf::from(format!("{}{OWNERSHIP_SUFFIX}", file.display()));
+    let lease = crate::platform::private_file(std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false))
+        .open(path).map_err(std::fs::TryLockError::Error)?;
+    lease.try_lock()?;
+    Ok(Arc::new(Ownership { _file: lease, accepting: AtomicBool::new(true) }))
+}
+
+// Called on the disk worker. Keep deletion exclusive through the last rename: a claim waiting on
+// the old session inode must see that its path vanished before it can create a new lease file.
+pub(crate) fn deletion_guard(file: &Path) -> Result<(Arc<Ownership>, Option<std::fs::File>, std::fs::File), String> {
+    let deadline = Instant::now() + crate::provider::claude::persistence_timeout();
+    let ownership = loop {
+        if !file.exists() { return Err(format!("{} was deleted", file.display())); }
+        match ownership(file) {
+            Ok(ownership) => break ownership,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(LOCK_POLL),
+            Err(error) => return Err(format!("{} cannot be deleted while a runtime or save holds it: {error}", file.display())),
+        }
+    };
+    let held = hold(file)?;
+    if !file.exists() { return Err(format!("{} was deleted", file.display())); }
+    let journal = crate::provider::claude::deletion_lock(file).map_err(|error| error.to_string())?;
+    Ok((ownership, held, journal))
+}
 
 pub fn socket_path(file: &Path) -> PathBuf {
     PathBuf::from(format!("{}{SOCKET_SUFFIX}", file.display()))
@@ -160,12 +205,18 @@ pub struct Claim {
     gate: Gate,
     taken: mpsc::UnboundedReceiver<Command>,
     watch: Arc<Mutex<Watch>>,
+    ownership: Arc<Ownership>,
+}
+
+impl Claim {
+    pub fn ownership(&self) -> Weak<Ownership> { Arc::downgrade(&self.ownership) }
 }
 
 // A claim no runtime gave up (its open failed after claiming, say): the messages it took go into
 // the file for the next runtime, under the file's lock, then the socket goes.
 impl Drop for Claim {
     fn drop(&mut self) {
+        self.ownership.accepting.store(false, Ordering::Release);
         if lock(&self.gate).is_some() {
             let _held = hold(&self.file);
             lock(&self.gate).take();
@@ -193,8 +244,13 @@ impl Drop for Claim {
 pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
     let Some(file) = session.file().map(Path::to_path_buf) else { return Ok(None) };
     let _held = hold(&file)?;
+    if (_held.is_some() || session.has_conversation()) && !file.exists() { return Err(format!("{} was deleted", file.display())); }
     let failed = |error: std::io::Error| format!("{}: {error}", socket_path(&file).display());
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/"))).map_err(failed)?;
+    let ownership = ownership(&file).map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => format!("{} {LIVE_ELSEWHERE} (a runtime or save still holds ownership)", file.display()),
+        std::fs::TryLockError::Error(error) => failed(error),
+    })?;
     let listener = crate::ipc::bind(&file).map_err(|error| if error.kind() == std::io::ErrorKind::AddrInUse { format!("{} {LIVE_ELSEWHERE}", file.display()) } else { failed(error) })?;
     if file.exists() {
         let cwd = PathBuf::from(&session.header().cwd);
@@ -204,7 +260,7 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
     let (taken_by, taken) = mpsc::unbounded_channel();
     let (gate, watch): (Gate, Arc<Mutex<Watch>>) = (Arc::new(Mutex::new(Some(taken_by))), Arc::default());
     let listening = Some(listen(listener, gate.clone(), watch.clone()));
-    Ok(Some(Claim { file, listening, gate, taken, watch }))
+    Ok(Some(Claim { file, listening, gate, taken, watch, ownership }))
 }
 
 // Take requests on the socket through the gate, one connection at a time, until the task is
@@ -679,7 +735,7 @@ pub async fn subscribe(file: &Path, mut heard: impl FnMut(Value)) -> bool {
 // --- The runtime ---
 
 enum Work {
-    Command(Command),
+    Command(Command, bool),
     Notice(crate::message::CustomMessage),
     // Idle compaction's time (Agent::idle_compaction_due).
     Idle,
@@ -722,14 +778,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     let task = tokio::task::spawn_local(async move {
         let handle = agent.handle();
         let mut team = crate::host::team(&agent.session);
-        let mut queue: VecDeque<Command> = VecDeque::new();
+        let mut queue: VecDeque<(Command, bool)> = VecDeque::new();
         let mut closing: Option<Option<oneshot::Sender<()>>> = None;
         let mut preparing = Box::pin(host.ready(&mut agent));
         let ready = loop {
             tokio::select! {
                 result = &mut preparing => break result,
                 command = next(&mut commands, &mut claim) => match command {
-                    Some(Command::Close(answer)) => {
+                    Some((Command::Close(answer), _)) => {
                         closing = Some(answer);
                         break Err("Session closed during plugin discovery".into());
                     }
@@ -741,12 +797,21 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         drop(preparing);
         let ready = ready.and_then(|()| confirm_checkin_run(agent.session.file()));
         if let Err(error) = ready {
-            done(Done { result: Err(error), notice: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
-            queue.push_front(Command::Close(closing.take().flatten()));
+            // Startup itself owns no command slot. Reject each accepted frontend command before
+            // closing instead of letting one unsolicited failure consume an arbitrary slot.
+            commands.close();
+            queue.extend(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true)));
+            done(Done { result: Err(error.clone()), notice: false, frontend: false, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+            for (command, frontend) in &queue {
+                if *frontend && !matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_) | Command::ReleaseIfIdle(_) | Command::Message(_) | Command::Checkin) {
+                    done(Done { result: Err(error.clone()), notice: false, frontend: true, model: agent.model().clone(), thinking: agent.thinking_level().to_string() });
+                }
+            }
+            queue.push_front((Command::Close(closing.take().flatten()), false));
         }
         // What the last runner left queued is taken at once.
         if wake && !agent.session.queued().is_empty() {
-            queue.push_back(Command::Message(String::new()));
+            queue.push_back((Command::Message(String::new()), false));
         }
         // The session file's lock, while a run of its own lets go.
         let mut held = None;
@@ -781,12 +846,12 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             }
             // A draining runtime still takes stops and close, but no queued work. The same
             // flag is set before a newly spawned runtime can run during a waiting restart.
-            let queued = queue.iter().position(|command| !handle.draining() || matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_)));
+            let queued = queue.iter().position(|(command, _)| !handle.draining() || matches!(command, Command::Stop(_) | Command::Close(_) | Command::Drain(_)));
             let work = match queued.and_then(|at| queue.remove(at)) {
-                Some(command) => Work::Command(command),
+                Some((command, frontend)) => Work::Command(command, frontend),
                 None => {
                     if let Some(generation) = release.take_if(|_| idle.is_none() && !handle.draining()) {
-                        queue.push_back(Command::ReleaseIfIdle(generation));
+                        queue.push_back((Command::ReleaseIfIdle(generation), false));
                         continue;
                     }
                     // Work that's there goes first: a message or a job's report starts a turn that
@@ -794,7 +859,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     tokio::select! {
                         biased;
                         command = next(&mut commands, &mut claim) => match command {
-                            Some(command) => Work::Command(command),
+                            Some((command, frontend)) => Work::Command(command, frontend),
                             None => break,
                         },
                         Some(notice) = agent.notice(), if wake && !handle.draining() => Work::Notice(notice),
@@ -803,26 +868,26 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
             };
             let work = match work {
-                Work::Command(Command::Stop(answer)) => {
+                Work::Command(Command::Stop(answer), _) => {
                     answer.map(|answer| answer.send(()));
                     if until_idle {
                         break;
                     }
                     continue;
                 }
-                Work::Command(Command::Close(answer)) => {
+                Work::Command(Command::Close(answer), _) => {
                     closing = Some(answer);
                     break;
                 }
-                Work::Command(Command::Drain(answer)) => {
+                Work::Command(Command::Drain(answer), _) => {
                     let _ = answer.send(());
                     continue;
                 }
-                Work::Command(command) if handle.draining() => {
-                    queue.push_back(command);
+                Work::Command(command, frontend) if handle.draining() => {
+                    queue.push_back((command, frontend));
                     continue;
                 }
-                Work::Command(Command::ReleaseIfIdle(generation)) => {
+                Work::Command(Command::ReleaseIfIdle(generation), _) => {
                     if generation.upgrade().is_none() { continue; }
                     if idle.is_some() {
                         release = Some(generation);
@@ -835,10 +900,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     held = None;
                     continue;
                 }
-                Work::Command(Command::Checkin) => Work::Command(Command::Message(String::new())),
+                Work::Command(Command::Checkin, frontend) => Work::Command(Command::Message(String::new()), frontend),
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt. A check-in above explicitly asks for its own turn.
-                Work::Command(Command::Message(text)) if !wake => {
+                Work::Command(Command::Message(text), _) if !wake => {
                     let kept = receive(&mut agent.session).and_then(|()| {
                         if text.is_empty() { Ok(()) } else { agent.session.queue(&text).map(|_| ()).map_err(|error| error.to_string()) }
                     });
@@ -865,10 +930,13 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 work => work,
             };
-            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_)));
+            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_), _));
+            let frontend = !notice && matches!(work, Work::Command(_, true));
+            let mut fast_frontend = false;
             let compacting = matches!(work, Work::Idle);
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
+            let attended = agent.unattended_allowed().is_ok();
             let result = {
                 let run = perform(&host, &mut agent, &mut team, work);
                 tokio::pin!(run);
@@ -882,32 +950,33 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         command = next(&mut commands, &mut claim), if closing.is_none() => match command {
                             // A message for a session compacting while idle stops the compaction and
                             // goes next: its turn reads the cache that's still warm.
-                            Some(command @ (Command::Message(_) | Command::Checkin | Command::Prompt(..))) if compacting && !handle.draining() => {
+                            Some((command @ (Command::Message(_) | Command::Checkin | Command::Prompt(..)), frontend)) if compacting && !handle.draining() => {
                                 handle.abort();
-                                queue.push_back(command);
+                                queue.push_back((command, frontend));
                             }
-                            Some(Command::Checkin) if !handle.draining() => {
+                            Some((Command::Checkin, _)) if !handle.draining() && attended => {
                                 handle.steer(String::new());
                                 shared.jobs.detach_all();
                             }
-                            Some(Command::Message(text)) if !handle.draining() => {
+                            Some((Command::Message(text), _)) if !handle.draining() && attended => {
                                 handle.steer(text);
                                 shared.jobs.detach_all();
                             }
-                            Some(Command::Stop(answer)) => {
+                            Some((Command::Stop(answer), _)) => {
                                 shared.jobs.detach_all();
                                 handle.abort();
                                 stops.push(answer);
                             }
-                            Some(Command::Close(answer)) => {
+                            Some((Command::Close(answer), _)) => {
                                 shared.jobs.detach_all();
                                 handle.abort();
                                 closing = Some(answer);
                             }
                             // Fast mode changes from the run's next request (Agent::respond), unless
                             // commands typed before it wait: then it waits behind them, in order.
-                            Some(Command::Fast(on)) if queue.is_empty() && !handle.draining() => {
+                            Some((Command::Fast(on), frontend)) if queue.is_empty() && !handle.draining() => {
                                 handle.swap_fast(Some(on));
+                                fast_frontend = frontend;
                             }
                             Some(other) => queue.push_back(other),
                             None => {
@@ -921,7 +990,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             lock(&watch).since = None;
             // A /fast no request took is done as a command of its own, before what came after it.
             if let Some(on) = handle.swap_fast(None) {
-                queue.push_front(Command::Fast(on));
+                queue.push_front((Command::Fast(on), fast_frontend));
             }
             // What a stop left unread stays queued here, for the session's next turn (or rpc's
             // clear_queue); it goes into the file when the session is given up.
@@ -933,7 +1002,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             match result {
                 Err(error) if compacting => say(format!("failed: {error}")),
                 _ if compacting => {}
-                result => done(Done { result, notice, model: agent.model().clone(), thinking: agent.thinking_level().to_string() }),
+                result => done(Done { result, notice, frontend, model: agent.model().clone(), thinking: agent.thinking_level().to_string() }),
             }
             if closing.is_some() || (until_idle && stopped) {
                 break;
@@ -961,10 +1030,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 let _ = listening.await;
             }
             lock(&claim.gate).take();
-            left.extend(std::iter::from_fn(|| claim.taken.try_recv().ok()));
+            left.extend(std::iter::from_fn(|| claim.taken.try_recv().ok()).map(|command| (command, false)));
         }
         requeue(&mut agent);
-        for command in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok())) {
+        for (command, _) in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true))) {
             let message = match command {
                 Command::Message(text) if !text.is_empty() => Some(crate::agent::user_message(&text)),
                 Command::Prompt(text, images) => Some(crate::agent::with_images(&text, images)),
@@ -980,6 +1049,9 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         }
         shared.jobs.shutdown("quit");
         agent.keep_notices();
+        // Fence queued provider work before giving up the socket. If the bounded close times out,
+        // a started save keeps the ownership lease itself, so no new runtime can overtake it.
+        if let Err(error) = crate::provider::close(agent.session.id()).await { eprintln!("piccosta: {error}"); }
         lock(&watch).tell(&json!({"end": true}).to_string());
         drop(claim);
         drop(held);
@@ -989,7 +1061,6 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         if let Some(timer) = timer {
             timer.abort();
         }
-        crate::provider::claude::close(agent.session.id());
         lock(&IDLE_NOTES).remove(agent.session.id());
         shared.web.shutdown();
         if let Some(Some(answer)) = closing {
@@ -1000,9 +1071,9 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     (sender, task)
 }
 
-// The next command for a runtime: its frontend's, or one its socket took. None once the frontend
-// has let go of it.
-async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Option<Claim>) -> Option<Command> {
+// The next command and its origin: true only for the frontend channel, not the socket. None
+// once the frontend has let go of the runtime.
+async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Option<Claim>) -> Option<(Command, bool)> {
     let taken = async {
         match claim {
             Some(claim) => claim.taken.recv().await,
@@ -1010,8 +1081,8 @@ async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Optio
         }
     };
     tokio::select! {
-        command = commands.recv() => command,
-        Some(command) = taken => Some(command),
+        command = commands.recv() => command.map(|command| (command, true)),
+        Some(command) = taken => Some((command, false)),
     }
 }
 
@@ -1020,7 +1091,7 @@ async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Optio
 async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) -> Result<(), String> {
     let written = |result: std::io::Result<()>| result.map_err(|error| format!("could not write the session: {error}"));
     let command = match work {
-        Work::Command(command) => command,
+        Work::Command(command, _) => command,
         Work::Notice(notice) => return agent.take_notice(notice).await,
         Work::Idle => return agent.compact_idle().await,
     };
@@ -1029,7 +1100,10 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
     }
     match command {
         Command::Prompt(text, images) => host.answer(agent, team, &text, images).await,
-        Command::Message(text) => host.answer(agent, team, &text, Vec::new()).await,
+        Command::Message(text) => {
+            agent.unattended_allowed()?;
+            host.answer(agent, team, &text, Vec::new()).await
+        }
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;
             Ok(())

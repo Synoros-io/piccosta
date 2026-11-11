@@ -184,32 +184,7 @@ impl App {
                     Err(error) => self.notice = Some(error),
                 }
             }
-            "new" => {
-                // Here first, then home, for a session outside every project.
-                let mut dirs = vec![super::render::home_relative(&self.current().cwd)];
-                if !dirs.iter().any(|dir| dir == "~") {
-                    dirs.push("~".into());
-                }
-                let folders = std::fs::read_dir(self.host.agent_dir.join("sessions")).into_iter().flatten().flatten();
-                let mut recent: Vec<crate::host::SessionSummary> = folders.flat_map(|folder| crate::host::sessions_in(&folder.path(), None, 1)).filter(|summary| summary.cwd.is_dir()).collect();
-                recent.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
-                // Then the projects worked in lately, then every git repository near home.
-                let repos = git_repositories(&crate::config::home());
-                // piccosta's own folders (the assistant's home) aren't projects.
-                for dir in recent.into_iter().map(|summary| summary.cwd).filter(|dir| !dir.starts_with(&self.host.agent_dir)).chain(repos) {
-                    let dir = super::render::home_relative(&dir);
-                    if !dirs.contains(&dir) {
-                        dirs.push(dir);
-                    }
-                }
-                self.pick("new session in · enter: here · ~ is home · or type any path, then flags: --model --effort --pair --name …", dirs, "", |app, typed| {
-                    app.command(&format!("new {typed}"));
-                });
-                let base = self.base_dir();
-                if let Some(picker) = &mut self.picker {
-                    picker.free = Some(base);
-                }
-            }
+            "new" => self.request_listing(super::listing::Kind::Projects, ""),
             "resume" => self.sessions(argument),
             // The scale is one file: /scale edit opens it (written out whole the first time), and
             // /scale <use> <model[:level]> ... sets one use's models there.
@@ -459,8 +434,12 @@ impl App {
         if !filter.is_empty() {
             return self.all_sessions(if filter == "all" { "" } else { filter });
         }
+        self.request_listing(super::listing::Kind::Resume(false), "");
+    }
+
+    pub(super) fn sessions_ready(&mut self, summaries: Vec<crate::host::SessionSummary>, filter: &str) {
         let known: std::collections::HashSet<std::path::PathBuf> = self.slots.iter().filter_map(|slot| slot.path.clone()).collect();
-        for summary in self.host.sessions(super::PICKER_SESSIONS) {
+        for summary in summaries {
             let path = summary.path.canonicalize().unwrap_or(summary.path);
             if !known.contains(&path) {
                 self.slots.push(super::Slot { cwd: summary.cwd, ..super::Slot::new(Some(path), summary.title) });
@@ -492,6 +471,20 @@ impl App {
         }
     }
 
+    pub(super) fn projects_ready(&mut self, mut recent: Vec<crate::host::SessionSummary>) {
+        let mut dirs = vec![super::render::home_relative(&self.current().cwd)];
+        if !dirs.iter().any(|dir| dir == "~") { dirs.push("~".into()); }
+        recent.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+        for dir in recent.into_iter().map(|summary| summary.cwd).filter(|dir| !dir.starts_with(&self.host.agent_dir)).chain(git_repositories(&crate::config::home())) {
+            let dir = super::render::home_relative(&dir);
+            if !dirs.contains(&dir) { dirs.push(dir); }
+        }
+        let filter = self.picker.as_ref().map(|picker| picker.filter.clone()).unwrap_or_default();
+        self.pick("new session in · enter: here · ~ is home · or type any path, then flags: --model --effort --pair --name …", dirs, &filter, |app, typed| { app.command(&format!("new {typed}")); });
+        let base = self.base_dir();
+        if let Some(picker) = &mut self.picker { picker.free = Some(base); }
+    }
+
     // A directory typed or picked: ~ is home; a relative one is looked for from the focused
     // session's directory, then from home (so "projects/x" finds ~/projects/x).
     fn directory(&self, typed: &str) -> Result<std::path::PathBuf, String> {
@@ -519,7 +512,10 @@ impl App {
     // Every project's sessions, newest first, each with its directory. One picked opens in this
     // pane, in its own directory, and joins the sidebar.
     fn all_sessions(&mut self, filter: &str) {
-        let mut found = crate::host::all_sessions(&self.host.agent_dir, usize::MAX);
+        self.request_listing(super::listing::Kind::Resume(true), filter);
+    }
+
+    pub(super) fn all_sessions_ready(&mut self, mut found: Vec<crate::host::SessionSummary>, filter: &str) {
         if !filter.is_empty() {
             let ids: Vec<_> = found.iter().filter(|summary| summary.id.starts_with(filter)).collect();
             if let [summary] = ids.as_slice() {
@@ -593,14 +589,17 @@ impl App {
         if !self.close(slot) {
             return None;
         }
-        self.slots[slot].path = None;
         let Some(path) = path else {
             self.notice = Some(format!("Closed “{title}”: it was never saved."));
             return None;
         };
-        let trashed = trash_session(&path);
-        self.notice = Some(if trashed.is_ok() { format!("Moved “{title}” to the trash.") } else { format!("“{title}” wasn't trashed; see above.") });
-        trashed.err()
+        self.notice = Some(format!("Moving “{title}” to the trash…"));
+        // Closing the pane only queues runtime shutdown. The existing counted disk worker waits
+        // for its lease, without blocking input or letting /restart strand a partial deletion.
+        self.asks.send(Box::new(move |_| {
+            let result = trash_session(&path);
+            (slot, Update::Deleted(path, result))
+        })).err().map(|_| "The disk worker stopped before the session could be trashed.".into())
     }
 
     // Put a command's output in the focused pane.
@@ -642,7 +641,14 @@ impl App {
         };
         let stats = crate::rpc::session_stats(&session);
         let number = |key: &str| stats.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let tokens = |key: &str| stats.get("tokens").and_then(|tokens| tokens.get(key)).and_then(Value::as_u64).unwrap_or(0);
+        let tokens = |key: &str| {
+            let known = stats.get("tokens").and_then(|tokens| tokens.get(key)).and_then(Value::as_u64).unwrap_or(0);
+            match (known, stats.get("tokensUnknown") == Some(&Value::Bool(true))) {
+                (0, true) => "unknown".into(),
+                (_, true) => format!("{known} + unknown"),
+                (_, false) => known.to_string(),
+            }
+        };
         format!(
             "{plans}responses   {}\ntool calls  {}\ninput       {}\noutput      {}\ncache read  {}\ncache write {}\ncost        {}",
             number("assistantMessages"), number("toolCalls"), tokens("input"), tokens("output"), tokens("cacheRead"), tokens("cacheWrite"),
@@ -918,8 +924,10 @@ fn markdown(messages: &[AgentMessage]) -> String {
 // back; nothing is ever deleted outright. Output: Ok when they all went, else what happened, naming
 // any file that couldn't come back and where it is.
 pub(crate) fn trash_session(path: &Path) -> Result<(), String> {
+    let _ownership = crate::runtime::deletion_guard(path)?;
     crate::ipc::remove(path);
-    let beside = [crate::provider::claude::SIDECAR_SUFFIX].map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", path.display())));
+    let [sidecar, journal_lock] = crate::provider::claude::sidecars(path);
+    let beside = [sidecar, journal_lock, std::path::PathBuf::from(format!("{}{}", path.display(), crate::runtime::OWNERSHIP_SUFFIX))];
     let mut moved: Vec<(&Path, (std::path::PathBuf, std::path::PathBuf))> = Vec::new();
     for file in beside.iter().map(|file| file.as_path()).filter(|file| file.exists()).chain(std::iter::once(path)) {
         let Some(went) = trash(file) else {

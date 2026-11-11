@@ -14,6 +14,8 @@
 // - Session listing, fork and branch copying, and labels' UI. They come with the commands that
 //   use them.
 
+pub mod index;
+
 use crate::clock;
 use crate::message::{
     to_model_messages, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, Content, CustomMessage, SystemSnapshot,
@@ -430,6 +432,7 @@ pub(crate) fn open_reader(path: &Path) -> io::Result<fs::File> {
 
 // A small continuity check for an append-only file: its header and the last complete line.
 // Reading these again catches truncate-and-regrow without hashing the whole retained history.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Anchor {
     offset: u64,
     length: usize,
@@ -439,12 +442,6 @@ struct Anchor {
 impl Anchor {
     fn new(offset: u64, bytes: &[u8]) -> Self {
         Self { offset, length: bytes.len(), hash: Sha256::digest(bytes).into() }
-    }
-
-    fn last_complete(bytes: &[u8], offset: u64) -> Option<Self> {
-        let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
-        let start = bytes[..end - 1].iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
-        Some(Self::new(offset + start as u64, &bytes[start..end]))
     }
 
     fn matches(&self, file: &mut fs::File) -> io::Result<bool> {
@@ -462,81 +459,113 @@ fn read_at(file: &mut fs::File, offset: u64, length: usize) -> io::Result<Vec<u8
 
 // One reader owns the retained tree. The offset counts bytes actually read, never a later
 // path length. A partial last line is kept as bytes so a split UTF-8 character survives a scan.
-pub(crate) struct Follower {
-    pub session: Session,
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Cursor {
     identity: (u64, u64),
     consumed: u64,
     modified: Option<std::time::SystemTime>,
     header_anchor: Anchor,
     anchor: Option<Anchor>,
-    tail: Vec<u8>,
+    tail: Option<Anchor>,
     accepted_tail: bool,
+}
+
+pub(crate) enum Record {
+    Header(SessionHeader),
+    Entry(Box<SessionEntry>),
+}
+
+impl Cursor {
+    // Read one observed prefix, reusing the same continuity rules for views and the index.
+    // An unfinished line stays on disk, not in the cache; on growth only that suffix is reread.
+    pub fn scan(path: &Path, previous: Option<&Self>, mut interested: impl FnMut(&str) -> bool, mut visit: impl FnMut(Record)) -> Result<Self, OpenError> {
+        let mut file = open_reader(path)?;
+        let metadata = file.metadata()?;
+        let identity = crate::platform::file_identity(&file)?;
+        let mut previous = previous.cloned().filter(|cursor| cursor.valid() && cursor.identity == identity && metadata.len() >= cursor.consumed
+            && (metadata.len() != cursor.consumed || metadata.modified().ok() == cursor.modified)
+            && !(cursor.accepted_tail && metadata.len() != cursor.consumed));
+        if let Some(cursor) = &previous {
+            if metadata.len() == cursor.consumed { return Ok(cursor.clone()); }
+            if !cursor.header_anchor.matches(&mut file)? || !cursor.anchor.as_ref().map_or(Ok(true), |anchor| anchor.matches(&mut file))?
+                || !cursor.tail.as_ref().map_or(Ok(true), |anchor| anchor.matches(&mut file))? { previous = None; }
+        }
+        let start = previous.as_ref().map_or(0, |cursor| cursor.tail.as_ref().map_or(cursor.consumed, |tail| tail.offset));
+        file.seek(io::SeekFrom::Start(start))?;
+        let mut input = io::BufReader::new(file.take(metadata.len() - start));
+        let mut bytes = Vec::new();
+        let mut position = start;
+        let mut header_anchor = previous.as_ref().map(|cursor| cursor.header_anchor.clone());
+        let mut anchor = previous.as_ref().and_then(|cursor| cursor.anchor.clone());
+        let mut last_complete = None;
+        let (mut tail, mut accepted_tail) = (None, false);
+        while input.read_until(b'\n', &mut bytes)? != 0 {
+            let line = String::from_utf8_lossy(&bytes);
+            let mut value = if header_anchor.is_none() || interested(&line) { parse_line(&line) } else { None };
+            let valid = value.is_some();
+            if header_anchor.is_none() && valid {
+                let header = parse_header(path, value.take().unwrap())?;
+                header_anchor = Some(Anchor::new(position, &bytes));
+                visit(Record::Header(header));
+            } else if let Some(entry) = value.and_then(entry_from_value) { visit(Record::Entry(Box::new(entry))); }
+            // Only the final complete line is a continuity anchor. Hashing every discarded
+            // line would turn a cold catalog into an unnecessary whole-history SHA pass.
+            if bytes.last() == Some(&b'\n') { last_complete = Some((position, bytes.len())); }
+            else {
+                tail = Some(Anchor::new(position, &bytes));
+                accepted_tail = valid || parse_line(&line).is_some();
+            }
+            position += bytes.len() as u64;
+            bytes.clear();
+        }
+        if let Some((offset, length)) = last_complete {
+            let mut file = input.into_inner().into_inner();
+            anchor = Some(Anchor::new(offset, &read_at(&mut file, offset, length)?));
+        }
+        let header_anchor = header_anchor.ok_or_else(|| OpenError::NotASession(path.to_path_buf()))?;
+        Ok(Self { identity, consumed: position, modified: metadata.modified().ok(), header_anchor, anchor, tail, accepted_tail })
+    }
+
+    fn valid(&self) -> bool {
+        let within = |anchor: &Anchor| anchor.offset.checked_add(anchor.length as u64).is_some_and(|end| end <= self.consumed);
+        within(&self.header_anchor) && self.anchor.as_ref().is_none_or(within) && self.tail.as_ref().is_none_or(within)
+    }
+}
+
+pub(crate) struct Follower {
+    pub session: Session,
+    pub cursor: Cursor,
 }
 
 impl Follower {
     pub fn open(path: &Path) -> Result<Self, OpenError> {
-        let mut file = open_reader(path)?;
-        let metadata = file.metadata()?;
-        let identity = crate::platform::file_identity(&file)?;
-        let mut bytes = Vec::new();
-        Read::by_ref(&mut file).take(metadata.len()).read_to_end(&mut bytes)?;
-        let session = Session::parse(path, &String::from_utf8_lossy(&bytes))?;
-        let tail = bytes[bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1)..].to_vec();
-        let accepted_tail = parse_line(&String::from_utf8_lossy(&tail)).is_some();
-        let header_anchor = bytes.split_inclusive(|byte| *byte == b'\n').scan(0, |offset, line| {
-            let start = *offset;
-            *offset += line.len();
-            Some((start, line))
-        }).find(|(_, line)| parse_line(&String::from_utf8_lossy(line)).is_some()).map(|(offset, line)| Anchor::new(offset as u64, line)).unwrap();
-        let anchor = Anchor::last_complete(&bytes, 0);
-        Ok(Self { session, identity, consumed: bytes.len() as u64, modified: metadata.modified().ok(), header_anchor, anchor, tail, accepted_tail })
+        let mut session = None;
+        let cursor = Cursor::scan(path, None, |_| true, |record| match record {
+            Record::Header(header) => session = Some(Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.to_path_buf()), flushed: true }),
+            Record::Entry(entry) => session.as_mut().unwrap().index_entry(*entry),
+        })?;
+        Ok(Self { session: session.unwrap(), cursor })
     }
 
-    // Output: None unchanged, Some(true) replacement, Some(false) a plain leaf extension.
-    // A valid final object without '\n' is visible immediately, like Session::read. Extending
-    // that line rebuilds once: it could be a newline, or an edit to the object already accepted.
+    // None unchanged, Some(true) a replacement or branch/context change, Some(false) extension.
     pub fn advance(&mut self) -> Result<Option<bool>, OpenError> {
-        let path = self.session.file().unwrap();
-        let mut file = open_reader(path)?;
-        let metadata = file.metadata()?;
-        let identity = crate::platform::file_identity(&file)?;
-        if identity != self.identity || metadata.len() < self.consumed || (metadata.len() == self.consumed && metadata.modified().ok() != self.modified) || (self.accepted_tail && metadata.len() != self.consumed) {
-            *self = Self::open(path)?;
-            return Ok(Some(true));
-        }
-        if metadata.len() == self.consumed { return Ok(None); }
-        // Growth alone isn't proof of append: a writer may have truncated and already regrown.
-        // Check the same opened handle, including any partial suffix we will join to new bytes.
-        let continuous = self.header_anchor.matches(&mut file)?
-            && self.anchor.as_ref().map_or(Ok(true), |anchor| anchor.matches(&mut file))?
-            && read_at(&mut file, self.consumed - self.tail.len() as u64, self.tail.len())? == self.tail;
-        if !continuous { *self = Self::open(path)?; return Ok(Some(true)); }
-        file.seek(io::SeekFrom::Start(self.consumed))?;
-        let mut added = Vec::new();
-        file.take(metadata.len() - self.consumed).read_to_end(&mut added)?;
-        self.consumed += added.len() as u64;
-        self.modified = metadata.modified().ok();
-        let mut bytes = std::mem::take(&mut self.tail);
-        bytes.extend(added);
-        let end = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
-        if let Some(anchor) = Anchor::last_complete(&bytes, self.consumed - bytes.len() as u64) { self.anchor = Some(anchor); }
-        let mut replace = false;
-        for line in bytes[..end].split(|byte| *byte == b'\n') {
-            if let Some(entry) = parse_line(&String::from_utf8_lossy(line)).and_then(entry_from_value) {
-                replace |= entry.parent_id() != self.session.leaf_id() || self.session.entry(entry.id()).is_some() || matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ContextEdit { .. });
-                self.session.index_entry(entry);
+        let path = self.session.file().unwrap().to_path_buf();
+        let (mut changed, mut replace) = (false, false);
+        self.cursor = Cursor::scan(&path, Some(&self.cursor), |_| true, |record| {
+            changed = true;
+            match record {
+                Record::Header(header) => {
+                    replace = true;
+                    self.session = Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.clone()), flushed: true };
+                }
+                Record::Entry(entry) => {
+                    let entry = *entry;
+                    replace |= entry.parent_id() != self.session.leaf_id() || self.session.entry(entry.id()).is_some() || matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ContextEdit { .. });
+                    self.session.index_entry(entry);
+                }
             }
-        }
-        self.tail = bytes[end..].to_vec();
-        if let Some(value) = parse_line(&String::from_utf8_lossy(&self.tail)) {
-            // Keep full-reader semantics even for imported files without the usual final newline.
-            self.accepted_tail = true;
-            if let Some(entry) = entry_from_value(value) {
-                replace |= entry.parent_id() != self.session.leaf_id() || self.session.entry(entry.id()).is_some() || matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ContextEdit { .. });
-                self.session.index_entry(entry);
-            }
-        }
-        Ok(Some(replace))
+        })?;
+        Ok(changed.then_some(replace))
     }
 }
 
@@ -665,38 +694,6 @@ impl Session {
         Ok(session)
     }
 
-    // Listing needs the header, last name and first prompt, not the conversation tree. Check the
-    // same JSON and entry parser as a full read; never turn an empty file into a new session.
-    pub fn summary(path: &Path, cwd: Option<&Path>) -> Result<(SessionHeader, Option<String>, Option<String>), OpenError> {
-        let file = open_reader(path)?;
-        let length = file.metadata()?.len();
-        let mut input = io::BufReader::new(file.take(length));
-        let mut bytes = Vec::new();
-        let header = loop {
-            if input.read_until(b'\n', &mut bytes)? == 0 { return Err(OpenError::NotASession(path.to_path_buf())); }
-            if let Some(value) = parse_line(&String::from_utf8_lossy(&bytes)) { break parse_header(path, value)?; }
-            bytes.clear();
-        };
-        if cwd.is_some_and(|cwd| Path::new(&header.cwd) != cwd) { return Ok((header, None, None)); }
-        let (mut name, mut prompt) = (None, None);
-        bytes.clear();
-        while input.read_until(b'\n', &mut bytes)? != 0 {
-            let line = String::from_utf8_lossy(&bytes);
-            // Those two JSON strings must occur on a title-bearing line. An escaped spelling
-            // takes the parser too, including pi's lone-surrogate repair. False positives are
-            // harmless; tool outputs and assistant payloads otherwise need no deserialization.
-            if (prompt.is_none() && line.contains("user")) || line.contains("session_info") || line.contains("\\u") {
-                match parse_line(&line).and_then(entry_from_value) {
-                    Some(SessionEntry::SessionInfo { name: Some(named), .. }) => name = Some(named),
-                    Some(SessionEntry::Message { message: AgentMessage::User(user), .. }) if prompt.is_none() => prompt = Some(user.content.text()),
-                    _ => {}
-                }
-            }
-            bytes.clear();
-        }
-        Ok((header, name, prompt))
-    }
-
     // The settings at the leaf, without cloning the projected conversation.
     pub fn state(&self) -> (Option<(String, String)>, String) {
         let (mut model, mut thinking) = (None, "off".to_string());
@@ -810,7 +807,7 @@ impl Session {
 
     // Metadata can stay in memory until the conversation starts. Queued input can't: it must
     // reach disk even when discovery was interrupted before the first user message.
-    fn has_conversation(&self) -> bool {
+    pub(crate) fn has_conversation(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(entry, SessionEntry::Message { message: AgentMessage::User(_) | AgentMessage::Assistant(_), .. })
         })

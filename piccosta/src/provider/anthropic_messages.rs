@@ -218,6 +218,7 @@ fn handle(
                     Content::Thinking { thinking: "[Reasoning redacted]".into(), thinking_signature: Some(string(block, "data")), redacted: Some(true) }
                 }
                 "tool_use" => Content::ToolCall {
+                    external: false,
                     id: string(block, "id"),
                     name: string(block, "name"),
                     arguments: block["input"].as_object().cloned().unwrap_or_default(),

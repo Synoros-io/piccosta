@@ -222,7 +222,9 @@ impl Host {
     // A session by path, this directory's latest (`latest`), or a new one, kept in memory only
     // when `persist` is false.
     pub fn session(&self, path: Option<&Path>, latest: bool, persist: bool) -> Result<Session, String> {
-        let latest = if latest { self.sessions(1).into_iter().next().map(|summary| summary.path) } else { None };
+        let latest = if latest {
+            session::index::newest(session::index::in_folder(&self.session_dir)).into_iter().find_map(|(_, path)| session::index::header(&path).ok().filter(|header| Path::new(&header.cwd) == self.cwd).map(|_| path))
+        } else { None };
         match path.map(Path::to_path_buf).or(latest) {
             Some(path) => Session::open(&path, &self.cwd).map_err(|error| error.to_string()),
             None => Ok(Session::create(&self.cwd, persist.then_some(self.session_dir.as_path()))),
@@ -233,7 +235,7 @@ impl Host {
     // (pi's continueRecent), each titled by its name or its first prompt. Files are opened newest
     // first and only until the limit is met.
     pub fn sessions(&self, limit: usize) -> Vec<SessionSummary> {
-        sessions_in(&self.session_dir, Some(&self.cwd), limit)
+        indexed_sessions(&self.agent_dir, session::index::in_folder(&self.session_dir), Some(&self.cwd), limit)
     }
 
     // The opening session a command line asks for: a new one in memory only (--no-session wins,
@@ -268,9 +270,21 @@ impl Host {
         if wanted.contains('/') || wanted.ends_with(".jsonl") {
             return Ok(self.cwd.join(wanted));
         }
-        let matches = |summary: &SessionSummary| summary.id.starts_with(wanted) || summary.title == wanted;
-        let found = self.sessions(usize::MAX).into_iter().find(matches).or_else(|| all_sessions(&self.agent_dir, usize::MAX).into_iter().find(matches));
-        found.map(|summary| summary.path).ok_or_else(|| format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
+        let mut index = session::index::Index::open(&self.agent_dir);
+        // Host resolution deliberately differs from the manager: newest matching local session
+        // first, even if another project's session has an exact id or a newer name match.
+        for (files, local) in [(session::index::in_folder(&self.session_dir), true), (session::index::files(&self.agent_dir, false), false)] {
+            for (modified, path) in session::index::newest(files) {
+                let Ok(header) = session::index::header(&path) else { continue };
+                if local && Path::new(&header.cwd) != self.cwd { continue; }
+                if header.id.starts_with(wanted) || index.summary(&path, modified, false).is_ok_and(|summary| summary.title == wanted) {
+                    index.save();
+                    return Ok(path);
+                }
+            }
+        }
+        index.save();
+        Err(format!("No session matches \"{wanted}\" (an id, the start of one, or a name)"))
     }
 
     // The model's tools: the built-in ones, the subagent tool (not in a subagent, which can't hand
@@ -341,7 +355,21 @@ impl Host {
         let append_prompt = self.append_prompt.clone().or(discovered_append);
         let manager = role.map(|role| crate::manager::prompt(role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
-        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
+        self.external_policy(model, session)?;
+        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, external_tools: model.api == crate::provider::acp_client::API, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
+    }
+
+    // An outside agent's tools cannot be narrowed by our executor. Refuse rather than promise
+    // that --no-tools or a read-only lane constrains a process which runs its own commands.
+    fn external_policy(&self, model: &Model, session: &Session) -> Result<(), String> {
+        if model.api != crate::provider::acp_client::API { return Ok(()); }
+        if !self.tools || self.tool_names.is_some() || !self.exclude_tools.is_empty() || self.work(session).0.is_some() || self.work(session).1 {
+            return Err("ACP agents own their tools; piccosta tool restrictions and read-only settings cannot constrain them.".into());
+        }
+        if model.interactive_only && (crate::manager::role(session).is_some() || crate::manager::work(session).is_some() || std::env::var_os(tools::subagent::CHILD_ENV).is_some() || crate::manager::started_by_agent()) {
+            return Err("This provider permits user-picked interactive sessions only (interactiveOnly in models.json); no managers, lanes, scale or subagents.".into());
+        }
+        Ok(())
     }
 
     // The model a session (None: a new one) opens on: the one asked for, else the one it last used,
@@ -351,7 +379,7 @@ impl Host {
             .map(str::to_string)
             .or_else(|| session.and_then(|session| session.state().0).map(|(provider, id)| format!("{provider}/{id}")))
             .or_else(|| self.settings.default_model())
-            .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)))
+            .or_else(|| registry.models().iter().find(|model| !model.interactive_only).map(|first| format!("{}/{}", first.provider, first.id)))
     }
 
     // What to await before opening a session on a model, when the model it would open on isn't
@@ -378,18 +406,22 @@ impl Host {
         let claim = crate::runtime::claim(&mut session)?;
         let registry = self.registry()?;
         let resumed = session.context();
+        let picked = model.is_some();
         let wanted = self.wanted(Some(&session), model, &registry);
         let wanted = wanted.ok_or_else(|| format!("no model: no connected account serves one; log in to one, or pass --model or set defaultModel in {}", self.agent_dir.join("settings.json").display()))?;
         // A session whose model is no longer offered opens on the default model, and with that gone
         // too, on the first model a connected account serves, rather than not at all (the status
         // line shows which). A model asked for by name still has to exist.
-        let fallback = || self.settings.default_model().and_then(|default| registry.resolve(&default).ok()).or(registry.models().first());
+        let fallback = || self.settings.default_model().and_then(|default| registry.resolve(&default).ok()).filter(|model| !model.interactive_only).or_else(|| registry.models().iter().find(|model| !model.interactive_only));
         let model = match (registry.resolve(&wanted), model) {
             (Ok(found), _) => found.clone(),
             (Err(error), Some(_)) if crate::model::listing(&self.agent_dir).is_some() => return Err(format!("{error} (the model lists are still being fetched; try again in a moment)")),
             (Err(error), Some(_)) => return Err(error),
             (Err(error), None) => fallback().ok_or(error)?.clone(),
         };
+        if model.interactive_only && !picked && resumed.model.as_ref() != Some(&(model.provider.clone(), model.id.clone())) {
+            return Err("An interactive-only provider cannot be an inherited or fallback model; pick it explicitly.".into());
+        }
         let has_thinking = resumed.messages.iter().any(|message| matches!(message, AgentMessage::Assistant(_)));
         // The level asked for, else one set in the session since its last reply (a manager's
         // `sessions` call writes it before the run), else, for a session that has run on this
@@ -442,6 +474,10 @@ impl Host {
             compaction,
             transport: self.settings.transport(),
             notices,
+            interaction: None,
+            interactive: false,
+            elicitation: false,
+            yolo: self.yolo,
             hold_for_jobs,
             manager_home,
             claim,
@@ -514,6 +550,10 @@ impl Host {
             count => count,
         };
         if turns > 1 {
+            agent.unattended_allowed()?;
+            for name in &speakers {
+                if self.registry()?.resolve(name)?.interactive_only { return Err("Interactive-only providers cannot join automatic pairs or trios.".into()); }
+            }
             agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
         agent.prompt_with_images(text, images).await?;
@@ -538,41 +578,22 @@ impl Host {
     }
 }
 
-// Session files in one directory, optionally restricted to their recorded cwd. A closed
-// session may have been renamed, so its header supplies both the id and the directory it ran in.
-// Every session on this computer, newest first: each project folder's newest `limit`, then the
-// newest `limit` of those.
+// Every session on this computer, newest first, stopping at `limit` valid summaries.
 pub fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<SessionSummary> {
-    let folders = std::fs::read_dir(agent_dir.join("sessions")).into_iter().flatten().flatten();
-    let mut found: Vec<SessionSummary> = folders.flat_map(|folder| sessions_in(&folder.path(), None, limit)).collect();
-    found.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
-    found.truncate(limit);
+    indexed_sessions(agent_dir, session::index::files(agent_dir, false), None, limit)
+}
+
+pub(crate) fn indexed_sessions(agent_dir: &Path, files: Vec<PathBuf>, cwd: Option<&Path>, limit: usize) -> Vec<SessionSummary> {
+    let mut index = session::index::Index::open(agent_dir);
+    let closed = session::closed_sessions(agent_dir);
+    let mut found = Vec::new();
+    for (modified, path) in session::index::newest(files) {
+        if found.len() == limit { break; }
+        if cwd.is_some_and(|cwd| !session::index::header(&path).is_ok_and(|header| Path::new(&header.cwd) == cwd)) { continue; }
+        if let Ok(summary) = index.summary(&path, modified, closed.contains_key(&crate::tools::paths::canonical(&path))) { found.push(summary); }
+    }
+    index.save();
     found
-}
-
-pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionSummary> {
-    sessions_matching(dir, cwd, limit, |_, _| true)
-}
-
-// Caller-specific exclusions belong before the summary read: discovery must never open a
-// listed session just because a sidecar rename changed its folder's timestamp.
-pub(crate) fn sessions_matching(dir: &Path, cwd: Option<&Path>, limit: usize, include: impl Fn(&Path, std::time::SystemTime) -> bool) -> Vec<SessionSummary> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jsonl"))
-        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-        .collect();
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    let closed = session::closed_sessions(&config::agent_dir());
-    files.into_iter().filter_map(|(modified, path)| {
-        if !include(&path, modified) { return None; }
-        let (header, name, prompt) = Session::summary(&path, cwd).ok()?;
-        let recorded = PathBuf::from(header.cwd);
-        cwd.is_none_or(|cwd| recorded == cwd).then(|| SessionSummary {
-            title: title_text(name.or(prompt).as_deref().unwrap_or("new session")), id: header.id, cwd: recorded, closed: closed.contains_key(&crate::tools::paths::canonical(&path)), path, modified,
-        })
-    }).take(limit).collect()
 }
 
 // The name the session was last given (pi's session_info entries).
@@ -595,7 +616,7 @@ pub fn title(session: &Session) -> String {
     title_text(&named.or_else(first_prompt).unwrap_or_else(|| "new session".into()))
 }
 
-fn title_text(text: &str) -> String {
+pub(crate) fn title_text(text: &str) -> String {
     let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
     line.chars().take(TITLE_CHARS).collect()
 }

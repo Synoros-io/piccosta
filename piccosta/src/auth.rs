@@ -251,6 +251,11 @@ pub(crate) async fn resolve_configured_key(value: &str) -> Result<String, String
 // that's there and empty (an apiKey of "", an empty variable or stored key) is an error: only a
 // models.json server with no apiKey at all is asked with no key.
 pub async fn credential_for(provider: &str, config: Option<&ProviderConfig>, paths: &CredentialPaths) -> Result<Credential, String> {
+    // A command-owned login never goes through our token store or another agent's OAuth files.
+    if config.is_some_and(|config| config.api.as_deref() == Some(crate::provider::acp_client::API)) {
+        if config.is_none_or(|config| config.command.first().is_none_or(String::is_empty)) { return Err("ACP provider needs command (executable and argv) in models.json".into()); }
+        return Ok(Credential { key: String::new(), account_id: None, origin: None, source: "agent-owned authentication".into() });
+    }
     let credential = first_credential(provider, config, paths).await?;
     if credential.key.is_empty() && credential.source != NO_KEY_NEEDED {
         return Err(format!("the key for \"{provider}\" from {} is empty", credential.source));

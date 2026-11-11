@@ -52,6 +52,10 @@ pub enum Content {
         mime_type: String,
     },
     ToolCall {
+        // False for old files and local calls. External agents execute their own tools; this is
+        // recorded history, not a request for our executor.
+        #[serde(default, skip_serializing_if = "is_false")]
+        external: bool,
         id: String,
         name: String,
         arguments: Map<String, Value>,
@@ -114,6 +118,14 @@ impl TextOrBlocks {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
+    // Pi's numeric fields stay zero when no per-turn counters were supplied. They are not a
+    // measured zero-token turn; consumers must keep that distinction when adding up usage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tokens_unknown: bool,
+    // An external agent's session reading, not per-turn input/output or cost. None means it did
+    // not report accounting; keep cumulative/context readings without adding them as fresh usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<Value>,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -153,6 +165,8 @@ pub struct Cost {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub settles: u32,
 }
+
+fn is_false(value: &bool) -> bool { !*value }
 
 fn is_zero(count: &u32) -> bool {
     *count == 0
@@ -255,6 +269,10 @@ pub struct AssistantMessage {
     pub response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    // Proven local/setup failure, before a prompt could be delivered. Unlike an uncertain turn,
+    // this diagnostic is not part of the external agent's conversation and can be retried safely.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_not_sent: bool,
     // The provider's own effort name used for this response, and pi's level that asked for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_thinking_level: Option<String>,

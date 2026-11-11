@@ -20,8 +20,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
-use std::fs;
+use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}};
+use std::{fs, io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write}};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -48,8 +48,11 @@ const SLUG_ADJECTIVES: &str = "ancient bold bright calm clever cool crimson dari
 const SLUG_NOUNS: &str = "arrow badge beacon blade brook castle cedar cloud comet crest dawn drift eagle ember falcon flame forge gale grove harbor hawk jade kettle lance maple marsh needle oak pearl pine ridge river rune sage shade spark stone thorn tower wave";
 // The kept records' sidecar next to pi's session file (pi lists only *.jsonl, so it's left alone).
 const SIDECAR_FORMAT: &str = "claude-bridge-kept";
-// Version 2 keeps one snapshot per shape; version 1 held only the session's last query.
-const SIDECAR_VERSION: u64 = 2;
+// Version 3 appends record/message suffixes; versions 1 and 2 held whole snapshots.
+const SIDECAR_VERSION: u64 = 3;
+// Reclaim superseded query generations once they take more space than the live ones. This keeps
+// the journal within twice its live bytes and pays for each checkpoint with the bytes replaced.
+const JOURNAL_GENERATIONS: u64 = 2;
 pub const SIDECAR_SUFFIX: &str = ".claude-bridge";
 // What a query is started with. A change in any part means a running Claude Code holds something
 // pi no longer wants. maxTokens is always unset here (pi passes none); it stays a part so sidecars
@@ -552,73 +555,356 @@ impl Records {
 
 // --- Kept records ---
 
+// A path can name a new file after a checkpoint or transcript replacement. Keep the opened file's
+// identity, not its path, and notice same-length writes too.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileStamp {
+    identity: (u64, u64),
+    length: u64,
+    modified: std::time::SystemTime,
+}
+
+fn file_stamp(file: &fs::File) -> io::Result<FileStamp> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle stays open and the output is a correctly sized Windows record.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 { return Err(io::Error::last_os_error()); }
+        (u64::from(information.dwVolumeSerialNumber), (u64::from(information.nFileIndexHigh) << u32::BITS) | u64::from(information.nFileIndexLow))
+    };
+    Ok(FileStamp { identity, length: metadata.len(), modified: metadata.modified()? })
+}
+
+// File/tail checks are conservative reset checks, not proof that an arbitrary prefix survived a
+// rewrite. Only the ephemeral live-appender token below authorizes reusing a cursor.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct TranscriptAnchor {
+    file: FileStamp,
+    start: u64,
+    digest: [u8; 32],
+}
+
+impl TranscriptAnchor {
+    fn matches_tail(&self, reader: &mut BufReader<fs::File>, end: u64, current: &FileStamp) -> io::Result<bool> {
+        if current.identity != self.file.identity || current.length < end || self.start >= end
+            || (current.length == self.file.length && current.modified != self.file.modified) {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(self.start))?;
+        let mut line = Vec::new();
+        reader.get_mut().take(end - self.start).read_to_end(&mut line)?;
+        Ok(line.len() as u64 == end - self.start && Sha256::digest(&line).as_slice() == self.digest)
+    }
+}
+
 // What a clean query end leaves for its pi session: Claude Code's chain records and the prints and
 // roles of the pi messages they hold (failed turns left out).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Kept {
     shape: Shape,
     prints: Vec<String>,
     roles: Vec<String>,
     records: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<(String, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<TranscriptAnchor>,
+    // Trust belongs to one live append-only Claude Code query, never to a durable sidecar. A
+    // restart, reattach, different child or foreign journal refresh always pays one full capture.
+    #[serde(skip)]
+    writer: Option<(u64, u32, u64)>,
+    #[serde(skip)]
+    bytes: u64,
 }
 
-// Per pi session: where its sidecar lives (None when pi doesn't save the session), what it kept.
-type KeptSessions = HashMap<String, (Option<PathBuf>, HashMap<String, Kept>)>;
-static KEPT: LazyLock<Mutex<KeptSessions>> = LazyLock::new(Default::default);
+// A complete line commits one shape's suffixes. A rewrite starts at zero; a torn final line leaves
+// the previous prefix intact. Old whole snapshots are the same update with both starts at zero.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Update {
+    #[serde(default)]
+    start: [usize; 2],
+    #[serde(flatten)]
+    kept: Kept,
+}
+
+#[derive(Default)]
+pub(super) struct KeptSession {
+    loaded: bool,
+    stamp: Option<FileStamp>,
+    sidecar: Option<PathBuf>,
+    shapes: HashMap<String, Kept>,
+    // None means an old sidecar (or none yet): migrate it once, not at every tool boundary.
+    end: Option<u64>,
+}
+
+// The outer lock only names sessions. Loading, parsing and writing hold a session's own lock on a
+// blocking worker, so closing another session never waits on a large transcript.
+pub(super) struct Cache {
+    closed: AtomicBool,
+    data: Mutex<KeptSession>,
+}
+pub(super) type Handle = Arc<Cache>;
+static KEPT: LazyLock<Mutex<HashMap<String, Handle>>> = LazyLock::new(Default::default);
+
+pub fn handle(key: &str) -> Option<Handle> { super::lock(&KEPT).get(key).cloned() }
+pub fn fence(cache: &Handle) { cache.closed.store(true, Ordering::Release); }
 
 fn strings(value: &Value) -> Vec<String> {
     value.as_array().into_iter().flatten().filter_map(|item| item.as_str().map(String::from)).collect()
 }
 
-// The first call for a pi session: remember its sidecar and load what an earlier process kept.
-pub fn attach(key: &str, session_file: Option<&Path>) {
-    let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !SETTINGS.keep || kept.contains_key(key) {
-        return;
-    }
-    let sidecar = session_file.map(|file| PathBuf::from(format!("{}{SIDECAR_SUFFIX}", file.display())));
-    let loaded = sidecar.as_ref().and_then(|path| fs::read_to_string(path).ok()).and_then(|text| {
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty()).map(serde_json::from_str::<Value>);
-        let meta = lines.next()?.ok()?;
-        if meta["format"] != SIDECAR_FORMAT {
-            return None;
+// The runtime's short file-lock polling cadence (runtime.rs LOCK_POLL), used off the executor.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
+pub fn lock_path(sidecar: &Path) -> PathBuf { PathBuf::from(format!("{}.lock", sidecar.display())) }
+
+// The stable journal inode's companion is also taken during deletion. A bounded wait means an
+// abandoned lock holder fails the request instead of making close or /restart wait forever.
+pub fn lock_sidecar(sidecar: &Path, closed: &AtomicBool) -> io::Result<fs::File> {
+    let guard = crate::platform::private_file(fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)).open(lock_path(sidecar))?;
+    let deadline = std::time::Instant::now() + SETTINGS.persistence;
+    loop {
+        if closed.load(Ordering::Acquire) { return Err(io::Error::other("the Claude history session was closed")); }
+        match guard.try_lock() {
+            Ok(()) => return Ok(guard),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::sleep(LOCK_RETRY),
+            Err(fs::TryLockError::WouldBlock) => return Err(io::Error::new(io::ErrorKind::TimedOut, "Claude history journal lock timed out")),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
         }
-        let snapshots: Vec<Kept> = match meta["version"].as_u64()? {
-            1 => vec![Kept { shape: meta["shape"].as_object().cloned()?, prints: strings(&meta["prints"]), roles: strings(&meta["roles"]),
-                records: lines.collect::<Result<_, _>>().ok()? }],
-            SIDECAR_VERSION => lines.map(|line| serde_json::from_value(line?)).collect::<Result<_, _>>().ok()?,
-            _ => return None,
-        };
-        Some(snapshots.into_iter().map(|kept| (query_key(key, &kept.shape).1, kept)).collect())
-    });
-    kept.insert(key.to_string(), (sidecar, loaded.unwrap_or_default()));
+    }
 }
 
-// At a clean query end: keep its session file's chain records for the next rewrite. Input: the pi
-// session, Claude Code's session id and project path, and what it holds (shape, prints, roles, its
-// final answer included). Written to the sidecar whole and renamed into place.
-pub fn keep(key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape: &Shape, prints: Vec<String>, roles: Vec<String>) {
-    if !SETTINGS.keep {
-        return;
-    }
-    let file = session_path(cc_session_id, project_path);
-    let Ok(text) = fs::read_to_string(&file) else {
-        return debug(&format!("kept: could not read {}, nothing kept", file.display()));
-    };
-    let records: Vec<Value> = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["uuid"].is_string()).collect();
-    let mut map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = map.entry(key.to_string()).or_default();
-    debug(&format!("kept: {} records of {cc_session_id} for {} piccosta messages", records.len(), prints.len()));
-    entry.1.insert(query_key(key, shape).1, Kept { shape: shape.clone(), prints, roles, records });
-    if let Some(sidecar) = &entry.0 {
-        let meta = json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd});
-        let text: String = std::iter::once(meta).chain(entry.1.values().map(|kept| serde_json::to_value(kept).expect("kept records are JSON")))
-            .map(|record| js::stringify(&record) + "\n").collect();
-        let partial = PathBuf::from(format!("{}.partial", sidecar.display()));
-        if fs::write(&partial, text).and_then(|()| fs::rename(&partial, sidecar)).is_err() {
-            debug(&format!("kept: could not save {}", sidecar.display()));
+impl KeptSession {
+    // Input: this session's key. Output: the sidecar lock, held through the caller's read or save.
+    // The companion inode stays put through checkpoints; only guarded session deletion moves it.
+    // Locking the journal itself would let old-inode waiters race its replacement.
+    fn refresh(&mut self, key: &str, closed: &AtomicBool) -> io::Result<Option<fs::File>> {
+        if closed.load(Ordering::Acquire) { return Err(io::Error::other("the Claude history session was closed")); }
+        let Some(path) = &self.sidecar else { self.loaded = true; return Ok(None) };
+        let guard = lock_sidecar(path, closed)?;
+        if closed.load(Ordering::Acquire) { return Err(io::Error::other("the Claude history session was closed")); }
+        let stamp = match fs::File::open(path) {
+            Ok(file) => Some(file_stamp(&file)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if !self.loaded || self.stamp != stamp {
+            self.shapes.clear();
+            self.end = None;
+            if stamp.is_some() { self.load(key)?; }
+            self.stamp = stamp;
+            self.loaded = true;
         }
+        Ok(Some(guard))
     }
+
+    fn load(&mut self, key: &str) -> io::Result<()> {
+        let Some(path) = &self.sidecar else { return Ok(()) };
+        let mut reader = BufReader::new(fs::File::open(path)?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if !line.ends_with('\n') { return Ok(()); }
+        let Ok(meta) = serde_json::from_str::<Value>(&line) else { return Ok(()) };
+        let version = meta["version"].as_u64().unwrap_or_default();
+        if meta["format"] != SIDECAR_FORMAT || ![1, 2, SIDECAR_VERSION].contains(&version) {
+            return Ok(());
+        }
+        if version == SIDECAR_VERSION {
+            self.end = Some(line.len() as u64);
+        }
+        if version == 1 {
+            let Some(shape) = meta["shape"].as_object() else { return Ok(()) };
+            let kept = Kept { shape: shape.clone(), prints: strings(&meta["prints"]), roles: strings(&meta["roles"]),
+                records: reader.lines().filter_map(|line| match line { Ok(line) if line.trim().is_empty() => None, other => Some(other) })
+                    .map(|line| Ok(serde_json::from_str(&line?)?)).collect::<io::Result<_>>()?, ..Default::default() };
+            self.shapes.insert(query_key(key, &kept.shape).1, kept);
+            return Ok(());
+        }
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 { break; }
+            // An interrupted append is not a snapshot. The next write removes only that tail.
+            if !line.ends_with('\n') { break; }
+            if line.trim().is_empty() {
+                if let Some(end) = &mut self.end { *end += line.len() as u64; }
+                continue;
+            }
+            let Ok(update) = serde_json::from_str::<Update>(&line) else { break };
+            let kept = self.shapes.entry(query_key(key, &update.kept.shape).1).or_default();
+            if update.start[0] > kept.prints.len() || update.start[1] > kept.records.len() { break; }
+            kept.prints.truncate(update.start[0]);
+            kept.roles.truncate(update.start[0]);
+            kept.records.truncate(update.start[1]);
+            kept.shape = update.kept.shape;
+            kept.prints.extend(update.kept.prints);
+            kept.roles.extend(update.kept.roles);
+            kept.records.extend(update.kept.records);
+            kept.source = update.kept.source;
+            kept.anchor = update.kept.anchor;
+            kept.bytes = if update.start[1] == 0 { 0 } else { kept.bytes } + line.len() as u64;
+            if let Some(end) = &mut self.end { *end += line.len() as u64; }
+        }
+        Ok(())
+    }
+
+    // Input: one acknowledged update. Output: it is on disk, or an error with the previous prefix
+    // still readable. Renaming is needed only for the initial write or an old-format migration.
+    fn save(&mut self, update: &Update, cwd: &str, closed: &AtomicBool) -> io::Result<u64> {
+        let Some(path) = &self.sidecar else { return Ok(0) };
+        let mut text = serde_json::to_vec(update)?;
+        text.push(b'\n');
+        if closed.load(Ordering::Acquire) { return Err(io::Error::other("the Claude history session was closed")); }
+        let replaced = update.start == [0, 0];
+        let live_bytes = text.len() as u64 + self.shapes.values().filter(|kept| !replaced || kept.shape != update.kept.shape).map(|kept| kept.bytes).sum::<u64>();
+        if let Some(end) = self.end.filter(|end| end.saturating_add(text.len() as u64) <= live_bytes.saturating_mul(JOURNAL_GENERATIONS)) {
+            let mut file = fs::OpenOptions::new().write(true).open(path)?;
+            file.set_len(end)?;
+            file.seek(SeekFrom::Start(end))?;
+            if let Err(error) = file.write_all(&text) {
+                let _ = file.set_len(end);
+                return Err(error);
+            }
+            self.end = Some(end + text.len() as u64);
+        } else {
+            let partial = PathBuf::from(format!("{}.{}.partial", path.display(), Uuid::new_v4()));
+            let checkpoint = (|| -> io::Result<u64> {
+                let mut file = io::BufWriter::new(crate::platform::private_file(fs::OpenOptions::new().write(true).create_new(true)).open(&partial)?);
+                serde_json::to_writer(&mut file, &json!({"format": SIDECAR_FORMAT, "version": SIDECAR_VERSION, "cwd": cwd}))?;
+                file.write_all(b"\n")?;
+                for kept in self.shapes.values_mut().filter(|kept| !replaced || kept.shape != update.kept.shape) {
+                    let snapshot = serde_json::to_vec(&*kept)?;
+                    file.write_all(&snapshot)?;
+                    file.write_all(b"\n")?;
+                    kept.bytes = snapshot.len() as u64 + 1;
+                }
+                file.write_all(&text)?;
+                file.flush()?;
+                let end = file.stream_position()?;
+                drop(file);
+                fs::rename(&partial, path)?;
+                Ok(end)
+            })();
+            if checkpoint.is_err() { let _ = fs::remove_file(&partial); }
+            self.end = Some(checkpoint?);
+        }
+        self.stamp = Some(file_stamp(&fs::File::open(path)?)?);
+        Ok(text.len() as u64)
+    }
+}
+
+// The first call for a pi session loads its sidecar off the executor. Closing removes this entry;
+// a later attachment reads the durable records again rather than retaining every closed session.
+pub async fn attach(key: &str, session_file: Option<&Path>, ownership: Option<Arc<crate::runtime::Ownership>>) -> io::Result<()> {
+    if !SETTINGS.keep { return Ok(()); }
+    if session_file.is_some() && ownership.is_none() { return Err(io::Error::other("saved Claude sessions require a runtime ownership lease")); }
+    let session = {
+        let mut sessions = super::lock(&KEPT);
+        if sessions.get(key).is_some_and(|cache| cache.closed.load(Ordering::Acquire)) {
+            let retired = sessions.remove(key);
+            tokio::task::spawn_blocking(move || drop(retired));
+        }
+        sessions.entry(key.to_string()).or_insert_with(|| {
+            let sidecar = session_file.map(|file| PathBuf::from(format!("{}{SIDECAR_SUFFIX}", file.display())));
+            Arc::new(Cache { closed: AtomicBool::new(false), data: Mutex::new(KeptSession { sidecar, ..Default::default() }) })
+        }).clone()
+    };
+    if session.data.try_lock().is_ok_and(|session| session.loaded) { return Ok(()); }
+    let key = key.to_string();
+    tokio::time::timeout(SETTINGS.persistence, tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        let mut data = super::lock(&session.data);
+        let _journal = data.refresh(&key, &session.closed)?;
+        Ok::<_, io::Error>(())
+    })).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Claude history load timed out; pending work retains ownership until it exits"))?
+        .map_err(io::Error::other)?
+}
+
+// Input: a closed pi session. Fence queued work immediately and wait a bounded time for active
+// work to clear. A timed-out save still owns its lease until its blocking worker returns.
+pub async fn close(key: &str) -> io::Result<()> {
+    let session = super::lock(&KEPT).remove(key);
+    if let Some(session) = session {
+        session.closed.store(true, Ordering::Release);
+        let key = key.to_string();
+        tokio::time::timeout(SETTINGS.persistence, tokio::task::spawn_blocking(move || {
+            let mut data = super::lock(&session.data);
+            let (shapes, records) = (data.shapes.len(), data.shapes.values().map(|kept| kept.records.len()).sum::<usize>());
+            data.shapes.clear();
+            debug(&format!("kept: released {shapes} shapes / {records} records for {key}"));
+        })).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Claude history close fence timed out; pending saves retain ownership until they exit"))?
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+// At a saved boundary, read only the complete lines added to this query's transcript. Commit the
+// suffix before changing the cached prefix or acknowledging the boundary to pi. The caller runs
+// this on a blocking worker; the source cursor advances only after the sidecar write succeeds.
+#[allow(clippy::too_many_arguments)]
+pub fn keep(cache: Handle, key: &str, cc_session_id: &str, project_path: &str, cwd: &str, shape: &Shape, prints: Vec<String>, roles: Vec<String>, writer: Option<(u64, u32, u64)>) -> io::Result<()> {
+    let mut session = super::lock(&cache.data);
+    let _journal = session.refresh(key, &cache.closed)?;
+    let shape_key = query_key(key, shape).1;
+    let previous = session.shapes.get(&shape_key);
+    let path = session_path(cc_session_id, project_path);
+    let mut reader = BufReader::new(fs::File::open(&path)?);
+    let stamp = file_stamp(reader.get_ref())?;
+    let live = writer.is_some_and(|(_, pid, start)| crate::proc::start(pid as i32) == Some(start));
+    let offset = match previous.filter(|kept| live && kept.writer == writer).and_then(|kept| kept.source.as_ref().zip(kept.anchor.as_ref())) {
+        Some(((id, end), anchor)) if id == cc_session_id && anchor.matches_tail(&mut reader, *end, &stamp)? => Some(*end),
+        _ => None,
+    };
+    if offset.is_none() && previous.is_some() { debug(&format!("kept: transcript reset for {cc_session_id}; rebuilding records")); }
+    reader.seek(SeekFrom::Start(offset.unwrap_or(0)))?;
+    let mut end = offset.unwrap_or(0);
+    let mut records = Vec::new();
+    let mut anchor = previous.filter(|_| offset.is_some()).and_then(|kept| kept.anchor.clone());
+    // Only the final complete line pins the cursor. Keep it in a second reusable buffer instead
+    // of hashing every line of a large initial capture or rereading the final line afterward.
+    let (mut line, mut last_line, mut last_start) = (String::new(), String::new(), end);
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') { break; }
+        let record: Value = serde_json::from_str(&line)?;
+        if record["uuid"].is_string() { records.push(record); }
+        last_start = end;
+        end += line.len() as u64;
+        std::mem::swap(&mut last_line, &mut line);
+    }
+    let current = file_stamp(reader.get_ref())?;
+    if current.identity != file_stamp(&fs::File::open(&path)?)?.identity || (current.length == stamp.length && current.modified != stamp.modified) {
+        return Err(io::Error::other("Claude transcript changed while keeping records"));
+    }
+    if !last_line.is_empty() {
+        anchor = Some(TranscriptAnchor { file: current, start: last_start, digest: Sha256::digest(last_line.as_bytes()).into() });
+    } else if let Some(anchor) = &mut anchor { anchor.file = current; }
+    let messages_start = if offset.is_some() { previous.map_or(0, |kept| prints.iter().zip(&kept.prints).take_while(|(left, right)| left == right).count()) } else { 0 };
+    let records_start = if offset.is_some() { previous.map_or(0, |kept| kept.records.len()) } else { 0 };
+    let update = Update { start: [messages_start, records_start], kept: Kept { shape: shape.clone(), prints: prints[messages_start..].to_vec(), roles: roles[messages_start..].to_vec(), records,
+        source: Some((cc_session_id.to_string(), end)), anchor, ..Default::default() } };
+    let bytes = if offset.is_none() || !update.kept.records.is_empty() || previous.is_none_or(|kept| kept.prints != prints) {
+        session.save(&update, cwd, &cache.closed)?
+    } else { 0 };
+    let kept = session.shapes.entry(shape_key).or_default();
+    kept.bytes = if records_start == 0 { 0 } else { kept.bytes } + bytes;
+    kept.shape = update.kept.shape;
+    kept.prints = prints;
+    kept.roles = roles;
+    kept.records.truncate(records_start);
+    kept.records.extend(update.kept.records);
+    kept.source = update.kept.source;
+    kept.anchor = update.kept.anchor;
+    kept.writer = writer;
+    debug(&format!("kept: {} records of {cc_session_id} for {} piccosta messages", kept.records.len(), kept.prints.len()));
+    Ok(())
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -849,8 +1135,10 @@ fn align(kept: &Kept, history: &[Message], count: usize) -> Vec<Option<usize>> {
 // conversion of the rest, or None when nothing could be copied (the caller converts it all).
 #[allow(clippy::too_many_arguments)]
 fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, project_path: &str, served: &[ToolDefinition], cli_model: &str, shape: &Shape) -> Option<Records> {
-    let map = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let kept = map.get(key)?.1.get(&query_key(key, shape).1)?;
+    let cache = handle(key)?;
+    let mut session = super::lock(&cache.data);
+    let _journal = session.refresh(key, &cache.closed).ok()?;
+    let kept = session.shapes.get(&query_key(key, shape).1)?;
     let shared = prints.iter().zip(&kept.prints).take_while(|(print, kept)| print == kept).count();
     // A cut has to leave every tool call with its results on the same side: a converted result whose
     // call was copied would be dropped as an orphan, a copied call whose results were converted
@@ -896,17 +1184,36 @@ fn from_kept(key: &str, history: &[Message], prints: &[String], cwd: &str, proje
     Some(records)
 }
 
-// Write the session a rewrite resumes. Input: the pi session, the history (visible messages before
-// the prompt) and its prints, the cwd and its realpath, the served tools, the Claude Code model and
-// the query's shape. Output: the new session's id. Always a fresh id: a discarded Claude Code may
-// still be flushing into the file it had.
+// A timed-out join still finishes on its worker. Keep the file and lease in its result so dropping
+// an unclaimed result cleans up before releasing ownership, even when the caller never polls it.
+pub(super) struct ResumeFile {
+    session_id: Option<String>,
+    project_path: String,
+    _ownership: Option<Arc<crate::runtime::Ownership>>,
+}
+
+impl ResumeFile {
+    pub fn session_id(&self) -> &str { self.session_id.as_deref().expect("resume file already taken") }
+    pub fn take(mut self) -> String { self.session_id.take().expect("resume file already taken") }
+}
+
+impl Drop for ResumeFile {
+    fn drop(&mut self) {
+        if let Some(id) = &self.session_id { delete_session(id, &self.project_path); }
+    }
+}
+
+// Write the session a rewrite resumes. Input: pi's history and prints, cwd and realpath, served
+// tools, model, shape and ownership lease. Output: a guarded file, taken only by a started query.
+// Always a fresh id: a discarded Claude Code may still be flushing into the file it had.
 #[allow(clippy::too_many_arguments)]
-pub fn write_session(key: &str, history: &[Message], prints: &[String], cwd: &str, project_path: &str, served: &[ToolDefinition], cli_model: &str, shape: &Shape) -> std::io::Result<String> {
+pub fn write_session(key: &str, history: &[Message], prints: &[String], cwd: &str, project_path: &str, served: &[ToolDefinition], cli_model: &str, shape: &Shape, ownership: Option<Arc<crate::runtime::Ownership>>) -> std::io::Result<ResumeFile> {
     let records = from_kept(key, history, prints, cwd, project_path, served, cli_model, shape).unwrap_or_else(|| {
         let mut records = Records::new(project_path, &real_or(cwd).nfc().collect::<String>(), cli_model);
         records.import(convert(history, served));
         records
     });
+    let file = ResumeFile { session_id: Some(records.session_id.clone()), project_path: project_path.to_string(), _ownership: ownership };
     records.save()?;
-    Ok(records.session_id)
+    Ok(file)
 }
