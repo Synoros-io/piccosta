@@ -1,8 +1,17 @@
 # piccosta
 
-One agent harness for every model you use, in Rust: Claude, GPT and opencode-go models, ACP agents and your own endpoints, with one session format, a terminal UI, print mode, pi's rpc protocol (T3 Code) and ACP (Zed and other editors). It stores no credentials of its own: it reads each account's existing login.
+The piccosta research harness is a new standard for LLM harnesses as of November 2026.
+Created to make coding agents more reliable in research, turned into a highly performant rust based harness that outperforms anything released to the public, for multi agent management, for cost and tool reliability, for customization, for system resource usage, and with many modern features. It is an active area of research.
 
-*To install, see below, or paste this to your coding agent:*
+piccosta is one agent harness for every model you use:
+- Claude, through your Claude Code login (your Claude plan), within tos via the agent sdk as of OCT 2026;
+- GPT, through your Codex login (your ChatGPT plan);
+- the opencode and opencode go models
+- BYO or connect
+
+It stores no credentials of its own: it uses each account's existing login, and reads those files without writing them. The one exception is a login already in piccosta's own `login/auth.json` (the TypeScript piccosta kept them there), which it reads first, refreshing a Codex login there and saving it back. It has one session format, a terminal UI, a print mode for scripts, pi's rpc protocol (for T3 Code) and ACP (for Zed and other editors). The idea is to allow the user to customize the frontend with any pre-existing one, or with a custom one their agents build, on top of the existing minimal tui or otherwise. It is written in Rust, initially based on the [pi coding agent](https://github.com/earendil-works/pi) and then tested, substantially improved, rewritten and repackaged.
+
+*To install see below, or paste this to your coding agent:*
 
 *Install piccosta (https://github.com/Synoros-io/piccosta) on this machine by following its README: put the release binary on my PATH, or build it if there's no release for this platform. Run `piccosta auth status`, and tell me how to log in to any account it doesn't find. Set `defaultProvider` and `defaultModel` in piccosta's settings.json to a model I'm logged in to. If I use Zed or T3 Code, set them up with `piccosta zed` or `piccosta t3`. Finish with `piccosta -p "say hello"` to show it works.*
 
@@ -18,16 +27,17 @@ One agent harness for every model you use, in Rust: Claude, GPT and opencode-go 
 - New models show up on their own: each account's model list is fetched at start and with `/models refresh`; per-model overrides go in `models.json` (`modelOverrides`, pi's format).
 - `"serviceTier": "priority"` asks a Codex model for its fast mode.
 - One thinking scale, `off` to `max`, mapped to what each model takes.
+- More will be added with time.
 
 ### Model scale
 
-- Kinds of work: critical, general, review, reading, bugs, search, tests, visual, prose, monitoring, exploration; each has its models, tools and instructions.
+Sliding scale : critical, general, review, reading code, bug hunting, web search, tests, visual work, writing prose, monitoring and exploration. 
 - Plan usage (Claude, Codex, opencode Go) is tracked and shown in the pane header and `/usage`; past `lowUsagePercent` (80) of a window, picks prefer another plan.
 - `/scale` shows it, `/scale edit` edits `scale.json`, `/scale <kind> <model[:level]>` sets one kind; `--use <kind>` starts a session on its pick.
 
 ### Managers
 
-- The assistant: a standing background session (`piccosta assistant`, or `"manager": {"autostart": true}`); talk to it in the sidebar or with `piccosta tell <text>`.
+- The assistant: a standing background session, inspired by Grokbot, OPENAI dots, and meta muse (`piccosta assistant`, or `"manager": {"autostart": true}`); talk to it in the sidebar or with `piccosta tell <text>`.
 - Project managers: the first session in a directory becomes its manager; `/manager` makes one elsewhere.
 - They list, read, start, message and stop sessions in any project, on any model or kind of work, check costs, keep schedules and send desktop notifications.
 - Sessions they start are real sessions that keep running when the manager restarts; the manager hears the result and reports.
@@ -41,6 +51,8 @@ One agent harness for every model you use, in Rust: Claude, GPT and opencode-go 
 - `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both.
 
 ### Pairs and trios
+
+Like Devin Fusion, piccosta can run two models together in one chat. A pair is two models going back and forth. A trio is the same two models with you in the loop.
 
 - `/pair <model>` (`--pair`): two models go back and forth in one chat until one ends with `[done]` or `pairRounds` (3) is reached.
 - `/trio <model>` (`--trio`): the other model checks the answer once, then waits for you.
@@ -105,6 +117,30 @@ One agent harness for every model you use, in Rust: Claude, GPT and opencode-go 
 - `--mode acp`: Agent Client Protocol for Zed and others, with Ask, Edits and Auto modes, diff permission cards, live command output and model and thinking pickers.
 - Sessions are pi's JSONL format, so every front end opens the same sessions.
 
+## Performance
+
+Measured on piccosta 0.2.0.
+
+| | piccosta 0.2.0 | pi 1.2.0 | Claude Code 2.1.316 |
+|---|---|---|---|
+| Whole 20-step run, wall time | 150 ms (140–170) | 1,240 ms (1,230–1,250) | 2,080 ms (2,050–2,190) |
+| CPU, user | 50 ms (40–60) | 440 ms (420–450) | 1,390 ms (1,360–1,420) |
+| CPU, system | 90 ms (80–110) | 140 ms (130–160) | 370 ms (350–370) |
+| Peak memory, largest process | 17.2 MB (15.5–17.5) | 130 MB (129–131) | 237 MB (223–237) |
+| Peak memory, all its processes | 26.6 MB (22.7–27.0) | 128 MB (128–130) | 250 MB (248–250) |
+| Start to first model request | 10.9 ms (10.2–12.7) | 249 ms (239–258) | 284 ms (277–321) |
+| Between a response and the next request (runs the tool) | 6.6 ms (6.0–7.4) | 47.8 ms (47.7–48.2) | 67.9 ms (67.3–69.8) |
+| Last response to exit | 53 ms (33–61) | 76 ms (58–86) | 98 ms (72–139) |
+| `--version` | 2.3 ms | 176 ms | 8.6 ms |
+| Terminal UI, idle: memory | 12.2 MB | 129 MB | 148 MB |
+| Terminal UI, idle: CPU | 0.3 ms per second | 0.0 ms per second | 3.3 ms per second |
+| On disk | one 32 MB static binary | 154 MB, plus Node.js | 314 MB |
+
+- **What each harness was:** each ran in a fresh config folder, so none read the user's own settings. piccosta was the static release binary.
+- **How CPU and memory were measured:** CPU counts each harness and the commands it ran. Peak memory comes from GNU time (largest process) and from sampling /proc every 50 ms (all its processes).
+- **Idle numbers:** taken over 30 seconds, after a 5-second settle, with nothing typed. Claude Code's idle figure is on its first-run welcome screen.
+- **Not measured:** the Codex CLI.
+
 ## Install
 
 Linux (any distribution): one static x86-64 binary, tried on Arch, Alpine 3.24, Debian 12 and Ubuntu 24.04. It needs the `ca-certificates` bundle. Read-only scale kinds run commands in a Landlock sandbox (Linux 6.12 or newer, else set `"readOnly": false` on the kind in `scale.json`).
@@ -115,7 +151,8 @@ curl -fL https://github.com/Synoros-io/piccosta/releases/latest/download/piccost
 chmod +x ~/.local/bin/piccosta
 ```
 
-Build from source (stable Rust; musl-gcc for the TLS library: `musl` on Arch, `musl-tools` on Debian and Ubuntu):
+To build it you need a recent stable Rust, and musl-gcc (the `musl`
+package on Arch, `musl-tools` on Debian and Ubuntu) for the TLS library's C code.
 
 ```sh
 git clone https://github.com/Synoros-io/piccosta && cd piccosta
