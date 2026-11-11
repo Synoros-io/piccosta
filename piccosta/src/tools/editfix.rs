@@ -51,10 +51,10 @@ const SCAN_CHAR_BUDGET: usize = 20_000_000;
 // head and tail are trimmed off. Past this many cells we stop being exact and report the whole
 // differing middle as one block.
 const LCS_CELL_BUDGET: usize = 4_000_000;
-// Files up to this size keep their content in the snapshot so we can say which lines changed;
-// bigger ones keep only a hash and get "changed" without line ranges. 2 MB is far above pi's
-// 50 KB read cap, so any file a model can sensibly edit fits.
-const SNAPSHOT_MAX_BYTES: usize = 2 * 1024 * 1024;
+// Don't reread whole large files just to annotate a later failed edit. Text already in memory
+// can keep a hash, but only snapshots up to this size keep line ranges. 2 MB is far above pi's
+// 50 KB read cap, so most files a model edits fit.
+pub(super) const SNAPSHOT_MAX_BYTES: usize = 2 * 1024 * 1024;
 // How many changed ranges we list before summarizing the rest as "and N more".
 const MAX_CHANGED_RANGES: usize = 8;
 // Shell commands that show a file to the model. These are the read commands mined from
@@ -66,7 +66,6 @@ const SHELL_READ_COMMANDS: [&str; 5] = ["cat", "head", "tail", "sed", "nl"];
 
 struct Snapshot {
     hash: u64,
-    // None when the file was over SNAPSHOT_MAX_BYTES.
     content: Option<String>,
     // Which tool showed it: read, edit, write, bash.
     via: &'static str,
@@ -111,13 +110,27 @@ impl SeenFiles {
         self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(paths::canonical(path), snapshot);
     }
 
-    // Input: an absolute path a tool just showed. Reads it from disk and records it. Directories
-    // and unreadable paths are skipped quietly: this runs after a tool already succeeded.
+    pub(super) fn forget(&self, path: &Path) {
+        self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&paths::canonical(path));
+    }
+
+    // Skip oversized files before reading. The bounded reader also handles a file growing after
+    // metadata: tracking a shell read must never turn head -n 1 into an unbounded read of its own.
     pub fn record(&self, path: &Path, via: &'static str) {
-        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        use std::io::Read;
+        let Ok(metadata) = std::fs::metadata(path) else { return };
+        if !metadata.is_file() { return; }
+        if metadata.len() > SNAPSHOT_MAX_BYTES as u64 {
+            self.forget(path);
             return;
         }
-        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(file) = std::fs::File::open(path) else { return };
+        let mut bytes = Vec::new();
+        if file.take(SNAPSHOT_MAX_BYTES as u64 + 1).read_to_end(&mut bytes).is_err() { return; }
+        if bytes.len() > SNAPSHOT_MAX_BYTES {
+            self.forget(path);
+            return;
+        }
         self.remember(path, &String::from_utf8_lossy(&bytes), via);
     }
 
@@ -548,8 +561,8 @@ pub fn explain_failure(display_path: &str, absolute: &Path, edits: &[Edit], seen
     // 1. Did the file move since the model saw it? Said first: when true, it's the reason.
     let snapshot = seen.snapshot_of(absolute);
     let file_changed = snapshot.as_ref().is_some_and(|(hash, ..)| hash_text(&content) != *hash);
-    let snapshot_content = snapshot.as_ref().and_then(|(_, content, ..)| content.clone());
-    let snapshot_lines: Vec<&str> = snapshot_content.as_deref().map(|text| text.split('\n').collect()).unwrap_or_default();
+    let snapshot_content = snapshot.as_ref().and_then(|(_, content, ..)| content.as_deref());
+    let snapshot_lines: Vec<&str> = snapshot_content.map(|text| text.split('\n').collect()).unwrap_or_default();
     // Snapshot-to-now diff, kept for mapping an oldText's old position to its new one below.
     let since_snapshot = (file_changed && snapshot_content.is_some()).then(|| diff_lines(&snapshot_lines, &file_lines));
     if let Some((_, _, via, at)) = &snapshot {

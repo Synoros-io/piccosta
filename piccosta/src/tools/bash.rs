@@ -118,7 +118,9 @@ impl Tool for BashTool {
             let result = run(&arguments, context).await;
             let succeeded = matches!(&result, Ok(Run::Finished(output) | Run::Background(output)) if !output.is_error);
             if succeeded {
-                context.shared.seen.record_shell_reads(&arguments.command, &context.cwd);
+                let (shared, command, cwd) = (context.shared.clone(), arguments.command.clone(), context.cwd.clone());
+                // Disk reads and edit snapshots belong off the executor, just like the read tool.
+                tokio::task::spawn_blocking(move || shared.seen.record_shell_reads(&command, &cwd)).await.map_err(|error| error.to_string())?;
             }
             // A command that came back within its time gets "did you mean" lines when its output
             // says a path doesn't exist. One moved to the background doesn't: its message is about

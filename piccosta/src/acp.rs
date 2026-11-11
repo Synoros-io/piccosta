@@ -637,6 +637,13 @@ impl Acp {
         let Some(live) = self.sessions.get_mut(session) else { return };
         live.model = done.model;
         live.thinking = done.thinking;
+        // A check-in or job report has no frontend command slot, even when a client prompt is
+        // waiting behind it. Its stop reason must not become that prompt's outcome either.
+        if done.notice {
+            live.stop = None;
+            live.error = None;
+            return;
+        }
         let prompt = live.owed.pop_front().flatten();
         if live.muted > 0 {
             live.muted -= 1;
@@ -748,7 +755,9 @@ impl Acp {
         let reports = (self.inputs.clone(), id.clone());
         let finishes = runs.clone();
         let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared.clone(), false, false, move |done| {
-            finishes.lock().unwrap().finished += 1;
+            // sent counts frontend commands only; notice turns must not advance cancellation
+            // past a queued client prompt that has not run yet.
+            if !done.notice { finishes.lock().unwrap().finished += 1; }
             let _ = reports.0.send(Input::Done(reports.1.clone(), serial, Box::new(done)));
         });
         let live = Live {

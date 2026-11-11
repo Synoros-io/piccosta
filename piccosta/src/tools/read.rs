@@ -79,9 +79,10 @@ fn read_file(arguments: &Arguments, absolute: &std::path::Path, context: &ToolCo
     paths::access(absolute, false).map_err(|error| paths::fs_error(&error, "access", Some(absolute)))?;
     let mut file = std::fs::File::open(absolute).map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;
+    (&mut file).take(image::SNIFF_BYTES as u64).read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;
 
-    if let Some(mime_type) = image::sniff_mime_type(&bytes[..bytes.len().min(image::SNIFF_BYTES)]) {
+    if let Some(mime_type) = image::sniff_mime_type(&bytes) {
+        file.read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;
         // The line under the heading: the resize hints, or why the image couldn't be prepared,
         // then the note for a model without vision.
         let note = (!context.model_accepts_images).then_some(NON_VISION_NOTE);
@@ -94,46 +95,91 @@ fn read_file(arguments: &Arguments, absolute: &std::path::Path, context: &ToolCo
         return Ok(ToolOutput { content, details: None, is_error: false });
     }
 
-    let text = String::from_utf8_lossy(&bytes);
-    let output = read_text(&text, arguments)?;
-    context.shared.seen.remember(absolute, &text, "read");
-    Ok(output)
+    if file.metadata().is_ok_and(|metadata| metadata.len() <= super::editfix::SNAPSHOT_MAX_BYTES as u64) {
+        // Bound this read too: a file can grow after metadata. The prefix then feeds the same
+        // streaming reader, and only complete, small files get an edit snapshot.
+        (&mut file).take(super::editfix::SNAPSHOT_MAX_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;
+        if bytes.len() <= super::editfix::SNAPSHOT_MAX_BYTES {
+            let output = read_text(bytes.as_slice(), arguments)?;
+            context.shared.seen.remember(absolute, &String::from_utf8_lossy(&bytes), "read");
+            return Ok(output);
+        }
+    }
+    context.shared.seen.forget(absolute);
+    read_text(bytes.as_slice().chain(file), arguments)
 }
 
-// Input: the file's text and the call's offset and limit. Output: the window the model sees, with
-// pi's notice for whatever was left out (read.ts:155-201).
-fn read_text(text: &str, arguments: &Arguments) -> Result<ToolOutput, String> {
-    let all_lines: Vec<&str> = text.split('\n').collect();
-    let total_file_lines = all_lines.len();
+// Input: a text stream and the requested window. Count omitted text for pi's notices and details,
+// but retain only enough of the window to apply the existing truncation rules. UTF-8 decoding
+// carries incomplete characters between chunks and, like from_utf8_lossy, keeps the BOM.
+fn read_text(mut reader: impl std::io::Read, arguments: &Arguments) -> Result<ToolOutput, String> {
     // 1-indexed, and 0 or nothing means the first line. A fractional offset counts as its whole
     // part, as JavaScript's slice takes it.
     let start_line = match arguments.offset {
         Some(offset) if offset != 0.0 => (offset - 1.0).max(0.0).trunc() as usize,
         _ => 0,
     };
-    let start_display = start_line + 1;
+    let start_display = start_line.saturating_add(1);
+    let end_line = arguments.limit.map_or(usize::MAX, |limit| start_line.saturating_add(limit.trunc().max(0.0) as usize));
+    let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+    // A read-sized chunk amortizes syscalls; the decoder supplies its worst-case lossy size.
+    let mut input = vec![0; DEFAULT_MAX_BYTES];
+    let mut decoded = String::new();
+    let (mut line, mut total_bytes, mut first_line_bytes) = (0, 0, 0);
+    let (mut selected, mut ends_with_newline) = (String::new(), false);
+    loop {
+        let count = reader.read(&mut input).map_err(|error| paths::fs_error(&error, "read", None))?;
+        decoded.clear();
+        // A pending partial character changes the decoder's worst case for this chunk.
+        decoded.reserve(decoder.max_utf8_buffer_length(count).ok_or("UTF-8 buffer too large")?);
+        let (_, consumed, _) = decoder.decode_to_string(&input[..count], &mut decoded, count == 0);
+        debug_assert_eq!(consumed, count);
+        for part in decoded.split_inclusive('\n') {
+            let newline = part.ends_with('\n');
+            let content = if newline { &part[..part.len() - 1] } else { part };
+            if line >= start_line && line < end_line {
+                if line == start_line { first_line_bytes += content.len(); }
+                // A newline belongs to the selected text only when the next line is selected too.
+                let part = if newline && line.saturating_add(1) < end_line { part } else { content };
+                total_bytes += part.len();
+                if !part.is_empty() { ends_with_newline = part.ends_with('\n'); }
+                if selected.len() <= DEFAULT_MAX_BYTES {
+                    let mut end = part.len().min(DEFAULT_MAX_BYTES + 1 - selected.len());
+                    while !part.is_char_boundary(end) { end += 1; }
+                    selected.push_str(&part[..end]);
+                }
+            }
+            if newline { line += 1; }
+        }
+        if count == 0 { break; }
+    }
+    let total_file_lines = line + 1;
     if start_line >= total_file_lines {
         let offset = crate::js::number_string(arguments.offset.unwrap_or(0.0));
         return Err(format!("Offset {offset} is beyond end of file ({total_file_lines} lines total)"));
     }
 
-    // A limit from the model is applied first; truncation then cuts within it.
-    let (selected, user_limited_lines) = match arguments.limit {
-        Some(limit) => {
-            let limit = limit.trunc().max(0.0) as usize;
-            let end_line = start_line.saturating_add(limit).min(total_file_lines);
-            (all_lines[start_line..end_line].join("\n"), Some(end_line - start_line))
-        }
-        None => (all_lines[start_line..].join("\n"), None),
-    };
-
-    let truncation = truncate::truncate_head(&selected, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let selected_lines = end_line.min(total_file_lines) - start_line;
+    let user_limited_lines = arguments.limit.map(|_| selected_lines);
+    let mut truncation = truncate::truncate_head(&selected, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    truncation.total_bytes = total_bytes;
+    truncation.total_lines = if total_bytes == 0 { 0 } else { selected_lines - usize::from(ends_with_newline) };
+    truncation.truncated = truncation.total_lines > DEFAULT_MAX_LINES || total_bytes > DEFAULT_MAX_BYTES;
+    if truncation.truncated && !truncation.first_line_exceeds_limit {
+        // The prefix can end on a newline with the next line still outside it. Only the full
+        // window tells us whether another line hit the byte budget before the line limit.
+        truncation.truncated_by = Some(if truncation.output_lines < truncation.total_lines.min(DEFAULT_MAX_LINES) {
+            truncate::TruncatedBy::Bytes
+        } else {
+            truncate::TruncatedBy::Lines
+        });
+    }
     let limit_text = truncate::format_size(DEFAULT_MAX_BYTES);
     let mut details = None;
     let output = if truncation.first_line_exceeds_limit {
         // The first line alone is over the limit: point the model at a shell command that shows
         // part of it.
-        let size = truncate::format_size(all_lines[start_line].len());
+        let size = truncate::format_size(first_line_bytes);
         details = Some(json!({"truncation": truncation}));
         format!(
             "[Line {start_display} is {size}, exceeds {limit_text} limit. Use bash: sed -n '{start_display}p' {} | head -c {DEFAULT_MAX_BYTES}]",

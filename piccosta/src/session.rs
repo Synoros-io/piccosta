@@ -22,9 +22,10 @@ use crate::message::{
 use crate::provider::transcript::current_system_message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 // The session format version this code reads and writes (session-manager.ts:41).
@@ -405,6 +406,140 @@ fn entry_from_value(value: Value) -> Option<SessionEntry> {
     }
 }
 
+fn parse_header(path: &Path, value: Value) -> Result<SessionHeader, OpenError> {
+    let header = match serde_json::from_value::<SessionHeader>(value) {
+        Ok(header) if header.kind == "session" => header,
+        _ => return Err(OpenError::NotASession(path.to_path_buf())),
+    };
+    let version = header.version.unwrap_or(1);
+    if version < CURRENT_SESSION_VERSION { return Err(OpenError::TooOld { path: path.to_path_buf(), version }); }
+    Ok(header)
+}
+
+// Open once and check that handle, not an earlier view of the path. Nonblocking open also
+// refuses a FIFO swapped in during open without waiting for its writer.
+pub(crate) fn open_reader(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NONBLOCK); }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() { return Err(io::Error::other("requires a regular session file")); }
+    Ok(file)
+}
+
+// A small continuity check for an append-only file: its header and the last complete line.
+// Reading these again catches truncate-and-regrow without hashing the whole retained history.
+struct Anchor {
+    offset: u64,
+    length: usize,
+    hash: [u8; 32],
+}
+
+impl Anchor {
+    fn new(offset: u64, bytes: &[u8]) -> Self {
+        Self { offset, length: bytes.len(), hash: Sha256::digest(bytes).into() }
+    }
+
+    fn last_complete(bytes: &[u8], offset: u64) -> Option<Self> {
+        let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
+        let start = bytes[..end - 1].iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+        Some(Self::new(offset + start as u64, &bytes[start..end]))
+    }
+
+    fn matches(&self, file: &mut fs::File) -> io::Result<bool> {
+        let bytes = read_at(file, self.offset, self.length)?;
+        Ok(bytes.len() == self.length && Sha256::digest(&bytes).as_slice() == self.hash)
+    }
+}
+
+fn read_at(file: &mut fs::File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+    file.seek(io::SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(length as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+// One reader owns the retained tree. The offset counts bytes actually read, never a later
+// path length. A partial last line is kept as bytes so a split UTF-8 character survives a scan.
+pub(crate) struct Follower {
+    pub session: Session,
+    identity: (u64, u64),
+    consumed: u64,
+    modified: Option<std::time::SystemTime>,
+    header_anchor: Anchor,
+    anchor: Option<Anchor>,
+    tail: Vec<u8>,
+    accepted_tail: bool,
+}
+
+impl Follower {
+    pub fn open(path: &Path) -> Result<Self, OpenError> {
+        let mut file = open_reader(path)?;
+        let metadata = file.metadata()?;
+        let identity = crate::platform::file_identity(&file)?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file).take(metadata.len()).read_to_end(&mut bytes)?;
+        let session = Session::parse(path, &String::from_utf8_lossy(&bytes))?;
+        let tail = bytes[bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1)..].to_vec();
+        let accepted_tail = parse_line(&String::from_utf8_lossy(&tail)).is_some();
+        let header_anchor = bytes.split_inclusive(|byte| *byte == b'\n').scan(0, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, line))
+        }).find(|(_, line)| parse_line(&String::from_utf8_lossy(line)).is_some()).map(|(offset, line)| Anchor::new(offset as u64, line)).unwrap();
+        let anchor = Anchor::last_complete(&bytes, 0);
+        Ok(Self { session, identity, consumed: bytes.len() as u64, modified: metadata.modified().ok(), header_anchor, anchor, tail, accepted_tail })
+    }
+
+    // Output: None unchanged, Some(true) replacement, Some(false) a plain leaf extension.
+    // A valid final object without '\n' is visible immediately, like Session::read. Extending
+    // that line rebuilds once: it could be a newline, or an edit to the object already accepted.
+    pub fn advance(&mut self) -> Result<Option<bool>, OpenError> {
+        let path = self.session.file().unwrap();
+        let mut file = open_reader(path)?;
+        let metadata = file.metadata()?;
+        let identity = crate::platform::file_identity(&file)?;
+        if identity != self.identity || metadata.len() < self.consumed || (metadata.len() == self.consumed && metadata.modified().ok() != self.modified) || (self.accepted_tail && metadata.len() != self.consumed) {
+            *self = Self::open(path)?;
+            return Ok(Some(true));
+        }
+        if metadata.len() == self.consumed { return Ok(None); }
+        // Growth alone isn't proof of append: a writer may have truncated and already regrown.
+        // Check the same opened handle, including any partial suffix we will join to new bytes.
+        let continuous = self.header_anchor.matches(&mut file)?
+            && self.anchor.as_ref().map_or(Ok(true), |anchor| anchor.matches(&mut file))?
+            && read_at(&mut file, self.consumed - self.tail.len() as u64, self.tail.len())? == self.tail;
+        if !continuous { *self = Self::open(path)?; return Ok(Some(true)); }
+        file.seek(io::SeekFrom::Start(self.consumed))?;
+        let mut added = Vec::new();
+        file.take(metadata.len() - self.consumed).read_to_end(&mut added)?;
+        self.consumed += added.len() as u64;
+        self.modified = metadata.modified().ok();
+        let mut bytes = std::mem::take(&mut self.tail);
+        bytes.extend(added);
+        let end = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+        if let Some(anchor) = Anchor::last_complete(&bytes, self.consumed - bytes.len() as u64) { self.anchor = Some(anchor); }
+        let mut replace = false;
+        for line in bytes[..end].split(|byte| *byte == b'\n') {
+            if let Some(entry) = parse_line(&String::from_utf8_lossy(line)).and_then(entry_from_value) {
+                replace |= entry.parent_id() != self.session.leaf_id() || self.session.entry(entry.id()).is_some() || matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ContextEdit { .. });
+                self.session.index_entry(entry);
+            }
+        }
+        self.tail = bytes[end..].to_vec();
+        if let Some(value) = parse_line(&String::from_utf8_lossy(&self.tail)) {
+            // Keep full-reader semantics even for imported files without the usual final newline.
+            self.accepted_tail = true;
+            if let Some(entry) = entry_from_value(value) {
+                replace |= entry.parent_id() != self.session.leaf_id() || self.session.entry(entry.id()).is_some() || matches!(entry, SessionEntry::Compaction { .. } | SessionEntry::ContextEdit { .. });
+                self.session.index_entry(entry);
+            }
+        }
+        Ok(Some(replace))
+    }
+}
+
 // A session: its header, its entries in file order, and the current leaf.
 #[derive(Clone)]
 pub struct Session {
@@ -520,14 +655,7 @@ impl Session {
     pub(crate) fn parse(path: &Path, text: &str) -> Result<Session, OpenError> {
         let mut values = text.split('\n').filter_map(parse_line);
         let Some(first) = values.next() else { return Err(OpenError::NotASession(path.to_path_buf())) };
-        let header: SessionHeader = match serde_json::from_value::<SessionHeader>(first) {
-            Ok(header) if header.kind == "session" => header,
-            _ => return Err(OpenError::NotASession(path.to_path_buf())),
-        };
-        let version = header.version.unwrap_or(1);
-        if version < CURRENT_SESSION_VERSION {
-            return Err(OpenError::TooOld { path: path.to_path_buf(), version });
-        }
+        let header = parse_header(path, first)?;
         let mut session = Session { header, entries: Vec::new(), index_by_id: HashMap::new(), leaf_id: None, file: Some(path.to_path_buf()), flushed: true };
         for value in values {
             if let Some(entry) = entry_from_value(value) {
@@ -535,6 +663,52 @@ impl Session {
             }
         }
         Ok(session)
+    }
+
+    // Listing needs the header, last name and first prompt, not the conversation tree. Check the
+    // same JSON and entry parser as a full read; never turn an empty file into a new session.
+    pub fn summary(path: &Path, cwd: Option<&Path>) -> Result<(SessionHeader, Option<String>, Option<String>), OpenError> {
+        let file = open_reader(path)?;
+        let length = file.metadata()?.len();
+        let mut input = io::BufReader::new(file.take(length));
+        let mut bytes = Vec::new();
+        let header = loop {
+            if input.read_until(b'\n', &mut bytes)? == 0 { return Err(OpenError::NotASession(path.to_path_buf())); }
+            if let Some(value) = parse_line(&String::from_utf8_lossy(&bytes)) { break parse_header(path, value)?; }
+            bytes.clear();
+        };
+        if cwd.is_some_and(|cwd| Path::new(&header.cwd) != cwd) { return Ok((header, None, None)); }
+        let (mut name, mut prompt) = (None, None);
+        bytes.clear();
+        while input.read_until(b'\n', &mut bytes)? != 0 {
+            let line = String::from_utf8_lossy(&bytes);
+            // Those two JSON strings must occur on a title-bearing line. An escaped spelling
+            // takes the parser too, including pi's lone-surrogate repair. False positives are
+            // harmless; tool outputs and assistant payloads otherwise need no deserialization.
+            if (prompt.is_none() && line.contains("user")) || line.contains("session_info") || line.contains("\\u") {
+                match parse_line(&line).and_then(entry_from_value) {
+                    Some(SessionEntry::SessionInfo { name: Some(named), .. }) => name = Some(named),
+                    Some(SessionEntry::Message { message: AgentMessage::User(user), .. }) if prompt.is_none() => prompt = Some(user.content.text()),
+                    _ => {}
+                }
+            }
+            bytes.clear();
+        }
+        Ok((header, name, prompt))
+    }
+
+    // The settings at the leaf, without cloning the projected conversation.
+    pub fn state(&self) -> (Option<(String, String)>, String) {
+        let (mut model, mut thinking) = (None, "off".to_string());
+        for entry in self.path_to_leaf() {
+            match entry {
+                SessionEntry::ThinkingLevelChange { thinking_level, .. } => thinking = thinking_level.clone(),
+                SessionEntry::ModelChange { provider, model_id, .. } => model = Some((provider.clone(), model_id.clone())),
+                SessionEntry::Message { message: AgentMessage::Assistant(reply), .. } => model = Some((reply.provider.clone(), reply.model.clone())),
+                _ => {}
+            }
+        }
+        (model, thinking)
     }
 
     // Add a parsed entry to the in-memory index and make it the leaf.
@@ -873,18 +1047,7 @@ impl Session {
     // What the model sees at the leaf, with the thinking level and model in force there
     // (session-manager.ts:418-433, 543-583).
     pub fn context(&self) -> SessionContext {
-        let mut thinking_level = "off".to_string();
-        let mut model = None;
-        for entry in self.path_to_leaf() {
-            match entry {
-                SessionEntry::ThinkingLevelChange { thinking_level: level, .. } => thinking_level = level.clone(),
-                SessionEntry::ModelChange { provider, model_id, .. } => model = Some((provider.clone(), model_id.clone())),
-                SessionEntry::Message { message: AgentMessage::Assistant(assistant), .. } => {
-                    model = Some((assistant.provider.clone(), assistant.model.clone()))
-                }
-                _ => {}
-            }
-        }
+        let (model, thinking_level) = self.state();
         let messages = self.projection().into_iter().flat_map(|entry| entry.messages).collect();
         SessionContext { messages, thinking_level, model }
     }

@@ -69,7 +69,10 @@ impl Tool for WriteTool {
             if let Some(message) = aborted() {
                 return Err(message);
             }
-            context.shared.seen.record(&absolute, "write");
+            // We already have the written text. Snapshot it off-thread, without rereading the
+            // path, so large writes keep a change hash without making shell reads expensive.
+            let shared = context.shared.clone();
+            tokio::task::spawn_blocking(move || shared.seen.remember(&absolute, &arguments.content, "write")).await.map_err(|error| error.to_string())?;
             Ok(ToolOutput { content: vec![Content::text(format!("Successfully wrote to {}", arguments.path))], details: None, is_error: false })
         })
     }

@@ -138,6 +138,7 @@ impl App {
                         && let Some(path) = self.slots[left].path.take()
                     {
                         crate::session::set_closed(&self.host.agent_dir, &path, true);
+                        self.closed.insert(path, crate::clock::now_ms());
                     }
                 }
             }
@@ -427,6 +428,7 @@ impl App {
                     && let Some(path) = self.slots[slot].path.take()
                 {
                     crate::session::set_closed(&self.host.agent_dir, &path, true);
+                    self.closed.insert(path, crate::clock::now_ms());
                 }
             }
             "delete" => self.delete_shown(),
@@ -552,6 +554,7 @@ impl App {
     fn resume_path(&mut self, path: std::path::PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
         crate::session::set_closed(&self.host.agent_dir, &path, false);
+        self.closed.remove(&path);
         let slot = self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)).unwrap_or_else(|| {
             self.slots.push(super::Slot::new(Some(path), super::NEW_TITLE.into()));
             self.slots.len() - 1

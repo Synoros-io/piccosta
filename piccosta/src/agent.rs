@@ -294,7 +294,6 @@ pub struct AgentConfig {
     pub transport: String,
     // Background jobs' finish messages.
     pub notices: mpsc::UnboundedReceiver<CustomMessage>,
-    pub gate: Option<Gate>,
     // Print and json mode: hold the run open while a background job runs, so its finish message
     // becomes a turn before the process exits.
     pub hold_for_jobs: bool,
@@ -310,6 +309,7 @@ pub struct Agent {
     pub(crate) pending_plugins: Option<tools::plugin::Discovery>,
     config: AgentConfig,
     emit: EventSink,
+    gate: Option<Gate>,
     // Cancelled when the user aborts; each run gets a fresh one, which the handle then holds.
     cancel: CancellationToken,
     handle: Handle,
@@ -382,14 +382,14 @@ impl Agent {
     // Input: the session, what to run with, and where events go. Records the model and thinking
     // level on the session where they differ from what it last had (sdk.ts:253-278, 449-452).
     pub fn new(mut session: Session, config: AgentConfig, emit: EventSink) -> std::io::Result<Agent> {
-        let context = session.context();
+        let (model, thinking_level) = session.state();
         let has_thinking_entry = session.path_to_leaf().iter().any(|entry| matches!(entry, SessionEntry::ThinkingLevelChange { .. }));
-        if context.model.as_ref() != Some(&(config.model.provider.clone(), config.model.id.clone())) {
+        if model.as_ref() != Some(&(config.model.provider.clone(), config.model.id.clone())) {
             let base = session.next_base();
             session.append(SessionEntry::ModelChange { base, provider: config.model.provider.clone(), model_id: config.model.id.clone() })?;
         }
         let level = provider::clamp_thinking_level(&config.model, &config.thinking_level).to_string();
-        if !has_thinking_entry || context.thinking_level != level {
+        if !has_thinking_entry || thinking_level != level {
             let base = session.next_base();
             session.append(SessionEntry::ThinkingLevelChange { base, thinking_level: level.clone() })?;
         }
@@ -397,7 +397,7 @@ impl Agent {
         config.model.service_tier = service_tier(&session, &config.model);
         let handle = Handle::default();
         let cancel = handle.lock().cancel.clone();
-        Ok(Agent { session, pending_plugins: None, config, emit, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, repeated_call: (String::new(), 0), machine_noted: None })
+        Ok(Agent { session, pending_plugins: None, config, emit, gate: None, cancel, handle, retry_attempt: 0, overflow_recovery_attempted: false, repeated_call: (String::new(), 0), machine_noted: None })
     }
 
     // The controls for this agent's runs (abort on Ctrl-C or Escape, queued messages).
@@ -617,7 +617,7 @@ impl Agent {
     }
 
     pub fn set_gate(&mut self, gate: Gate) {
-        self.config.gate = Some(gate);
+        self.gate = Some(gate);
     }
 
     // A background job's finish message, when one comes while nothing runs. A frontend waits on
@@ -1468,7 +1468,7 @@ impl Agent {
             };
             // The gate's answer for a call that passed the checks; an abort while it waits is an
             // abort.
-            let checked = match (checked, self.config.gate.clone()) {
+            let checked = match (checked, self.gate.clone()) {
                 (Ok((tool, validated)), Some(gate)) => tokio::select! {
                     allowed = gate(id.clone(), name.clone(), validated.clone(), tool.approval(&validated), tool.read_only()) => allowed.map(|()| (tool, validated)),
                     () = self.cancel.cancelled() => Err("Operation aborted".to_string()),

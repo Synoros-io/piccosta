@@ -1,10 +1,10 @@
-// Check-ins are messages to this session, not prompt state. Every runtime fires its own; the
-// assistant service covers sessions nobody runs. One locked store lets the two meet safely.
+// Check-ins are messages to this session, not prompt state. One dispatcher covers the process's
+// runtimes; the assistant service also covers sessions nobody runs. The locked store joins them.
 use super::{Tool, ToolContext, ToolFuture, ToolOutput};
 use crate::message::{Content, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{fs, path::{Path, PathBuf}, time::Duration};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::{Arc, Mutex, Weak}, time::Duration};
 
 // The service and runtimes look once a second, like the manager's lane watcher. Failed deliveries
 // start with the service's restart interval and back off to five minutes.
@@ -17,7 +17,7 @@ const CLAIM_MS: i64 = crate::runtime::STOP_WAIT.as_millis() as i64;
 const DAY_MS: i64 = 86_400_000;
 const STORE: &str = "checkins.json";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Checkin {
     id: String,
     text: String,
@@ -73,8 +73,9 @@ fn store<T>(agent_dir: &Path, change: impl FnOnce(&mut Vec<Checkin>) -> Result<T
         save(&path, &timers)?;
         fs::remove_file(legacy).map_err(|error| error.to_string())?;
     }
+    let before = timers.clone();
     let result = change(&mut timers)?;
-    save(&path, &timers)?;
+    if timers != before { save(&path, &timers)?; }
     Ok(result)
 }
 
@@ -102,29 +103,75 @@ fn time_ms(text: &str) -> Option<i64> {
     crate::clock::ms_from_iso(&format!("{clock}Z"))?.checked_sub(offset)
 }
 
-// The same clock in a frontend and the service; neither waits on a receiver on its own thread.
-pub async fn watch(agent_dir: PathBuf, only: Option<PathBuf>) {
-    let mut poll = tokio::time::interval(POLL);
-    loop {
-        poll.tick().await;
-        let (agent_dir, only) = (agent_dir.clone(), only.clone());
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = fire(&agent_dir, only.as_deref()) { eprintln!("piccosta checkin: {error}"); }
-        });
+type Receivers = Mutex<HashMap<Option<PathBuf>, usize>>;
+static DISPATCHERS: Mutex<Option<HashMap<PathBuf, Weak<Receivers>>>> = Mutex::new(None);
+
+// Each watcher keeps its receiver registered until aborted. The service's None covers all files;
+// ordinary runtimes mustn't launch unattended sessions just because they share the store.
+struct Receiver(Arc<Receivers>, Option<PathBuf>);
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        let mut receivers = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = receivers.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 { receivers.remove(&self.1); }
+        }
     }
+}
+
+// One awaited poll per process and agent dir, however many runtimes are open. A weak reference
+// lets the dispatcher end when its last watcher goes away; missed ticks don't queue disk work.
+pub async fn watch(agent_dir: PathBuf, only: Option<PathBuf>) {
+    let receivers = {
+        let mut dispatchers = DISPATCHERS.lock().unwrap_or_else(|error| error.into_inner());
+        let dispatchers = dispatchers.get_or_insert_with(HashMap::new);
+        dispatchers.retain(|_, dispatcher| dispatcher.strong_count() > 0);
+        match dispatchers.get(&agent_dir).and_then(Weak::upgrade) {
+            Some(receivers) => receivers,
+            None => {
+                let receivers = Arc::new(Receivers::default());
+                let weak = Arc::downgrade(&receivers);
+                dispatchers.insert(agent_dir.clone(), weak.clone());
+                tokio::spawn(async move {
+                    let mut poll = tokio::time::interval(POLL);
+                    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        poll.tick().await;
+                        let Some(receivers) = weak.upgrade() else { break };
+                        let only = receivers.lock().unwrap_or_else(|error| error.into_inner()).keys().cloned().collect::<Vec<_>>();
+                        let agent_dir = agent_dir.clone();
+                        match tokio::task::spawn_blocking(move || fire(&agent_dir, &only)).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => eprintln!("piccosta checkin: {error}"),
+                            Err(error) => eprintln!("piccosta checkin: {error}"),
+                        }
+                        // A replacement watcher must join this dispatcher while its poll is
+                        // blocked, even if the last old watcher was aborted in the meantime.
+                        drop(receivers);
+                    }
+                });
+                receivers
+            }
+        }
+    };
+    *receivers.lock().unwrap_or_else(|error| error.into_inner()).entry(only.clone()).or_default() += 1;
+    let _receiver = Receiver(receivers, only);
+    std::future::pending::<()>().await;
 }
 
 // Claim under the store lock, then give each delivery its own blocking worker. A stopped
 // receiver holds neither the store nor another receiver; a dead dispatcher leaves a claim we
 // can take over. The occurrence's delivery id makes that takeover safe even after a lost answer.
-fn fire(agent_dir: &Path, only: Option<&Path>) -> Result<(), String> {
+fn fire(agent_dir: &Path, only: &[Option<PathBuf>]) -> Result<(), String> {
     let owner = crate::runtime::Run::of(std::process::id() as i32).ok_or("could not identify check-in dispatcher")?;
     let due = store(agent_dir, |timers| {
+        if timers.is_empty() { return Ok(Vec::new()); }
         let now = crate::clock::now_ms();
-        timers.retain(|timer| !crate::session::is_closed(agent_dir, &timer.file) && timer.file.exists());
+        let closed = crate::session::closed_sessions(agent_dir);
+        timers.retain(|timer| !closed.contains_key(&crate::tools::paths::canonical(&timer.file)) && timer.file.exists());
         let mut due = Vec::new();
         for timer in timers {
-            if only.is_some_and(|file| file != timer.file) || timer.next > now || timer.retry_at > now || timer.claimed.as_ref().is_some_and(|(owner, until)| *until > now && owner.alive()) { continue; }
+            if !(only.contains(&None) || only.iter().any(|file| file.as_ref() == Some(&timer.file))) || timer.next > now || timer.retry_at > now || timer.claimed.as_ref().is_some_and(|(owner, until)| *until > now && owner.alive()) { continue; }
             timer.claimed = Some((owner.clone(), now.saturating_add(CLAIM_MS)));
             due.push(timer.clone());
         }

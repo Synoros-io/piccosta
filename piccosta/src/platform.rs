@@ -42,6 +42,21 @@ pub const NULL: &str = "/dev/null";
 #[cfg(windows)]
 pub const NULL: &str = "NUL";
 
+// Identity from the open handle, so a replacement between stat and open can't lend its
+// cursor to a different file. Windows' file index is scoped to its volume, like Unix's inode.
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    { use std::os::unix::fs::MetadataExt; let metadata = file.metadata()?; Ok((metadata.dev(), metadata.ino())) }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 { return Err(std::io::Error::last_os_error()); }
+        Ok((information.dwVolumeSerialNumber as u64, ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64))
+    }
+}
+
 // Find native executables without making callers know about Windows' suffix.
 pub fn executable(dir: &Path, name: &str) -> std::path::PathBuf {
     let path = dir.join(name);

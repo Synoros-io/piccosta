@@ -140,6 +140,23 @@ pub struct SessionSummary {
     pub closed: bool,
 }
 
+// Opening does the disk reads, claiming and prompt preparation before the thread-local agent
+// is made. The TUI can prepare an automatic wake on its worker without blocking input.
+pub(crate) struct Prepared {
+    pub session: Session,
+    config: AgentConfig,
+    plugins: Option<tools::plugin::Discovery>,
+}
+
+impl Prepared {
+    pub fn finish(self, emit: EventSink) -> Result<(Agent, Arc<ToolShared>), String> {
+        let shared = self.config.tool_shared.clone();
+        let mut agent = Agent::new(self.session, self.config, emit).map_err(|error| format!("could not write the session: {error}"))?;
+        agent.pending_plugins = self.plugins;
+        Ok((agent, shared))
+    }
+}
+
 impl Host {
     pub fn load() -> Host {
         Host::at(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
@@ -332,7 +349,7 @@ impl Host {
     fn wanted(&self, session: Option<&Session>, model: Option<&str>, registry: &ModelRegistry) -> Option<String> {
         model
             .map(str::to_string)
-            .or_else(|| session.and_then(|session| session.context().model).map(|(provider, id)| format!("{provider}/{id}")))
+            .or_else(|| session.and_then(|session| session.state().0).map(|(provider, id)| format!("{provider}/{id}")))
             .or_else(|| self.settings.default_model())
             .or_else(|| registry.models().first().map(|first| format!("{}/{}", first.provider, first.id)))
     }
@@ -353,7 +370,11 @@ impl Host {
     // and read again (runtime.rs claim), and everything after is made from it as it is then.
     // Output: the agent and the tools' shared state (background jobs, web results), which the
     // caller shuts down at the end.
-    pub fn open(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, emit: EventSink, hold_for_jobs: bool) -> Result<(Agent, Arc<ToolShared>), String> {
+    pub fn open(&self, session: Session, model: Option<&str>, thinking: Option<&str>, emit: EventSink, hold_for_jobs: bool) -> Result<(Agent, Arc<ToolShared>), String> {
+        self.prepare(session, model, thinking, hold_for_jobs)?.finish(emit)
+    }
+
+    pub(crate) fn prepare(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, hold_for_jobs: bool) -> Result<Prepared, String> {
         let claim = crate::runtime::claim(&mut session)?;
         let registry = self.registry()?;
         let resumed = session.context();
@@ -421,14 +442,11 @@ impl Host {
             compaction,
             transport: self.settings.transport(),
             notices,
-            gate: None,
             hold_for_jobs,
             manager_home,
             claim,
         };
-        let mut agent = Agent::new(session, config, emit).map_err(|error| format!("could not write the session: {error}"))?;
-        agent.pending_plugins = pending_plugins;
-        Ok((agent, tool_shared))
+        Ok(Prepared { session, config, plugins: pending_plugins })
     }
 
     // The runtime waits here, not input dispatch. The installed paths were snapshotted at open;
@@ -533,6 +551,12 @@ pub fn all_sessions(agent_dir: &Path, limit: usize) -> Vec<SessionSummary> {
 }
 
 pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionSummary> {
+    sessions_matching(dir, cwd, limit, |_, _| true)
+}
+
+// Caller-specific exclusions belong before the summary read: discovery must never open a
+// listed session just because a sidecar rename changed its folder's timestamp.
+pub(crate) fn sessions_matching(dir: &Path, cwd: Option<&Path>, limit: usize, include: impl Fn(&Path, std::time::SystemTime) -> bool) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
@@ -542,10 +566,11 @@ pub fn sessions_in(dir: &Path, cwd: Option<&Path>, limit: usize) -> Vec<SessionS
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     let closed = session::closed_sessions(&config::agent_dir());
     files.into_iter().filter_map(|(modified, path)| {
-        let session = Session::open(&path, cwd.unwrap_or(dir)).ok()?;
-        let recorded = Path::new(&session.header().cwd);
+        if !include(&path, modified) { return None; }
+        let (header, name, prompt) = Session::summary(&path, cwd).ok()?;
+        let recorded = PathBuf::from(header.cwd);
         cwd.is_none_or(|cwd| recorded == cwd).then(|| SessionSummary {
-            title: title(&session), id: session.id().to_string(), cwd: recorded.to_path_buf(), closed: closed.contains_key(&crate::tools::paths::canonical(&path)), path, modified,
+            title: title_text(name.or(prompt).as_deref().unwrap_or("new session")), id: header.id, cwd: recorded, closed: closed.contains_key(&crate::tools::paths::canonical(&path)), path, modified,
         })
     }).take(limit).collect()
 }
@@ -567,7 +592,10 @@ pub fn title(session: &Session) -> String {
             _ => None,
         })
     };
-    let text = named.or_else(first_prompt).unwrap_or_else(|| "new session".into());
+    title_text(&named.or_else(first_prompt).unwrap_or_else(|| "new session".into()))
+}
+
+fn title_text(text: &str) -> String {
     let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
     line.chars().take(TITLE_CHARS).collect()
 }

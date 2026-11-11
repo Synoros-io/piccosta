@@ -15,7 +15,7 @@ const WAIT: Duration = Duration::from_secs(2);
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_CLIENTS: usize = 8;
 const MAX_QUEUED_REQUESTS: usize = 4;
-type Opened = Result<(crate::session::Session, Option<std::time::SystemTime>), String>;
+type Opened = Result<crate::session::Follower, String>;
 pub(super) struct Request {
     value: Value,
     opened: Option<Opened>,
@@ -87,26 +87,8 @@ impl Control {
 // Read and validate away from the UI. Check the opened handle too: a path can be replaced
 // between metadata and open. Nonblocking open keeps that race from waiting on a Unix FIFO.
 fn read_session(file: &str) -> Opened {
-    let read = || -> Result<_, std::io::Error> {
-        use std::io::Read;
-        let path = Path::new(file).canonicalize()?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NONBLOCK); }
-        if !path.metadata()?.is_file() { return Err(std::io::Error::other("TUI open requires a regular session file")); }
-        let input = options.open(&path)?;
-        let metadata = input.metadata()?;
-        if !metadata.is_file() { return Err(std::io::Error::other("TUI open requires a regular session file")); }
-        // No size cap: sessions run to tens of megabytes, and a regular file is finite (the
-        // checks above already refuse /dev/zero and FIFOs).
-        let mut bytes = Vec::new();
-        let mut input = input;
-        input.read_to_end(&mut bytes)?;
-        Ok((path, bytes, metadata.modified().ok()))
-    };
-    let (path, bytes, modified) = read().map_err(|error| error.to_string())?;
-    crate::session::Session::parse(&path, &String::from_utf8_lossy(&bytes)).map(|session| (session, modified)).map_err(|error| error.to_string())
+    let path = Path::new(file).canonicalize().map_err(|error| error.to_string())?;
+    crate::session::Follower::open(&path).map_err(|error| error.to_string())
 }
 
 // CLI control never starts a model, refreshes a catalog or writes a session. Status comes from
@@ -154,8 +136,8 @@ pub fn cli(arguments: &[String]) -> Result<(), String> {
 }
 
 impl App {
-    pub(super) fn control(&mut self, request: Request) {
-        if request.answer.is_closed() { return; }
+    pub(super) fn control(&mut self, mut request: Request) {
+        if request.answer.is_closed() { self.retire(request); return; }
         let restart = request.value["do"] == "restart";
         let result = match request.value["do"].as_str() {
             Some("status") => Ok(json!({
@@ -164,8 +146,9 @@ impl App {
                 "open": self.slots.iter().filter(|slot| slot.opened).map(|slot| json!({"id": slot.id, "file": slot.path, "title": slot.title, "working": slot.busy() || slot.working_elsewhere})).collect::<Vec<_>>(),
                 "restarting": self.restart_waiting
             })),
-            Some("open") if self.single => Err(super::SINGLE.into()),
-            Some("open") => request.opened.unwrap().and_then(|(session, modified)| self.open_background(session, modified)).map(|()| json!({"ok": true})),
+            Some("open") if self.single => { self.retire(request.opened.take()); Err(super::SINGLE.into()) }
+            Some("open") if self.restart_waiting || self.quit => { self.retire(request.opened.take()); Err("TUI is restarting".into()) }
+            Some("open") => request.opened.unwrap().and_then(|reader| self.open_background(reader)).map(|()| json!({"ok": true})),
             Some("restart") => {
                 self.command("restart");
                 Ok(json!({"ok": true, "waiting": self.slots.iter().any(super::Slot::busy)}))
@@ -179,15 +162,24 @@ impl App {
         if restart { self.restart_replies.push(request.written); }
     }
 
-    fn open_background(&mut self, session: crate::session::Session, modified: Option<std::time::SystemTime>) -> Result<(), String> {
-        let path = session.file().unwrap().to_path_buf();
+    fn open_background(&mut self, reader: crate::session::Follower) -> Result<(), String> {
+        let path = reader.session.file().unwrap().to_path_buf();
         let existing = self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path));
         let slot = existing.unwrap_or_else(|| {
             self.slots.push(super::Slot { saved: true, ..super::Slot::new(Some(path), super::NEW_TITLE.into()) });
             self.slots.len() - 1
         });
         // Just a sidebar row, not a new runtime or a prompt. Existing live views stay untouched.
-        if self.slots[slot].live.is_none() { self.follow_session(slot, session, modified); }
+        if self.slots[slot].live.is_none() {
+            let ticket = std::sync::Arc::downgrade(&self.slots[slot].incarnation);
+            let host = self.host.clone();
+            self.asks.send(Box::new(move |worker| {
+                let followed = if ticket.strong_count() == 0 { None } else { Some(worker.start(slot, ticket.clone(), reader, &host)) };
+                (slot, super::Update::Followed(ticket, Box::new(Ok(followed))))
+            })).map_err(|_| "the delivery thread has stopped".to_string())?;
+            self.slots[slot].followed = true;
+            self.slots[slot].follow_pending = true;
+        } else { self.retire(reader); }
         self.slots[slot].opened = true;
         self.save_state().map_err(|error| error.to_string())
     }
