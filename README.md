@@ -49,6 +49,7 @@ Sliding scale : critical, general, review, reading code, bug hunting, web search
 - Each manager has an append-only ledger (older halves archived monthly, `ledger search`); the assistant also keeps a short memory (`ledger remember`, `forget`).
 - Managers are told to keep to their project and to ask before spending your Claude or Codex plan.
 - `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both. Great for a Fable/Astra type research advisor
+- Intent reviewer: after turns you didn't start (check-ins, reports, timers, other agents), a fresh one-shot review checks the agent against your own dated words and notifies you on drift; it runs on the session's own model and plan (`intentReview` settings: on/off, roles, minutes, model).
 
 ### Pairs and trios
 
@@ -67,20 +68,21 @@ Like Devin Fusion, piccosta can run two models together in one chat. A pair is t
 
 ### Terminal UI
 
-- Sidebar of sessions grouped by project, managers first; up to four panes side by side.
+- Sidebar of sessions grouped by project, managers first; drag its edge or Alt+, / Alt+. to resize, Ctrl+B to hide. Up to four panes; `/layout` switches side by side, stacked or 2×2.
 - Ctrl+N starts a session in any directory with flags (`myproject --use critical --pair <model> --name "lane A"`).
 - Pane contents, scroll, unsent input and open sessions are restored by `piccosta -c`; `/restart` relaunches on a fresh binary with everything as it was.
 - Session list searched with Ctrl+S, `/resume all`, `-r <id or name>`, `-c`; Page Up/Down walks it.
 - A session index makes manager, ACP, TUI and usage/cache listings fast on large histories.
 - A session runs in one process; others follow it live and send input to it, including `-r`/`--session` on a session live in another piccosta.
 - `piccosta tui` lists running terminal UIs; `piccosta open <id or name>` opens a session in one; `piccosta restart` relaunches one on a fresh binary.
-- `--single`: the terminal UI on one session, no sidebar.
+- `--single`: the terminal UI on one session, no sidebar, filling the screen; `--inline` draws it in the terminal's scrollback instead.
 - `/fast on|off`: fast mode on Codex and Claude from the next request.
 - Delete twice moves a session to the trash; idle sessions close themselves.
 - Enter queues a message, Esc stops the run, Ctrl+X Ctrl+S sends the queue, ↑ takes it back, Ctrl+C stops/clears/quits.
 - Editor: cross-session history, Tab completion, word moves and deletes, undo.
 - Mouse: drag copies, double-click selects a path, triple-click a line, right-click pastes; over ssh through the terminal.
 - Typeset math: formulas as images in Ghostty, kitty and WezTerm (including through tmux), Unicode elsewhere.
+- `/scratch`: a Markdown scratchpad per project beside your sessions; agents write it, what you type is added, math and local images render, `/scratch edit` opens it in your editor.
 - Commands: `/model`, `/effort`, `/compact`, `/autocompact`, `/new`, `/clear`, `/fork`, `/rewind`, `/rename`, `/close`, `/delete`, `/status`, `/context`, `/usage`, `/cost`, `/scale`, `/diff`, `/copy`, `/export`, `/init`, `/review`, `/agents`, `/ps`, `/stop`; `/help` lists the rest.
 
 ### Agent loop
@@ -256,6 +258,7 @@ Files live in `$PICCOSTA_AGENT_DIR`, else `$XDG_DATA_HOME/piccosta/agent`, else 
 - `auth.commandTimeoutSeconds` (15): bound for `!command` key lookups.
 - `web.fetch.maxSizeMB` (5): largest page fetched, PDFs aside.
 - `usage.refreshSeconds` (300): how often plan usage is polled.
+- `scratchpad.path`, `scratchpad.sharedAcrossWorktrees`: where the scratchpad lives (default: one per folder, outside the repo).
 - `models.json` `compat.reasoningReplayField`: the field a model's thinking is sent back in.
 - `clientId` and `tokenUrl` in the `openai-codex` entry of `login/auth.json`: replace OpenAI's refresh client and endpoint.
 
