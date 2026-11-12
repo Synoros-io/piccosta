@@ -47,7 +47,7 @@ Sliding scale : critical, general, review, reading code, bug hunting, web search
 - Managers check in on working sessions every `manager.checkMinutes` (30) and remind about idle ones after `manager.inactiveMinutes`.
 - Slow commands always go to the background.
 - Each manager has an append-only ledger (older halves archived monthly, `ledger search`); the assistant also keeps a short memory (`ledger remember`, `forget`).
-- Managers are told to keep to their project and to ask before spending your Claude or Codex plan; these are instructions to the model, not enforced limits.
+- Managers are told to keep to their project and to ask before spending your Claude or Codex plan; these are instructions to the model.
 - `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both. Great for a Fable/Astra type research advisor
 
 ### Pairs and trios
