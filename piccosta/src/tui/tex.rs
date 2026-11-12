@@ -65,6 +65,7 @@ const DIACRITICS: &str = concat!(
 );
 
 // What a formula became.
+#[derive(Clone)]
 pub enum Formula {
     // An uploaded image and the cells it fills.
     Image { id: u32, columns: u16, rows: u16 },
@@ -82,9 +83,10 @@ pub struct Tex {
     // Every formula drawn so far, by source, block or inline, and the widest it may be.
     cache: HashMap<(String, bool, u16), Option<Formula>>,
     first_id: u32,
-    next_id: u32,
+    ids: std::sync::Arc<std::sync::Mutex<(u32, Vec<u32>)>>,
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     // Uploads waiting to be written before the next frame.
-    pending: Vec<u8>,
+    pending: Vec<(u32, Vec<u8>)>,
 }
 
 impl Tex {
@@ -101,7 +103,20 @@ impl Tex {
         let shade = if background_is_light(&replies) { 0.12 } else { 0.88 };
         // Image ids are per terminal, so two piccostas in one window start apart.
         let first_id = (std::process::id() % 4096) << 12 | 1;
-        Tex { images, tmux, cell: cell_size(&replies), ink: TexColor::rgb(shade, shade, shade), cache: HashMap::new(), first_id, next_id: first_id, pending: Vec::new() }
+        Tex { images, tmux, cell: cell_size(&replies), ink: TexColor::rgb(shade, shade, shade), cache: HashMap::new(), first_id, ids: std::sync::Arc::new(std::sync::Mutex::new((first_id, Vec::new()))), epoch: Default::default(), pending: Vec::new() }
+    }
+
+    // A document worker shares only the transport's id allocator, never transcript formula rows.
+    pub(super) fn fork(&self) -> Self {
+        Self { images: self.images, tmux: self.tmux, cell: self.cell, ink: self.ink, cache: HashMap::new(), first_id: self.first_id, ids: self.ids.clone(), epoch: self.epoch.clone(), pending: Vec::new() }
+    }
+    pub(super) fn epoch(&self) -> u64 { self.epoch.load(std::sync::atomic::Ordering::Relaxed) }
+    pub(super) fn receive(&mut self, bytes: Vec<u8>) { if !bytes.is_empty() { self.pending.push((0, bytes)); } }
+    pub(super) fn pending(&mut self) -> Vec<u8> { self.prepared().into_values().flatten().collect() }
+    pub(super) fn prepared(&mut self) -> HashMap<u32, Vec<u8>> { std::mem::take(&mut self.pending).into_iter().collect() }
+    pub(super) fn recycle(&self, ids: &[u32]) { self.ids.lock().unwrap().1.extend_from_slice(ids); }
+    pub(super) fn block_ids(&mut self) -> Vec<u32> {
+        self.cache.drain().filter_map(|(_, formula)| match formula { Some(Formula::Image { id, .. }) => Some(id), _ => None }).collect()
     }
 
     pub fn images(&self) -> bool {
@@ -121,7 +136,7 @@ impl Tex {
         let key = (tex.to_string(), display, max_columns);
         if !self.cache.contains_key(&key) {
             let image = if self.images { self.image(tex, display, max_columns) } else { None };
-            let formula = image.or_else(|| text(tex).filter(|rows| display || rows.len() == 1).map(Formula::Text));
+            let formula = image.or_else(|| text(tex).map(Formula::Text));
             self.cache.insert(key.clone(), formula);
         }
         self.cache.get(&key).and_then(Option::as_ref)
@@ -154,23 +169,43 @@ impl Tex {
             rows = (rows * u32::from(max_columns)).div_ceil(columns).max(1);
             columns = u32::from(max_columns).max(1);
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let limit = u32::from(max_cells());
+        if rows > limit { columns = (columns * limit).div_ceil(rows).max(1); rows = limit; }
+        Some(self.upload(&png, columns.min(limit) as u16, rows as u16))
+    }
+
+    // PNGs are already decoded, fitted and encoded by the scratchpad's disk worker. The UI only
+    // queues this bounded upload; its placeholder cells use exactly the same transport as TeX.
+    pub(super) fn upload(&mut self, png: &[u8], columns: u16, rows: u16) -> Formula {
+        let mut ids = self.ids.lock().unwrap();
+        let id = ids.1.pop().unwrap_or_else(|| { let id = ids.0; ids.0 += 1; id });
+        drop(ids);
+        let mut bytes = Vec::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
         let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(CHUNK).collect();
         for (index, chunk) in chunks.iter().enumerate() {
             let more = u8::from(index + 1 < chunks.len());
             let control = if index == 0 { format!("a=t,f=100,t=d,i={id},q=2,m={more}") } else { format!("m={more}") };
-            command(&mut self.pending, &control, chunk, self.tmux);
+            command(&mut bytes, &control, chunk, self.tmux);
         }
-        command(&mut self.pending, &format!("a=p,U=1,i={id},c={columns},r={rows},q=2"), b"", self.tmux);
-        Some(Formula::Image { id, columns: columns as u16, rows: rows as u16 })
+        command(&mut bytes, &format!("a=p,U=1,i={id},c={columns},r={rows},q=2"), b"", self.tmux);
+        self.pending.push((id, bytes));
+        Formula::Image { id, columns: columns.min(max_cells()), rows: rows.min(max_cells()) }
     }
+
+    pub(super) fn discard(&mut self, id: u32) {
+        let mut bytes = Vec::new();
+        command(&mut bytes, &format!("a=d,d=I,i={id},q=2"), b"", self.tmux);
+        self.receive(bytes);
+        self.recycle(&[id]);
+    }
+
+    pub(super) fn cell(&self) -> (u32, u32) { self.cell }
 
     // Write the uploads made since the last frame. Call before drawing it.
     pub fn flush(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         if !self.pending.is_empty() {
-            out.write_all(&std::mem::take(&mut self.pending))?;
+            for (_, bytes) in std::mem::take(&mut self.pending) { out.write_all(&bytes)?; }
             out.flush()?;
         }
         Ok(())
@@ -178,17 +213,35 @@ impl Tex {
 
     // Forget every image this process uploaded (on exit, or when the terminal lost them).
     pub fn clear(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        if self.next_id > self.first_id {
-            command(&mut self.pending, &format!("a=d,d=R,x={},y={},q=2", self.first_id, self.next_id - 1), b"", self.tmux);
+        let mut bytes = Vec::new();
+        let mut ids = self.ids.lock().unwrap();
+        if ids.0 > self.first_id {
+            command(&mut bytes, &format!("a=d,d=R,x={},y={},q=2", self.first_id, ids.0 - 1), b"", self.tmux);
         }
+        ids.1.clear();
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(ids);
         self.cache.clear();
+        self.receive(bytes);
         self.flush(out)
     }
 }
 
+// Placeholder foregrounds carry their image id; ordinary colored text doesn't request uploads.
+pub(super) fn row_ids<'a>(row: &'a ratatui::text::Line<'_>) -> impl Iterator<Item = u32> + 'a {
+    row.spans.iter().filter_map(|span| match span.style.fg { Some(Color::Rgb(red, green, blue)) if span.content.contains(PLACEHOLDER) => Some(u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue)), _ => None })
+}
+
+// Kitty's coordinate alphabet is finite; fitting happens before upload, never by repeating row 0.
+pub(super) fn max_cells() -> u16 { DIACRITICS.chars().count() as u16 }
+
 // One row of an image's placeholder cells, and the color that names the image.
 pub fn placeholders(id: u32, row: u16, columns: u16) -> (String, Color) {
-    let diacritic = |index: u16| DIACRITICS.chars().nth(usize::from(index)).unwrap_or('\u{305}');
+    static DIACRITIC_CELLS: std::sync::LazyLock<Vec<char>> = std::sync::LazyLock::new(|| DIACRITICS.chars().collect());
+    let diacritics = &*DIACRITIC_CELLS;
+    let diacritic = |index: u16| diacritics[usize::from(index)];
+    if usize::from(row) >= diacritics.len() { return (String::new(), Color::Reset); }
+    let columns = columns.min(diacritics.len() as u16);
     let mut cells = String::with_capacity(usize::from(columns) * 8);
     for column in 0..columns {
         cells.push(PLACEHOLDER);

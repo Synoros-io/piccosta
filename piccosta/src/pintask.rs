@@ -176,12 +176,16 @@ pub fn pin(branch: &[&SessionEntry], preparation: &Preparation, reason: Reason, 
         .into_iter()
         .map(|source| {
             let date = clock::dated(source.recorded_at);
-            let text = source.message.content.text();
-            let label = if source.kind == "user" { format!("user; original {date}") }
+            let text = source.message.timer.as_ref().and_then(|timer| timer.prompt.clone()).unwrap_or_else(|| source.message.content.text());
+            let label = if source.kind == "human input" { format!("human input; original {date}") }
+                else if let Some(interface) = source.message.origin.unverified_interface() { format!("{}; interface {interface}; recorded {date}", source.kind) }
+                else if source.kind == "unknown legacy input" { format!("unknown authorship; recorded {date}") }
                 else if source.kind == "user timer replay" {
-                    // The native header records when the user set the prompt; delivery is later.
-                    let set = text.strip_prefix("[user timer, set ").and_then(|header| header.split_once(", fired "))
-                        .and_then(|(set, _)| clock::ms_from_iso(set)).map(clock::dated).unwrap_or_else(|| "date unknown".into());
+                    let set = match source.message.origin {
+                        crate::message::InputOrigin::UserTimer { set_at } => Some(set_at),
+                        // Old native timers have no typed set time, only their generated header.
+                        _ => text.strip_prefix("[user timer, set ").and_then(|header| header.split_once(", fired ")).and_then(|(set, _)| clock::ms_from_iso(set)),
+                    }.filter(|time| *time > 0).map(clock::dated).unwrap_or_else(|| "date unknown".into());
                     format!("user's words; delivered by user timer at {date}; set at {set}")
                 } else { format!("{}; delivered {date}; original date unknown", source.kind) };
             (source.id, label, text)

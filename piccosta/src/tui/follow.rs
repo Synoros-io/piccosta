@@ -48,6 +48,11 @@ impl Transcript {
         self.messages.push(message);
     }
 
+    // Auxiliary usage has no transcript message and must not replace the context-size reading.
+    pub fn account(&mut self, entry: &crate::session::SessionEntry) {
+        if let crate::session::SessionEntry::Usage { provider, usage, .. } = entry { self.cost.add(usage, provider); }
+    }
+
     fn from_messages(messages: impl IntoIterator<Item = AgentMessage>) -> Self {
         let mut transcript = Self::default();
         for message in messages { transcript.remember(message); }
@@ -94,8 +99,10 @@ impl Followed {
 
     pub fn replacement(host: &Host, session: &Session) -> Self {
         let projection = session.projection();
-        let tokens = crate::compaction::estimate_projected_context_tokens(&projection, &session.path_to_leaf()).tokens;
+        let branch = session.path_to_leaf();
+        let tokens = crate::compaction::estimate_projected_context_tokens(&projection, &branch).tokens;
         let mut transcript = Transcript::from_messages(projection.into_iter().flat_map(|entry| entry.messages));
+        for entry in branch { transcript.account(entry); }
         transcript.context_tokens = tokens;
         Self::metadata(host, session, transcript, true)
     }
@@ -145,6 +152,9 @@ impl Worker {
         // A new system snapshot changes the folded prompt, so use the full projection for it too.
         replace |= following.reader.session.entries()[before.min(following.reader.session.entries().len())..].iter().any(|entry| matches!(entry, crate::session::SessionEntry::Message { message: AgentMessage::System(_), .. }));
         let result = if replace { Followed::replacement(host, &following.reader.session) } else {
+            for entry in &following.reader.session.entries()[before..] {
+                if let crate::session::SessionEntry::Usage { provider, usage, .. } = entry { following.cost.add(usage, provider); }
+            }
             let messages = following.reader.session.entries()[before..].iter().flat_map(crate::session::entry_context_messages);
             let mut transcript = Transcript::from_messages(messages);
             for message in &transcript.messages {

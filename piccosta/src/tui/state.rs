@@ -1,6 +1,6 @@
 // The terminal UI's state, kept so it comes back as it was: what each pane shows, how far it's scrolled
-// and what's typed in it and not sent, which pane has focus, whether the sidebar shows, and the
-// sessions open besides, until the user closes them. `piccosta -c` and
+// and what's typed in it and not sent, their layout, which pane has focus, the sidebar's width
+// and whether it shows, and the sessions open besides, until the user closes them. `piccosta -c` and
 // /restart bring it back.
 //
 // One file per terminal, written when it changes (at each agent scan, so a crash loses a couple
@@ -50,8 +50,16 @@ pub struct State {
     pub panes: Vec<Kept>,
     pub focus: usize,
     pub sidebar: bool,
+    #[serde(default = "sidebar_width")]
+    pub sidebar_width: u16,
+    #[serde(default = "pane_layout")]
+    pub layout: super::PaneLayout,
     pub open: Vec<Kept>,
 }
+
+fn sidebar_width() -> u16 { super::SIDEBAR_WIDTH }
+// Snapshots from before /layout had columns, regardless of a fresh UI's default.
+fn pane_layout() -> super::PaneLayout { super::PaneLayout::Columns }
 
 #[derive(Serialize, Default)]
 pub struct Handover {
@@ -70,6 +78,9 @@ pub struct Handover {
 #[derive(Serialize, Deserialize)]
 pub struct Kept {
     pub session: Option<PathBuf>,
+    // Missing means a session, so snapshots from before document panes keep their meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratchpad: Option<PathBuf>,
     #[serde(default)]
     pub title: String,
     pub cwd: PathBuf,

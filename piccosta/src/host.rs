@@ -108,7 +108,7 @@ fn team_note(team: &Team, speakers: &[String], turn: usize, rounds: u64, last: b
     };
     let text = format!("{speaker}: you're in a {kind} with {}, and the user reads you all. {how} {task} Then stop; {next} speaks next.", others.join(" and "));
     let details = serde_json::json!({ "mode": kind, "speaker": speaker, "after": previous });
-    crate::message::CustomMessage { custom_type: PAIR_TYPE.into(), content: crate::message::TextOrBlocks::Text(text), display: true, details: Some(details), timestamp: crate::clock::now_ms() }
+    crate::message::CustomMessage { custom_type: PAIR_TYPE.into(), origin: crate::message::InputOrigin::Harness { name: PAIR_TYPE.into() }, content: crate::message::TextOrBlocks::Text(text), display: true, details: Some(details), timestamp: crate::clock::now_ms() }
 }
 
 // Whether an exchange stops before the next turn: the last reply failed or was stopped, or (in a
@@ -348,7 +348,7 @@ impl Host {
     // file can't be read (prompt::sections).
     pub fn sections(&self, model: &Model, session: &Session, tool_list: &[Arc<dyn tools::Tool>]) -> Result<IndexMap<String, String>, String> {
         let (cwd, role) = (Path::new(&session.header().cwd), crate::manager::role(session));
-        let messages = crate::message::to_model_messages(&session.context().messages);
+        let messages = crate::message::to_model_messages(&session.context().messages, session.header().notice_token.as_deref());
         let held_context = crate::provider::transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
         let constitution = prompt::constitution(&model.name, self.settings.get("constitution"))?;
         let (custom_prompt, discovered_append) = prompt::custom_prompts(&self.agent_dir);
@@ -356,7 +356,10 @@ impl Host {
         let manager = role.map(|role| crate::manager::prompt(role, cwd));
         let append_prompt = if manager.is_some() { Some([manager, append_prompt].into_iter().flatten().collect::<Vec<_>>().join("\n\n")) } else { append_prompt };
         self.external_policy(model, session)?;
-        Ok(prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, external_tools: model.api == crate::provider::acp_client::API, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context }))
+        let mut sections = prompt::sections(&prompt::PromptInputs { cwd, agent_dir: &self.agent_dir, tools: tool_list, external_tools: model.api == crate::provider::acp_client::API, custom_prompt, append_prompt, constitution, context_files: self.context_files, held_context });
+        // Tokenless legacy sessions keep their old leading prompt and use plain notice attribution.
+        if let Some(token) = &session.header().notice_token { sections.insert("notice_provenance".into(), crate::message::notice_rule(token)); }
+        Ok(sections)
     }
 
     // An outside agent's tools cannot be narrowed by our executor. Refuse rather than promise
@@ -537,8 +540,8 @@ impl Host {
     // turns until one ends its reply with the done line, or the round limit. Each turn is the
     // speaker's model on the session for one run, opened by its note; the session model takes it
     // back for the user's next message. A failed or stopped turn ends the exchange.
-    pub async fn answer(&self, agent: &mut Agent, team: &Team, text: &str, images: Vec<crate::message::Content>, timer: Option<crate::message::UserTimer>) -> Result<(), String> {
-        if text.is_empty() && images.is_empty() && agent.session.queued().is_empty() {
+    pub async fn answer(&self, agent: &mut Agent, team: &Team, message: crate::message::UserMessage) -> Result<(), String> {
+        if message.is_empty() && agent.session.queued().is_empty() {
             return Ok(());
         }
         let lead = format!("{}/{}", agent.model().provider, agent.model().id);
@@ -556,7 +559,7 @@ impl Host {
             }
             agent.hold_notice(team_note(team, &speakers, 0, rounds, false));
         }
-        agent.prompt_with_images(text, images, timer).await?;
+        agent.prompt(message).await?;
         let mut result = Ok(());
         for turn in 1..turns {
             if agent.aborted() || exchange_over(&agent.session, team.pair && turn > 1) {

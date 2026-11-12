@@ -126,26 +126,20 @@ impl Tool for EditTool {
                 return Err("Edit tool input is invalid. edits must contain at least one replacement.".into());
             }
             let absolute = paths::resolve(&arguments.path, &context.cwd);
-            let _turn = context.shared.mutations.lock(&absolute).await;
-            match edit_file(&arguments.path, &absolute, &arguments.edits, context).await {
-                Ok(output) => Ok(output),
-                Err(message) if context.cancel.is_cancelled() => Err(message),
-                Err(message) => {
-                    // The diagnosis reads the file and may scan it for a while; it runs off the
-                    // async workers. If it fails the model still gets pi's message.
-                    let shared = context.shared.clone();
-                    let (path, edits) = (arguments.path.clone(), arguments.edits.clone());
-                    let extra = tokio::task::spawn_blocking(move || editfix::explain_failure(&path, &absolute, &edits, &shared.seen))
-                        .await
-                        .unwrap_or_default();
-                    if extra.is_empty() { Err(message) } else { Err(format!("{message}\n\n{}", extra.join("\n"))) }
+            super::mutate(absolute, context, move |absolute, context, board| {
+                match edit_file(&arguments.path, absolute, &arguments.edits, context, board) {
+                    Err(message) if !context.cancel.is_cancelled() => {
+                        let extra = editfix::explain_failure(&arguments.path, absolute, &arguments.edits, &context.shared.seen);
+                        if extra.is_empty() { Err(message) } else { Err(format!("{message}\n\n{}", extra.join("\n"))) }
+                    }
+                    result => result,
                 }
-            }
+            }).await
         })
     }
 }
 
-async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], context: &ToolContext<'_>) -> Result<ToolOutput, String> {
+fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], context: &ToolContext<'_>, scratchpad: bool) -> Result<ToolOutput, String> {
     // Abort is checked between steps, never mid-write (edit.ts:168-172).
     let aborted = || context.cancel.is_cancelled().then(|| "Operation aborted".to_string());
     if let Some(message) = aborted() {
@@ -157,7 +151,7 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
         }
         return Err(format!("Could not edit file: {path}. Error code: {}.", paths::error_code(&error)));
     }
-    let bytes = tokio::fs::read(absolute).await.map_err(|error| paths::fs_error(&error, "read", None))?;
+    let bytes = std::fs::read(absolute).map_err(|error| paths::fs_error(&error, "read", None))?;
     if let Some(message) = aborted() {
         return Err(message);
     }
@@ -169,10 +163,11 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
     })?;
 
     let (final_content, diff, first_changed_line) = edit_content(&raw, edits, path)?;
+    if scratchpad && final_content.len() > crate::scratchpad::MAX_BYTES { return Err(format!("scratchpad exceeds {} bytes", crate::scratchpad::MAX_BYTES)); }
     if let Some(message) = aborted() {
         return Err(message);
     }
-    paths::replace(absolute, final_content.clone().into_bytes()).await.map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
+    paths::replace(absolute, final_content.as_bytes()).map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
     if let Some(message) = aborted() {
         return Err(message);
     }
@@ -180,7 +175,7 @@ async fn edit_file(path: &str, absolute: &std::path::Path, edits: &[Edit], conte
 
     Ok(ToolOutput {
         content: vec![Content::text(format!("Successfully replaced {} block(s) in {path}.", edits.len()))],
-        details: Some(json!({"diff": diff, "firstChangedLine": first_changed_line})),
+        details: Some(json!({"diff": diff, "firstChangedLine": first_changed_line, "scratchpad": scratchpad.then(|| crate::scratchpad::stamp(absolute, Some(&final_content)).ok()).flatten()})),
         is_error: false,
     })
 }

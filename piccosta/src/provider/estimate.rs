@@ -7,9 +7,10 @@
 
 use super::transcript;
 use crate::message::{Content, Message, StopReason, TextOrBlocks, Usage};
+use crate::model::Model;
 
 // pi's rule of thumb for characters per token, and what one image counts as (estimate.ts:15-16).
-const CHARS_PER_TOKEN: f64 = 3.5;
+pub(crate) const CHARS_PER_TOKEN: f64 = 3.5;
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
 // The context size a response reported: its total, or the sum of its parts when there's no total.
@@ -66,6 +67,35 @@ pub fn message_tokens(message: &Message) -> u64 {
             tokens_for_chars(chars)
         }
     }
+}
+
+// The complete request's estimated input, with the same system/tool replay its API uses.
+// Input: model and messages, including any summary prompt. Output: tokens at pi's request-size
+// rate. Folded tools count once; replaced sections and removed tools don't survive folding.
+pub fn request_tokens(model: &Model, messages: &[Message]) -> u64 {
+    let updates = matches!(model.api.as_str(), "openai-completions" | "openai-responses" | "openai-codex-responses") && model.compat_flag("supportsMidConvoSystemMessages");
+    let support = match model.api.as_str() {
+        "openai-completions" if updates && model.compat_flag("supportsMidConvoToolAdditions") => transcript::ToolSupport::Additions,
+        "openai-responses" | "openai-codex-responses" => super::responses::tool_support(model),
+        _ => transcript::ToolSupport::None,
+    };
+    let mut resolved = transcript::resolve_transcript(messages, updates);
+    let (tools, folded) = transcript::request_tools(&resolved, support);
+    let mut tokens = if tools.is_empty() { 0 } else { tokens_for_chars(crate::js::utf16_len(&serde_json::to_string(&tools).unwrap_or_default())) };
+    let mut system_index = 0;
+    for (index, message) in resolved.iter_mut().enumerate() {
+        if let Message::System(system) = message {
+            system.content = TextOrBlocks::Text(if index == 0 { transcript::system_message_text(system) } else { transcript::render_system_message_update(system) });
+            system.sections = None;
+            if system_index < folded {
+                system.tools_added = None;
+                system.tools_removed = None;
+            }
+            system_index += 1;
+        }
+        tokens += message_tokens(message);
+    }
+    tokens
 }
 
 fn timestamp_of(message: &Message) -> i64 {

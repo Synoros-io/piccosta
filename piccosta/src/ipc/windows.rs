@@ -54,6 +54,10 @@ pub fn connect(file: &Path) -> std::io::Result<Stream> {
     Ok(pipe)
 }
 pub async fn connect_async(file: &Path) -> std::io::Result<NamedPipeClient> { ClientOptions::new().open(name(file)?) }
+pub fn client_peer(stream: &NamedPipeServer) -> Option<i32> {
+    let mut pid = 0;
+    (unsafe { GetNamedPipeClientProcessId(stream.as_raw_handle(), &mut pid) } != 0).then_some(pid as i32)
+}
 pub fn peer(stream: &Stream) -> Option<i32> {
     let mut pid = 0;
     (unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &mut pid) } != 0).then_some(pid as i32)

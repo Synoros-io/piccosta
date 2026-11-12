@@ -170,20 +170,20 @@ pub fn canonical(path: &Path) -> PathBuf {
 // fails part way (a full disk) puts the old text back, so the file isn't left empty or half written;
 // when even that fails, the old text is kept beside it and the error says where. A file this user
 // may write but not read is written without that safety, as before.
-pub async fn replace(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
-    let old = match tokio::fs::read(path).await {
+pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let old = match std::fs::read(path) {
         Ok(old) => Some(old),
         Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => None,
         Err(error) => return Err(error),
     };
-    let Err(error) = tokio::fs::write(path, &bytes).await else { return Ok(()) };
+    let Err(error) = std::fs::write(path, bytes) else { return Ok(()) };
     let Some(old) = old else { return Err(error) };
-    if tokio::fs::write(path, &old).await.is_ok() {
+    if std::fs::write(path, &old).is_ok() {
         return Err(error);
     }
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let backup = path.with_file_name(format!("{name}.before-piccosta"));
-    let kept = match tokio::fs::write(&backup, &old).await {
+    let kept = match std::fs::write(&backup, &old) {
         Ok(()) => format!("its old text is in {}", backup.display()),
         Err(_) => "its old text couldn't be kept anywhere".to_string(),
     };

@@ -24,7 +24,7 @@ use crate::auth::{self, CredentialPaths};
 use crate::compaction::{self, Reason};
 use crate::config::{CompactionSettings, RetrySettings};
 use crate::message::{
-    AgentMessage, AssistantErrorKind, AssistantMessage, Content, CustomMessage, StopReason, SystemMessage, TextOrBlocks, ToolDefinition, ToolReference,
+    AgentMessage, AssistantErrorKind, AssistantMessage, Content, CustomMessage, InputOrigin, StopReason, SystemMessage, TextOrBlocks, ToolDefinition, ToolReference,
     ToolResultMessage, Usage, UserMessage,
 };
 use crate::model::{Model, ModelRegistry};
@@ -169,8 +169,8 @@ struct Inbox {
     cancel: CancellationToken,
     // The turn executing now, independent of a frontend's model selection for its next turn.
     running_api: Option<String>,
-    steer: Vec<String>,
-    follow_up: Vec<String>,
+    steer: Vec<UserMessage>,
+    follow_up: Vec<UserMessage>,
     steering_all: bool,
     follow_up_all: bool,
     // A /fast that came during the run, for its next request.
@@ -195,13 +195,13 @@ impl Handle {
     // The running turn's API, or None before it starts and after it settles.
     pub fn running_api(&self) -> Option<String> { self.lock().running_api.clone() }
 
-    pub fn steer(&self, text: String) {
-        self.lock().steer.push(text);
+    pub fn steer(&self, message: UserMessage) {
+        self.lock().steer.push(message);
         self.0.1.notify_one();
     }
 
-    pub fn follow_up(&self, text: String) {
-        self.lock().follow_up.push(text);
+    pub fn follow_up(&self, message: UserMessage) {
+        self.lock().follow_up.push(message);
         self.0.1.notify_one();
     }
 
@@ -221,11 +221,11 @@ impl Handle {
     // What's queued and not sent yet: steering, then follow-ups.
     pub fn queued(&self) -> (Vec<String>, Vec<String>) {
         let inbox = self.lock();
-        (inbox.steer.clone(), inbox.follow_up.clone())
+        (inbox.steer.iter().map(|message| message.content.text()).collect(), inbox.follow_up.iter().map(|message| message.content.text()).collect())
     }
 
     // Take back everything queued (pi's clear_queue), e.g. to put it back in the editor on abort.
-    pub fn clear(&self) -> (Vec<String>, Vec<String>) {
+    pub fn clear(&self) -> (Vec<UserMessage>, Vec<UserMessage>) {
         let mut inbox = self.lock();
         (std::mem::take(&mut inbox.steer), std::mem::take(&mut inbox.follow_up))
     }
@@ -235,20 +235,9 @@ impl Handle {
     }
 }
 
-fn dequeue(queue: &mut Vec<String>, all: bool) -> Vec<String> {
+fn dequeue(queue: &mut Vec<UserMessage>, all: bool) -> Vec<UserMessage> {
     let count = if all { queue.len() } else { queue.len().min(1) };
     queue.drain(..count).collect()
-}
-
-pub(crate) fn user_message(text: &str) -> AgentMessage {
-    with_images(text, Vec::new())
-}
-
-// The user's text, then any images they attached (pi puts them after the text).
-pub(crate) fn with_images(text: &str, images: Vec<Content>) -> AgentMessage {
-    let mut blocks = vec![Content::text(text)];
-    blocks.extend(images);
-    AgentMessage::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp: clock::now_ms(), timer: None })
 }
 
 // A stream event in pi's json form (json-event.ts:16-35): its type and content index, the delta or
@@ -555,14 +544,18 @@ impl Agent {
     // file text to file text (prompt::instructions), so piccosta's wording around them doesn't
     // count. Until then a new build's wording, a tool's description or a changed scale wait.
     // Output: the system message to add, None when nothing differs.
-    fn prompt_update(&mut self) -> Option<SystemMessage> {
+    async fn prompt_update(&mut self) -> Option<SystemMessage> {
         let event = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
             SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
             SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
             _ => None,
         });
-        let messages = crate::message::to_model_messages(&self.session.context().messages);
-        let held = transcript::current_system_message(&messages).and_then(|system| system.sections?.shift_remove("project_context")?);
+        let messages = crate::message::to_model_messages(&self.session.context().messages, self.session.header().notice_token.as_deref());
+        let current = transcript::current_system_message(&messages);
+        // Copies and reopenings keep the prompt's namespace, so ordinary deliveries leave this
+        // equal. Reconcile only a missing or obsolete notice rule.
+        let notice_changed = current.as_ref().and_then(|system| system.sections.as_ref()?.get("notice_provenance")?.as_ref()) != self.config.sections.get("notice_provenance");
+        let held = current.and_then(|system| system.sections?.shift_remove("project_context")?);
         let now = if self.config.context_files { crate::prompt::context_now(&self.config.cwd, &crate::config::agent_dir()) } else { Some(None) };
         // An edit is a file whose text the prompt doesn't hold yet. One gone from the list (removed,
         // or a second link to a file already there) waits for the next compaction, which builds the
@@ -572,12 +565,15 @@ impl Agent {
             // Each file's part with its closing tag, so a file cut short isn't found inside the old one.
             crate::prompt::instructions(project.as_deref()).split_inclusive(crate::prompt::FILE_END).any(|file| !held.contains(file))
         });
-        if !event.is_none_or(|event| event) && !edited {
+        if !event.is_none_or(|event| event) && !edited && !notice_changed {
             return None;
         }
         if let Some(project) = now {
             crate::prompt::set_project_context(&mut self.config.sections, project);
         }
+        let (cwd, directory) = (self.config.cwd.clone(), self.config.tool_shared.bin_dir.parent()?.to_path_buf());
+        let path = tokio::task::spawn_blocking(move || crate::scratchpad::path(&cwd, &directory)).await.ok()?;
+        self.config.sections.insert("cwd".into(), crate::prompt::cwd(&self.config.cwd, &path));
         self.prompt_patch()
     }
 
@@ -585,7 +581,7 @@ impl Agent {
     // differ (None for one that went), the tools added or changed, and the tools gone. None when
     // it's the same.
     fn prompt_patch(&self) -> Option<SystemMessage> {
-        let current = transcript::current_system_message(&crate::message::to_model_messages(&self.session.context().messages));
+        let current = transcript::current_system_message(&crate::message::to_model_messages(&self.session.context().messages, self.session.header().notice_token.as_deref()));
         let held: IndexMap<String, Option<String>> = current.as_ref().and_then(|system| system.sections.clone()).unwrap_or_default();
         let held_tools = current.and_then(|system| system.tools_added).unwrap_or_default();
         let tools: Vec<ToolDefinition> = self.config.tools.iter().filter(|_| self.config.model.api != provider::acp_client::API).map(|tool| tool.definition()).collect();
@@ -621,18 +617,32 @@ impl Agent {
         Ok(id)
     }
 
+    // Owner-only audit persistence. Verdict metadata is visible but never model context;
+    // advisories are passive context, not queued prompts that could start another turn.
+    pub(crate) fn record_custom(&mut self, kind: &str, data: Value) -> Result<(), String> {
+        self.record_entry(SessionEntry::Custom { base: self.session.next_base(), custom_type: kind.into(), data: Some(data) })
+    }
+
+    pub(crate) fn record_entry(&mut self, entry: SessionEntry) -> Result<(), String> {
+        self.session.append(entry.clone()).map_err(|error| error.to_string())?;
+        (self.emit)(&Event::EntryAppended { entry });
+        Ok(())
+    }
+
+    pub(crate) fn record_notice(&mut self, notice: CustomMessage) -> Result<(), String> {
+        self.add_message(AgentMessage::Custom(notice), &mut Vec::new()).map(|_| ())
+    }
+
     // Send the user's prompt, with any images (rpc mode's `images`), and run until the model is
     // done (and any retry or background job it waits on). An empty one with none answers only
     // what's queued in the session. Output: an error only when the session can't be written; model
     // failures end up in the session as failed assistant messages, as in pi.
-    pub async fn prompt_with_images(&mut self, text: &str, images: Vec<Content>, timer: Option<crate::message::UserTimer>) -> Result<(), String> {
+    pub async fn prompt(&mut self, message: UserMessage) -> Result<(), String> {
         // A prompt in a closed session opens it again.
         if let Some(file) = self.session.file() {
             crate::session::set_closed(&crate::config::agent_dir(), file, false);
         }
-        let mut first = (!text.is_empty() || !images.is_empty()).then(|| with_images(text, images));
-        if let Some(AgentMessage::User(user)) = &mut first { user.timer = timer; }
-        self.run_from(first).await
+        self.run_from((!message.is_empty()).then_some(AgentMessage::User(message))).await
     }
 
     pub fn set_gate(&mut self, gate: Gate) {
@@ -717,7 +727,7 @@ impl Agent {
         starting.extend(first);
         let mut aborted = false;
         loop {
-            if let Some(system) = self.prompt_update() {
+            if let Some(system) = self.prompt_update().await {
                 starting.insert(0, AgentMessage::System(system));
             }
             // The end of a run, failed or not, which a Claude query still parked on tool calls
@@ -803,7 +813,7 @@ impl Agent {
         if !queued.is_empty() {
             self.announce_queue();
         }
-        messages.extend(queued.iter().filter(|text| !text.is_empty()).map(|text| user_message(text)));
+        messages.extend(queued.into_iter().filter(|message| !message.is_empty()).map(AgentMessage::User));
         Ok(messages)
     }
 
@@ -938,7 +948,7 @@ impl Agent {
             }
             if self.repeated_call.1 >= REPEATED_CALL_LIMIT {
                 let text = format!("piccosta stopped the run: the same call was made {} times in a row ({}).", self.repeated_call.1, crate::tools::jobs::command_preview(self.repeated_call.0.split('\n').next().unwrap_or_default()));
-                let note = CustomMessage { custom_type: LOOP_NOTE_TYPE.into(), content: TextOrBlocks::Text(text), display: true, details: None, timestamp: clock::now_ms() };
+                let note = CustomMessage { custom_type: LOOP_NOTE_TYPE.into(), origin: InputOrigin::Harness { name: LOOP_NOTE_TYPE.into() }, content: TextOrBlocks::Text(text), display: true, details: None, timestamp: clock::now_ms() };
                 self.add_message(AgentMessage::Custom(note), &mut new_messages)?;
                 (self.emit)(&Event::AgentEnd { messages: new_messages, will_retry: false, entry_id: entry_id.clone() });
                 return Ok(RunOutcome { aborted: false, retry: None, last_assistant: Some((assistant, entry_id)) });
@@ -975,7 +985,7 @@ impl Agent {
             let all = inbox.steering_all;
             dequeue(&mut inbox.steer, all)
         };
-        messages.extend(steer.iter().filter(|text| !text.is_empty()).map(|text| user_message(text)));
+        messages.extend(steer.into_iter().filter(|message| !message.is_empty()).map(AgentMessage::User));
         Ok(messages)
     }
 
@@ -1000,7 +1010,7 @@ impl Agent {
         if let Some(on) = self.handle.swap_fast(None) && self.set_fast(on).is_err() {
             self.handle.swap_fast(Some(on));
         }
-        let messages = crate::message::to_model_messages(&self.session.context().messages);
+        let messages = crate::message::to_model_messages(&self.session.context().messages, self.session.header().notice_token.as_deref());
         let model = &self.config.model;
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
         let message = match credential {
@@ -1237,7 +1247,7 @@ impl Agent {
         // small-context model to a larger one shouldn't compact for the old one's overflow.
         let model = &self.config.model;
         let same_model = model.provider == assistant.provider && model.id == assistant.model;
-        let context_window = model.context_window;
+        let context_window = model.compaction_window(settings.reserve_tokens);
         let max_tokens = model.max_tokens;
 
         let branch = self.session.path_to_leaf();
@@ -1341,7 +1351,8 @@ impl Agent {
     // An estimate that falls short still gets the overflow's compact-and-retry after the run.
     async fn compact_before_next_response(&mut self) -> Result<(), String> {
         if self.config.model.api == provider::acp_client::API { return Ok(()); }
-        let context_window = self.config.model.context_window;
+        let reply_room = if self.config.model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
+        let context_window = self.config.model.compaction_window(reply_room);
         if context_window == 0 {
             return Ok(());
         }
@@ -1350,7 +1361,6 @@ impl Agent {
             let branch = self.session.path_to_leaf();
             compaction::estimate_projected_context_tokens(&projection, &branch).tokens
         };
-        let reply_room = if self.config.model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
         let last_resort = CompactionSettings { compact_at: None, reserve_tokens: reply_room, ..self.config.compaction };
         if compaction::should_compact(tokens, context_window, last_resort) {
             self.run_auto_compaction(Reason::Threshold, false, None).await?;
@@ -1382,11 +1392,12 @@ impl Agent {
                 // room for the reply.
                 let mut messages = self.session.context().messages;
                 let reply_room = if model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
-                if model.context_window > 0 {
-                    compaction::fit(&mut messages, model.context_window.saturating_sub(reply_room));
+                let context_window = model.compaction_window(reply_room);
+                if context_window > 0 {
+                    compaction::fit(&mut messages, context_window.saturating_sub(reply_room), model, &self.session, instructions);
                 }
                 let source_dates = compaction::source_dates(&self.session, &messages);
-                let messages = crate::message::to_model_messages(&messages);
+                let messages = crate::message::to_model_messages(&messages, self.session.header().notice_token.as_deref());
                 let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone(), self.ownership.clone()), instructions, &source_dates).await;
                 let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
                     usage: response.usage.clone(), note: None };
@@ -1435,7 +1446,7 @@ impl Agent {
         // The compacted context starts a new cache anyway, so the prompt is brought up to date now,
         // before the first response on it: a compaction inside a tool loop goes straight on to the
         // next response, and an update left for the next run would rewrite the cache a second time.
-        if let Some(system) = self.prompt_update() {
+        if let Some(system) = self.prompt_update().await {
             let message = AgentMessage::System(system);
             (self.emit)(&Event::MessageStart { message: message.clone() });
             (self.emit)(&Event::MessageEnd { message: message.clone() });

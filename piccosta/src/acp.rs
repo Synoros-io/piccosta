@@ -424,7 +424,7 @@ impl Acp {
                 let (name, argument) = trimmed.strip_prefix('/').map(|line| line.split_once(' ').map_or((line, ""), |(name, rest)| (name, rest.trim()))).unwrap_or(("", ""));
                 let command = match name {
                     "compact" => Command::Compact(Some(argument.to_string()).filter(|text| !text.is_empty())),
-                    _ => Command::Prompt(crate::prompt::command_prompt(&text).unwrap_or_else(|| text.clone()), images, None),
+                    _ => Command::Prompt(crate::message::UserMessage::new(&crate::prompt::command_prompt(&text).unwrap_or_else(|| text.clone()), images, crate::message::InputOrigin::frontend("acp"))),
                 };
                 if !live.titled {
                     live.titled = true;

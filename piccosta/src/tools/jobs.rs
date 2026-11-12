@@ -493,6 +493,7 @@ impl Jobs {
         details.insert("logPath".into(), job.log_path.display().to_string().into());
         let _ = self.notices.send(CustomMessage {
             custom_type: NOTICE_TYPE.to_string(),
+            origin: crate::message::InputOrigin::JobReport { id: job.id },
             content: TextOrBlocks::Text(lines.join("\n")),
             display: true,
             details: Some(serde_json::Value::Object(details)),

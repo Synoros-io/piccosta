@@ -27,7 +27,7 @@ const FEWEST_ROWS: usize = 5;
 // Frames drawn at most for one: the second places the live part at the height the first wanted.
 const DRAWS: usize = 2;
 
-// pane_inner's margin: rows are printed a column in from each side, as the pane draws them.
+// The pane's margin: rows are printed a column in from each side, as the pane draws them.
 const MARGIN: u16 = 1;
 
 // The live part's first row, for restore (and so a panic) to take it off the screen; NONE when
@@ -171,7 +171,7 @@ impl App {
     // nothing more can change. Another session in the pane (/clear, /resume) is printed from its
     // start; a /fork or /rewind's copy only past what it shares with the one before (commands.rs fork).
     fn finished(&mut self, width: u16) -> Rows {
-        let slot_index = self.panes[0].slot;
+        let slot_index = self.session_index();
         if self.printed.0 != slot_index {
             (self.printed, self.streamed) = ((slot_index, 0), Streamed::default());
         }
@@ -230,7 +230,7 @@ impl App {
     pub(super) fn streaming(&mut self, slot_index: usize, width: u16) -> Option<Rows> {
         let slot = &self.slots[slot_index];
         let parts = slot.partial.as_ref()?;
-        if !self.single {
+        if !self.inline {
             return Some(render::assistant(parts, None, &slot.tools, self.flags, self.frame, width, &mut self.tex));
         }
         let (model, started) = slot.partial_model.clone()?;
@@ -244,7 +244,7 @@ impl App {
     pub(super) fn unprinted(&mut self, slot_index: usize, index: usize, width: u16, flags: Flags) -> Rows {
         let slot = &self.slots[slot_index];
         match &slot.messages[index] {
-            AgentMessage::Assistant(reply) if self.single && reply.timestamp == self.streamed.0 => {
+            AgentMessage::Assistant(reply) if self.inline && reply.timestamp == self.streamed.0 => {
                 let ended = Some((&reply.stop_reason, reply.error_message.as_deref()));
                 render::assistant(&rest(&render::blocks(reply), self.streamed), ended, &slot.tools, flags, self.frame, width, &mut self.tex)
             }

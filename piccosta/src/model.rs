@@ -132,8 +132,47 @@ fn input_kinds(types: &Value) -> Value {
     if image { json!(["text", "image"]) } else { json!(["text"]) }
 }
 
+// Text prices in opencode's list, including its context-size overrides. Input: cost.text.
+// Output: ModelCost's flat rates and tiers. Cache writes can be a number or prices by retention;
+// the ordinary write rate uses 30m, while an explicit 1h rate stays separate. A 12h rate isn't a
+// 1h rate. Unknown shapes reach checked rather than silently becoming free.
+fn opencode_cost(text: &Value) -> Value {
+    let rates = |threshold: Option<u64>| {
+        let side = |name: &str| {
+            let mut side = text[name].clone();
+            if let Some(override_price) = side["overrides"].as_array().into_iter().flatten()
+                .filter(|price| price.pointer("/when/context/gt").and_then(Value::as_u64).is_some_and(|limit| threshold.is_some_and(|threshold| limit <= threshold)))
+                .max_by_key(|price| price.pointer("/when/context/gt").and_then(Value::as_u64))
+                .cloned()
+                && let (Some(side), Some(override_price)) = (side.as_object_mut(), override_price.as_object()) {
+                merge_object(side, override_price);
+            }
+            side
+        };
+        let (input, output) = (side("input"), side("output"));
+        let price = |value: &Value| if value.is_null() { 0.into() } else { value.clone() };
+        let write = &input["cache"]["write"];
+        let mut cost = json!({"input": price(&input["price"]), "output": price(&output["price"]),
+            "cacheRead": price(&input["cache"]["read"]), "cacheWrite": price(write.get("30m").unwrap_or(write))});
+        if let Some(hour) = write.get("1h") { cost["cacheWrite1h"] = hour.clone(); }
+        cost
+    };
+    let mut cost = rates(None);
+    let thresholds: std::collections::BTreeSet<u64> = ["input", "output"].into_iter()
+        .flat_map(|side| text[side]["overrides"].as_array().into_iter().flatten())
+        .filter_map(|price| price.pointer("/when/context/gt").and_then(Value::as_u64)).collect();
+    if !thresholds.is_empty() {
+        cost["tiers"] = thresholds.into_iter().map(|threshold| {
+            let mut tier = rates(Some(threshold));
+            tier["inputTokensAbove"] = threshold.into();
+            tier
+        }).collect();
+    }
+    cost
+}
+
 // One model of opencode-go's list as piccosta's, on the first of its APIs piccosta speaks, or
-// None when it has none of them. A field it leaves out stays null, for checked to refuse the list.
+// None when it has none of them. A field it leaves out stays null, for checked to skip the model.
 fn opencode_model(raw: &Value) -> Option<Value> {
     let apis = [("chat-completions", "openai-completions"), ("responses", "openai-responses"), ("messages", "anthropic-messages"), ("generate-content", "google-generative-ai")];
     let (route, api) = apis.into_iter().find(|(route, _)| raw["api"].get(route).is_some())?;
@@ -142,11 +181,11 @@ fn opencode_model(raw: &Value) -> Option<Value> {
     let base = base.as_str().filter(|_| api == "anthropic-messages").map_or(base.clone(), |base| base.trim_end_matches("/v1").into());
     let reasoning = &raw["capabilities"]["reasoning"];
     let efforts: Vec<&str> = reasoning["effort"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    let price = |pointer: &str| raw["cost"]["text"].pointer(pointer).cloned().unwrap_or(0.into());
     let mut model = json!({"id": raw["id"], "name": raw["name"].as_str().or(raw["id"].as_str()), "api": api, "baseUrl": base,
         "reasoning": reasoning["supported"] == true, "input": input_kinds(&raw["modalities"]["input"]),
-        "cost": {"input": price("/input/price"), "output": price("/output/price"), "cacheRead": price("/input/cache/read"), "cacheWrite": price("/input/cache/write")},
+        "cost": opencode_cost(&raw["cost"]["text"]),
         "contextWindow": raw["limit"]["context"], "maxTokens": raw["limit"]["output"]});
+    if let Some(limit) = raw["limit"].get("input") { model["maxInputTokens"] = limit.clone(); }
     if let Some(map) = effort_map(&efforts) {
         model["thinkingLevelMap"] = map;
     }
@@ -294,21 +333,26 @@ fn home(provider: &str, config: Option<&ProviderConfig>) -> Result<Option<url::O
 
 // A fetched list made ready to keep. One model per id: a later entry for an id (Claude Code names a
 // model again under an alias such as "opus") replaces the earlier one in its place. Every model is
-// read as load reads it, so one bad entry keeps the last list instead of breaking them all. Then,
+// read as load reads it, with a named note for each bad entry rather than losing the list. Then,
 // as a list doesn't choose where the key goes, a model whose URL isn't on the provider's home is
 // left out, with a note. Input: the provider, its converted models, and its home (home()). Output:
 // the models and the notes, or why the list can't be kept.
 fn checked(provider: &str, models: impl Iterator<Item = Value>, origin: Option<url::Origin>) -> Result<(Vec<Value>, Vec<String>), String> {
     let models: Vec<Value> = models.map(|model| (model["id"].to_string(), model)).collect::<IndexMap<_, _>>().into_values().collect();
-    as_models(provider, &models)?;
     let mut notes = Vec::new();
     let models = models.into_iter().filter(|model| {
+        if let Err(error) = as_models(provider, std::slice::from_ref(model)) {
+            notes.push(format!("left out {}: {error}", model["id"]));
+            return false;
+        }
         let at_home = origin.as_ref().is_none_or(|origin| model["baseUrl"].as_str().and_then(|url| reqwest::Url::parse(url).ok()).is_some_and(|url| url.origin() == *origin));
         if !at_home {
             notes.push(format!("left out {}: its URL {} isn't on {}", model["id"], model["baseUrl"], origin.as_ref().map_or(String::new(), url::Origin::ascii_serialization)));
         }
         at_home
-    }).collect();
+    }).collect::<Vec<_>>();
+    // An empty answer may be real, but a list we couldn't read mustn't erase the saved one.
+    if models.is_empty() && !notes.is_empty() { return Err(notes.join("; ")); }
     Ok((models, notes))
 }
 
@@ -458,6 +502,8 @@ pub struct CostTier {
     pub cache_read: f64,
     #[serde(serialize_with = "json_number::serialize", default)]
     pub cache_write: f64,
+    #[serde(rename = "cacheWrite1h", serialize_with = "json_number::serialize_option", default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<f64>,
 }
 
 // One chat model. `compat` holds the provider quirks the request builders read (developer role,
@@ -483,6 +529,9 @@ pub struct Model {
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,
+    // Some lists give an input ceiling as well as the combined context and output ceilings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
     // pi's thinking levels (off, minimal, low, medium, high, xhigh, max) to the provider's own
     // effort names. A null value marks a level the model doesn't support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,6 +551,15 @@ pub struct Model {
 }
 
 impl Model {
+    // The window used for compaction, which subtracts the reply reserve from it. Cap the input
+    // part without reducing max_tokens or the combined window the provider uses for output.
+    pub fn compaction_window(&self, reply_reserve: u64) -> u64 {
+        self.max_input_tokens.map_or(self.context_window, |input| {
+            let window = input.saturating_add(reply_reserve);
+            if self.context_window == 0 { window } else { self.context_window.min(window) }
+        })
+    }
+
     // A compat flag, false when the model doesn't set it.
     pub fn compat_flag(&self, key: &str) -> bool {
         self.compat.as_ref().and_then(|compat| compat.get(key)).and_then(Value::as_bool).unwrap_or(false)

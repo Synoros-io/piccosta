@@ -685,7 +685,7 @@ pub fn checkpoint(session: &crate::session::Session, assistant: &AssistantMessag
     if assistant.response_id.as_deref() != Some(acknowledged) {
         return Ok(());
     }
-    connection.record.prints = prints(&crate::message::to_model_messages(&session.context().messages));
+    connection.record.prints = prints(&crate::message::to_model_messages(&session.context().messages, session.header().notice_token.as_deref()));
     connection.record.in_flight = false;
     if let Err(error) = save(connection.file.as_deref(), &connection.record) {
         connection.record.in_flight = true;

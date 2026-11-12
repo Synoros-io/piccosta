@@ -103,11 +103,17 @@ impl SeenFiles {
         let content = as_edit_sees(text);
         let snapshot = Snapshot {
             hash: hash_text(&content),
-            content: (text.len() <= SNAPSHOT_MAX_BYTES).then_some(content),
+            content: (text.len() <= SNAPSHOT_MAX_BYTES).then(|| text.to_string()),
             via,
             at: Instant::now(),
         };
         self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(paths::canonical(path), snapshot);
+    }
+
+    // Scratchpad writers need byte-for-byte freshness, not edit's normalized line endings.
+    pub fn unchanged(&self, path: &Path, text: &str) -> bool {
+        self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&paths::canonical(path))
+            .is_some_and(|snapshot| snapshot.content.as_deref() == Some(text))
     }
 
     pub(super) fn forget(&self, path: &Path) {
@@ -164,7 +170,7 @@ impl SeenFiles {
 
     fn snapshot_of(&self, path: &Path) -> Option<(u64, Option<String>, &'static str, Instant)> {
         let files = self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        files.get(&paths::canonical(path)).map(|snapshot| (snapshot.hash, snapshot.content.clone(), snapshot.via, snapshot.at))
+        files.get(&paths::canonical(path)).map(|snapshot| (snapshot.hash, snapshot.content.as_deref().map(as_edit_sees), snapshot.via, snapshot.at))
     }
 }
 

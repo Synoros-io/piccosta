@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 46] = [
+const COMMANDS: [(&str, &str); 49] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns (esc stops the focused turn)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -79,7 +79,9 @@ const COMMANDS: [(&str, &str); 46] = [
     ("/agents", "the subagent jobs and their models"),
     ("/ps", "background jobs"),
     ("/stop", "kill the background jobs"),
+    ("/scratch [edit]", "open/focus the shared Markdown scratchpad; enter appends, edit opens $EDITOR"),
     ("/split", "open a new session in another pane"),
+    ("/layout", "cycle panes: columns, rows, grid (four panes start in a grid)"),
     ("/close", "close this session: it's done and leaves the list (/resume finds it, and a message opens it again)"),
     ("/delete", "move this session to the trash and show the next; the Delete key twice, with nothing typed, does it too"),
     ("/help", "this list"),
@@ -88,6 +90,7 @@ const COMMANDS: [(&str, &str); 46] = [
     ("", "^backspace deletes a word · ^shift+delete clears what's typed (↑ brings it back)"),
     ("", "running: enter queues · ^x^s or ^enter sends now · ↑ takes back · esc stops, queue goes next"),
     ("", "^n new · ^s sessions · pgup/pgdn or alt+↑↓ through the sidebar (shown, started when you type) · ^b sidebar"),
+    ("", "alt+, / alt+. narrow/widen sidebar · drag its right edge to resize"),
     ("", "^\\ split · ^] close pane · alt+←→ panes · alt+pgup/pgdn or the wheel scrolls · ^o tools · ^t thinking"),
     ("copy", "drag to select (double-click a word, triple-click a row); it copies when you let go · ^c copies a selection · shift+arrows extend it"),
     ("paste", "right-click pastes the clipboard, middle-click the last selection, ^v the clipboard · shift+arrows select in the editor"),
@@ -101,13 +104,17 @@ impl App {
         let (name, raw_argument) = line.split_once(' ').map_or((line.trim(), ""), |(name, rest)| (name, rest));
         let argument = raw_argument.trim();
         match name {
+            "scratch" => self.scratch(argument),
+            "close" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => self.close_pane(),
+            "help" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => self.notice = Some("Scratchpad: enter appends · alt+enter newline · /scratch edit · /layout · /close · ^s sessions · alt+←→ panes".into()),
+            _ if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) && !matches!(name, "layout" | "quit" | "exit" | "restart" | "resume" | "pwd" | "cwd" | "split" | "new") && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') => self.notice = Some(format!("/{name} is a session command; focus a session first.")),
             // --single has one session: the commands that open others only say so.
             "new" | "manager" | "advisor" | "assistant" if self.one_session() => {}
             // /clear starts this tab over, as Claude Code's does: a new session in the same directory
             // (a manager's or advisor's in that role) takes its place, and the one left leaves the sidebar (it's still on disk, in /resume).
             // /clear <name> names the one left first. A running turn stops first (esc).
             "clear" => {
-                let left = self.panes[self.focus].slot;
+                let left = self.session_index();
                 if self.slots[left].busy() {
                     self.notice = Some("A turn is running; esc stops it, then /clear.".into());
                 } else if let Some(slot) = {
@@ -169,7 +176,7 @@ impl App {
                 }
                 let dir = match args.messages.first() {
                     Some(dir) => self.directory(dir),
-                    None => Ok(self.current().cwd.clone()),
+                    None => Ok(self.focus_cwd().to_path_buf()),
                 };
                 match dir {
                     Ok(dir) => {
@@ -190,7 +197,7 @@ impl App {
             // The scale is one file: /scale edit opens it (written out whole the first time), and
             // /scale <use> <model[:level]> ... sets one use's models there.
             "scale" if argument == "edit" => match crate::scale::write_out(&self.host.agent_dir) {
-                Ok(path) => self.edit = Some(path),
+                Ok(path) => self.edit = Some(super::Edit::Scale(path)),
                 Err(error) => self.notice = Some(error),
             },
             "scale" if !argument.is_empty() => {
@@ -370,7 +377,7 @@ impl App {
             "context" => self.report(self.context()),
             "usage" | "cost" => self.report(self.usage()),
             "timer" => {
-                let slot = self.panes[self.focus].slot;
+                let slot = self.session_index();
                 let Some(file) = self.slots[slot].path.clone() else {
                     self.notice = Some("User timers need a saved session (not --no-session).".into());
                     return true;
@@ -382,7 +389,7 @@ impl App {
                 })).is_err() { self.notice = Some("The timer disk worker stopped.".into()); }
             }
             "diff" => self.diff(),
-            "pwd" | "cwd" => self.notice = Some(self.current().cwd.display().to_string()),
+            "pwd" | "cwd" => self.notice = Some(self.focus_cwd().display().to_string()),
             "copy" => self.copy(argument),
             "export" => self.export(argument),
             // The session is titled by the command, not the long prompt it stands for.
@@ -390,7 +397,7 @@ impl App {
                 if self.current().title == super::NEW_TITLE {
                     self.focused().title = format!("/{line}");
                 }
-                self.send(crate::prompt::command_prompt(&format!("/{line}")).unwrap_or_default());
+                self.send(crate::prompt::command_prompt(&format!("/{line}")).unwrap_or_default(), crate::message::InputOrigin::keyboard());
             }
             "agents" => match crate::tools::subagent::SubagentTool::load(&self.host.agent_dir, None) {
                 Some(tool) => self.report(tool.describe().join("\n")),
@@ -408,10 +415,11 @@ impl App {
                 self.notice = Some(format!("Stopped {count} background job{}.", if count == 1 { "" } else { "s" }));
             }
             "split" => self.split(),
+            "layout" => self.layout = self.layout.next(),
             // Closing says the session is done: it leaves the list for good, and a message in it
             // (from /resume, or a manager) opens it again.
             "close" => {
-                let slot = self.panes[self.focus].slot;
+                let slot = self.session_index();
                 if self.close(slot)
                     && let Some(path) = self.slots[slot].path.take()
                 {
@@ -480,9 +488,9 @@ impl App {
                 app.show(slot);
             }
         });
-        let current = self.panes[self.focus].slot;
+        let current = self.panes[self.focus].target;
         if let Some(picker) = &mut self.picker {
-            picker.selected = if filter.is_empty() { listed.iter().position(|&index| index == current).unwrap_or(0) } else { 0 };
+            picker.selected = if filter.is_empty() { listed.iter().position(|&index| super::Target::Session(index) == current).unwrap_or(0) } else { 0 };
             picker.delete = Some(|app, choice| {
                 if let Some(slot) = number(&choice).and_then(|place| app.listed().get(place).copied())
                     && let Some(error) = app.delete(slot)
@@ -495,7 +503,7 @@ impl App {
     }
 
     pub(super) fn projects_ready(&mut self, mut recent: Vec<crate::host::SessionSummary>) {
-        let mut dirs = vec![super::render::home_relative(&self.current().cwd)];
+        let mut dirs = vec![super::render::home_relative(self.focus_cwd())];
         if !dirs.iter().any(|dir| dir == "~") { dirs.push("~".into()); }
         recent.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
         for dir in recent.into_iter().map(|summary| summary.cwd).filter(|dir| !dir.starts_with(&self.host.agent_dir)).chain(git_repositories(&crate::config::home())) {
@@ -517,7 +525,7 @@ impl App {
 
     // Where a typed path starts from: the focused session's directory, else piccosta's.
     fn base_dir(&self) -> std::path::PathBuf {
-        if self.current().cwd.as_os_str().is_empty() { self.host.cwd.clone() } else { self.current().cwd.clone() }
+        if self.focus_cwd().as_os_str().is_empty() { self.host.cwd.clone() } else { self.focus_cwd().to_path_buf() }
     }
 
     // Set this session's level and save it as the model's, saying so when the model runs a
@@ -583,13 +591,13 @@ impl App {
 
     // Delete the session shown here, then show the one after it in the list (or before, at the end).
     pub(super) fn delete_shown(&mut self) {
-        let slot = self.panes[self.focus].slot;
+        let slot = self.session_index();
         let listed = self.listed();
         let at = listed.iter().position(|&index| index == slot);
         // --single shows nothing else: close() leaves a fresh session in its pane.
         let next = at.filter(|_| !self.single).and_then(|at| listed.get(at + 1).or_else(|| at.checked_sub(1).and_then(|before| listed.get(before)))).copied();
         let failed = self.delete(slot);
-        if let Some(next) = next.filter(|&next| !self.slots[next].gone() && self.panes[self.focus].slot != next) {
+        if let Some(next) = next.filter(|&next| !self.slots[next].gone() && self.panes[self.focus].target != super::Target::Session(next)) {
             self.show(next);
         }
         if let Some(error) = failed {
@@ -629,7 +637,8 @@ impl App {
     pub(super) fn report(&mut self, text: String) {
         let pane = self.focus;
         self.panes[pane].scroll = 0;
-        self.focused().messages.push(report_message(text));
+        if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) { self.notice = Some(text); }
+        else { self.focused().messages.push(report_message(text)); }
     }
 
     fn status(&self) -> String {
@@ -769,9 +778,9 @@ impl App {
             Ok(Some(slot)) => {
                 let printed = self.printed.1;
                 self.show(slot);
-                // --single: what the copy shares with this session is in the scrollback already, and
+                // --inline: what the copy shares with this session is in the scrollback already, and
                 // a rewind says where it went back to before what follows (inline.rs).
-                if self.single {
+                if self.inline {
                     let messages = &self.slots[slot].messages;
                     let prompts = messages.iter().filter(|message| matches!(message, AgentMessage::User(_))).count();
                     // A fork keeps what was printed of a reply it shares; a rewind starts over.
@@ -879,7 +888,7 @@ fn words(line: &str) -> Vec<String> {
 
 // A report, as the pane keeps it: shown, never sent to the model.
 pub(super) fn report_message(text: String) -> AgentMessage {
-    AgentMessage::Custom(CustomMessage { custom_type: REPORT.into(), content: TextOrBlocks::Text(text), display: true, details: None, timestamp: crate::clock::now_ms() })
+    AgentMessage::Custom(CustomMessage { custom_type: REPORT.into(), origin: crate::message::InputOrigin::Harness { name: REPORT.into() }, content: TextOrBlocks::Text(text), display: true, details: None, timestamp: crate::clock::now_ms() })
 }
 
 // The command names that start with what's typed, in /help's order (for tab).

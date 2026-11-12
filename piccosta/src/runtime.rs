@@ -28,7 +28,7 @@
 
 use crate::agent::{Agent, Event};
 use crate::host::{Host, Team};
-use crate::message::{AgentMessage, Content, StopReason};
+use crate::message::{AgentMessage, InputOrigin, StopReason, UserMessage};
 use crate::model::Model;
 use crate::session::Session;
 use crate::tools::ToolShared;
@@ -72,12 +72,12 @@ static IDLE_NOTES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new())
 // What a runtime is asked. Message, Stop and Close are taken at once; the rest wait their turn.
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
 pub enum Command {
-    Prompt(String, Vec<Content>, Option<crate::message::UserTimer>),
-    Message(String),
+    Prompt(UserMessage),
+    Message(UserMessage),
     // A durable check-in starts a turn even when a frontend normally starts each one itself.
     Checkin,
     // Only the owning runtime admits a user timer. It must never enter the durable inbox first.
-    Timer(crate::message::UserTimer, String, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
+    Timer(UserMessage, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
     // Acknowledge only between runs, after the frontend has set Handle::draining.
@@ -245,10 +245,10 @@ impl Drop for Claim {
             lock(&self.gate).take();
             let mut session = Session::open(&self.file, self.file.parent().unwrap_or(Path::new("/"))).ok();
             while let Ok(command) = self.taken.try_recv() {
-                if let (Command::Message(text), Some(session)) = (command, session.as_mut())
-                    && !text.is_empty()
+                if let (Command::Message(message), Some(session)) = (command, session.as_mut())
+                    && !message.is_empty()
                 {
-                    let _ = session.queue(&text);
+                    let _ = session.queue_message(AgentMessage::User(message));
                 }
             }
         }
@@ -282,7 +282,7 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
     take_inbox(session).map_err(|error| format!("{}: {error}", file.display()))?;
     let (taken_by, taken) = mpsc::unbounded_channel();
     let (gate, watch): (Gate, Arc<Mutex<Watch>>) = (Arc::new(Mutex::new(Some(taken_by))), Arc::default());
-    let listening = Some(listen(listener, gate.clone(), watch.clone()));
+    let listening = Some(listen(listener, gate.clone(), watch.clone(), file.clone()));
     Ok(Some(Claim { file, listening, gate, taken, watch, ownership }))
 }
 
@@ -292,10 +292,11 @@ pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
 // short is never a message. A request is a whole line: one its sender didn't finish writing is
 // never acted on, so a sender whose write failed knows it wasn't (ask). A stop or close is answered
 // by a task of its own once it has taken effect, a subscriber's lines by another.
-fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) -> tokio::task::JoinHandle<()> {
+fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>, file: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let Ok(stream) = crate::ipc::accept(&listener).await else { return };
+            let peer = crate::ipc::client_peer(&stream);
             let (read, mut write) = tokio::io::split(stream);
             let mut line = String::new();
             if !matches!(tokio::time::timeout(READ_WAIT, tokio::io::BufReader::new(read).read_line(&mut line)).await, Ok(Ok(1..))) || !line.ends_with('\n') {
@@ -309,7 +310,13 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                     let (parent, job) = (std::env::var(crate::tools::subagent::SESSION_ENV).ok(), std::env::var(crate::tools::subagent::CHILD_ENV).ok());
                     json!({"working": since.is_some(), "since": since, "parent": parent, "job": job})
                 }
-                "message" => json!({"ok": send(Command::Message(request["text"].as_str().unwrap_or_default().to_string()))}),
+                "message" | "tell" => {
+                    let request = request.clone();
+                    match tokio::task::spawn_blocking(move || socket_message(&request, peer)).await {
+                        Ok(message) => json!({"ok": send(Command::Message(message))}),
+                        Err(error) => json!({"ok": false, "error": error.to_string()}),
+                    }
+                },
                 "checkin" => json!({"ok": send(Command::Checkin)}),
                 "thinking" => match request["level"].as_str().filter(|level| crate::provider::THINKING_LEVELS.contains(level)) {
                     Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
@@ -319,10 +326,23 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
                 "timer" if lock(&watch).closing => json!({"outcome": TimerOutcome::SkippedBusy}),
                 "timer" => {
                     let (answer, answered) = oneshot::channel();
-                    let timer = crate::message::UserTimer { id: request["id"].as_str().unwrap_or_default().to_string(), title: request["title"].as_str().unwrap_or_default().to_string() };
-                    let sent = send(Command::Timer(timer, request["text"].as_str().unwrap_or_default().to_string(), Instant::now() + ASK_WAIT, answer));
+                    // Authentication may wait on disk. It must not extend the dispatcher's
+                    // admission window and replay a timer after cancellation won the store lock.
+                    let remaining = request["expiresAt"].as_i64().map(|at| Duration::from_millis(at.saturating_sub(crate::clock::now_ms()).max(0) as u64)).unwrap_or(ASK_WAIT).min(ASK_WAIT);
+                    let expires = Instant::now() + remaining;
+                    let (target, id) = (file.clone(), request["id"].as_str().unwrap_or_default().to_string());
+                    let admitted = tokio::task::spawn_blocking(move || crate::tools::checkin::timer_input(&crate::config::agent_dir(), &target, &id, peer)).await;
+                    let message = match admitted {
+                        Ok(Ok(message)) => message,
+                        result => {
+                            let error = match result { Ok(Err(error)) => error, Err(error) => error.to_string(), _ => unreachable!() };
+                            let _ = write.write_all(format!("{}\n", json!({"error": error})).as_bytes()).await;
+                            continue;
+                        }
+                    };
+                    let sent = Instant::now() < expires && send(Command::Timer(message, expires, answer));
                     tokio::spawn(async move {
-                        let result = if sent { tokio::time::timeout(ASK_WAIT, answered).await.ok().and_then(Result::ok) } else { None };
+                        let result = if sent { tokio::time::timeout_at(tokio::time::Instant::from_std(expires), answered).await.ok().and_then(Result::ok) } else { None };
                         let reply = match result {
                             Some(Ok(outcome)) => json!({"outcome": outcome}),
                             Some(Err(error)) => json!({"error": error}),
@@ -360,6 +380,24 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>) 
             let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
         }
     })
+}
+
+// A claimed sender is an agent only when the socket peer also owns that session's runtime.
+// Shell children cannot borrow the parent's identity, and a sender never gets to claim Human.
+fn sending_session(file: &Path, peer: Option<i32>) -> Option<String> {
+    let peer = peer?;
+    let stream = connect(file).ok()?;
+    (crate::ipc::peer(&stream) == Some(peer)).then(|| crate::session::index::header(file).ok().map(|header| header.id)).flatten()
+}
+
+fn socket_message(request: &Value, peer: Option<i32>) -> UserMessage {
+    let origin = if request["do"] == "tell" { InputOrigin::cli("tell") }
+        else if let Some(session) = request["sender"].as_str().and_then(|file| sending_session(Path::new(file), peer)) { InputOrigin::AgentMessage { session } }
+        else { InputOrigin::frontend("runtime socket") };
+    // Decode the body alone. Even malformed origin/timestamp/timer fields are not authority.
+    let content = request.get("message").and_then(|message| message.get("content")).and_then(|content| serde_json::from_value(content.clone()).ok())
+        .unwrap_or_else(|| crate::message::TextOrBlocks::Text(request["text"].as_str().unwrap_or_default().into()));
+    UserMessage { content, timestamp: crate::clock::now_ms(), timer: None, origin }
 }
 
 // --- Asking a runtime from outside ---
@@ -481,9 +519,14 @@ pub enum Sent {
 // the file as a queued message for the next one, and with `launch` (the directory and log for a run
 // of its own) a run started now, unless it's a manager's session, whose runs spend its model and
 // wait for its service or a terminal. A message once sent is never sent again.
-pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<Sent, String> {
+pub fn send(file: &Path, message: &UserMessage, sender: Option<&Path>, launch: Option<(&Path, &Path)>) -> Result<Sent, String> {
     let held = hold(file)?;
-    match ask(file, json!({"do": "message", "text": text}), ASK_WAIT) {
+    let request = json!({"do": if matches!(message.origin, InputOrigin::Cli { .. }) { "tell" } else { "message" }, "text": message.content.text(), "message": {"content": message.content}, "sender": sender});
+    let mut answer = ask(file, request.clone(), ASK_WAIT);
+    if matches!(&answer, Asked::Answered(answer) if answer["error"] == "no such request") && request["do"] == "tell" {
+        answer = ask(file, json!({"do": "message", "text": message.content.text()}), ASK_WAIT);
+    }
+    match answer {
         Asked::Nobody => {}
         Asked::Answered(answer) if answer["ok"] == true => return Ok(Sent::Delivered),
         Asked::Answered(Value::Null) | Asked::Silent(_) => return Ok(Sent::Unconfirmed),
@@ -494,7 +537,8 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
         return Err(format!("{}: no such session", file.display()));
     }
     let mut session = Session::open(file, file.parent().unwrap_or(Path::new("/"))).map_err(|error| error.to_string())?;
-    session.queue(text).map_err(|error| format!("{}: {error}", file.display()))?;
+    let message = socket_message(&request, Some(std::process::id() as i32));
+    session.queue_message(AgentMessage::User(message)).map_err(|error| format!("{}: {error}", file.display()))?;
     let lane = crate::manager::role(&session).is_none();
     drop(held);
     match launch.filter(|_| lane) {
@@ -506,27 +550,37 @@ pub fn send(file: &Path, text: &str, launch: Option<(&Path, &Path)>) -> Result<S
 // A retryable delivery is on disk before its sender advances a cursor. The inbox belongs to the
 // receiver, under the same handoff lock as claim and shutdown. Its id survives consumption, so a
 // check-in can retry a lost wake answer without repeating a message the receiver already took.
-pub fn deliver(file: &Path, id: &str, text: &str) -> Result<(), String> {
-    deliver_to(file, id, text, false, None)
+pub fn deliver(file: &Path, id: &str, message: &UserMessage) -> Result<(), String> {
+    deliver_to(file, id, message, false, None).map(|_| ())
+}
+
+// Origin says what the harness recorded at its own ingress, not who can tamper with its files.
+// A same-user process deliberately writing the inbox/session can forge it. The intent reviewer
+// catches drift, not a hostile agent forging JSON. This path records forwarded TUI keystrokes;
+// the socket only wakes the owner. CLI/RPC/ACP never enter it.
+pub(crate) fn send_keyboard(file: &Path, input: &UserMessage) -> Result<Sent, String> {
+    let message = UserMessage { origin: InputOrigin::Human { interface: "tui-forwarded".into() }, timer: None, ..input.clone() };
+    deliver_to(file, &format!("keyboard:{}", uuid::Uuid::new_v4()), &message, false, None)
 }
 
 // A check-in uses the same durable inbox, but wakes idle editor sessions too. An unattended lane
 // gets the same run a manager's message would give it; everyone else keeps the message queued.
-pub fn deliver_checkin(file: &Path, id: &str, text: &str, launch: Option<(&Path, &Path)>) -> Result<(), String> {
-    deliver_to(file, id, text, true, launch)
+pub fn deliver_checkin(file: &Path, id: &str, message: &UserMessage, launch: Option<(&Path, &Path)>) -> Result<(), String> {
+    deliver_to(file, id, message, true, launch).map(|_| ())
 }
 
 // Ask the owner to admit an ordinary prompt, without holding the session file. Its user entry
 // carries the occurrence id; a retry is acknowledged without starting that prompt again.
-pub fn deliver_timer(file: &Path, id: &str, text: &str, title: &str) -> Result<TimerOutcome, String> {
-    match ask(file, json!({"do": "timer", "id": id, "text": text, "title": title}), ASK_WAIT) {
+pub fn deliver_timer(file: &Path, message: &UserMessage) -> Result<TimerOutcome, String> {
+    let timer = message.timer.as_ref().ok_or("missing timer occurrence")?;
+    match ask(file, json!({"do": "timer", "id": timer.id, "title": timer.title, "text": message.content.text(), "message": message, "expiresAt": crate::clock::now_ms().saturating_add(ASK_WAIT.as_millis() as i64)}), ASK_WAIT) {
         Asked::Nobody => Ok(TimerOutcome::SkippedNotRunning),
         Asked::Answered(answer) => serde_json::from_value(answer["outcome"].clone()).map_err(|_| answer["error"].as_str().unwrap_or("timer admission was not confirmed").to_string()),
         _ => Err("timer admission was not confirmed".into()),
     }
 }
 
-fn deliver_to(file: &Path, id: &str, text: &str, wake: bool, launch: Option<(&Path, &Path)>) -> Result<(), String> {
+fn deliver_to(file: &Path, id: &str, message: &UserMessage, wake: bool, launch: Option<(&Path, &Path)>) -> Result<Sent, String> {
     let held = hold(file)?;
     if held.is_none() { return Err(format!("{}: no such session for delivery", file.display())); }
     let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
@@ -535,7 +589,9 @@ fn deliver_to(file: &Path, id: &str, text: &str, wake: bool, launch: Option<(&Pa
     output.read_to_string(&mut pending).map_err(|error| error.to_string())?;
     if !pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|line| line["delivery_id"] == id) {
         let length = output.metadata().map_err(|error| error.to_string())?.len();
-        let line = format!("{}\n", json!({"text": text, "delivery_id": id}));
+        // Older live receivers only read text. Keep it beside the typed payload so a rolling
+        // restart cannot acknowledge an empty message or discard an unread inbox.
+        let line = format!("{}\n", json!({"text": message.content.text(), "message": message, "delivery_id": id}));
         if let Err(error) = output.write_all(line.as_bytes()).and_then(|()| output.sync_all()) {
             return Err(match output.set_len(length) {
                 Ok(()) => error.to_string(),
@@ -546,13 +602,17 @@ fn deliver_to(file: &Path, id: &str, text: &str, wake: bool, launch: Option<(&Pa
     // Shutdown takes this same lock. Either the runner takes the wake before it checks for idle,
     // or it is already gone and we start the next one; EOF is not an acknowledgement.
     match ask(file, json!({"do": if wake { "checkin" } else { "message" }, "text": ""}), ASK_WAIT) {
-        _ if !wake => Ok(()),
-        Asked::Answered(answer) if answer["ok"] == true => Ok(()),
+        answer if !wake => Ok(match answer {
+            Asked::Nobody => Sent::Queued,
+            Asked::Answered(answer) if answer["ok"] == true => Sent::Delivered,
+            _ => Sent::Unconfirmed,
+        }),
+        Asked::Answered(answer) if answer["ok"] == true => Ok(Sent::Delivered),
         Asked::Nobody => {
             drop(held);
             match launch {
-                Some((cwd, log)) => launch_checkin(file, cwd, log),
-                None => Ok(()), // Ordinary sessions and advisors wait until someone opens them.
+                Some((cwd, log)) => launch_checkin(file, cwd, log).map(|()| Sent::Queued),
+                None => Ok(Sent::Queued), // Ordinary sessions and advisors wait until someone opens them.
             }
         }
         _ => Err(format!("{}: check-in wake was not confirmed", file.display())),
@@ -579,10 +639,12 @@ fn take_inbox(session: &mut Session) -> std::io::Result<()> {
     let taken = session.entries().iter().any(|entry| matches!(entry, crate::session::SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == crate::session::QUEUED_TYPE && data["inbox"] == name));
     let mut texts = Vec::new();
     for line in pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
-        let Some(text) = line["text"].as_str() else { continue };
         if let Some(id) = line["delivery_id"].as_str() {
-            session.queue_delivery(id, text)?;
-        } else if !taken {
+            // Recorded ingress, not authenticated authorship: same-user file writers can forge it.
+            let message = line.get("message").and_then(|message| serde_json::from_value(message.clone()).ok())
+                .unwrap_or_else(|| UserMessage::new(line["text"].as_str().unwrap_or_default(), Vec::new(), InputOrigin::Unknown));
+            session.queue_delivery(id, message)?;
+        } else if !taken && let Some(text) = line["text"].as_str() {
             texts.push(text.to_string());
         }
     }
@@ -789,6 +851,7 @@ enum Work {
     Notice(crate::message::CustomMessage),
     // Idle compaction's time (Agent::idle_compaction_due).
     Idle,
+    Review(Value),
 }
 
 // A sleep until `at` (epoch ms), over at once when that's past.
@@ -813,7 +876,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     lock(&watch).receipts = agent.session.delivery_ids();
     // Each turn the model ends goes to the subscribers, with how many jobs still run.
     let (heard, jobs) = (watch.clone(), shared.clone());
+    let (worked, unattended) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (did_work, admitted) = (worked.clone(), unattended.clone());
     agent.tap(move |event| {
+        if matches!(event, Event::AgentStart) { did_work.store(true, Ordering::Relaxed); }
+        if let Event::MessageEnd { message } = event && crate::intent_review::unattended(message) { admitted.store(true, Ordering::Relaxed); }
         if let Event::MessageEnd { message: AgentMessage::User(user) } = event && let Some(timer) = &user.timer {
             let mut watched = lock(&heard);
             watched.receipts.insert(timer.id.clone());
@@ -833,6 +900,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     let timer = agent.session.file().map(|file| tokio::task::spawn_local(crate::tools::checkin::watch(host.agent_dir.clone(), Some(file.to_path_buf()))));
     let task = tokio::task::spawn_local(async move {
         let handle = agent.handle();
+        let mut reviews = if agent.manager_home().is_some() { crate::intent_review::State::load(agent.session.file()).await } else { crate::intent_review::State::default() };
         let mut team = crate::host::team(&agent.session);
         let mut queue: VecDeque<(Command, bool)> = VecDeque::new();
         let mut closing: Option<Option<oneshot::Sender<()>>> = None;
@@ -846,8 +914,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         closing = Some(answer);
                         break Err("Session closed during plugin discovery".into());
                     }
-                    Some((Command::Timer(timer, _, _, answer), _)) => {
-                        let outcome = if lock(&watch).receipts.contains(&timer.id) { TimerOutcome::Delivered } else { TimerOutcome::SkippedBusy };
+                    Some((Command::Timer(message, _, answer), _)) => {
+                        let outcome = if message.timer.as_ref().is_some_and(|timer| lock(&watch).receipts.contains(&timer.id)) { TimerOutcome::Delivered } else { TimerOutcome::SkippedBusy };
                         let _ = answer.send(Ok(outcome));
                     }
                     Some(command) => queue.push_back(command),
@@ -872,7 +940,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         }
         // What the last runner left queued is taken at once.
         if wake && !agent.session.queued().is_empty() {
-            queue.push_back((Command::Message(String::new()), false));
+            queue.push_back((Command::Message(UserMessage::new("", Vec::new(), InputOrigin::Unknown)), false));
         }
         // The session file's lock, while a run of its own lets go.
         let mut held = None;
@@ -911,7 +979,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             let work = match queued.and_then(|at| queue.remove(at)) {
                 Some((command, frontend)) => Work::Command(command, frontend),
                 None => {
-                    if let Some(generation) = release.take_if(|_| idle.is_none() && !handle.draining()) {
+                    if let Some(generation) = release.take_if(|_| idle.is_none() && !handle.draining() && !reviews.running()) {
                         queue.push_back((Command::ReleaseIfIdle(generation), false));
                         continue;
                     }
@@ -923,12 +991,18 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             Some((command, frontend)) => Work::Command(command, frontend),
                             None => break,
                         },
+                        result = reviews.next() => Work::Review(result),
                         Some(notice) = agent.notice(), if wake && !handle.draining() => Work::Notice(notice),
                         () = until(idle.map_or(0, |(due, _)| due)), if idle.is_some() && !handle.draining() => Work::Idle,
                     }
                 }
             };
             let work = match work {
+                Work::Review(result) => {
+                    if let Err(error) = crate::intent_review::apply(&mut agent, &host, result) { eprintln!("piccosta intent review: {error}"); }
+                    if until_idle && queue.is_empty() && commands.is_empty() && claim.as_ref().is_none_or(|claim| claim.taken.is_empty()) { break; }
+                    continue;
+                }
                 Work::Command(Command::Stop(answer), _) => {
                     answer.map(|answer| answer.send(()));
                     if until_idle {
@@ -945,7 +1019,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     let _ = answer.send(());
                     continue;
                 }
-                Work::Command(Command::Timer(timer, text, expires, answer), _) => {
+                Work::Command(Command::Timer(message, expires, answer), _) => {
+                    let Some(timer) = &message.timer else { let _ = answer.send(Err("missing timer occurrence".into())); continue };
                     if answer.is_closed() || Instant::now() >= expires { continue; }
                     // Accepted occurrences count while their prompt is running too. Admission and
                     // starting use one command, so later messages follow the ordinary prompt order.
@@ -958,7 +1033,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         continue;
                     }
                     lock(&watch).timer_answer = Some((timer.id.clone(), answer));
-                    Work::Command(Command::Prompt(text, Vec::new(), Some(timer)), false)
+                    Work::Command(Command::Prompt(message), false)
                 }
                 Work::Command(command, frontend) if handle.draining() => {
                     queue.push_back((command, frontend));
@@ -966,7 +1041,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 Work::Command(Command::ReleaseIfIdle(generation), _) => {
                     if generation.upgrade().is_none() { continue; }
-                    if idle.is_some() {
+                    if idle.is_some() || reviews.running() {
                         release = Some(generation);
                         continue;
                     }
@@ -977,12 +1052,12 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     held = None;
                     continue;
                 }
-                Work::Command(Command::Checkin, frontend) => Work::Command(Command::Message(String::new()), frontend),
+                Work::Command(Command::Checkin, frontend) => Work::Command(Command::Message(UserMessage::new("", Vec::new(), InputOrigin::Checkin)), frontend),
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt. A check-in above explicitly asks for its own turn.
-                Work::Command(Command::Message(text), _) if !wake => {
+                Work::Command(Command::Message(message), _) if !wake => {
                     let kept = receive(&mut agent.session).and_then(|()| {
-                        if text.is_empty() { Ok(()) } else { agent.session.queue(&text).map(|_| ()).map_err(|error| error.to_string()) }
+                        if message.is_empty() { Ok(()) } else { agent.session.queue_message(AgentMessage::User(message)).map(|_| ()).map_err(|error| error.to_string()) }
                     });
                     if let Err(error) = kept { eprintln!("piccosta: could not queue a message: {error}"); }
                     continue;
@@ -1007,7 +1082,13 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
                 work => work,
             };
-            let notice = matches!(work, Work::Notice(_) | Work::Command(Command::Message(_) | Command::Prompt(_, _, Some(_)), _));
+            // Completion routing is independent of authorship: RPC/ACP still own their prompt
+            // slots even though they cannot prove a human wrote the input.
+            let notice = match &work {
+                Work::Notice(_) | Work::Command(Command::Message(_), _) => true,
+                Work::Command(Command::Prompt(message), _) => message.timer.is_some(),
+                _ => false,
+            };
             let frontend = !notice && matches!(work, Work::Command(_, true));
             let mut fast_frontend = false;
             let compacting = matches!(work, Work::Idle);
@@ -1015,7 +1096,9 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             let mut stops = Vec::new();
             let mut receiving = true;
             let attended = agent.unattended_allowed().is_ok();
-            let occurrence = match &work { Work::Command(Command::Prompt(_, _, Some(timer)), _) => Some(timer.id.clone()), _ => None };
+            let occurrence = match &work { Work::Command(Command::Prompt(message), _) => message.timer.as_ref().map(|timer| timer.id.clone()), _ => None };
+            worked.store(false, Ordering::Relaxed);
+            unattended.store(false, Ordering::Relaxed);
             let result = {
                 let run = perform(&host, &mut agent, &mut team, work);
                 tokio::pin!(run);
@@ -1027,9 +1110,10 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             say(format!("skipped for the request at {}: busy, the session was working", at(request)));
                         },
                         command = next(&mut commands, &mut claim), if receiving => match command {
-                            Some((Command::Timer(timer, _, _, answer), _)) => {
-                                let result = if lock(&watch).receipts.contains(&timer.id) { Ok(TimerOutcome::Delivered) }
-                                    else if occurrence.as_deref() == Some(timer.id.as_str()) { Err("timer prompt append was not confirmed".into()) }
+                            Some((Command::Timer(message, _, answer), _)) => {
+                                let id = message.timer.as_ref().map(|timer| timer.id.as_str());
+                                let result = if id.is_some_and(|id| lock(&watch).receipts.contains(id)) { Ok(TimerOutcome::Delivered) }
+                                    else if id.is_some() && occurrence.as_deref() == id { Err("timer prompt append was not confirmed".into()) }
                                     else { Ok(TimerOutcome::SkippedBusy) };
                                 let _ = answer.send(result);
                             }
@@ -1041,11 +1125,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                                 queue.push_back((command, frontend));
                             }
                             Some((Command::Checkin, _)) if !handle.draining() && attended => {
-                                handle.steer(String::new());
+                                handle.steer(UserMessage::new("", Vec::new(), InputOrigin::Checkin));
                                 shared.jobs.detach_all();
                             }
-                            Some((Command::Message(text), _)) if !handle.draining() && attended => {
-                                handle.steer(text);
+                            Some((Command::Message(message), _)) if !handle.draining() && attended => {
+                                handle.steer(message);
                                 shared.jobs.detach_all();
                             }
                             Some((Command::Stop(answer), _)) => {
@@ -1077,6 +1161,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
             };
             lock(&watch).since = None;
+            if !compacting && closing.is_none() && worked.load(Ordering::Relaxed) && unattended.load(Ordering::Relaxed)
+                && let Err(error) = reviews.start(&host, &mut agent) { eprintln!("piccosta intent review: {error}"); }
             // Only the normal user-message append acknowledges delivery. If it never happened,
             // the sender retries; there is no separate queued receipt to strand at the idle gate.
             if let Some(id) = &occurrence {
@@ -1105,7 +1191,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             // in as it did, which it answers first. Under the file's lock, which a sender delivers
             // under too: once it's held, every message sent is in, and a sender after it finds
             // nobody and queues its message in the file.
-            if until_idle && queue.is_empty() {
+            if until_idle && queue.is_empty() && !reviews.running() {
                 held = agent.session.file().map(hold);
                 if commands.is_empty() && claim.as_ref().is_none_or(|claim| claim.taken.is_empty()) {
                     break;
@@ -1130,9 +1216,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         requeue(&mut agent);
         for (command, _) in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true))) {
             let message = match command {
-                Command::Message(text) if !text.is_empty() => Some(crate::agent::user_message(&text)),
-                Command::Prompt(text, images, _) => Some(crate::agent::with_images(&text, images)),
-                Command::Timer(_, _, _, answer) => {
+                Command::Message(message) | Command::Prompt(message) if !message.is_empty() => Some(AgentMessage::User(message)),
+                Command::Timer(_, _, answer) => {
                     let _ = answer.send(Ok(TimerOutcome::SkippedBusy));
                     None
                 }
@@ -1146,6 +1231,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 eprintln!("piccosta: could not keep runtime input: {error}");
             }
         }
+        if let Some(data) = reviews.stop().await && let Err(error) = crate::intent_review::record(&mut agent, &data) { eprintln!("piccosta intent review: {error}"); }
         shared.jobs.shutdown("quit");
         agent.keep_notices();
         // Fence queued provider work before giving up the socket. If the bounded close times out,
@@ -1170,8 +1256,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     (sender, task)
 }
 
-// The next command and its origin: true only for the frontend channel, not the socket. None
-// once the frontend has let go of the runtime.
+// The next command and its completion channel: true for the frontend, not the socket. This
+// flag says nothing about authorship. None once the frontend has let go of the runtime.
 async fn next(commands: &mut mpsc::UnboundedReceiver<Command>, claim: &mut Option<Claim>) -> Option<(Command, bool)> {
     let taken = async {
         match claim {
@@ -1193,15 +1279,16 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         Work::Command(command, _) => command,
         Work::Notice(notice) => return agent.take_notice(notice).await,
         Work::Idle => return agent.compact_idle().await,
+        Work::Review(_) => return Ok(()),
     };
     if matches!(command, Command::Prompt(..) | Command::Message(_)) {
         receive(&mut agent.session)?;
     }
     match command {
-        Command::Prompt(text, images, timer) => host.answer(agent, team, &text, images, timer).await,
-        Command::Message(text) => {
+        Command::Prompt(message) => host.answer(agent, team, message).await,
+        Command::Message(message) => {
             agent.unattended_allowed()?;
-            host.answer(agent, team, &text, Vec::new(), None).await
+            host.answer(agent, team, message).await
         }
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;
@@ -1228,8 +1315,8 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
 // its next turn, here or in the next runtime, takes it first.
 fn requeue(agent: &mut Agent) {
     let (steer, follow_up) = agent.handle().clear();
-    for text in steer.into_iter().chain(follow_up) {
-        if let Err(error) = agent.session.queue(&text) {
+    for message in steer.into_iter().chain(follow_up) {
+        if let Err(error) = agent.session.queue_message(AgentMessage::User(message)) {
             eprintln!("piccosta: could not keep a message: {error}");
         }
     }

@@ -144,7 +144,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
         }
     });
     for prompt in prompts {
-        let _ = commands.send(piccosta::runtime::Command::Prompt(prompt, Vec::new(), None));
+        let _ = commands.send(piccosta::runtime::Command::Prompt(piccosta::message::UserMessage::new(&prompt, Vec::new(), piccosta::message::InputOrigin::cli("print"))));
     }
     // SIGTERM and SIGHUP close the runtime, which stops the run, keeps what it hadn't read in the
     // session and kills its jobs with their process groups. SIGINT goes the SIGTERM way (exit 143),
@@ -283,10 +283,10 @@ async fn run() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("tell") => {
-            let text = piccosta::manager::from_user(&arguments[1..].join(" "));
+            let message = piccosta::message::UserMessage::new(&arguments[1..].join(" "), Vec::new(), piccosta::message::InputOrigin::cli("tell"));
             let Some(file) = piccosta::manager::session_file(&config::agent_dir()) else { return fail("no assistant yet: start it with `piccosta assistant`".into()) };
             // To its runtime; with the service down it waits in its session.
-            return match piccosta::runtime::send(&file, &text, None) {
+            return match piccosta::runtime::send(&file, &message, None, None) {
                 // Sent all the same, so it isn't a failure to send again.
                 Ok(piccosta::runtime::Sent::Unconfirmed) => {
                     eprintln!("piccosta: sent, not confirmed: the assistant didn't answer in time");

@@ -131,7 +131,7 @@ fn base64_len(bytes: usize) -> usize {
     bytes.div_ceil(3) * 4
 }
 
-pub(super) fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
+pub(crate) fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let rgba = image.to_rgba8();
     image::codecs::png::PngEncoder::new(&mut out)
@@ -163,12 +163,21 @@ pub(super) fn decode(bytes: &[u8]) -> Option<DynamicImage> {
 
 // A plugin may supply compressed images, not just screenshots. Four default-sized 2000x2000
 // frames is the source-pixel ceiling; 64 MB bounds its RGBA8 decode before any normalization.
-pub(super) const MAX_PLUGIN_RESPONSE_PIXELS: u64 = 4 * 2000 * 2000;
+pub(crate) const MAX_PLUGIN_RESPONSE_PIXELS: u64 = 4 * 2000 * 2000;
 const MAX_PLUGIN_DECODE_BYTES: u64 = MAX_PLUGIN_RESPONSE_PIXELS * 4;
 
 // Validate dimensions and decoder allocation before decoding. Always normalize plugin bytes,
 // then fit that PNG to the provider: a small JPEG can become a much larger PNG.
 pub(super) fn prepare_plugin(bytes: &[u8], limits: Limits, pixels_left: &mut u64) -> Result<Prepared, String> {
+    let image = decode_guarded(bytes, pixels_left)?;
+    // No original bytes to forward: fit the decoded frame first, then encode a clean PNG (or
+    // JPEG when PNG won't fit). Encoding the full source first needlessly expands large JPEGs.
+    prepare_decoded(&[], "image/png", limits, image)
+}
+
+// Input: compressed bytes and the remaining decoded-pixel allowance. Check dimensions and
+// allocation before decoding; both plugins and the scratchpad need this guard on small zip bombs.
+pub(crate) fn decode_guarded(bytes: &[u8], pixels_left: &mut u64) -> Result<DynamicImage, String> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| format!("bad image: {e}"))?;
     let mut budget = image::Limits::default();
     budget.max_alloc = Some(MAX_PLUGIN_DECODE_BYTES);
@@ -180,9 +189,7 @@ pub(super) fn prepare_plugin(bytes: &[u8], limits: Limits, pixels_left: &mut u64
     let orientation = decoder.orientation().ok();
     let mut image = DynamicImage::from_decoder(decoder).map_err(|e| format!("bad image: could not decode: {e}"))?;
     if let Some(orientation) = orientation { image.apply_orientation(orientation); }
-    // No original bytes to forward: fit the decoded frame first, then encode a clean PNG (or
-    // JPEG when PNG won't fit). Encoding the full source first needlessly expands large JPEGs.
-    prepare_decoded(&[], "image/png", limits, image)
+    Ok(image)
 }
 
 // Input: an image file's bytes, its sniffed type and the limits to fit. Output: the image as it goes to the model,

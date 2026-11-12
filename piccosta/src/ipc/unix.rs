@@ -70,6 +70,8 @@ pub async fn accept(listener: &Listener) -> std::io::Result<tokio::net::UnixStre
         if stream.peer_cred()?.uid() == unsafe { libc::geteuid() } { return Ok(stream); }
     }
 }
+pub fn client_peer(stream: &tokio::net::UnixStream) -> Option<i32> { stream.peer_cred().ok()?.pid() }
+
 pub fn peer(stream: &Stream) -> Option<i32> {
     #[cfg(target_os = "linux")]
     {

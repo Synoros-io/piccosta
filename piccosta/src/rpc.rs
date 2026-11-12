@@ -307,10 +307,10 @@ impl Rpc {
                     if live.acp_turn() && matches!(command["streamingBehavior"].as_str(), Some("steer" | "followUp")) { return Err(ACP_QUEUE_UNSUPPORTED.into()); }
                     match command.get("streamingBehavior").and_then(Value::as_str) {
                         Some("steer") => {
-                            live.handle.steer(message);
+                            live.handle.steer(crate::message::UserMessage::new(&message, Vec::new(), crate::message::InputOrigin::frontend("rpc")));
                             live.shared.jobs.detach_all();
                         }
-                        Some("followUp") => live.handle.follow_up(message),
+                        Some("followUp") => live.handle.follow_up(crate::message::UserMessage::new(&message, Vec::new(), crate::message::InputOrigin::frontend("rpc"))),
                         _ => return Err(BUSY.into()),
                     }
                     self.announce_queue();
@@ -321,12 +321,13 @@ impl Rpc {
                 respond(id, "prompt", Ok(Some(json!({"disposition": "started"}))));
                 live.streaming = true;
                 live.pending_prompt = Some((live.owed.len(), live.model.api.clone()));
-                self.send(Command::Prompt(message, images, None), None);
+                self.send(Command::Prompt(crate::message::UserMessage::new(&message, images, crate::message::InputOrigin::frontend("rpc"))), None);
                 return Ok(Reply::Later);
             }
             "steer" | "follow_up" => {
                 if live.acp_turn() { return Err(ACP_QUEUE_UNSUPPORTED.into()); }
                 let message = text("message");
+                let message = crate::message::UserMessage::new(&message, Vec::new(), crate::message::InputOrigin::frontend("rpc"));
                 if kind == "steer" { live.handle.steer(message) } else { live.handle.follow_up(message) }
                 self.announce_queue();
                 Some(json!({"disposition": "queued"}))
@@ -343,7 +344,7 @@ impl Rpc {
             "clear_queue" => {
                 let (steering, follow_up) = live.handle.clear();
                 self.announce_queue();
-                Some(json!({"steering": steering, "followUp": follow_up}))
+                Some(json!({"steering": steering.iter().map(|message| message.content.text()).collect::<Vec<_>>(), "followUp": follow_up.iter().map(|message| message.content.text()).collect::<Vec<_>>()}))
             }
             "new_session" => {
                 let parent = command.get("parentSession").and_then(Value::as_str).map(str::to_string);

@@ -44,6 +44,9 @@ pub struct Args {
     pub restore: bool,
     // --single: the terminal UI on one session, with no sidebar and no other sessions.
     pub single: bool,
+    // --inline: --single drawn into the terminal's scrollback, Claude Code style, instead of
+    // filling the screen.
+    pub inline: bool,
     pub help: bool,
     pub version: bool,
     pub messages: Vec<String>,
@@ -99,6 +102,7 @@ pub fn parse(arguments: &[String]) -> Args {
             "--continue" | "-c" => args.continue_recent = true,
             "--restore" => args.restore = true,
             "--single" => args.single = true,
+            "--inline" => (args.single, args.inline) = (true, true),
             "--no-session" => args.no_session = true,
             "--yolo" | "--dangerously-skip-permissions" | "--dangerously-bypass-approvals-and-sandbox" => args.yolo = true,
             "--no-context-files" | "-nc" => args.no_context_files = true,
@@ -215,6 +219,7 @@ Options:
   --fork <path|id>       Start a new session holding that one's history
   --no-session           Keep the session in memory only
   --single               Just this one session in the terminal: no sidebar, no other sessions
+  --inline               --single in the terminal's scrollback instead of the whole screen
   --session-dir <dir>    Where session files go
   -n, --name <name>      Name the session
   --pair <model>         Work with that model as a pair: the two answer each other in turn

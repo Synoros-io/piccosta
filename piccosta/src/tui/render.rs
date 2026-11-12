@@ -186,6 +186,49 @@ pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, t
     writer.rows
 }
 
+pub(super) struct DocumentBlock {
+    text: String,
+    events: Vec<Md<'static>>,
+    images: Vec<u32>,
+    pub rows: Rows,
+    pub ids: Vec<u32>,
+    pub graphics: std::sync::Mutex<HashMap<u32, Vec<u8>>>,
+}
+
+// Parse the whole document so reference links still resolve across blocks. The disk worker
+// reuses rows by source/width, checking resolved events and image versions too. TeX's temporary
+// cache belongs to each changed block, never to a transcript; surviving blocks keep their ids.
+pub(super) fn document(text: &str, width: u16, tex: &mut Tex, images: &HashMap<String, Formula>, previous: &[std::sync::Arc<DocumentBlock>]) -> (Vec<std::sync::Arc<DocumentBlock>>, Vec<u32>) {
+    let mut cache: HashMap<_, _> = previous.iter().map(|block| (block.text.clone(), block.clone())).collect();
+    let (mut blocks, mut events, mut created) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut depth, mut start) = (0, 0);
+    let source = dollar_math(&clean(text));
+    for (event, range) in Parser::new_ext(&source, MARKDOWN).into_offset_iter() {
+        if events.is_empty() { start = range.start; }
+        match event { Md::Start(_) => depth += 1, Md::End(_) => depth -= 1, _ => {} }
+        events.push(event.into_static());
+        if depth != 0 { continue; }
+        let text = &source[start..range.end];
+        let versions: Vec<_> = events.iter().filter_map(|event| match event { Md::Start(Tag::Image { dest_url, .. }) => Some(match images.get(dest_url.as_ref()) { Some(Formula::Image { id, .. }) => *id, _ => 0 }), _ => None }).collect();
+        let block = match cache.get(text).filter(|block| block.events == events && block.images == versions) {
+            Some(block) => block.clone(),
+            None => {
+                let mut writer = Writer::new(tex, width);
+                writer.images = Some(images);
+                writer.events(events.iter().cloned());
+                let rows = writer.rows;
+                let ids = tex.block_ids();
+                created.extend_from_slice(&ids);
+                std::sync::Arc::new(DocumentBlock { text: text.to_string(), events: events.clone(), images: versions, rows, ids, graphics: std::sync::Mutex::new(tex.prepared()) })
+            }
+        };
+        cache.insert(text.to_string(), block.clone());
+        blocks.push(block);
+        events.clear();
+    }
+    (blocks, created)
+}
+
 // One level of indentation: what starts its first row and every row after.
 struct Level {
     first: String,
@@ -215,11 +258,13 @@ struct Writer<'t> {
     code: bool,
     // A table being read: its rows of cells.
     table: Option<Vec<Vec<String>>>,
+    images: Option<&'t HashMap<String, Formula>>,
+    image_alt: bool,
 }
 
 impl<'t> Writer<'t> {
     fn new(tex: &'t mut Tex, width: u16) -> Writer<'t> {
-        Writer { tex, width: usize::from(width).max(8), rows: Vec::new(), line: Vec::new(), used: 0, content: false, levels: Vec::new(), styles: vec![Style::new()], lists: Vec::new(), code: false, table: None }
+        Writer { tex, width: usize::from(width).max(8), rows: Vec::new(), line: Vec::new(), used: 0, content: false, levels: Vec::new(), styles: vec![Style::new()], lists: Vec::new(), code: false, table: None, images: None, image_alt: false }
     }
 
     fn style(&self) -> Style {
@@ -318,7 +363,11 @@ impl<'t> Writer<'t> {
 
     fn markdown(&mut self, text: &str) {
         let source = dollar_math(&clean(text));
-        for event in Parser::new_ext(&source, MARKDOWN) {
+        self.events(Parser::new_ext(&source, MARKDOWN));
+    }
+
+    fn events<'a>(&mut self, events: impl IntoIterator<Item = Md<'a>>) {
+        for event in events {
             if let Some(table) = &mut self.table {
                 match event {
                     Md::Start(Tag::TableRow | Tag::TableHead) => table.push(Vec::new()),
@@ -339,11 +388,31 @@ impl<'t> Writer<'t> {
     }
 
     fn markdown_event(&mut self, event: Md) {
+        if self.image_alt {
+            if matches!(event, Md::End(TagEnd::Image)) { self.image_alt = false; }
+            return;
+        }
         let push_style = |writer: &mut Writer, change: fn(Style) -> Style| {
             let style = change(writer.style());
             writer.styles.push(style);
         };
         match event {
+            Md::Start(Tag::Image { dest_url, .. }) => {
+                if let Some(Formula::Image { id, columns, rows }) = self.images.and_then(|images| images.get(dest_url.as_ref())) {
+                    let (id, columns, rows) = (*id, *columns, *rows);
+                    // A resize can paint before its fitted preview comes back. Alt text is better
+                    // than wrapping one image row into several, which scrambles its coordinates.
+                    if usize::from(columns) > self.room() { return; }
+                    self.flush_line(false);
+                    for row in 0..rows {
+                        let (cells, color) = tex::placeholders(id, row, columns);
+                        self.piece(cells, usize::from(columns), Style::new().fg(color));
+                        self.flush_line(false);
+                    }
+                    self.image_alt = true;
+                    self.blank();
+                }
+            }
             Md::Start(Tag::Heading { .. }) => push_style(self, |style| style.fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
             Md::Start(Tag::Emphasis) => push_style(self, |style| style.add_modifier(Modifier::ITALIC)),
             Md::Start(Tag::Strong) => push_style(self, |style| style.add_modifier(Modifier::BOLD)),
@@ -454,6 +523,9 @@ impl<'t> Writer<'t> {
                 let columns = usize::from(*columns);
                 self.piece(cells, columns, Style::new().fg(color));
             }
+            // Not every exponent has Unicode superscripts. Keep the fallback's whole grid,
+            // using the block layout rather than rejecting it or dropping its lower rows.
+            Some(Formula::Text(rows)) if rows.len() > 1 => self.display_math(source),
             Some(Formula::Text(rows)) => {
                 let row = rows.first().cloned().unwrap_or_default();
                 self.word(&row, Style::new().fg(theme::MATH));

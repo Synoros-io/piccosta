@@ -44,6 +44,34 @@ struct Checkin {
     source: Option<PathBuf>,
 }
 
+impl Checkin {
+    fn occurrence(&self) -> String {
+        match &self.source {
+            Some(home) => format!("schedule:{}:{}:{}", home.display(), self.id, self.next),
+            None => format!("checkin:{}:{}", self.id, self.next),
+        }
+    }
+
+    fn user_input(&self, agent_dir: &Path) -> crate::message::UserMessage {
+        let text = format!("[user timer, set {}, fired {}]\n{}\n\n[Latest known usage — cached readings, not current]\n{}",
+            crate::clock::iso_from_ms(self.created), crate::clock::iso_from_ms(crate::clock::now_ms()), self.text, crate::scale::latest_usage(agent_dir));
+        let mut message = crate::message::UserMessage::new(&text, Vec::new(), crate::message::InputOrigin::UserTimer { set_at: self.created });
+        message.timer = Some(crate::message::UserTimer { id: self.occurrence(), title: crate::host::title_text(&self.text), prompt: Some(self.text.clone()) });
+        message
+    }
+}
+
+// The dispatcher holds the store lock through admission. Read its atomically published snapshot
+// without taking that lock, and verify the socket peer owns the claim. Timer words and dates
+// come from the user's stored timer, never from a caller's payload or claimed origin.
+pub(crate) fn timer_input(agent_dir: &Path, file: &Path, id: &str, peer: Option<i32>) -> Result<crate::message::UserMessage, String> {
+    let bytes = fs::read(agent_dir.join(STORE)).map_err(|error| error.to_string())?;
+    let timers: Vec<Checkin> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    timers.iter().find(|timer| timer.user && timer.occurrence() == id && crate::tools::paths::canonical(&timer.file) == crate::tools::paths::canonical(file)
+        && timer.claimed.as_ref().is_some_and(|(owner, _)| Some(owner.pid) == peer && owner.alive()))
+        .map(|timer| timer.user_input(agent_dir)).ok_or_else(|| "timer dispatcher or user-owned occurrence could not be verified".into())
+}
+
 fn save(path: &Path, timers: &[Checkin]) -> Result<(), String> {
     let partial = path.with_extension("json.partial");
     let mut output = fs::File::create(&partial).map_err(|error| error.to_string())?;
@@ -199,23 +227,18 @@ fn fire(agent_dir: &Path, only: &[Option<PathBuf>]) -> Result<(), String> {
 // Delivery is outside the store lock. Finalize only the occurrence we claimed: cancellation or
 // a later occurrence mustn't be undone by a slow receiver's answer.
 fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
-    let id = match &claimed.source {
-        Some(home) => format!("schedule:{}:{}:{}", home.display(), claimed.id, claimed.next),
-        None => format!("checkin:{}:{}", claimed.id, claimed.next),
-    };
+    let id = claimed.occurrence();
     let sent = if claimed.user {
-        let text = format!("[user timer, set {}, fired {}]\n{}\n\n[Latest known usage — cached readings, not current]\n{}",
-            crate::clock::iso_from_ms(claimed.created), crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.text, crate::scale::latest_usage(agent_dir));
         // Cancellation and admission have one order: off either removes this occurrence before
         // we ask, or waits for its admission answer. The owner never needs this store lock.
         store(agent_dir, |timers| {
             if !timers.iter().any(|timer| timer == &claimed) || crate::session::is_closed(agent_dir, &claimed.file) { return Ok(crate::runtime::TimerOutcome::SkippedBusy); }
-            crate::runtime::deliver_timer(&claimed.file, &id, &text, &crate::host::title_text(&claimed.text))
+            crate::runtime::deliver_timer(&claimed.file, &claimed.user_input(agent_dir))
         })
     } else {
         let text = format!("[{}, checkin {}]\n{}", crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.id, claimed.text);
         let launch = crate::manager::checkin_launch(agent_dir, &claimed.file);
-        crate::runtime::deliver_checkin(&claimed.file, &id, &text, launch.as_ref().map(|(cwd, log)| (cwd.as_path(), log.as_path()))).map(|()| crate::runtime::TimerOutcome::Delivered)
+        crate::runtime::deliver_checkin(&claimed.file, &id, &crate::message::UserMessage::new(&text, Vec::new(), crate::message::InputOrigin::Checkin), launch.as_ref().map(|(cwd, log)| (cwd.as_path(), log.as_path()))).map(|()| crate::runtime::TimerOutcome::Delivered)
     };
     store(agent_dir, |timers| {
         let now = crate::clock::now_ms();

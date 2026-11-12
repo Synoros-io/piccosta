@@ -16,6 +16,7 @@ use crate::message::{
     to_model_messages, AgentMessage, AssistantMessage, Content, Message, StopReason, TextOrBlocks, Usage,
     UserMessage,
 };
+use crate::model::Model;
 use crate::provider::{self, estimate, transcript, Request};
 use crate::session::{ProjectedEntry, Session, SessionEntry};
 use crate::{clock, js};
@@ -127,6 +128,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                 Content::Image { .. } => 0,
             })
             .sum(),
+        AgentMessage::Custom(custom) if custom.custom_type == crate::intent_review::RECORD => return 0,
         AgentMessage::Custom(custom) => content_chars(&custom.content),
         AgentMessage::ToolResult(result) => blocks_chars(&result.content),
         AgentMessage::BashExecution(execution) => js::utf16_len(&execution.command) + js::utf16_len(&execution.output),
@@ -200,7 +202,7 @@ pub fn estimate_projected_context_tokens(projection: &[ProjectedEntry<'_>], bran
             return estimate;
         }
     }
-    let model_messages = to_model_messages(&messages);
+    let model_messages = to_model_messages(&messages, None);
     let mut tokens = transcript::current_system_message(&model_messages)
         .map(|system| estimate_tokens(&AgentMessage::System(system)))
         .unwrap_or(0);
@@ -517,6 +519,7 @@ pub fn source_dates(session: &Session, messages: &[AgentMessage]) -> String {
     }).collect();
     let excerpts = crate::pintask::source_excerpts(&texts);
     let user_source = |user: &UserMessage| {
+        if !user.origin.is_unknown() { return user.origin.label(); }
         let mut matches = sources.iter().filter(|source| source.message.timestamp == user.timestamp && source.message == user).map(|source| source.kind);
         let first = matches.next().unwrap_or("user source uncertain");
         if matches.all(|kind| kind == first) { first } else { "user source uncertain" }
@@ -527,7 +530,7 @@ pub fn source_dates(session: &Session, messages: &[AgentMessage]) -> String {
             AgentMessage::User(user) => {
                 let text = user.content.text();
                 let source = if text.trim().is_empty() { "non-text user input" } else { user_source(user) };
-                (source.to_string(), (source == "user").then_some(user.timestamp), excerpts[text.as_str()].clone())
+                (source.to_string(), (matches!(source, "human input" | "unknown legacy input") || user.origin.unverified_interface().is_some()).then_some(user.timestamp), excerpts[text.as_str()].clone())
             }
             AgentMessage::Custom(custom) => (format!("custom {}", custom.custom_type), None, String::new()),
             AgentMessage::BranchSummary(_) => ("branch summary".into(), None, String::new()),
@@ -553,7 +556,7 @@ pub fn source_dates(session: &Session, messages: &[AgentMessage]) -> String {
         let values = if references.iter().all(String::is_empty) { references.len().to_string() } else { references.join(",") };
         format!("{group}: {values}")
     }).collect();
-    format!("\n\n## Source/date reference\nUser excerpts survive filtering and merging; dated rows give local date/offset: excerpt@time. User means no delivery receipt, not proof of authorship. Ambiguous excerpts do not identify a unique source. Other rows count source records. Summary/pin and replay times do not date original quotes.\n{}", rows.join("\n"))
+    format!("\n\n## Source/date reference\nUser excerpts survive filtering and merging; dated rows give local date/offset: excerpt@time. Human input has a recorded ingress source; unknown legacy input is not proof of authorship. Ambiguous excerpts do not identify a unique source. Other rows count source records. Summary/pin and replay times do not date original quotes.\n{}", rows.join("\n"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -589,15 +592,32 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
     Some(blocks_text(&response.content, "\n")).filter(|text| !text.trim().is_empty()).ok_or_else(|| format!("{label} returned empty text"))
 }
 
+// The appended summary request, shared with the fitter so these instructions take room too.
+fn summary_prompt(instructions: Option<&str>, source_dates: &str) -> UserMessage {
+    let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
+    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}{focus}{source_dates}");
+    UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() } }
+}
+
 // A compaction's summary (agent.rs run_auto_compaction): `request` is the session's own, as its
 // turns send it, and the summary prompt goes after its messages as one more, so the provider reads
 // everything before it from its cache rather than having all of it sent again. One request: the
 // model sees the whole context, split turn or not. Not retried: a failure leaves the session as it
 // was, for the next turn. `instructions` is the user's focus for /compact.
 pub async fn summarize_in_place(request: Request<'_>, instructions: Option<&str>, source_dates: &str) -> AssistantMessage {
-    let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
-    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}{focus}{source_dates}");
-    let messages = [request.messages, &[Message::User(UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms(), timer: None })]].concat();
+    let messages = [request.messages, &[Message::User(summary_prompt(instructions, source_dates))]].concat();
+    // A protected summary or one oversized turn may survive fit. Refuse that request rather than
+    // send it over the input ceiling or cut the user's text; a failed compaction keeps the history.
+    if let Some(limit) = request.model.max_input_tokens {
+        let tokens = estimate::request_tokens(request.model, &messages);
+        if tokens > limit {
+            let mut failed = provider::new_output(request.model, &request.model.api);
+            failed.stop_reason = StopReason::Error;
+            failed.request_not_sent = true;
+            failed.error_message = Some(format!("Summary request exceeds the model's input limit ({tokens} estimated tokens, {limit} allowed)"));
+            return failed;
+        }
+    }
     let (sender, _receiver) = mpsc::unbounded_channel();
     provider::stream(Request { messages: &messages, in_place: true, ..request }, sender).await
 }
@@ -612,14 +632,22 @@ pub fn accept_summary(preparation: &Preparation, response: AssistantMessage) -> 
 // are shortened first: those after the last answer (what overflowed; everything before them is what
 // the last request sent and the cache holds), then all of them. Past that the oldest turns go, but
 // never a system message or the previous compaction's summary, which the new one has to carry on.
-pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64) {
-    let total = |messages: &[AgentMessage]| messages.iter().map(estimate_tokens).sum::<u64>();
+// With an input ceiling, measure the whole summary request, resolving its prompt and tools just
+// as the guard does. Otherwise keep pi's original history-only sizes and cuts.
+pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64, model: &Model, session: &Session, instructions: Option<&str>) {
+    let total = |messages: &[AgentMessage]| {
+        if model.max_input_tokens.is_none() { return messages.iter().map(estimate_tokens).sum(); }
+        let mut request = to_model_messages(messages, session.header().notice_token.as_deref());
+        request.push(Message::User(summary_prompt(instructions, &source_dates(session, messages))));
+        estimate::request_tokens(model, &request)
+    };
+    let chars_per_token = if model.max_input_tokens.is_some() { estimate::CHARS_PER_TOKEN } else { CHARS_PER_TOKEN };
     let tail = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))).map_or(0, |at| at + 1);
     let mut cut_before_answer = false;
     for from in [tail, 0] {
         let now = total(messages);
         if now > budget {
-            shorten_results(messages, from, budget, now);
+            shorten_results(messages, from, budget, now, chars_per_token);
             cut_before_answer |= from < tail;
         }
     }
@@ -646,16 +674,16 @@ pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64) {
 
 // The text of each tool result from `from` on cut to one length, so that `messages` (now `total`
 // tokens) comes to `budget`.
-fn shorten_results(messages: &mut [AgentMessage], from: usize, budget: u64, total: u64) {
+fn shorten_results(messages: &mut [AgentMessage], from: usize, budget: u64, total: u64, chars_per_token: f64) {
     let texts = |message: &AgentMessage| match message {
         AgentMessage::ToolResult(result) => result.content.iter().filter_map(|block| if let Content::Text { text, .. } = block { Some(text.chars().count()) } else { None }).collect(),
         _ => Vec::new(),
     };
     let lengths: Vec<usize> = messages[from..].iter().flat_map(texts).collect();
     let chars: usize = lengths.iter().sum();
-    let room = budget.saturating_sub(total.saturating_sub((chars as f64 / CHARS_PER_TOKEN) as u64));
+    let room = budget.saturating_sub(total.saturating_sub((chars as f64 / chars_per_token) as u64));
     // Each cut text ends with a note of what was cut, which takes room too.
-    let max_chars = ((room as f64 * CHARS_PER_TOKEN) as usize / lengths.len().max(1)).saturating_sub(TRUNCATION_NOTE_CHARS);
+    let max_chars = ((room as f64 * chars_per_token) as usize / lengths.len().max(1)).saturating_sub(TRUNCATION_NOTE_CHARS);
     for message in &mut messages[from..] {
         if let AgentMessage::ToolResult(result) = message {
             for block in &mut result.content {

@@ -75,9 +75,12 @@ impl Tool for ReadTool {
 // The blocking part: everything after the path is resolved. Runs on tokio's blocking pool, so a
 // slow disk or a large image resize doesn't stall the other tool calls.
 fn read_file(arguments: &Arguments, absolute: &std::path::Path, context: &ToolContext) -> Result<ToolOutput, String> {
+    // A read and its remembered version belong to one save, not the middle of another writer.
+    let board = crate::scratchpad::path(&context.cwd, context.shared.bin_dir.parent().unwrap());
+    let _board_lock = (paths::canonical(absolute) == paths::canonical(&board)).then(|| crate::scratchpad::lock(absolute)).transpose()?;
     // pi checks readability with access(R_OK) first, so that's the syscall a missing file names.
     paths::access(absolute, false).map_err(|error| super::pathhint::file_error(&error, "access", absolute, &context.cwd))?;
-    let mut file = std::fs::File::open(absolute).map_err(|error| super::pathhint::file_error(&error, "open", absolute, &context.cwd))?;
+    let mut file = if _board_lock.is_some() { crate::scratchpad::open(absolute, false)? } else { std::fs::File::open(absolute).map_err(|error| super::pathhint::file_error(&error, "open", absolute, &context.cwd))? };
     let mut bytes = Vec::new();
     (&mut file).take(image::SNIFF_BYTES as u64).read_to_end(&mut bytes).map_err(|error| paths::fs_error(&error, "read", None))?;
 

@@ -670,10 +670,12 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) {
     }
     let input_tokens = usage.input + usage.cache_read + usage.cache_write;
     let mut rates = (model.cost.input, model.cost.output, model.cost.cache_read, model.cost.cache_write);
+    let mut long_write_rate = model.cost.cache_write_1h;
     let mut matched_threshold: i64 = -1;
     for tier in &model.cost.tiers {
         if input_tokens > tier.input_tokens_above && tier.input_tokens_above as i64 > matched_threshold {
             rates = (tier.input, tier.output, tier.cache_read, tier.cache_write);
+            long_write_rate = tier.cache_write_1h.or(model.cost.cache_write_1h);
             matched_threshold = tier.input_tokens_above as i64;
         }
     }
@@ -684,7 +686,7 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) {
     usage.cost.input = input_rate / PER_MILLION * usage.input as f64;
     usage.cost.output = output_rate / PER_MILLION * usage.output as f64;
     usage.cost.cache_read = cache_read_rate / PER_MILLION * usage.cache_read as f64;
-    let long_write_rate = model.cost.cache_write_1h.unwrap_or(input_rate * HOUR_WRITE_INPUT_MULTIPLIER);
+    let long_write_rate = long_write_rate.unwrap_or(input_rate * HOUR_WRITE_INPUT_MULTIPLIER);
     usage.cost.cache_write = (cache_write_rate * short_write + long_write_rate * long_write) / PER_MILLION;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }

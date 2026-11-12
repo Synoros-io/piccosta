@@ -174,6 +174,19 @@ pub struct ToolContext<'a> {
     pub shared: Arc<ToolShared>,
 }
 
+// Queue order survives cancellation too: the blocking transaction owns both guards through the
+// freshness check, mutation and remembered version. Nothing holding the sidecar awaits pool work.
+pub(super) async fn mutate(path: PathBuf, context: &ToolContext<'_>, change: impl FnOnce(&std::path::Path, &ToolContext<'_>, bool) -> Result<ToolOutput, String> + Send + 'static) -> Result<ToolOutput, String> {
+    let queue = context.shared.mutations;
+    let turn = queue.lock(&path).await;
+    let context = ToolContext { session: None, ..context.clone() };
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        let lock = crate::scratchpad::guard(&path, &context.cwd, context.shared.bin_dir.parent().unwrap(), &context.shared.seen)?;
+        change(&path, &context, lock.is_some())
+    }).await.map_err(|error| error.to_string())?
+}
+
 // Whether the built-in tool called `name` only reads (Tool::read_only); no other tool does.
 pub fn read_only(name: &str) -> bool {
     builtin().iter().any(|tool| tool.name() == name && tool.read_only())

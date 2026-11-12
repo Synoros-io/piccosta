@@ -13,6 +13,7 @@ mod model_add;
 mod tex;
 mod follow;
 mod listing;
+mod scratch;
 
 use crate::agent::{Event, Handle};
 use crate::host::Host;
@@ -61,11 +62,18 @@ const RECENT_SESSIONS: usize = 30;
 const OTHER_PROJECTS: usize = 8;
 const RECENT_PER_OTHER_PROJECT: usize = 3;
 const SIDEBAR_WIDTH: u16 = 30;
+// A short title still fits at eighteen; twice the old width is enough for a long one.
+const SIDEBAR_MIN_WIDTH: u16 = 18;
+const SIDEBAR_MAX_WIDTH: u16 = 2 * SIDEBAR_WIDTH;
+// Keep the space the panes had at the old sidebar's smallest screen.
+const SIDEBAR_PANES_WIDTH: u16 = SIDEBAR_MIN_SCREEN - SIDEBAR_WIDTH;
 // The widest a picker gets: room for a project, a title and an age.
 const PICKER_MAX_WIDTH: u16 = 110;
 // Below this screen width the sidebar steps aside for the panes.
 const SIDEBAR_MIN_SCREEN: u16 = 90;
 const MAX_PANES: usize = 4;
+// A shared top border, a header, and the editor's two borders around one text row.
+const PANE_MIN_HEIGHT: u16 = 5;
 const EDITOR_MAX_ROWS: usize = 8;
 // How often running sessions' spinners turn, and how many turns each of the working line's dots
 // lasts (about 400 ms).
@@ -117,6 +125,10 @@ enum Update {
     // whether it was a look for agents.
     Scanned(Box<follow::Scan>),
     Listed(Box<listing::Listing>),
+    Scratch(usize, std::sync::Weak<()>, Vec<crate::scratchpad::Stamp>, Box<Result<Option<scratch::View>, String>>),
+    Appended(usize, Result<Option<crate::scratchpad::Stamp>, String>, String),
+    ScratchEdit(usize, std::sync::Weak<()>, Result<(), String>),
+    ScratchPath(PathBuf, PathBuf, bool),
     Followed(std::sync::Weak<()>, Box<Result<Option<follow::Followed>, String>>),
     Awoken(std::sync::Weak<()>, Box<Result<(crate::host::Prepared, follow::Followed), String>>),
     Nothing,
@@ -132,6 +144,8 @@ impl Update {
         match self {
             Self::Asked(_, update) => update.needs_draw(),
             Self::Listed(listing) => listing.done,
+            Self::Scratch(_, _, _, result) => !matches!(result.as_ref(), Ok(None)),
+            Self::Nothing => false,
             _ => true,
         }
     }
@@ -321,8 +335,14 @@ impl std::ops::DerefMut for Slot {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.transcript }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    Session(usize),
+    Scratchpad(usize),
+}
+
 struct Pane {
-    slot: usize,
+    target: Target,
     // Rows scrolled up from the bottom; 0 follows the newest.
     scroll: usize,
     // While scrolled up: the message count and the rows below them (the answer being written, the
@@ -331,15 +351,31 @@ struct Pane {
     anchor: Option<(usize, usize)>,
 }
 
+enum Edit {
+    Scale(PathBuf),
+    Scratchpad(usize, PathBuf),
+}
+
+impl Edit {
+    fn path(&self) -> &Path { match self { Self::Scale(path) | Self::Scratchpad(_, path) => path } }
+}
+
 struct App {
     host: Arc<Host>,
     tex: tex::Tex,
     slots: Vec<Slot>,
+    scratchpads: Vec<scratch::Scratchpad>,
     panes: Vec<Pane>,
     focus: usize,
     sidebar: bool,
+    sidebar_width: u16,
+    sidebar_drag: bool,
+    layout: PaneLayout,
     // --single: one pane on one session, no sidebar, and no other sessions looked for or listed.
     single: bool,
+    // --inline: --single printed into the terminal's scrollback (inline.rs) instead of filling the
+    // screen. Everything about printing finished messages only once hangs on this, not on single.
+    inline: bool,
     flags: Flags,
     frame: usize,
     sender: UnboundedSender<(usize, Update)>,
@@ -378,7 +414,7 @@ struct App {
     restart_queries: Option<Vec<tokio::sync::oneshot::Receiver<()>>>,
     restart_replies: futures_util::stream::FuturesUnordered<tokio::sync::oneshot::Receiver<()>>,
     // A file to open in the user's editor (/scale edit), with the screen handed over meanwhile.
-    edit: Option<PathBuf>,
+    edit: Option<Edit>,
     // When this piccosta started, and each session folder's time when last looked at, for the
     // sessions made since (find_new_sessions).
     started: std::time::SystemTime,
@@ -404,6 +440,7 @@ struct App {
     // Where things were drawn, for the mouse.
     sidebar_rows: Vec<(u16, usize)>,
     pane_rects: Vec<Rect>,
+    pane_layout: Option<(PaneLayout, Rect, usize)>,
     body_rects: Vec<Rect>,
     // The focused pane's editor text and its first row in view, and whether the mouse is selecting in it.
     editor_area: (Rect, usize),
@@ -427,7 +464,7 @@ struct App {
 // to copy it when it's next drawn (the button came up, or ctrl+c).
 struct Selection {
     pane: usize,
-    slot: usize,
+    target: Target,
     anchor: Option<(clip::Point, clip::Point)>,
     head: (clip::Point, clip::Point),
     clicks: u8,
@@ -533,17 +570,22 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     let mut control = control::Control::bind(&state_file)?;
     // The terminal goes back as it was however this returns, a setup that failed partway included.
     let _restore = Restore;
-    let mut terminal = setup(args.single).map_err(|error| format!("could not set up the terminal: {error}"))?;
-    let mut inline = if args.single { Some(inline::Inline::start().map_err(|error| format!("could not set up the terminal: {error}"))?) } else { None };
+    let mut terminal = setup(args.inline).map_err(|error| format!("could not set up the terminal: {error}"))?;
+    let mut inline = if args.inline { Some(inline::Inline::start().map_err(|error| format!("could not set up the terminal: {error}"))?) } else { None };
     let (sender, updates) = unbounded_channel();
     let mut app = App {
         host: host.clone(),
-        tex: if args.single { tex::Tex::detect().text_only() } else { tex::Tex::detect() },
+        tex: if args.inline { tex::Tex::detect().text_only() } else { tex::Tex::detect() },
         slots: Vec::new(),
+        scratchpads: Vec::new(),
         panes: Vec::new(),
         focus: 0,
         sidebar: true,
+        sidebar_width: SIDEBAR_WIDTH,
+        sidebar_drag: false,
+        layout: PaneLayout::default(),
         single: args.single,
+        inline: args.inline,
         flags: Flags::default(),
         frame: 0,
         asks: asker(sender.clone(), false),
@@ -587,7 +629,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         rewind: Vec::new(),
         history: Vec::new(),
         sidebar_rows: Vec::new(),
-        pane_rects: Vec::new(),
+        pane_rects: Vec::with_capacity(MAX_PANES),
+        pane_layout: None,
         body_rects: Vec::new(),
         editor_area: Default::default(),
         editor_drag: false,
@@ -609,7 +652,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     }
     // Shown in the pane, where the notices that come with starting don't replace it.
     if let Some(note) = note {
-        app.report(crate::scale::fell_back(&note, &app.current().model));
+        let model = match app.panes[app.focus].target { Target::Session(slot) => app.slots[slot].model.as_str(), Target::Scratchpad(_) => app.model.as_deref().unwrap_or_default() };
+        app.report(crate::scale::fell_back(&note, model));
     }
     if !host.settings.load_errors.is_empty() {
         app.report(format!("Invalid settings file:\n{}", host.settings.load_errors.join("\n")));
@@ -617,9 +661,9 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     }
     app.adopt_jobs(handover.sessions);
     // After a /restart the conversation is in the scrollback already.
-    if args.restore {
-        app.printed = (app.panes[0].slot, app.current().messages.len());
-        if app.single { app.slots[app.panes[0].slot].restored = true; }
+    if args.restore && app.inline && let Target::Session(slot) = app.panes[0].target {
+        app.printed = (slot, app.slots[slot].messages.len());
+        app.slots[slot].restored = true;
     }
     if let Some(problem) = unread {
         let list = |names: Vec<String>| if names.is_empty() { "none".to_string() } else { names.join(", ") };
@@ -697,27 +741,28 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         }
         // A file to edit: the user's editor gets the terminal ($VISUAL, else $EDITOR), and the
         // screen comes back when it exits. Sessions carry on meanwhile; their updates wait.
-        if let Some(path) = app.edit.take() {
+        if let Some(edit) = app.edit.take() {
             redraw = true;
-            match std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) {
-                None => app.notice = Some(format!("Set $EDITOR to edit it here; the file is {}", path.display())),
-                Some(editor) => {
-                    restore();
-                    let ran = std::process::Command::new(&editor).arg(&path).status();
-                    terminal = setup(app.single).map_err(|error| format!("could not set up the terminal again: {error}"))?;
-                    match &mut inline {
-                        Some(inline) => *inline = inline::Inline::start().map_err(|error| error.to_string())?,
-                        None => terminal.clear().map_err(|error| error.to_string())?,
+            // A pending EventStream owns crossterm's reader. Leave it to the editor and setup's
+            // cursor query; otherwise their reads contend with its blocked background poll.
+            drop(input);
+            let edited = external_editor(edit.path(), app.inline, &mut terminal, &mut inline)?;
+            input = EventStream::new();
+            app.lost_images();
+            app.notice = Some(match edited {
+                Err(error) => error,
+                Ok(()) => match edit {
+                    Edit::Scale(path) => match crate::scale::changes(&app.host.agent_dir) {
+                        Ok(_) => format!("{} saved; new sessions and subagents use it", path.display()),
+                        Err(error) => format!("Not valid, so it's left out: {error}"),
+                    },
+                    Edit::Scratchpad(board, _) => {
+                        app.invalidate_scratch(board);
+                        app.scan_scratchpads();
+                        "Scratchpad editor finished; reloading after the save settles.".into()
                     }
-                    app.notice = Some(match ran {
-                        Ok(_) => match crate::scale::changes(&app.host.agent_dir) {
-                            Ok(_) => format!("{} saved; new sessions and subagents use it", path.display()),
-                            Err(error) => format!("Not valid, so it's left out: {error}"),
-                        },
-                        Err(error) => format!("{}: {error}", editor.to_string_lossy()),
-                    });
-                }
-            }
+                },
+            });
         }
     }
     if !app.restart {
@@ -745,6 +790,28 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         return Err(format!("could not start {} again: {error}", exe.display()));
     }
     Ok(std::process::ExitCode::from(exit_code))
+}
+
+// Hand the terminal to the user's editor, then rebuild its screen. The outer result is terminal
+// setup (fatal); the inner one is an editor failure, which belongs in the requesting pane.
+fn external_editor(path: &Path, inline_mode: bool, terminal: &mut ratatui::DefaultTerminal, inline: &mut Option<inline::Inline>) -> Result<Result<(), String>, String> {
+    let Some(editor) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) else {
+        return Ok(Err(format!("Set $EDITOR to edit it here; the file is {}", path.display())));
+    };
+    restore();
+    let ran = std::process::Command::new(&editor).arg(path).status();
+    *terminal = setup(inline_mode).map_err(|error| format!("could not set up the terminal again: {error}"))?;
+    match inline {
+        Some(inline) => *inline = inline::Inline::start().map_err(|error| error.to_string())?,
+        // This is a fresh fullscreen buffer. Terminal::clear queries and preserves a cursor we
+        // don't need, and that query can race the retiring EventStream's background reader.
+        None => crossterm::execute!(std::io::stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All)).map_err(|error| error.to_string())?,
+    }
+    Ok(match ran {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{} exited {status}; check the file before retrying", editor.to_string_lossy())),
+        Err(error) => Err(format!("{}: {error}", editor.to_string_lossy())),
+    })
 }
 
 // Follow the launcher, not current_exe's resolved symlink: an update can point it at a new build.
@@ -930,7 +997,7 @@ impl App {
             let first = self.slots.len();
             self.slots.push(Slot::new(None, NEW_TITLE.into()));
             let loaded = self.load(first, self.model.clone(), args.thinking.clone(), Some(args));
-            self.panes.push(Pane { slot: first, scroll: 0, anchor: None });
+            self.panes.push(Pane { target: Target::Session(first), scroll: 0, anchor: None });
             // With no account's models yet there's nothing to open on, but /models refresh and
             // logging in still have to be reachable: the pane opens when something is typed.
             match loaded {
@@ -939,8 +1006,7 @@ impl App {
             }
         }
         // /restart keeps the restored pane as it was, including a closed pane's read-only state.
-        if !args.restore {
-            let first = self.panes[self.focus].slot;
+        if !args.restore && let Target::Session(first) = self.panes[self.focus].target {
             if let Some(name) = &args.name {
                 self.slots[first].title = name.clone();
                 self.tell(Command::Name(name.clone()));
@@ -959,7 +1025,7 @@ impl App {
         }
         let opening = args.messages.join("\n");
         if !opening.trim().is_empty() && !args.restore {
-            self.send(opening);
+            self.send(opening, crate::message::InputOrigin::cli("tui startup"));
         }
         Ok(())
     }
@@ -973,6 +1039,12 @@ impl App {
         let on_screen = state.panes.len();
         let mut errors = Vec::new();
         for (index, kept) in state.panes.into_iter().chain(state.open).enumerate() {
+            if let Some(path) = kept.scratchpad {
+                let board = self.scratch_index(path, kept.cwd);
+                self.scratchpads[board].draft = Editor::with(kept.draft);
+                if index < on_screen { self.panes.push(Pane { target: Target::Scratchpad(board), scroll: kept.scroll, anchor: None }); }
+                continue;
+            }
             let path = kept.session;
             // A new session has no file yet; its draft still belongs here, even off-screen.
             if path.is_none() && ((index >= on_screen && kept.draft.is_empty()) || !kept.cwd.is_dir()) {
@@ -981,7 +1053,7 @@ impl App {
             // Panes that showed one session come back on one slot, sharing its draft.
             if let Some(slot) = path.as_ref().and_then(|path| self.slots.iter().position(|slot| slot.path.as_ref() == Some(path))) {
                 if index < on_screen {
-                    self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
+                    self.panes.push(Pane { target: Target::Session(slot), scroll: kept.scroll, anchor: None });
                 }
                 continue;
             }
@@ -997,7 +1069,7 @@ impl App {
             }
             self.slots[slot].draft.insert(&kept.draft);
             if index < on_screen {
-                self.panes.push(Pane { slot, scroll: kept.scroll, anchor: None });
+                self.panes.push(Pane { target: Target::Session(slot), scroll: kept.scroll, anchor: None });
             }
         }
         if !errors.is_empty() {
@@ -1007,7 +1079,7 @@ impl App {
         if self.panes.is_empty()
             && let Some(slot) = self.slots.iter().position(|slot| slot.opened)
         {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None });
+            self.panes.push(Pane { target: Target::Session(slot), scroll: 0, anchor: None });
         }
         if self.panes.is_empty() {
             self.slots.clear();
@@ -1015,6 +1087,8 @@ impl App {
         }
         self.focus = state.focus.min(self.panes.len() - 1);
         self.sidebar = state.sidebar;
+        self.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        self.layout = state.layout;
         true
     }
 
@@ -1030,14 +1104,18 @@ impl App {
             return Ok(());
         }
         // Even a missing or unreadable file stays named here until the user closes its row.
-        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| slot.saved || path.exists()), title: slot.title.clone(), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone() };
-        let panes = self.panes.iter().map(|pane| kept(&self.slots[pane.slot], pane.scroll)).collect();
-        let elsewhere = |index: usize| !self.panes.iter().any(|pane| pane.slot == index);
-        let open = (0..self.slots.len())
+        let kept = |slot: &Slot, scroll: usize| state::Kept { session: slot.path.clone().filter(|path| slot.saved || path.exists()), scratchpad: None, title: slot.title.clone(), cwd: slot.cwd.clone(), scroll, draft: slot.draft.text.clone() };
+        let panes = self.panes.iter().map(|pane| match pane.target {
+            Target::Session(slot) => kept(&self.slots[slot], pane.scroll),
+            Target::Scratchpad(board) => { let board = &self.scratchpads[board]; state::Kept { session: None, scratchpad: Some(board.path.clone()), title: String::new(), cwd: board.cwd.clone(), scroll: pane.scroll, draft: board.draft.text.clone() } },
+        }).collect();
+        let elsewhere = |index: usize| !self.panes.iter().any(|pane| pane.target == Target::Session(index));
+        let mut open: Vec<_> = (0..self.slots.len())
             .filter(|&index| elsewhere(index) && (self.slots[index].opened || !self.slots[index].draft.text.is_empty()))
             .map(|index| kept(&self.slots[index], 0))
             .collect();
-        let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, open }).unwrap_or_default();
+        open.extend(self.scratchpads.iter().enumerate().filter(|(index, board)| !board.draft.text.is_empty() && !self.panes.iter().any(|pane| pane.target == Target::Scratchpad(*index))).map(|(_, board)| state::Kept { session: None, scratchpad: Some(board.path.clone()), title: String::new(), cwd: board.cwd.clone(), scroll: 0, draft: board.draft.text.clone() }));
+        let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, sidebar_width: self.sidebar_width, layout: self.layout, open }).unwrap_or_default();
         self.saved_state.save(&self.state_file, &text)
     }
 
@@ -1232,6 +1310,7 @@ impl App {
         } else {
             let view = &mut self.slots[slot];
             for message in agent.session.context().messages { view.remember(message); }
+            for entry in agent.session.path_to_leaf() { view.account(entry); }
             view.context_tokens = crate::compaction::estimate_projected_context_tokens(&agent.session.projection(), &agent.session.path_to_leaf()).tokens;
         }
         let host = self.slots[slot].host.clone().unwrap_or_else(|| self.host.clone());
@@ -1296,12 +1375,18 @@ impl App {
         self.history.splice(0..0, prompts);
     }
 
+    fn session_index(&self) -> usize {
+        let Target::Session(index) = self.panes[self.focus].target else { unreachable!("scratchpad input is not session input") };
+        index
+    }
+
     fn current(&self) -> &Slot {
-        &self.slots[self.panes[self.focus].slot]
+        &self.slots[self.session_index()]
     }
 
     fn focused(&mut self) -> &mut Slot {
-        let slot = &mut self.slots[self.panes[self.focus].slot];
+        let index = self.session_index();
+        let slot = &mut self.slots[index];
         slot.release_generation = Arc::new(());
         slot
     }
@@ -1313,19 +1398,19 @@ impl App {
             return;
         }
         let listed = self.listed();
-        if let Some(at) = listed.iter().position(|&index| index == self.panes[self.focus].slot) {
+        if let Some(at) = listed.iter().position(|&index| self.panes[self.focus].target == Target::Session(index)) {
             let next = if earlier { (at + listed.len() - 1) % listed.len() } else { (at + 1) % listed.len() };
             self.show(listed[next]);
-        }
+        } else if let Some(&first) = listed.first() { self.show(first); }
     }
 
     // Show a slot in the focused pane. An earlier session is read from its file and nothing starts:
     // its agent starts only when something is typed into it. Its row stays open in this UI even
     // without an agent. A new session left empty behind it goes away.
     fn show(&mut self, slot: usize) {
-        let leaving = self.panes[self.focus].slot;
+        let leaving = self.panes[self.focus].target;
         // --single keeps no session open but the one shown (a /fork's or /clear's leaves it).
-        self.slots[leaving].opened &= !self.single;
+        if let Target::Session(leaving) = leaving { self.slots[leaving].opened &= !self.single; }
         self.slots[slot].opened = true;
         self.slots[slot].release_generation = Arc::new(());
         if self.slots[slot].live.is_none() {
@@ -1335,8 +1420,11 @@ impl App {
             }
         }
         self.slots[slot].unread = false;
-        self.panes[self.focus] = Pane { slot, scroll: 0, anchor: None };
-        self.put_away(leaving);
+        self.panes[self.focus] = Pane { target: Target::Session(slot), scroll: 0, anchor: None };
+        match leaving {
+            Target::Session(leaving) => self.put_away(leaving),
+            Target::Scratchpad(board) => { self.invalidate_scratch(board); self.clear_scratch_images(board); },
+        }
     }
 
     // Ask an off-screen runtime to release itself when idle. Never drop its sender on the UI's
@@ -1345,7 +1433,7 @@ impl App {
     // reach it as messages, and a message to a session nothing runs only waits for the user.
     fn put_away(&mut self, slot: usize) {
         let view = &self.slots[slot];
-        if self.panes.iter().any(|pane| pane.slot == slot) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() || view.manager {
+        if self.panes.iter().any(|pane| pane.target == Target::Session(slot)) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() || view.manager {
             return;
         }
         let Some((_, commands)) = &view.live else { return };
@@ -1369,7 +1457,7 @@ impl App {
         if let Some(picker) = &mut self.picker {
             picker.filter.push_str(&text);
         } else {
-            self.focused().draft.insert(&text);
+            self.draft_mut().insert(&text);
         }
     }
 
@@ -1391,7 +1479,7 @@ impl App {
             self.notice = Some("Another piccosta is running this session; this pane follows it, and nothing typed here goes to it.".into());
             return false;
         }
-        match self.reopen(self.panes[self.focus].slot) {
+        match self.reopen(self.session_index()) {
             Ok(()) => true,
             Err(error) => {
                 self.notice = Some(error);
@@ -1411,14 +1499,14 @@ impl App {
     // its own tools and prompt settings. Without flags it takes the focused session's model and
     // level. The session runs in that directory: its tools, its AGENTS.md, its session folder.
     fn new_session_in(&mut self, dir: Option<PathBuf>, args: Option<crate::cli::Args>) -> Option<usize> {
-        let current = self.current();
-        let dir = dir.unwrap_or_else(|| if current.cwd.as_os_str().is_empty() { self.host.cwd.clone() } else { current.cwd.clone() });
-        if current.empty() && current.cwd == dir && args.is_none() {
-            return Some(self.panes[self.focus].slot);
+        let current = match self.panes[self.focus].target { Target::Session(slot) => Some(&self.slots[slot]), Target::Scratchpad(_) => None };
+        let dir = dir.unwrap_or_else(|| if self.focus_cwd().as_os_str().is_empty() { self.host.cwd.clone() } else { self.focus_cwd().to_path_buf() });
+        if current.is_some_and(|current| current.empty() && current.cwd == dir) && args.is_none() {
+            return Some(self.session_index());
         }
         let flags = args.as_ref();
-        let model = flags.and_then(crate::cli::model_name).or_else(|| Some(current.model.clone()).filter(|model| !model.is_empty())).or(self.model.clone());
-        let thinking = flags.and_then(|args| args.thinking.clone()).or_else(|| Some(current.thinking.clone()).filter(|level| !level.is_empty()));
+        let model = flags.and_then(crate::cli::model_name).or_else(|| current.map(|current| current.model.clone()).filter(|model| !model.is_empty())).or(self.model.clone());
+        let thinking = flags.and_then(|args| args.thinking.clone()).or_else(|| current.map(|current| current.thinking.clone()).filter(|level| !level.is_empty()));
         let host = flags.map(|args| Arc::new(Host::for_args_at(args, dir.clone())));
         let slot = self.slots.len();
         self.slots.push(Slot { cwd: dir, host, ..Slot::new(None, NEW_TITLE.into()) });
@@ -1448,7 +1536,7 @@ impl App {
 
     // The editor's text: a command, a prompt, or steering for a run in progress.
     fn submit(&mut self) {
-        let text = self.focused().draft.take();
+        let text = self.draft_mut().take();
         if text.trim().is_empty() {
             return;
         }
@@ -1462,10 +1550,13 @@ impl App {
         {
             return;
         }
-        self.send(text);
+        if self.append_pending() { self.draft_mut().insert(&text); self.notice = Some("An append is still pending; draft kept.".into()); }
+        else if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.append_scratch(text); }
+        else { self.send(text, crate::message::InputOrigin::keyboard()); }
     }
 
-    fn send(&mut self, text: String) {
+    fn send(&mut self, text: String, origin: crate::message::InputOrigin) {
+        if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.notice = Some("Focus a session to send an agent a message.".into()); return; }
         let pane = self.focus;
         self.panes[pane].scroll = 0;
         // A message for a session not open here goes to whatever runs it (the assistant's service,
@@ -1474,9 +1565,13 @@ impl App {
         if self.current().live.is_none()
             && let Some(path) = self.current().path.clone().filter(|path| path.exists())
         {
-            let (slot, sent) = (self.panes[pane].slot, if self.current().manager { crate::manager::from_user(&text) } else { text.clone() });
+            let (slot, sent) = (self.session_index(), crate::message::UserMessage::new(&text, Vec::new(), origin));
             let draft = text.clone();
-            match self.deliveries.send(Box::new(move |_| (slot, Update::Sent(crate::runtime::send(&path, &sent, None), text)))) {
+            match self.deliveries.send(Box::new(move |_| {
+                let result = if matches!(sent.origin, crate::message::InputOrigin::Human { .. }) { crate::runtime::send_keyboard(&path, &sent) }
+                    else { crate::runtime::send(&path, &sent, None, None) };
+                (slot, Update::Sent(result, text))
+            })) {
                 Ok(()) => self.sending += 1,
                 Err(_) => {
                     self.slots[slot].draft.insert(&draft);
@@ -1497,7 +1592,8 @@ impl App {
         // left waiting on them; else it starts a turn (runtime.rs).
         // ACP has no steering method. A user's message is an explicit prompt, queued behind the
         // current one, not the unattended runtime-message path used by timers and other agents.
-        let command = if interactive_only { Command::Prompt(text.clone(), Vec::new(), None) } else { Command::Message(text.clone()) };
+        let message = crate::message::UserMessage::new(&text, Vec::new(), origin);
+        let command = if interactive_only { Command::Prompt(message) } else { Command::Message(message) };
         let _ = commands.send(command);
         if slot.busy() {
             return;
@@ -1587,16 +1683,19 @@ impl App {
             return;
         }
         if let Some(slot) = self.new_session() {
-            self.panes.push(Pane { slot, scroll: 0, anchor: None });
+            self.panes.push(Pane { target: Target::Session(slot), scroll: 0, anchor: None });
             self.focus = self.panes.len() - 1;
         }
     }
 
     fn close_pane(&mut self) {
         if self.panes.len() > 1 {
-            let slot = self.panes.remove(self.focus).slot;
+            let target = self.panes.remove(self.focus).target;
             self.focus = self.focus.min(self.panes.len() - 1);
-            self.put_away(slot);
+            match target {
+                Target::Session(slot) => self.put_away(slot),
+                Target::Scratchpad(board) => { self.invalidate_scratch(board); self.clear_scratch_images(board); },
+            }
         }
     }
 
@@ -1608,9 +1707,8 @@ impl App {
         let Some((handle, commands)) = &self.focused().live else { return };
         let (steer, follow_up) = handle.clear();
         let _ = commands.send(Command::Stop(None));
-        let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
-        if !queued.is_empty() {
-            let _ = commands.send(Command::Prompt(queued.join("\n\n"), Vec::new(), None));
+        for message in steer.into_iter().chain(follow_up) {
+            let _ = commands.send(Command::Prompt(message));
         }
     }
 
@@ -1619,6 +1717,7 @@ impl App {
     // nothing can move (the model is writing), the run stops and the queue is the next prompt. With
     // nothing running it's enter.
     fn send_now(&mut self) {
+        if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.submit(); return; }
         if self.restart_waiting || !self.current().busy() {
             self.submit();
             return;
@@ -1627,7 +1726,7 @@ impl App {
         if !text.trim().is_empty() {
             self.history.push(text.clone());
             if let Some((handle, _)) = &self.current().live {
-                handle.steer(text);
+                handle.steer(crate::message::UserMessage::new(&text, Vec::new(), crate::message::InputOrigin::keyboard()));
             }
         }
         let detached = self.current().shared.as_ref().is_some_and(|shared| shared.jobs.detach_all());
@@ -1642,7 +1741,7 @@ impl App {
         let slot = self.focused();
         let Some((handle, _)) = &slot.live else { return false };
         let (steer, follow_up) = handle.clear();
-        let queued: Vec<String> = steer.into_iter().chain(follow_up).collect();
+        let queued: Vec<String> = steer.into_iter().chain(follow_up).map(|message| message.content.text()).collect();
         if queued.is_empty() {
             return false;
         }
@@ -1674,7 +1773,7 @@ impl App {
         // Repeated folder writes can't queue another scan behind a slow one.
         if !self.scanning {
             let runtimes_due = self.runtime_scan_due;
-            let asked = |index: usize| self.slots[index].live.is_none() && (runtimes_due || self.slots[index].parent.is_some() || self.panes.iter().any(|pane| pane.slot == index));
+            let asked = |index: usize| self.slots[index].live.is_none() && (runtimes_due || self.slots[index].parent.is_some() || self.panes.iter().any(|pane| pane.target == Target::Session(index)));
             let files = (0..self.slots.len()).filter(|&index| asked(index)).filter_map(|index| self.slots[index].path.clone()).collect();
             let active = |slot: &Slot| slot.busy() || !slot.agents.is_empty() || slot.shared.as_ref().is_some_and(|shared| shared.jobs.running_count() > 0);
             let agents = runtimes_due || self.slots.iter().any(|slot| slot.watched() && active(slot));
@@ -1688,6 +1787,7 @@ impl App {
             self.scanning = self.asks.send(Box::new(move |worker| (0, Update::Scanned(Box::new(worker.scan(request)))))).is_ok();
             if self.scanning { self.runtime_scan_due = false; }
         }
+        self.scan_scratchpads();
         let _ = self.save_state();
     }
 
@@ -1709,7 +1809,7 @@ impl App {
             }
         }
         for index in 0..self.slots.len() {
-            let on_screen = self.panes.iter().any(|pane| pane.slot == index);
+            let on_screen = self.panes.iter().any(|pane| pane.target == Target::Session(index));
             let slot = &mut self.slots[index];
             let Some(path) = &slot.path else { continue };
             if !tickets.get(path).is_some_and(|ticket| ticket.ptr_eq(&Arc::downgrade(&slot.incarnation))) { continue; }
@@ -1738,7 +1838,7 @@ impl App {
         // done: its row goes unless it's on screen or holds a draft, restored rows too. /resume
         // still finds it.
         for index in 0..self.slots.len() {
-            let on_screen = self.panes.iter().any(|pane| pane.slot == index);
+            let on_screen = self.panes.iter().any(|pane| pane.target == Target::Session(index));
             let slot = &self.slots[index];
             let finished = slot.path.as_deref().is_some_and(|path| path.parent().and_then(Path::file_name) == Some("subagents".as_ref()) && statuses.get(path) == Some(&None));
             if finished && slot.live.is_none() && !on_screen && slot.draft.text.is_empty() && self.close(index) {
@@ -1773,7 +1873,7 @@ impl App {
         for index in asleep { self.wake(index); }
         for index in 0..self.slots.len() {
             let finished = self.slots[index].parent.is_some() && self.slots[index].path.as_ref().is_some_and(|path| statuses.get(path) == Some(&None));
-            if finished && !self.slots[index].opened && !self.panes.iter().any(|pane| pane.slot == index) {
+            if finished && !self.slots[index].opened && !self.panes.iter().any(|pane| pane.target == Target::Session(index)) {
                 self.slots[index].path = None;
             }
         }
@@ -1862,7 +1962,7 @@ impl App {
             return false;
         }
         // Another session to show, needed only when every pane shows this one.
-        let showing: Vec<usize> = (0..self.panes.len()).rev().filter(|&pane| self.panes[pane].slot == slot).collect();
+        let showing: Vec<usize> = (0..self.panes.len()).rev().filter(|&pane| self.panes[pane].target == Target::Session(slot)).collect();
         // In --single a fresh session takes the pane, or nothing closes (an empty one would be reused, and
         // with no model to start on there's none).
         let next = if showing.len() < self.panes.len() { None } else if self.single {
@@ -1875,23 +1975,49 @@ impl App {
             if self.panes.len() > 1 {
                 self.panes.remove(pane);
             } else {
-                self.panes[pane] = Pane { slot: next.unwrap_or(slot), scroll: 0, anchor: None };
+                self.panes[pane] = Pane { target: Target::Session(next.unwrap_or(slot)), scroll: 0, anchor: None };
             }
         }
         self.focus = self.focus.min(self.panes.len() - 1);
-        self.focused();
+        if matches!(self.panes[self.focus].target, Target::Session(_)) { self.focused(); }
         true
     }
 
     fn update(&mut self, slot: usize, update: Update) {
-        let visible = self.panes.iter().any(|pane| pane.slot == slot);
+        // Document results don't name session slots. Dispatch them before borrowing a Slot.
+        let update = match update {
+            Update::Asked(delivery, update) => {
+                if delivery { self.deliveries.pending -= 1; } else { self.asks.pending -= 1; }
+                self.update(slot, *update);
+                return;
+            }
+            Update::Scratch(board, ticket, ready, result) => { self.scratch_result(board, ticket, ready, *result); return; }
+            Update::ScratchPath(cwd, path, edit) => { self.scratch_path(cwd, path, edit); return; }
+            Update::Appended(board, result, text) => { self.appended(board, result, text); return; }
+            Update::ScratchEdit(board, ticket, result) => {
+                if self.scratch_edit_current(board, &ticket) {
+                    match result {
+                        Ok(()) => self.edit = Some(Edit::Scratchpad(board, self.scratchpads[board].path.clone())),
+                        Err(error) => self.notice = Some(format!("Cannot open scratchpad editor: {error}")),
+                    }
+                }
+                return;
+            }
+            Update::Report(text) => { self.report(text); return; }
+            Update::Scanned(scan) => { self.scanned(*scan); return; }
+            Update::Listed(listing) => { self.listed_result(listing); return; }
+            Update::ModelProbe(flow, result) => { self.probed_model(flow, result); return; }
+            Update::Nothing => return,
+            update => update,
+        };
+        let visible = self.panes.iter().any(|pane| pane.target == Target::Session(slot));
         let view = &mut self.slots[slot];
         match update {
             Update::Ask(question, items, answer, external) => {
                 let cancel = view.live.as_ref().filter(|_| external).map(|(handle, _)| handle.clone());
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
-            Update::Report(text) => self.report(text),
+            Update::Report(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
             Update::TimerReport(file, text) => {
                 if view.path.as_ref() == Some(&file) { view.messages.push(commands::report_message(text)); }
             }
@@ -1918,14 +2044,7 @@ impl App {
                 });
                 self.show(slot);
             }
-            Update::ModelProbe(flow, result) => self.probed_model(flow, result),
-            Update::Nothing => {},
-            Update::Asked(delivery, update) => {
-                if delivery { self.deliveries.pending -= 1; } else { self.asks.pending -= 1; }
-                self.update(slot, *update);
-            }
-            Update::Scanned(scan) => self.scanned(*scan),
-            Update::Listed(listing) => self.listed_result(listing),
+            Update::ModelProbe(..) | Update::Scanned(..) | Update::Listed(..) | Update::Asked(..) | Update::Nothing => unreachable!(),
             Update::Followed(ticket, result) => {
                 if !ticket.ptr_eq(&Arc::downgrade(&view.incarnation)) || view.live.is_some() { self.retire(result); return; }
                 view.follow_pending = false;
@@ -1933,7 +2052,7 @@ impl App {
                     Ok(Some(followed)) => {
                         if let Some(old) = followed.apply(view) { self.retire(old); }
                         let view = &mut self.slots[slot];
-                        if self.single && view.restored && self.printed.0 == slot { self.printed.1 = view.messages.len(); }
+                        if self.inline && view.restored && self.printed.0 == slot { self.printed.1 = view.messages.len(); }
                         view.restored = false;
                     }
                     Err(error) => self.notice = Some(format!("{}{}: {error}", if view.restored { "Could not restore TUI session " } else { "" }, view.title)),
@@ -2008,6 +2127,7 @@ impl App {
                     let diff = result.pointer("/details/diff").and_then(Value::as_str).map(str::to_string);
                     view.tools.insert(tool_call_id.clone(), ToolView { text: result_text(&result), diff, is_error, running: false });
                     view.touch(&tool_call_id);
+                    if !is_error && let Some(stamp) = result.pointer("/details/scratchpad").and_then(|stamp| serde_json::from_value(stamp.clone()).ok()) { let cwd = view.cwd.clone(); self.scratch_ready(&cwd, stamp); }
                 }
                 Event::AutoRetryStart { attempt, max_attempts, delay_ms, error_message } => {
                     view.state = State::Retrying(format!("retry {attempt}/{max_attempts} in {}s: {}", delay_ms / 1000, render::fit(&error_message, 60)));
@@ -2029,6 +2149,10 @@ impl App {
                     if let Some(error) = error_message {
                         self.notice = Some(error);
                     }
+                }
+                Event::EntryAppended { entry: entry @ crate::session::SessionEntry::Usage { .. } } => view.account(&entry),
+                Event::EntryAppended { entry: crate::session::SessionEntry::Custom { custom_type, data: Some(data), .. } } if custom_type == crate::intent_review::RECORD => {
+                    view.messages.push(commands::report_message(crate::intent_review::line(&data)));
                 }
                 Event::EntryAppended { entry: crate::session::SessionEntry::Custom { custom_type, data: Some(miss), .. } } if custom_type == crate::cache::MISS_TYPE => {
                     view.messages.push(commands::report_message(crate::cache::line(&miss)));
@@ -2060,17 +2184,25 @@ impl App {
                             *scroll = if mouse.kind == MouseEventKind::ScrollUp { *scroll + WHEEL_ROWS } else { scroll.saturating_sub(WHEEL_ROWS) };
                         }
                     }
+                    // The sidebar's border owns its drag, even once the pointer crosses a pane.
+                    MouseEventKind::Down(MouseButton::Left) if self.picker.is_none() && self.sidebar_rect.contains(at) && at.x + 1 == self.sidebar_rect.right() => {
+                        self.sidebar_drag = true;
+                        self.selection = None;
+                        self.editor_drag = false;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if self.sidebar_drag => self.resize_sidebar(at.x.saturating_sub(self.sidebar_rect.x).saturating_add(1)),
+                    MouseEventKind::Up(MouseButton::Left) if std::mem::take(&mut self.sidebar_drag) => self.resize_sidebar(at.x.saturating_sub(self.sidebar_rect.x).saturating_add(1)),
                     // A press on a pane's conversation starts a selection there; a second or third quick
                     // press on the same cell selects its word or its row. One in the editor puts its
                     // cursor there, and a drag from it selects in the editor.
                     MouseEventKind::Down(MouseButton::Left) if self.editor_area.0.contains(at) => {
                         let cursor = self.editor_offset(at);
                         (self.selection, self.editor_drag) = (None, true);
-                        let draft = &mut self.focused().draft;
+                        let draft = self.draft_mut();
                         (draft.anchor, draft.cursor) = (Some(cursor), cursor);
                     }
-                    MouseEventKind::Drag(MouseButton::Left) if self.editor_drag => self.focused().draft.cursor = self.editor_offset(at),
-                    MouseEventKind::Up(MouseButton::Left) if std::mem::take(&mut self.editor_drag) => self.focused().draft.cursor = self.editor_offset(at),
+                    MouseEventKind::Drag(MouseButton::Left) if self.editor_drag => self.draft_mut().cursor = self.editor_offset(at),
+                    MouseEventKind::Up(MouseButton::Left) if std::mem::take(&mut self.editor_drag) => self.draft_mut().cursor = self.editor_offset(at),
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(pane) = pane {
                             self.focus = pane;
@@ -2079,8 +2211,8 @@ impl App {
                                 _ => 1,
                             };
                             self.last_click = Some((Instant::now(), at, clicks));
-                            let slot = self.panes[pane].slot;
-                            self.selection = self.body_rects.get(pane).is_some_and(|body| body.contains(at)).then_some(Selection { pane, slot, anchor: None, head: Default::default(), clicks, at, moved: true, held: true, copy: false });
+                            let target = self.panes[pane].target;
+                            self.selection = self.body_rects.get(pane).is_some_and(|body| body.contains(at)).then_some(Selection { pane, target, anchor: None, head: Default::default(), clicks, at, moved: true, held: true, copy: false });
                         } else if self.sidebar_rect.contains(at)
                             && let Some(&(_, slot)) = self.sidebar_rows.iter().rev().find(|(row, _)| *row <= mouse.row)
                         {
@@ -2108,14 +2240,18 @@ impl App {
             Input::FocusLost => {
                 self.selection.iter_mut().for_each(|selection| selection.held = false);
                 self.editor_drag = false;
+                self.sidebar_drag = false;
             }
             // tmux drops images sent to a hidden pane; send them all again on coming back.
-            Input::FocusGained => {
-                let _ = self.tex.clear(&mut std::io::stdout());
-                self.slots.iter_mut().for_each(|slot| slot.cache.clear());
-            }
+            Input::FocusGained => self.lost_images(),
             _ => {}
         }
+    }
+
+    fn lost_images(&mut self) {
+        let _ = self.tex.clear(&mut std::io::stdout());
+        self.slots.iter_mut().for_each(|slot| slot.cache.clear());
+        self.scan_scratchpads();
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -2158,8 +2294,8 @@ impl App {
         }
         match key.code {
             // Text selected in the editor (shift+arrows): ctrl+c copies it.
-            KeyCode::Char('c') if control && self.current().draft.selection().is_some() => {
-                let draft = &self.current().draft;
+            KeyCode::Char('c') if control && self.draft().selection().is_some() => {
+                let draft = self.draft();
                 let text = draft.selection().map(|range| draft.text[range].to_string()).unwrap_or_default();
                 let via = clip::copy(&text);
                 self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
@@ -2167,15 +2303,16 @@ impl App {
             KeyCode::Char('v') if control => self.paste(false),
             // Ctrl+Shift+Delete clears what's typed; ↑ brings it back from the history.
             KeyCode::Delete if control && shift => {
-                let text = self.focused().draft.take();
+                let text = self.draft_mut().take();
                 if !text.trim().is_empty() && self.history.last() != Some(&text) {
                     self.history.push(text);
                 }
             }
             // The Delete key with nothing typed deletes the session shown here: the first press says
             // which, a second soon after moves it to the trash and shows the next one in the list.
-            KeyCode::Delete if self.current().draft.text.is_empty() => {
-                let slot = self.panes[self.focus].slot;
+            KeyCode::Delete if self.draft().text.is_empty() && matches!(self.panes[self.focus].target, Target::Scratchpad(_)) => self.close_pane(),
+            KeyCode::Delete if self.draft().text.is_empty() => {
+                let slot = self.session_index();
                 if delete_armed.is_some_and(|(when, armed)| armed == slot && when.elapsed() < QUIT_CONFIRM) {
                     self.delete_shown();
                 } else {
@@ -2187,11 +2324,11 @@ impl App {
             KeyCode::Char('m') if control => self.sessions(""),
             // Claude Code's ctrl+c: stop the run here; else clear the draft; else a second press
             // within QUIT_CONFIRM quits. ctrl+d on an empty draft quits the same two-press way.
-            KeyCode::Char('c') if control && self.current().busy() => self.interrupt(),
-            KeyCode::Char('c') if control && !self.current().draft.text.is_empty() => {
-                self.focused().draft.take();
+            KeyCode::Char('c') if control && self.focus_busy() => self.interrupt(),
+            KeyCode::Char('c') if control && !self.draft().text.is_empty() => {
+                self.draft_mut().take();
             }
-            KeyCode::Char('c' | 'd') if control && (key.code == KeyCode::Char('c') || self.current().draft.text.is_empty()) => {
+            KeyCode::Char('c' | 'd') if control && (key.code == KeyCode::Char('c') || self.draft().text.is_empty()) => {
                 if self.quit_armed.is_some_and(|armed| armed.elapsed() < QUIT_CONFIRM) {
                     self.quit = true;
                 } else {
@@ -2201,7 +2338,7 @@ impl App {
                     self.notice = Some(format!("{running}{pressed} again quits piccosta (to delete a session: the Delete key)"));
                 }
             }
-            KeyCode::Esc if self.current().busy() => self.interrupt(),
+            KeyCode::Esc if self.focus_busy() => self.interrupt(),
             KeyCode::Esc => self.panes[self.focus].scroll = 0,
             KeyCode::Char('x') if control => {
                 self.chord = true;
@@ -2210,8 +2347,8 @@ impl App {
             // Ctrl+enter arrives as itself only where the terminal reports it (not through tmux
             // without extended-keys); ctrl+x ctrl+s works anywhere.
             KeyCode::Enter if control => self.send_now(),
-            KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => self.focused().draft.insert("\n"),
-            KeyCode::Char('j') if control => self.focused().draft.insert("\n"),
+            KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => self.draft_mut().insert("\n"),
+            KeyCode::Char('j') if control => self.draft_mut().insert("\n"),
             KeyCode::Enter => self.submit(),
             // A new session: where, from a list that starts with this directory (enter keeps it).
             KeyCode::Char('n') if control => {
@@ -2236,7 +2373,12 @@ impl App {
             KeyCode::Char('t') if control => {
                 self.flags.thinking_open = !self.flags.thinking_open;
             }
-            KeyCode::Char('b') if control => self.sidebar = !self.sidebar,
+            KeyCode::Char('b') if control => {
+                self.sidebar = !self.sidebar;
+                self.sidebar_drag = false;
+            }
+            KeyCode::Char(',') if alt => self.resize_sidebar(self.sidebar_rect.width.saturating_sub(1)),
+            KeyCode::Char('.') if alt => self.resize_sidebar(self.sidebar_rect.width.saturating_add(1)),
             KeyCode::PageUp => {
                 let step = self.pane_rects.get(self.focus).map_or(10, |rect| usize::from(rect.height / 2));
                 self.panes[self.focus].scroll += step;
@@ -2247,29 +2389,29 @@ impl App {
                 *scroll = scroll.saturating_sub(step);
             }
             // Tab finishes a command name from what's typed: the first that fits.
-            KeyCode::Tab if self.current().draft.text.starts_with('/') && !self.current().draft.text.contains(char::is_whitespace) => {
-                if let Some(name) = commands::completions(&self.current().draft.text, false).first() {
+            KeyCode::Tab if self.draft().text.starts_with('/') && !self.draft().text.contains(char::is_whitespace) => {
+                if let Some(name) = commands::completions(&self.draft().text, false).first() {
                     let text = format!("{name} ");
-                    self.focused().draft = Editor::with(text);
+                    *self.draft_mut() = Editor::with(text);
                 }
             }
             // Down from a recalled prompt steps to the newer one, and past the newest to empty.
-            KeyCode::Down if !shift && self.history.contains(&self.current().draft.text) => {
-                let current = self.current().draft.text.clone();
+            KeyCode::Down if !shift && self.history.contains(&self.draft().text) => {
+                let current = self.draft().text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(0);
                 let text = self.history.get(position + 1).cloned().unwrap_or_default();
-                self.focused().draft = Editor::with(text);
+                *self.draft_mut() = Editor::with(text);
             }
             // Up from the editor's first line takes back what's queued, as in Claude Code.
-            KeyCode::Up if !shift && !self.current().draft.text[..self.current().draft.cursor].contains('\n') && self.take_back() => {}
-            KeyCode::Up if !shift && (self.current().draft.text.is_empty() || self.history.contains(&self.current().draft.text)) => {
-                let current = self.current().draft.text.clone();
+            KeyCode::Up if !shift && !self.draft().text[..self.draft().cursor].contains('\n') && matches!(self.panes[self.focus].target, Target::Session(_)) && self.take_back() => {}
+            KeyCode::Up if !shift && (self.draft().text.is_empty() || self.history.contains(&self.draft().text)) => {
+                let current = self.draft().text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(self.history.len());
                 if let Some(previous) = position.checked_sub(1).and_then(|index| self.history.get(index)).cloned() {
-                    self.focused().draft = Editor::with(previous);
+                    *self.draft_mut() = Editor::with(previous);
                 }
             }
-            _ => self.focused().draft.key(key),
+            _ => self.draft_mut().key(key),
         }
     }
 
@@ -2341,6 +2483,9 @@ impl App {
             let Some((slot, update)) = self.updates.recv().await else { break };
             self.update(slot, update);
         }
+        // An append can fail while quitting. Its recovered draft must reach the snapshot too,
+        // including one whose pane the user closed while the disk worker was still out.
+        if !self.scratchpads.is_empty() { let _ = self.save_state(); }
         for slot in &mut self.slots {
             // A runtime ends when its commands' channel goes: it stops its turn and keeps in the
             // session what it hadn't read.
@@ -2355,35 +2500,49 @@ impl App {
         crate::provider::shutdown().await;
     }
 
+    // Resize the visible sidebar, leaving the panes their minimum room. Hidden and single UIs
+    // keep their preference; a terminal shrinking only limits what gets drawn, not what is saved.
+    fn resize_sidebar(&mut self, width: u16) {
+        if self.sidebar_rect.width == 0 { return; }
+        let screen = self.pane_rects.iter().map(|rect| rect.right()).max().unwrap_or_default().saturating_sub(self.sidebar_rect.x);
+        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH.min(screen.saturating_sub(SIDEBAR_PANES_WIDTH)).max(SIDEBAR_MIN_WIDTH));
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         // How long the focused draft has been on the way to /descent. The screen is drawn again at
         // least every agent scan, so the name shows up within one of the 12 s mark.
-        let toward = commands::toward_descent(&self.current().draft.text);
+        let toward = commands::toward_descent(&self.draft().text);
         self.descent_since = if toward { self.descent_since.or_else(|| Some(Instant::now())) } else { None };
         let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         let sidebar = self.sidebar && !self.single && main.width >= SIDEBAR_MIN_SCREEN;
-        let [side, panes] = Layout::horizontal([Constraint::Length(if sidebar { SIDEBAR_WIDTH } else { 0 }), Constraint::Fill(1)]).areas(main);
+        let [side, panes] = Layout::horizontal([Constraint::Length(if sidebar { self.sidebar_width.min(main.width.saturating_sub(SIDEBAR_PANES_WIDTH)) } else { 0 }), Constraint::Fill(1)]).areas(main);
         self.sidebar_rect = side;
         if sidebar {
             self.draw_sidebar(frame, side);
         }
-        let rects = Layout::horizontal(vec![Constraint::Fill(1); self.panes.len()]).split(panes);
-        self.pane_rects = rects.to_vec();
+        // Focus and transcript updates don't move panes. Reuse their rectangles until they do.
+        let layout = (self.layout, panes, self.panes.len());
+        if self.pane_layout != Some(layout) {
+            self.layout.areas(panes, self.panes.len(), &mut self.pane_rects);
+            self.pane_layout = Some(layout);
+            self.scan_scratchpads();
+        }
         self.body_rects.clear();
         self.editor_area = Default::default();
+        self.typing_at = None;
         // A selection goes once its pane loses the focus or shows another session.
-        if self.selection.as_ref().is_some_and(|selection| selection.pane != self.focus || self.panes.get(selection.pane).is_none_or(|pane| pane.slot != selection.slot)) {
+        if self.selection.as_ref().is_some_and(|selection| selection.pane != self.focus || self.panes.get(selection.pane).is_none_or(|pane| pane.target != selection.target)) {
             self.selection = None;
         }
-        for (index, rect) in rects.iter().enumerate() {
-            self.draw_pane(frame, index, *rect);
+        for index in 0..self.pane_rects.len() {
+            self.draw_pane(frame, index, self.pane_rects[index]);
         }
         let line = if self.restart_waiting {
             let names: Vec<_> = self.slots.iter().enumerate().filter(|(slot, _)| self.restart_draining.contains_key(slot)).map(|(_, slot)| slot.title.as_str()).collect();
             if names.is_empty() { "Restarting; waiting for input delivery, session preparation and Claude Code handover".into() }
             else { format!("Restart waiting on: {} · esc stops the focused turn", names.join(", ")) }
         } else { self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string()) };
-        let cwd = render::home_relative(&self.current().cwd);
+        let cwd = render::home_relative(self.focus_cwd());
         let room = usize::from(status.width).saturating_sub(cwd.width() + 2);
         let text = format!(" {:<room$} {cwd}", render::fit(&line, room));
         frame.render_widget(Paragraph::new(text).style(Style::new().fg(theme::DIM)), status);
@@ -2400,7 +2559,7 @@ impl App {
         let mut lines = vec![Line::from(Span::styled(" piccosta", Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD))), Line::default()];
         self.sidebar_rows.clear();
         let room = usize::from(inner.width).saturating_sub(3);
-        let shown = self.panes[self.focus].slot;
+        let shown = self.panes[self.focus].target;
         // A heading over each project's sessions; open ones carry a mark, earlier ones are dim.
         let mut project: Option<PathBuf> = None;
         for index in self.listed() {
@@ -2424,7 +2583,7 @@ impl App {
                 State::Idle if slot.unread => ("●", theme::OK),
                 State::Idle => (" ", theme::DIM),
             };
-            let title_style = match (index == shown, slot.live.is_some()) {
+            let title_style = match (Target::Session(index) == shown, slot.live.is_some()) {
                 (true, _) => Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
                 (false, true) => Style::new(),
                 (false, false) => Style::new().fg(theme::DIM),
@@ -2440,23 +2599,27 @@ impl App {
 
     fn draw_pane(&mut self, frame: &mut Frame, index: usize, rect: Rect) {
         let focused = index == self.focus;
-        let block = if index > 0 { Block::new().borders(Borders::LEFT).border_style(Style::new().fg(theme::DIM)) } else { Block::new() };
-        let inner = pane_inner(index, rect);
+        // Only shared edges need borders. Text, selection and editor all use this same interior.
+        let first = self.pane_rects[0];
+        let borders = if rect.x > first.x { Borders::LEFT } else { Borders::NONE }
+            | if rect.y > first.y { Borders::TOP } else { Borders::NONE };
+        let block = Block::new().borders(borders).border_style(Style::new().fg(theme::DIM));
+        let inner = block.inner(rect).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
         frame.render_widget(block, rect);
-        let slot_index = self.panes[index].slot;
+        let slot_index = match self.panes[index].target {
+            Target::Session(slot) => slot,
+            Target::Scratchpad(board) => return self.draw_scratch(frame, index, board, inner),
+        };
         let width = inner.width;
 
         // The editor (focused pane only) and what's queued above it.
-        let (editor_rows, cursor, _) = self.slots[slot_index].draft.layout(usize::from(width.saturating_sub(4)).max(1));
         let queued = self.slots[slot_index].live.as_ref().map(|(handle, _)| handle.queued()).unwrap_or_default();
         let queued: Vec<String> = queued.0.into_iter().chain(queued.1).collect();
         // While a command name is being typed, the ones it could be, on one line (tab takes the first).
         let draft = &self.slots[slot_index].draft.text;
         let descent = focused && self.descent_since.is_some_and(|since| since.elapsed() >= commands::DESCENT_REVEAL);
         let completions = if draft.starts_with('/') && !draft.contains(char::is_whitespace) { commands::completions(draft, descent) } else { Vec::new() };
-        let editor_height = if focused { editor_rows.len().clamp(1, EDITOR_MAX_ROWS) as u16 + 2 } else { 0 };
-        let queued_height = if focused { (queued.len().min(3) + usize::from(!completions.is_empty())) as u16 } else { 0 };
-        let [header, body, queue, editor] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(queued_height), Constraint::Length(editor_height)]).areas(inner);
+        let ([header, body, queue, editor], editor_rows, cursor) = Self::editor_layout(&self.slots[slot_index].draft, inner, focused, queued.len().min(3) + usize::from(!completions.is_empty()));
 
         let slot = &self.slots[slot_index];
         let mut spans = vec![Span::styled(render::fit(&slot.title, usize::from(width) / 2), if focused { Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) })];
@@ -2502,7 +2665,7 @@ impl App {
             below = (count == self.slots[slot_index].messages.len()).then_some(now);
         }
         // --single's live part takes as many rows as it has (inline.rs), so all of them are counted.
-        let wanted = if self.single { usize::MAX } else { height + self.panes[index].scroll };
+        let wanted = if self.inline { usize::MAX } else { height + self.panes[index].scroll };
         let (mut rows, _, mut messages) = self.transcript(slot_index, width, wanted, usize::MAX);
         // While it works, a line under the conversation says so, its dots moving and its time
         // counting, so it's plain the model is still at it.
@@ -2531,7 +2694,7 @@ impl App {
         };
         self.panes[index].anchor = (scroll > 0).then_some((count, tail));
         let end = rows.len() - scroll;
-        self.live_rows = 2 + rows.len() + usize::from(queued_height + editor_height);
+        self.live_rows = 2 + rows.len() + usize::from(queue.height + editor.height);
         let start = end.saturating_sub(height);
         // Rows sit at the bottom, as a chat does, until they fill the pane.
         let top = body.y + (height - (end - start)) as u16;
@@ -2543,7 +2706,7 @@ impl App {
         // (to the row at the edge when the mouse is past it), grown to a word or a row for a double
         // or triple click; copied when due (before the status line, which says so), else shown
         // reversed. A plain click selects nothing.
-        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.pane == index && end > start) {
+        if self.selection.as_ref().is_some_and(|selection| selection.pane == index && end > start) {
             let mut view = Vec::new();
             let mut first = 0;
             for &(message, length) in &messages {
@@ -2556,24 +2719,9 @@ impl App {
                 }
                 first += length;
             }
-            if (std::mem::replace(&mut selection.moved, false) || selection.held)
-                && let Some(&(row, at)) = view.get(usize::from(selection.at.y.clamp(top, shown.bottom() - 1) - top))
-            {
-                selection.head = clip::word(&clip::cells(&rows[row], at), selection.at.x.saturating_sub(body.x), selection.clicks);
-            }
-            let (anchor, head) = (*selection.anchor.get_or_insert(selection.head), selection.head);
-            let (from, to) = if anchor.0 <= head.0 { (anchor.0, head.1) } else { (head.0, anchor.1) };
-            if std::mem::take(&mut selection.copy) {
-                if from == to && selection.clicks == 1 {
-                    self.selection = None;
-                } else {
-                    let text = self.selected_text(slot_index, width, &rows, &messages, from, to);
-                    let via = clip::copy(&text);
-                    self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
-                }
-            }
-            if self.selection.is_some() {
-                clip::highlight(frame.buffer_mut(), shown, |y| view.get(usize::from(y)).and_then(|&(row, at)| clip::span(&rows[row], at, from, to)));
+            if let Some((from, to)) = self.select_rows(frame, index, shown, &rows, &view) {
+                let text = self.selected_text(slot_index, width, &rows, &messages, from, to);
+                self.copied(text);
             }
         }
         if scroll > 0 {
@@ -2583,39 +2731,70 @@ impl App {
         }
 
         if focused {
-            let mut lines: Vec<Line> = queued.iter().take(3).map(|text| Line::from(Span::styled(format!("↳ {}", render::fit(text.lines().next().unwrap_or(""), usize::from(width) - 2)), Style::new().fg(theme::DIM)))).collect();
+            let mut lines: Vec<Line> = queued.iter().take(3).map(|text| Line::from(Span::styled(format!("↳ {}", render::fit(text.lines().next().unwrap_or(""), usize::from(width.saturating_sub(2)))), Style::new().fg(theme::DIM)))).collect();
             if !completions.is_empty() {
                 lines.push(Line::from(Span::styled(render::fit(&completions.join("  "), usize::from(width)), Style::new().fg(theme::ACCENT))));
             }
             frame.render_widget(Paragraph::new(lines), queue);
-            let border = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(if self.slots[slot_index].busy() { theme::DIM } else { theme::ACCENT }));
-            let text_area = border.inner(editor).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
-            frame.render_widget(border, editor);
-            let visible = usize::from(text_area.height);
-            let first = (cursor.0 + 1).saturating_sub(visible);
-            // An empty box says nothing, except the two keys that matter while a turn runs.
-            if self.slots[slot_index].draft.text.is_empty() {
-                if self.slots[slot_index].busy() {
-                    frame.render_widget(Paragraph::new("esc stops · ^x^s sends now").style(Style::new().fg(theme::DIM)), text_area);
-                }
-            } else {
-                let shown: Vec<Line> = editor_rows.iter().skip(first).take(visible).map(|row| Line::from(row.clone())).collect();
-                frame.render_widget(Paragraph::new(shown), text_area);
-                // Text selected with shift+arrows, from its first character to its last.
-                let draft = &self.slots[slot_index].draft;
-                if let Some(range) = draft.selection() {
-                    let last = draft.text[..range.end].char_indices().last().map_or(range.start, |(at, _)| at);
-                    let width = usize::from(text_area.width).max(1);
-                    let (from, to) = (draft.spot(width, range.start), draft.spot(width, last));
-                    let row = |y: u16| first + usize::from(y);
-                    clip::highlight(frame.buffer_mut(), text_area, |y| (from.0..=to.0).contains(&row(y)).then(|| (if row(y) == from.0 { from.1 as u16 } else { 0 }, if row(y) == to.0 { to.1 as u16 } else { u16::MAX })));
-                }
+            self.draw_editor(frame, editor, &editor_rows, cursor);
+        }
+    }
+
+    // Header first, then the editor, then the queue; both pane targets use the same tiny-screen budget.
+    fn editor_layout(draft: &Editor, inner: Rect, focused: bool, queued: usize) -> ([Rect; 4], Vec<String>, (usize, usize)) {
+        let (rows, cursor, _) = draft.layout(usize::from(inner.width.saturating_sub(4)).max(1));
+        let height = if focused { (rows.len().clamp(1, EDITOR_MAX_ROWS) as u16 + 2).min(inner.height.saturating_sub(1)) } else { 0 };
+        let queue = if focused { (queued as u16).min(inner.height.saturating_sub(1 + height)) } else { 0 };
+        (Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(queue), Constraint::Length(height)]).areas(inner), rows, cursor)
+    }
+
+    // Only row mappings and the source of copied text differ between document and session panes.
+    fn select_rows(&mut self, frame: &mut Frame, pane: usize, shown: Rect, rows: &[Line<'static>], places: &[(usize, clip::Row)]) -> Option<(clip::Point, clip::Point)> {
+        let selection = self.selection.as_mut().filter(|selection| selection.pane == pane && !shown.is_empty())?;
+        if (std::mem::replace(&mut selection.moved, false) || selection.held)
+            && let Some(&(row, at)) = places.get(usize::from(selection.at.y.clamp(shown.y, shown.bottom() - 1) - shown.y))
+        { selection.head = clip::word(&clip::cells(&rows[row], at), selection.at.x.saturating_sub(shown.x), selection.clicks); }
+        let (anchor, head) = (*selection.anchor.get_or_insert(selection.head), selection.head);
+        let (from, to) = if anchor.0 <= head.0 { (anchor.0, head.1) } else { (head.0, anchor.1) };
+        let copy = std::mem::take(&mut selection.copy);
+        if copy && from == to && selection.clicks == 1 { self.selection = None; return None; }
+        clip::highlight(frame.buffer_mut(), shown, |y| places.get(usize::from(y)).and_then(|&(row, at)| clip::span(&rows[row], at, from, to)));
+        copy.then_some((from, to))
+    }
+    fn copied(&mut self, text: String) {
+        let via = clip::copy(&text);
+        self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
+    }
+
+    // The same editor and height/cursor rules for a session prompt and a document paragraph.
+    fn draw_editor(&mut self, frame: &mut Frame, editor: Rect, editor_rows: &[String], cursor: (usize, usize)) {
+        let border = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(if self.focus_busy() { theme::DIM } else { theme::ACCENT }));
+        let text_area = border.inner(editor).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
+        frame.render_widget(border, editor);
+        let visible = usize::from(text_area.height);
+        let first = (cursor.0 + 1).saturating_sub(visible);
+        // An empty box says nothing, except the two keys that matter while a turn runs.
+        if self.draft().text.is_empty() {
+            if self.focus_busy() {
+                frame.render_widget(Paragraph::new("esc stops · ^x^s sends now").style(Style::new().fg(theme::DIM)), text_area);
             }
-            self.editor_area = (text_area, first);
-            self.typing_at = self.picker.is_none().then(|| Position::new(text_area.x + cursor.1 as u16, text_area.y + (cursor.0 - first) as u16));
-            if let Some(at) = self.typing_at {
-                frame.set_cursor_position(at);
+        } else {
+            let shown: Vec<Line> = editor_rows.iter().skip(first).take(visible).map(|row| Line::from(row.clone())).collect();
+            frame.render_widget(Paragraph::new(shown), text_area);
+            // Text selected with shift+arrows, from its first character to its last.
+            let draft = self.draft();
+            if let Some(range) = draft.selection() {
+                let last = draft.text[..range.end].char_indices().last().map_or(range.start, |(at, _)| at);
+                let width = usize::from(text_area.width).max(1);
+                let (from, to) = (draft.spot(width, range.start), draft.spot(width, last));
+                let row = |y: u16| first + usize::from(y);
+                clip::highlight(frame.buffer_mut(), text_area, |y| (from.0..=to.0).contains(&row(y)).then(|| (if row(y) == from.0 { from.1 as u16 } else { 0 }, if row(y) == to.0 { to.1 as u16 } else { u16::MAX })));
             }
+        }
+        self.editor_area = (text_area, first);
+        self.typing_at = (self.picker.is_none() && !text_area.is_empty()).then(|| Position::new(text_area.x + cursor.1 as u16, text_area.y + (cursor.0 - first) as u16));
+        if let Some(at) = self.typing_at {
+            frame.set_cursor_position(at);
         }
     }
 
@@ -2660,7 +2839,7 @@ impl App {
     fn editor_offset(&self, at: Position) -> usize {
         let (area, first) = self.editor_area;
         let place = (first + usize::from(at.y.saturating_sub(area.y).min(area.height.saturating_sub(1))), usize::from(at.x.saturating_sub(area.x)));
-        self.current().draft.offset_at(usize::from(area.width).max(1), place)
+        self.draft().offset_at(usize::from(area.width).max(1), place)
     }
 
     // A session's rows, drawn from the bottom up until `wanted` are there (or the session's start).
@@ -2678,7 +2857,7 @@ impl App {
         }
         // --single's printed messages are in the scrollback, not here.
         let slot = &self.slots[slot_index];
-        let first = if self.single && self.printed.0 == slot_index { self.printed.1.min(slot.messages.len()) } else { 0 };
+        let first = if self.inline && self.printed.0 == slot_index { self.printed.1.min(slot.messages.len()) } else { 0 };
         for index in (first..self.slots[slot_index].messages.len()).rev() {
             if count >= wanted && index < since {
                 break;
@@ -2703,7 +2882,7 @@ impl App {
         }
         // While tools are folded, a run of calls over several messages draws on its last one, so its
         // ended calls fold into one line. --single prints its calls open instead.
-        let run = (!flags.tools_open && !self.single).then(|| run_of(&slot.messages, index, flags)).flatten();
+        let run = (!flags.tools_open && !self.inline).then(|| run_of(&slot.messages, index, flags)).flatten();
         // One that draws nothing of a run still names a switched-to model where the switch was.
         let mut rows = model_row(&slot.messages[..index], model_of(&slot.messages[index]));
         rows.extend(match (&run, &slot.messages[index]) {
@@ -2753,11 +2932,38 @@ impl App {
     }
 }
 
-// Where a pane's text goes: inside its left border (panes after the first have one) and a column
-// of margin on each side.
-fn pane_inner(index: usize, rect: Rect) -> Rect {
-    let block = if index > 0 { Block::new().borders(Borders::LEFT) } else { Block::new() };
-    block.inner(rect).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 })
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PaneLayout {
+    Columns,
+    Rows,
+    #[default]
+    Grid,
+}
+
+impl PaneLayout {
+    // Rectangles stay in reading order, so the existing pane keys and mouse lookup agree.
+    // Two panes share one row; three give the last pane the whole lower row; four make a quad.
+    fn areas(self, area: Rect, count: usize, rects: &mut Vec<Rect>) {
+        rects.clear();
+        let constraints = [Constraint::Fill(1); MAX_PANES];
+        // Columns need no horizontal separators. Use them when stacking would hide the editor;
+        // keep the preference so growing the terminal brings its rows or grid back.
+        let rows = match self { Self::Rows => count, Self::Grid => count.div_ceil(2), Self::Columns => 1 };
+        let layout = if area.height / (rows as u16) < PANE_MIN_HEIGHT { Self::Columns } else { self };
+        match layout {
+            Self::Rows => rects.extend_from_slice(&Layout::vertical(constraints[..count].iter().copied()).split(area)),
+            Self::Grid if count > 2 => {
+                for (row, area) in Layout::vertical(constraints[..rows].iter().copied()).split(area).iter().enumerate() {
+                    rects.extend_from_slice(&Layout::horizontal(constraints[..(count - row * 2).min(2)].iter().copied()).split(*area));
+                }
+            }
+            _ => rects.extend_from_slice(&Layout::horizontal(constraints[..count].iter().copied()).split(area)),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self { Self::Columns => Self::Rows, Self::Rows => Self::Grid, Self::Grid => Self::Columns }
+    }
 }
 
 // A response from a different model than the one before it (in `earlier`) says whose it is (a
@@ -2812,10 +3018,10 @@ fn model_of(message: &AgentMessage) -> Option<String> {
 
 fn message_rows(message: &AgentMessage, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut tex::Tex) -> Rows {
     match message {
-        // A manager's news (a lane's turn, a schedule) comes in as its message, "[<time>, what]",
-        // but it's for the model: shown as a notice. The user's own words sent to it from
-        // elsewhere, "[<time>, from the user]", stay the user's.
-        AgentMessage::User(user) if is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags),
+        // New inputs carry their source. The old text convention is only a legacy fallback;
+        // a human quoting a check-in must still look like a human message.
+        AgentMessage::User(user) if user.origin.is_notice() || user.origin.is_unknown() && is_news(&user.content.text()) => render::news(&user.content.text(), width, tex, flags),
+        AgentMessage::User(user) if user.origin.unverified_interface().is_some() => render::user(&format!("[{}, interface {}]\n{}", user.origin.label(), user.origin.unverified_interface().unwrap_or_default(), user.content.text()), width, tex),
         AgentMessage::User(user) => render::user(&user.content.text(), width, tex),
         AgentMessage::Assistant(assistant) => {
             render::assistant(&render::blocks(assistant), Some((&assistant.stop_reason, assistant.error_message.as_deref())), tools, flags, frame, width, tex)

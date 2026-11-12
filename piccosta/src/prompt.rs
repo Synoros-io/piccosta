@@ -310,6 +310,11 @@ pub fn sections(inputs: &PromptInputs) -> IndexMap<String, String> {
     sections
 }
 
+// The path is resolved off-thread at the agent's normal prompt refresh, never in UI setup.
+pub fn cwd(cwd: &Path, scratchpad: &Path) -> String {
+    tagged("cwd", &format!("{}\nScratchpad: {} — shared Markdown for the user's pane; read before write/edit, use local PNG/JPEG and TeX math.", cwd.to_string_lossy().replace('\\', "/"), scratchpad.display()))
+}
+
 // A section as the prompt carries it: its text inside a tag named for it.
 fn tagged(name: &str, content: &str) -> String {
     format!("<{name}>\n{content}\n</{name}>")

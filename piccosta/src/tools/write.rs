@@ -50,30 +50,15 @@ impl Tool for WriteTool {
         Box::pin(async move {
             let arguments: Arguments = serde_json::from_value(Value::Object(arguments)).map_err(|error| error.to_string())?;
             let absolute = paths::resolve(&arguments.path, &context.cwd);
-            let _turn = context.shared.mutations.lock(&absolute).await;
-            // An abort is only checked between steps: a write already started finishes, so the
-            // queue never lets the next change in while this one is still landing (write.ts:68-72).
-            let aborted = || context.cancel.is_cancelled().then(|| "Operation aborted".to_string());
-            if let Some(message) = aborted() {
-                return Err(message);
-            }
-            if let Some(parent) = absolute.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|error| paths::fs_error(&error, "mkdir", Some(parent)))?;
-            }
-            if let Some(message) = aborted() {
-                return Err(message);
-            }
-            paths::replace(&absolute, arguments.content.clone().into_bytes())
-                .await
-                .map_err(|error| paths::fs_error(&error, "open", Some(&absolute)))?;
-            if let Some(message) = aborted() {
-                return Err(message);
-            }
-            // We already have the written text. Snapshot it off-thread, without rereading the
-            // path, so large writes keep a change hash without making shell reads expensive.
-            let shared = context.shared.clone();
-            tokio::task::spawn_blocking(move || shared.seen.remember(&absolute, &arguments.content, "write")).await.map_err(|error| error.to_string())?;
-            Ok(ToolOutput { content: vec![Content::text(format!("Successfully wrote to {}", arguments.path))], details: None, is_error: false })
+            super::mutate(absolute, context, move |absolute, context, board| {
+                if context.cancel.is_cancelled() { return Err("Operation aborted".into()); }
+                if board && arguments.content.len() > crate::scratchpad::MAX_BYTES { return Err(format!("scratchpad exceeds {} bytes", crate::scratchpad::MAX_BYTES)); }
+                if let Some(parent) = absolute.parent() { std::fs::create_dir_all(parent).map_err(|error| paths::fs_error(&error, "mkdir", Some(parent)))?; }
+                if context.cancel.is_cancelled() { return Err("Operation aborted".into()); }
+                paths::replace(absolute, arguments.content.as_bytes()).map_err(|error| paths::fs_error(&error, "open", Some(absolute)))?;
+                context.shared.seen.remember(absolute, &arguments.content, "write");
+                Ok(ToolOutput { content: vec![Content::text(format!("Successfully wrote to {}", arguments.path))], details: board.then(|| json!({"scratchpad": crate::scratchpad::stamp(absolute, Some(&arguments.content)).ok()})), is_error: false })
+            }).await
         })
     }
 }

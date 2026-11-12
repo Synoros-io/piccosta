@@ -417,7 +417,7 @@ fn ledger_search(home: &Path, session: Option<&Path>, query: &str) -> String {
             if let crate::session::SessionEntry::Message { message: AgentMessage::User(user), .. } = entry {
                 let text = user.content.text();
                 if matches(&text) {
-                    found.push(format!("the user, {}: {text}", entry.base().timestamp));
+                    found.push(format!("{}, {}: {text}", user.origin.label(), entry.base().timestamp));
                 }
             }
         }
@@ -636,7 +636,7 @@ pub async fn watch(home: PathBuf, manager: tokio::sync::mpsc::WeakUnboundedSende
         let Some(_manager) = manager.upgrade() else { return };
         let Some(file) = pointer(&home) else { return };
         for (id, text) in news {
-            if let Err(error) = crate::runtime::deliver(&file, &id, &text) {
+            if let Err(error) = crate::runtime::deliver(&file, &id, &crate::message::UserMessage::new(&text, Vec::new(), crate::message::InputOrigin::LaneReport { session: id.split(':').nth(1).unwrap_or_default().into() })) {
                 eprintln!("piccosta manager: could not keep lane report: {error}");
                 return;
             }
@@ -759,7 +759,7 @@ fn ago(modified: std::time::SystemTime) -> String {
 fn message_line(message: &AgentMessage, limit: usize) -> Option<String> {
     let cut = |text: String| if text.chars().count() > limit { format!("{}…", text.chars().take(limit).collect::<String>()) } else { text };
     match message {
-        AgentMessage::User(user) => Some(format!("user: {}", cut(user.content.text()))),
+        AgentMessage::User(user) => Some(format!("{}: {}", user.origin.label(), cut(user.content.text()))),
         AgentMessage::Assistant(assistant) => {
             let mut parts = Vec::new();
             for block in &assistant.content {
@@ -841,11 +841,12 @@ impl SessionsTool {
     // step, else in a run of its own. Either way it's one of this manager's lanes from then on.
     // Sent off this thread, which may be a terminal UI's, since a stopped runtime holds a send up
     // by its wait. Output: what happened, for the reply.
-    async fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str) -> Result<String, String> {
+    async fn run(&self, file: &Path, cwd: &Path, message: &str, title: &str, sender: Option<&Path>) -> Result<String, String> {
         // A message opens a closed session again, from now: the lane's own run did it only as it
         // took the message, and the watch, looking in between, dropped the lane as closed by
         // someone else, never to hear its turns (newC's and Yao's managers, 2026-11-06).
-        let (to, cwd, message, log, agent_dir) = (file.to_path_buf(), cwd.to_path_buf(), message.to_string(), run_log(&self.home, file), self.agent_dir.clone());
+        let sender = sender.map(Path::to_path_buf);
+        let (to, cwd, message, log, agent_dir) = (file.to_path_buf(), cwd.to_path_buf(), crate::message::UserMessage::new(message, Vec::new(), crate::message::InputOrigin::frontend("sessions")), run_log(&self.home, file), self.agent_dir.clone());
         let (sent, heard, role) = tokio::task::spawn_blocking(move || {
             crate::session::set_closed(&agent_dir, &to, false);
             let mut index = crate::session::index::Index::open(&agent_dir);
@@ -854,7 +855,7 @@ impl SessionsTool {
             let role = session.as_ref().and_then(role);
             drop(session);
             index.save();
-            (crate::runtime::send(&to, &message, Some((&cwd, &log))), heard, role)
+            (crate::runtime::send(&to, &message, sender.as_deref(), Some((&cwd, &log))), heard, role)
         }).await.map_err(|error| error.to_string())?;
         // An advisor answers its manager by message, so it isn't a lane, and an advisor's lanes are
         // only the sessions it started: a message from it to a manager isn't followed.
@@ -1023,7 +1024,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     let started = fs::read_to_string(self.home.join(STARTED_FILE)).unwrap_or_default().lines().any(|line| Path::new(line) == summary.path);
                     match action {
                         "read" => {},
-                        "message" if role.is_some_and(|role| role != Role::Advisor) => return text(self.run(&summary.path, &summary.cwd, &format!("[{}, from {from}]\n{}", now_text(), need("message")?), &summary.title).await?),
+                        "message" if role.is_some_and(|role| role != Role::Advisor) => return text(self.run(&summary.path, &summary.cwd, &format!("[{}, from {from}]\n{}", now_text(), need("message")?), &summary.title, context.session_file.as_deref()).await?),
                         "message" | "close" if started => {},
                         "message" | "close" => return Err(format!("\"{}\" isn't a manager or a session you started.", summary.title)),
                         action => return Err(format!("No action \"{action}\" for an advisor: list, projects, read, start, message or close.")),
@@ -1068,7 +1069,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                         Some(message) => {
                             let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
                             let message = crate::session::delegation_message(context, string(&arguments, "discussed"), message)?;
-                            text(format!("{started} {}", self.run(&file, &dir, &message, &title).await?))
+                            text(format!("{started} {}", self.run(&file, &dir, &message, &title, context.session_file.as_deref()).await?))
                         }
                         None => {
                             take_lane(&self.home, &file, &name, None, String::new(), false);
@@ -1082,7 +1083,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     // Changes go in only while nothing runs it, before the message starts a run.
                     let configured = if changes { crate::runtime::when_idle(&summary.path, |session| self.configure(session, &arguments, false))? } else { None };
                     let note = configured.transpose()?.and_then(|(_, note)| note).map(|note| format!("{note}. "));
-                    text(format!("{}{}", note.unwrap_or_default(), self.run(&summary.path, &summary.cwd, need("message")?, &summary.title).await?))
+                    text(format!("{}{}", note.unwrap_or_default(), self.run(&summary.path, &summary.cwd, need("message")?, &summary.title, context.session_file.as_deref()).await?))
                 }
                 // Stop a lane's run, as Esc does: what it's running moves to the background and its
                 // turn stops; a run of its own then ends, and everything it started with it. One
@@ -1200,10 +1201,13 @@ impl Tool for ManagerTools {
     }
 }
 
+pub(crate) fn notify_command(settings: &crate::config::Settings) -> Vec<String> {
+    settings.get("manager.notifyCommand").and_then(Value::as_array).map(|words| words.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()).filter(|words| !words.is_empty()).unwrap_or_else(|| DEFAULT_NOTIFY.map(str::to_string).to_vec())
+}
+
 // The tools only managers get, its ledger among them.
 pub fn tools(agent_dir: &Path, settings: &crate::config::Settings, role: Role, cwd: &Path) -> Vec<Arc<dyn Tool>> {
-    let notify = settings.get("manager.notifyCommand").and_then(Value::as_array).map(|words| words.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()).filter(|words| !words.is_empty());
-    let notify = notify.unwrap_or_else(|| DEFAULT_NOTIFY.map(str::to_string).to_vec());
+    let notify = notify_command(settings);
     let home = home_for(agent_dir, role, cwd);
     let quota = quota(settings, settings.get("manager.askBeforePlanQuota").and_then(Value::as_bool).unwrap_or(true));
     let sessions: Arc<dyn Tool> = Arc::new(SessionsTool { agent_dir: agent_dir.to_path_buf(), home: home.clone(), quota, advising: role == Role::Advisor });
@@ -1225,12 +1229,6 @@ pub fn prompt(role: Role, cwd: &Path) -> String {
             format!("{ASSISTANT_ROLE}{named}\n\nYour memory: {memory}")
         }
     }
-}
-
-// A message from the user to a manager, saying so with the time, as its sessions tool says its
-// messages do.
-pub fn from_user(text: &str) -> String {
-    format!("[{}, from the user]\n{text}", now_text())
 }
 
 // --- The service ---

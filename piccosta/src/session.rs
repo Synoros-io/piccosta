@@ -19,7 +19,7 @@ pub mod index;
 use crate::clock;
 use crate::message::{
     to_model_messages, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, Content, CustomMessage, SystemSnapshot,
-    TextOrBlocks, Usage, UserMessage,
+    InputOrigin, TextOrBlocks, Usage, UserMessage,
 };
 use crate::provider::transcript::current_system_message;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,9 @@ pub(crate) fn user_sources<'a>(branch: &[&'a SessionEntry]) -> Vec<UserSource<'a
     for entry in branch {
         match *entry {
             SessionEntry::Custom { base, custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => {
-                if let (Some(text), Some(id)) = (data["text"].as_str(), data["delivery_id"].as_str()) {
+                let text = data["text"].as_str().map(str::to_string).or_else(|| serde_json::from_value::<UserMessage>(data["message"].clone()).ok()
+                    .filter(|message| message.origin.is_unknown()).map(|message| message.content.text()));
+                if let (Some(text), Some(id)) = (text, data["delivery_id"].as_str()) {
                     let kind = if id.starts_with("checkin:") || id.starts_with("schedule:") { "check-in replay" }
                         else if id.starts_with("lane:") || id.starts_with("run:") { "lane report" } else { "session delivery" };
                     pending.push((text, kind, clock::ms_from_iso(&base.timestamp).unwrap_or(0)));
@@ -61,12 +63,15 @@ pub(crate) fn user_sources<'a>(branch: &[&'a SessionEntry]) -> Vec<UserSource<'a
             SessionEntry::Message { message: AgentMessage::User(user), .. } => {
                 let text = user.content.text();
                 // A native timer already has its source; it mustn't consume an older queued receipt.
-                let (kind, recorded_at) = match &user.timer {
-                    Some(_) => ("user timer replay", user.timestamp),
-                    None => match pending.iter().position(|(queued, _, _)| *queued == text) {
+                let (kind, recorded_at) = if !user.origin.is_unknown() {
+                    (user.origin.label(), user.timestamp)
+                } else if user.timer.is_some() {
+                    ("user timer replay", user.timestamp)
+                } else {
+                    match pending.iter().position(|(queued, _, _)| *queued == text) {
                         Some(at) => { let (_, kind, time) = pending.remove(at); (kind, time) }
-                        None => ("user", user.timestamp),
-                    },
+                        None => ("unknown legacy input", user.timestamp),
+                    }
                 };
                 sources.push(UserSource { id: entry.id(), message: user, kind, recorded_at });
             }
@@ -83,8 +88,8 @@ fn discussion(session: &Session, call: &str, start: Option<&str>) -> String {
     let end = branch.iter().rposition(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::Assistant(reply), .. } if reply.content.iter().any(|block| matches!(block, Content::ToolCall { id, .. } if id == call)))).unwrap_or(branch.len());
     let mut said = Vec::new();
     for entry in &branch[..end] {
-        let (user, text) = match entry {
-            SessionEntry::Message { message: AgentMessage::User(user), .. } => (true, match &user.content {
+        let (user, label, text) = match entry {
+            SessionEntry::Message { message: AgentMessage::User(user), .. } => (true, user.origin.label(), match &user.content {
                 TextOrBlocks::Text(text) => text.clone(),
                 TextOrBlocks::Blocks(blocks) => blocks.iter().filter_map(|block| match block {
                     Content::Text { text, .. } => Some(text.as_str()),
@@ -92,18 +97,18 @@ fn discussion(session: &Session, call: &str, start: Option<&str>) -> String {
                     _ => None,
                 }).collect::<Vec<_>>().join("\n"),
             }),
-            SessionEntry::Message { message: AgentMessage::Assistant(reply), .. } if reply.content.iter().any(|block| matches!(block, Content::Text { .. })) => (false, reply.content.iter().filter_map(|block| match block {
+            SessionEntry::Message { message: AgentMessage::Assistant(reply), .. } if reply.content.iter().any(|block| matches!(block, Content::Text { .. })) => (false, "Assistant", reply.content.iter().filter_map(|block| match block {
                 Content::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             }).collect::<Vec<_>>().join("\n")),
             _ => continue,
         };
-        said.push((user, text));
+        said.push((user, label, text));
     }
     let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let last_user = said.iter().rposition(|(user, _)| *user).unwrap_or(said.len());
-    let first = start.map(normalized).filter(|start| !start.is_empty()).and_then(|start| said.iter().rposition(|(user, text)| *user && normalized(text).starts_with(&start))).unwrap_or(last_user);
-    let mut said: Vec<_> = said.into_iter().skip(first).map(|(user, text)| (user, text.chars().count(), format!("{}: {text}\n\n", if user { "User" } else { "Assistant" }))).collect();
+    let last_user = said.iter().rposition(|(user, _, _)| *user).unwrap_or(said.len());
+    let first = start.map(normalized).filter(|start| !start.is_empty()).and_then(|start| said.iter().rposition(|(user, _, text)| *user && normalized(text).starts_with(&start))).unwrap_or(last_user);
+    let mut said: Vec<_> = said.into_iter().skip(first).map(|(user, label, text)| (user, text.chars().count(), format!("{label}: {text}\n\n"))).collect();
     let mut chars: usize = said.iter().map(|(_, _, text)| text.chars().count()).sum();
     let (mut assistants, mut users, mut assistant_chars, mut user_chars) = (0, 0, 0, 0);
     loop {
@@ -147,6 +152,10 @@ pub struct SessionHeader {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
     pub id: String,
+    // A random notice namespace, stable across reopen/compaction. Legacy headers have none:
+    // enrolling them would change their leading prompt. Same-user file readers can learn it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_token: Option<String>,
     pub timestamp: String,
     pub cwd: String,
     // The session this one was forked from, as a file path.
@@ -246,13 +255,15 @@ pub enum SessionEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
     },
-    // A message a feature adds to the model's context, as a user message.
+    // A feature's message, projected as attributed harness data, not a user instruction.
     CustomMessage {
         #[serde(flatten)]
         base: EntryBase,
         #[serde(rename = "customType")]
         custom_type: String,
         content: Option<TextOrBlocks>,
+        #[serde(default, skip_serializing_if = "InputOrigin::is_unknown")]
+        origin: InputOrigin,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
         display: bool,
@@ -682,6 +693,7 @@ impl Session {
                 kind: "session".to_string(),
                 version: Some(CURRENT_SESSION_VERSION),
                 id,
+                notice_token: Some(uuid::Uuid::new_v4().to_string()),
                 timestamp,
                 cwd: cwd.to_string_lossy().into_owned(),
                 parent_session: None,
@@ -835,14 +847,15 @@ impl Session {
         self.append(SessionEntry::Message { base, message })
     }
 
-    // Append a message a feature sends (a background job's finish notice, say) as a custom_message
-    // entry; it reaches the model as a user message (agent-session.ts:2396).
+    // Keep a feature's message (a job report, say) in pi's custom_message entry shape. Projection
+    // attributes it separately from the user's words.
     pub fn append_custom_message(&mut self, message: &CustomMessage) -> io::Result<String> {
         let base = self.next_base();
         self.append(SessionEntry::CustomMessage {
             base,
             custom_type: message.custom_type.clone(),
             content: Some(message.content.clone()),
+            origin: message.origin.clone(),
             details: message.details.clone(),
             display: message.display,
         })
@@ -902,11 +915,6 @@ impl Session {
         Ok(())
     }
 
-    // Queue a message for the session's next turn (QUEUED_TYPE).
-    pub fn queue(&mut self, text: &str) -> io::Result<String> {
-        self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text })))
-    }
-
     // Keep the whole message: a job report has details, and a prompt can have images.
     pub fn queue_message(&mut self, message: AgentMessage) -> io::Result<String> {
         self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": message })))
@@ -932,9 +940,9 @@ impl Session {
 
     // A delivery keeps its identity after the queue is consumed, so a sender can retry after
     // losing the acknowledgement without starting another turn for the same occurrence.
-    pub fn queue_delivery(&mut self, id: &str, text: &str) -> io::Result<()> {
+    pub fn queue_delivery(&mut self, id: &str, message: UserMessage) -> io::Result<()> {
         if !self.has_delivery(id) {
-            self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "text": text, "delivery_id": id })))?;
+            self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": AgentMessage::User(message), "delivery_id": id })))?;
         }
         Ok(())
     }
@@ -950,7 +958,7 @@ impl Session {
         }).flat_map(|data| {
             let message = data.get("message").and_then(|message| serde_json::from_value(message.clone()).ok());
             let texts = data.get("text").into_iter().chain(data["texts"].as_array().into_iter().flatten());
-            message.into_iter().chain(texts.filter_map(|text| text.as_str().map(crate::agent::user_message))).collect::<Vec<_>>()
+            message.into_iter().chain(texts.filter_map(|text| text.as_str().map(|text| AgentMessage::User(UserMessage::new(text, Vec::new(), InputOrigin::Unknown))))).collect::<Vec<_>>()
         }).collect()
     }
 
@@ -1004,6 +1012,8 @@ impl Session {
     // conversation, as pi does; otherwise on its first message.
     pub fn branch(&self, leaf: Option<&str>, dir: &Path) -> io::Result<Session> {
         let mut branched = Session::create(Path::new(&self.header.cwd), Some(dir));
+        // The namespace belongs to the copied history; rekeying it would discard its cache.
+        branched.header.notice_token = self.header.notice_token.clone();
         branched.header.parent_session = self.file.as_ref().map(|path| path.to_string_lossy().into_owned());
         let mut parent: Option<String> = None;
         let mut label_replacements = HashMap::new();
@@ -1092,9 +1102,7 @@ impl Session {
                     match edits.get(source.id()) {
                         None => messages,
                         Some(None) => Vec::new(),
-                        Some(Some(replacement)) => {
-                            messages.into_iter().map(|message| apply_replacement(message, replacement)).collect()
-                        }
+                        Some(Some(replacement)) => messages.into_iter().map(|message| apply_replacement(message, replacement)).collect(),
                     }
                 };
                 ProjectedEntry { source, messages }
@@ -1125,7 +1133,7 @@ impl Session {
         usage: Option<Usage>,
     ) -> io::Result<String> {
         let base = self.next_base();
-        let model_messages = to_model_messages(&self.context().messages);
+        let model_messages = to_model_messages(&self.context().messages, self.header.notice_token.as_deref());
         let system_message = current_system_message(&model_messages).map(|mut system| {
             system.timestamp = clock::ms_from_iso(&base.timestamp).unwrap_or(0);
             SystemSnapshot::System(system)
@@ -1162,10 +1170,14 @@ pub struct ProjectedEntry<'a> {
 pub fn entry_context_messages(entry: &SessionEntry) -> Vec<AgentMessage> {
     let ms_of = |timestamp: &str| clock::ms_from_iso(timestamp).unwrap_or(0);
     match entry {
+        SessionEntry::Custom { base, custom_type, data: Some(data) } if custom_type == crate::intent_review::RECORD => vec![AgentMessage::Custom(CustomMessage {
+            custom_type: custom_type.clone(), origin: InputOrigin::Harness { name: custom_type.clone() }, content: TextOrBlocks::Text(crate::intent_review::line(data)), display: true, details: Some(data.clone()), timestamp: ms_of(&base.timestamp),
+        })],
         SessionEntry::Message { message, .. } => vec![message.clone()],
-        SessionEntry::CustomMessage { base, custom_type, content, details, display } => {
+        SessionEntry::CustomMessage { base, custom_type, content, origin, details, display } => {
             vec![AgentMessage::Custom(CustomMessage {
                 custom_type: custom_type.clone(),
+                origin: origin.clone(),
                 content: content.clone().unwrap_or(TextOrBlocks::Blocks(Vec::new())),
                 display: *display,
                 details: details.clone(),

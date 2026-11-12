@@ -144,7 +144,8 @@ impl App {
         let result = match request.value["do"].as_str() {
             Some("status") => Ok(json!({
                 "pid": std::process::id(), "active": self.active, "focus": self.focus,
-                "panes": self.panes.iter().map(|pane| self.slots[pane.slot].path.clone()).collect::<Vec<_>>(),
+                "panes": self.panes.iter().map(|pane| match pane.target { super::Target::Session(slot) => self.slots[slot].path.clone(), super::Target::Scratchpad(_) => None }).collect::<Vec<_>>(),
+                "scratchpads": self.panes.iter().filter_map(|pane| match pane.target { super::Target::Scratchpad(board) => Some(self.scratchpads[board].path.clone()), _ => None }).collect::<Vec<_>>(),
                 "open": self.slots.iter().filter(|slot| slot.opened).map(|slot| json!({"id": slot.id, "file": slot.path, "title": slot.title, "working": slot.busy() || slot.working_elsewhere})).collect::<Vec<_>>(),
                 "restarting": self.restart_waiting
             })),
