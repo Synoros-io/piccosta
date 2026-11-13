@@ -539,19 +539,20 @@ impl Agent {
     // every request repeats it byte for byte: any change to it rewrites the provider's whole prompt
     // cache (a new build's wording did that to every running session on its next turn, 11.9M tokens
     // written in a day, 2026-11-01). It's built again only when what it's made from changes: the
-    // session has none yet; it was compacted or put on another model since (each starts a new cache
-    // anyway); or its AGENTS.md files now differ from the instructions its prompt holds, compared
-    // file text to file text (prompt::instructions), so piccosta's wording around them doesn't
+    // session has none yet; it was compacted or put on another model with no assistant reply since
+    // (the first request already checks it, even when identical); or its AGENTS.md files now differ,
+    // compared file text to file text (prompt::instructions), so piccosta's wording around them doesn't
     // count. Until then a new build's wording, a tool's description or a changed scale wait.
     // Output: the system message to add, None when nothing differs.
     async fn prompt_update(&mut self) -> Option<SystemMessage> {
         let event = self.session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
-            SessionEntry::Message { message: AgentMessage::System(_), .. } => Some(false),
+            SessionEntry::Message { message: AgentMessage::System(_) | AgentMessage::Assistant(_), .. } => Some(false),
             SessionEntry::Compaction { .. } | SessionEntry::ModelChange { .. } => Some(true),
             _ => None,
         });
         let messages = crate::message::to_model_messages(&self.session.context().messages, self.session.header().notice_token.as_deref());
         let current = transcript::current_system_message(&messages);
+        let missing_prompt = current.is_none();
         // Copies and reopenings keep the prompt's namespace, so ordinary deliveries leave this
         // equal. Reconcile only a missing or obsolete notice rule.
         let notice_changed = current.as_ref().and_then(|system| system.sections.as_ref()?.get("notice_provenance")?.as_ref()) != self.config.sections.get("notice_provenance");
@@ -565,7 +566,7 @@ impl Agent {
             // Each file's part with its closing tag, so a file cut short isn't found inside the old one.
             crate::prompt::instructions(project.as_deref()).split_inclusive(crate::prompt::FILE_END).any(|file| !held.contains(file))
         });
-        if !event.is_none_or(|event| event) && !edited && !notice_changed {
+        if !missing_prompt && !event.is_none_or(|event| event) && !edited && !notice_changed {
             return None;
         }
         if let Some(project) = now {

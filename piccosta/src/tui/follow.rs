@@ -210,19 +210,30 @@ impl Worker {
             }
         }
         projects.extend(summaries.iter().map(|summary| summary.cwd.clone()));
-        let managers = if discover || !projects.is_empty() { managers(&host, projects) } else { Vec::new() };
+        let managers = if discover || !projects.is_empty() { managers(&host, projects) } else { Managers::default() };
         Scan { statuses, models, modified, tickets, closed, closed_before, summaries, managers, agents, index }
     }
 }
 
-pub(super) type Managers = Vec<(PathBuf, PathBuf, String, bool)>;
+#[derive(Default)]
+pub(super) struct Managers {
+    pub rows: Vec<(PathBuf, PathBuf, String, bool)>,
+    pub projects: HashMap<PathBuf, PathBuf>,
+}
 pub(super) fn managers(host: &Host, projects: BTreeSet<PathBuf>) -> Managers {
-    let managers = projects.into_iter().filter_map(|cwd| crate::manager::project_manager(&host.agent_dir, &cwd).map(|path| (cwd, path, crate::manager::PROJECT_NAME.to_string())))
+    let (mut seen, mut grouping) = (BTreeSet::new(), HashMap::new());
+    let managers = projects.iter().filter_map(|cwd| {
+        let managed = crate::manager::managed_project(&host.agent_dir, cwd);
+        grouping.insert(cwd.clone(), managed.as_ref().map_or(cwd.as_path(), |(folder, _)| folder).to_path_buf());
+        managed
+    })
+        .filter(|(cwd, _)| seen.insert(cwd.to_path_buf())).map(|(cwd, path)| (cwd.to_path_buf(), path, crate::manager::PROJECT_NAME.to_string()))
         .chain(crate::manager::session_file(&host.agent_dir).map(|path| (crate::manager::home(&host.agent_dir), path, crate::manager::assistant_name(&host.agent_dir))));
-    managers.flat_map(|(cwd, path, title)| {
+    let rows = managers.flat_map(|(cwd, path, title)| {
         let advisor = crate::manager::advisor(&host.agent_dir, &cwd).map(|file| (cwd.clone(), file, crate::manager::ADVISOR_NAME.to_string(), true));
         [Some((cwd, path, title, false)), advisor]
-    }).flatten().map(|(cwd, path, title, advisor)| (cwd, crate::tools::paths::canonical(&path), title, advisor)).collect()
+    }).flatten().map(|(cwd, path, title, advisor)| (cwd, crate::tools::paths::canonical(&path), title, advisor)).collect();
+    Managers { rows, projects: grouping }
 }
 
 pub(super) struct ScanRequest {

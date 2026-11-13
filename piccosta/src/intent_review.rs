@@ -7,12 +7,11 @@ use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 pub const RECORD: &str = "piccosta-intent-review";
-const ATTEMPT: &str = "piccosta-intent-review-attempt";
+pub(crate) const ATTEMPT: &str = "piccosta-intent-review-attempt";
 pub const ADVISORY: &str = "piccosta-intent-advisory";
-// The user's chosen cooldown; the other defaults bound one audit to roughly 24k input tokens, a short
-// verdict. DeepSeek-low exhausted 4096 and 8192 reasoning tokens on a 31k-token packet
-// (2026-11-11); these are attempt caps, not a completion guarantee. Settings override them.
-const MINUTES: u64 = 30;
+// Defaults bound one audit to roughly 24k input tokens and a short verdict. DeepSeek-low exhausted
+// 4096 and 8192 reasoning tokens on a 31k-token packet (2026-11-11); these are attempt caps,
+// not a completion guarantee. Settings override them.
 const EVIDENCE_CHARS: usize = 96_000;
 const OUTPUT_TOKENS: u64 = 8192;
 const SECONDS: u64 = 180;
@@ -27,48 +26,17 @@ const PROMPT: &str = r#"Audit whether this agent follows the user's general spir
 Return JSON only: {"verdict":"on_track|drifted|incomplete","summary":"short explanation","findings":[{"action":{"session":"id","id":"entry","quote":"exact observed action excerpt"},"instruction":{"session":"id","id":"entry","at":"exact supplied date","quote":"exact original user excerpt"},"reason":"why this action or omission drifts"}]}. Drift requires at least one evidence-linked finding; include distinct material problems, not several copies of one issue. Copy short contiguous excerpts exactly, without ellipses, splicing or paraphrase; copy the supplied date string. Do not invent permissions, facts, dates or quotes. If at least one specific drift is supported by the visible action and original instruction, return drifted even when other evidence was omitted; disclose those limits. Return incomplete only when no supported verdict can be made. Never infer that an omitted action did not happen. Repeated visible status-only turns can demonstrate drift even without the full history; a partial packet cannot establish that all work is on_track."#;
 
 fn number(settings: &Settings, key: &str, default: u64) -> u64 { settings.get(&format!("intentReview.{key}")).and_then(Value::as_u64).unwrap_or(default) }
-fn enabled(settings: &Settings, role: Option<&str>) -> bool {
-    if settings.get("intentReview").and_then(Value::as_bool) == Some(false) || settings.get("intentReview.enabled").and_then(Value::as_bool) == Some(false) { return false; }
-    let Some(role) = role else { return false };
-    settings.get("intentReview.roles").and_then(Value::as_array).is_none_or(|roles| roles.iter().any(|name| name == role || role == "project" && name == "manager"))
-}
-
-pub fn unattended(message: &AgentMessage) -> bool {
-    match message {
-        AgentMessage::User(user) => !user.is_empty() && !matches!(user.origin, InputOrigin::Human { .. }) && !matches!(user.origin, InputOrigin::Harness { ref name } if name == ADVISORY),
-        // Team coordination and other internal harness bookkeeping aren't unattended ingress.
-        AgentMessage::Custom(custom) => custom.origin.is_notice() && !matches!(custom.origin, InputOrigin::Harness { .. }),
-        _ => false,
-    }
-}
-
 #[derive(Default)]
 pub struct State {
     task: Option<tokio::task::JoinHandle<Value>>,
     cancel: CancellationToken,
     attempt: Option<Rc<RefCell<Value>>>,
-    previous: Option<i64>,
-    role: Option<&'static str>,
-    hydration_error: Option<String>,
 }
 impl Drop for State { fn drop(&mut self) { self.cancel.cancel(); } }
 impl State {
-    // Hydrate once off the LocalSet. A read failure cannot authorize a fresh paid request.
-    pub async fn load(file: Option<&Path>) -> Self {
-        let Some(file) = file.map(Path::to_path_buf) else { return Self::default() };
-        let loaded = tokio::task::spawn_blocking(move || {
-            let session = Session::read(&file).map_err(|error| error.to_string())?;
-            let role = match crate::manager::role(&session) { Some(crate::manager::Role::Assistant) => Some("assistant"), Some(crate::manager::Role::Project) => Some("project"), Some(crate::manager::Role::Advisor) => Some("advisor"), None => None };
-            let previous = session.path_to_leaf().into_iter().rev().find_map(|entry| match entry {
-                SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == ATTEMPT && data["session"] == session.id() => data["at"].as_i64(), _ => None,
-            });
-            Ok::<_,String>((previous, role))
-        }).await.map_err(|error| error.to_string()).and_then(|result| result);
-        let mut state = Self::default();
-        match loaded { Ok((previous, role)) => { state.previous = previous; state.role = role; }, Err(error) => { state.hydration_error = Some(error); state.role = Some("unknown"); } }
-        state
-    }
     pub fn running(&self) -> bool { self.task.is_some() }
+    pub fn cancel(&self) { if self.running() { self.cancel.cancel(); } }
+    pub fn cancellation(&self) -> Option<CancellationToken> { self.running().then(|| self.cancel.clone()) }
     pub async fn stop(&mut self) -> Option<Value> {
         if !self.running() { return None; }
         self.cancel.cancel();
@@ -79,35 +47,50 @@ impl State {
             let mut data = self.attempt.as_ref().unwrap().borrow().clone(); data["verdict"] = json!("incomplete"); data["summary"] = json!(error.to_string()); data
         }), None => std::future::pending().await };
         self.task = None;
+        self.cancel = CancellationToken::new();
         value
     }
-    // Called only after perform, from actual admitted-input events, never a frontend flag.
-    // Persist before polling; the runtime's cooldown makes throttled turns constant-time.
-    pub fn start(&mut self, host: &Host, agent: &mut Agent) -> Result<(), String> {
-        if self.running() || agent.model().interactive_only || !enabled(&host.settings, self.role) { return Ok(()); }
-        let now = crate::clock::now_ms();
-        if self.previous.is_some_and(|at| now.saturating_sub(at) < Duration::from_secs(number(&host.settings, "minutes", MINUTES).saturating_mul(60)).as_millis() as i64) { return Ok(()); }
-        let Some(file) = agent.session.file().map(Path::to_path_buf) else { return Ok(()) };
-        let Some(end) = agent.session.leaf_id().map(str::to_string) else { return Ok(()) };
-        let request = uuid::Uuid::new_v4().to_string();
+    // Input: an authenticated /align occurrence on an idle owner. Persist its receipt before
+    // starting; retries count this attempt once, even if the owner never answers or completes it.
+    pub fn start(&mut self, host: &Host, agent: &mut Agent, occurrence: &str) -> Result<crate::runtime::TimerOutcome, String> {
+        use crate::runtime::TimerOutcome;
+        if self.running() { return Ok(TimerOutcome::Deferred); }
+        if agent.model().interactive_only { return Ok(TimerOutcome::SkippedRefused); }
+        let Some(file) = agent.session.file().map(Path::to_path_buf) else { return Ok(TimerOutcome::SkippedUnchanged) };
+        let Some(end) = agent.session.leaf_id().map(str::to_string) else { return Ok(TimerOutcome::SkippedUnchanged) };
+        let branch = agent.session.path_to_leaf();
+        let covered = checkpoint(&branch, agent.session.id());
+        let start = covered.and_then(|id| branch.iter().position(|entry| entry.id() == id)).map_or(0, |at| at + 1);
+        if !branch[start..].iter().any(|entry| action(entry, 0).is_some_and(|text| !text.is_empty())) && crate::session::user_sources(&branch[start..]).is_empty() { return Ok(TimerOutcome::SkippedUnchanged); }
         let name = host.settings.get("intentReview.model").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{}/{}",agent.model().provider,agent.model().id));
-        let (model, level) = crate::scale::split(&name);
-        let provider = model.split('/').next().unwrap_or_default();
+        let (identity, level) = crate::scale::split(&name);
+        // Refusals and slot contention precede admission, so neither spends the user's count.
+        let lease = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(host.agent_dir.join("intent-review.lock")).map_err(|error| error.to_string())?;
+        if lease.try_lock().is_err() { return Ok(TimerOutcome::Deferred); }
+        // Resolve once, without a scale or fallback. An unavailable selection still records an
+        // incomplete attempt; only a known interactive-only restriction refuses admission.
+        let resolved = (|| {
+            if host.settings.get("intentReview.model").is_some_and(|value| !value.is_string()) { return Err("intentReview.model must be provider/id[:level]".into()); }
+            if !identity.contains('/') { return Err("intentReview.model must name its provider/id explicitly".into()); }
+            let registry = crate::model::ModelRegistry::load(&host.agent_dir.join("models.json"))?;
+            Ok((registry.resolve(identity)?.clone(), registry))
+        })();
+        if resolved.as_ref().is_ok_and(|(model, _)| model.interactive_only) { return Ok(TimerOutcome::SkippedRefused); }
+        let request = uuid::Uuid::new_v4().to_string();
+        let provider = identity.split('/').next().unwrap_or_default();
         let plan = crate::auth::account(&provider.to_ascii_lowercase()).map_or("per-token", |account| account.plan_name);
-        let attempt = json!({"session":agent.session.id(),"through":end,"request":request,"at":now,"model":model,"provider":provider,"thinking":level.unwrap_or("low"),"plan":plan,"requestSent":false,"usage":Usage::default()});
+        let attempt = json!({"session":agent.session.id(),"through":end,"occurrence":occurrence,"request":request,"at":crate::clock::now_ms(),"model":identity,"provider":provider,"thinking":level.unwrap_or("low"),"plan":plan,"requestSent":false,"usage":Usage::default()});
         agent.record_custom(ATTEMPT, attempt.clone())?;
-        self.previous = Some(now);
         let progress = Rc::new(RefCell::new(attempt));
         self.attempt = Some(progress.clone());
-        let (settings, dir, hydration_error) = (host.settings.clone(), host.agent_dir.clone(), self.hydration_error.clone());
+        let (settings, dir) = (host.settings.clone(), host.agent_dir.clone());
         let cancel = self.cancel.child_token();
         self.task = Some(tokio::task::spawn_local(async move {
             let output = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err("owner closed before the review completed".into()),
                 result = tokio::time::timeout(Duration::from_secs(number(&settings,"seconds",SECONDS)), async {
-                    if let Some(error) = hydration_error { return Err(format!("review cooldown unavailable: {error}")); }
-                    audit(&dir, &file, &end, &settings, &progress, cancel.clone()).await
+                    audit(&dir, &file, &end, &settings, &progress, cancel.clone(), (resolved, lease)).await
                 }) => result.unwrap_or_else(|_| Err("intent review deadline expired".into())),
             };
             cancel.cancel();
@@ -120,8 +103,14 @@ impl State {
             }
             result
         }));
-        Ok(())
+        Ok(TimerOutcome::Delivered)
     }
+}
+
+fn checkpoint<'a>(branch: &[&'a SessionEntry], session: &str) -> Option<&'a str> {
+    branch.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == RECORD && data["session"] == session => data["coveredThrough"].as_str(), _ => None,
+    })
 }
 
 fn clipped(text: &str, limit: usize) -> String { text.chars().take(limit).collect() }
@@ -146,10 +135,8 @@ fn packet(dir: &Path, file: &Path, end: &str, settings: &Settings) -> Result<Val
     if session.entry(end).is_none() { return Err("captured review end is missing".into()); }
     let branch = session.path_to(Some(end));
     let cutoff = branch.last().map(|entry| entry.base().timestamp.clone()).unwrap_or_default();
-    let checkpoint = branch.iter().rev().find_map(|entry| match entry {
-        SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == RECORD && data["session"] == session.id() => data["coveredThrough"].as_str().map(str::to_string), _ => None,
-    });
-    let start = checkpoint.as_deref().and_then(|id| branch.iter().position(|entry| entry.id() == id)).map_or(0, |at| at.saturating_sub(number(settings, "overlap", OVERLAP as u64) as usize));
+    let checkpoint = checkpoint(&branch, session.id());
+    let start = checkpoint.and_then(|id| branch.iter().position(|entry| entry.id() == id)).map_or(0, |at| at.saturating_sub(number(settings, "overlap", OVERLAP as u64) as usize));
     let mut users = Vec::new();
     let mut manager_source = None;
     let mut uncertainty = Vec::new();
@@ -230,24 +217,14 @@ fn validate(verdict: &Value, evidence: &Value) -> Result<(), String> {
     Ok(())
 }
 
-async fn audit(dir: &Path, file: &Path, end: &str, settings: &Settings, progress: &RefCell<Value>, cancel: CancellationToken) -> Result<Value, String> {
+async fn audit(dir: &Path, file: &Path, end: &str, settings: &Settings, progress: &RefCell<Value>, cancel: CancellationToken, admitted: (Result<(crate::model::Model, crate::model::ModelRegistry), String>, std::fs::File)) -> Result<Value, String> {
+    let (resolved, _lease) = admitted;
+    let (mut model, registry) = resolved?;
+    if !matches!(model.api.as_str(), "openai-completions" | "openai-responses" | "openai-codex-responses" | "anthropic-messages" | "google-generative-ai" | crate::provider::claude::PROVIDER) { return Err("resolved review model cannot provide an unattended tool-less audit".into()); }
+    model.max_tokens = model.max_tokens.min(number(settings, "outputTokens", OUTPUT_TOKENS)).max(1);
     let cancel = cancel.child_token();
     let (directory, path, through, configured) = (dir.to_path_buf(), file.to_path_buf(), end.to_string(), settings.clone());
-    let (evidence, registry, _lease) = tokio::task::spawn_blocking(move || {
-        let lease = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(directory.join("intent-review.lock")).map_err(|error| error.to_string())?;
-        lease.try_lock().map_err(|error| format!("another intent review holds the audit slot: {error}"))?;
-        let registry = crate::model::ModelRegistry::load(&directory.join("models.json"))?;
-        Ok::<_,String>((packet(&directory, &path, &through, &configured)?, registry, lease))
-    }).await.map_err(|error| error.to_string())??;
-    if settings.get("intentReview.model").is_some_and(|value| !value.is_string()) { return Err("intentReview.model must be provider/id[:level]".into()); }
-    let identity = progress.borrow()["model"].as_str().unwrap_or_default().to_string();
-    if !identity.contains('/') { return Err("intentReview.model must name its provider/id explicitly".into()); }
-    // The user chose this session's plan, or explicitly named another. Never consult the scale,
-    // substitute an available model, or fall back after an auth/provider failure. Resolve it now
-    // so a restriction set since the target opened is still enforced.
-    let mut model = registry.resolve(&identity)?.clone();
-    if model.interactive_only || !matches!(model.api.as_str(), "openai-completions" | "openai-responses" | "openai-codex-responses" | "anthropic-messages" | "google-generative-ai" | crate::provider::claude::PROVIDER) { return Err("resolved review model cannot provide an unattended tool-less audit".into()); }
-    model.max_tokens = model.max_tokens.min(number(settings, "outputTokens", OUTPUT_TOKENS)).max(1);
+    let evidence = tokio::task::spawn_blocking(move || packet(&directory, &path, &through, &configured)).await.map_err(|error| error.to_string())??;
     // These APIs cap total generation, reasoning included. Codex and the Claude bridge expose no
     // token cap: low by default (or the user's explicit :level), the one deadline and the size
     // backstop bound the attempt instead. They remain usable; this isn't a hard spend guarantee.

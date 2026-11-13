@@ -49,7 +49,7 @@ Sliding scale : critical, general, review, reading code, bug hunting, web search
 - Each manager has an append-only ledger (older halves archived monthly, `ledger search`); the assistant also keeps a short memory (`ledger remember`, `forget`).
 - Managers are told to keep to their project and to ask before spending your Claude or Codex plan.
 - `/advisor`: a session that advises the pane's manager (or the project's) on direction and research; you can talk to both. Great for a Fable/Astra type research advisor
-- Intent reviewer: after turns you didn't start (check-ins, reports, timers, other agents), a fresh one-shot review checks the agent against your own dated words and notifies you on drift; it runs on the session's own model and plan (`intentReview` settings: on/off, roles, minutes, model).
+- Intent reviewer (TUI): `/align <interval> [count]` schedules reviews against your dated instructions on the session's own model and plan, notifying you on drift; busy reviews defer, unchanged/offline skips cost no count; `/align` lists, `/align off [id]` cancels future reviews, Esc stops a running one. Nothing runs without your timer; `/review` remains code review.
 
 ### Pairs and trios
 
@@ -259,6 +259,7 @@ Files live in `$PICCOSTA_AGENT_DIR`, else `$XDG_DATA_HOME/piccosta/agent`, else 
 - `web.fetch.maxSizeMB` (5): largest page fetched, PDFs aside.
 - `usage.refreshSeconds` (300): how often plan usage is polled.
 - `scratchpad.path`, `scratchpad.sharedAcrossWorktrees`: where the scratchpad lives (default: one per folder, outside the repo).
+- `intentReview.model` (`provider/id[:level]`): explicit review override; otherwise the session's own model at low. Attempt bounds: `maxChars` (96000), `outputTokens` (8192), `seconds` (180), `outputChars` (65536), `overlap` (12), `outcomeChars` (2048), all under `intentReview`; scheduling is only `/align`.
 - `models.json` `compat.reasoningReplayField`: the field a model's thinking is sent back in.
 - `clientId` and `tokenUrl` in the `openai-codex` entry of `login/auth.json`: replace OpenAI's refresh client and endpoint.
 

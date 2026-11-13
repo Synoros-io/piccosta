@@ -116,6 +116,7 @@ enum Update {
     // A delayed timer report belongs to the captured session, not whichever pane has focus now.
     TimerReport(PathBuf, String),
     Deleted(PathBuf, Result<(), String>),
+    Closed(std::sync::Weak<()>, Result<(), String>),
     // /assistant's start, done: what it did, if anything; the assistant is shown when it's there.
     Assistant(Option<String>),
     // A tool's per-call question. Dropping its answer (Esc, quit) refuses it.
@@ -130,7 +131,7 @@ enum Update {
     ScratchEdit(usize, std::sync::Weak<()>, Result<(), String>),
     ScratchPath(PathBuf, PathBuf, bool),
     Followed(std::sync::Weak<()>, Box<Result<Option<follow::Followed>, String>>),
-    Awoken(std::sync::Weak<()>, Box<Result<(crate::host::Prepared, follow::Followed), String>>),
+    Awoken(std::sync::Weak<()>, bool, Box<Result<(crate::host::Prepared, follow::Followed), String>>),
     Nothing,
     Asked(bool, Box<Update>),
     // How a message from the slot's editor to a session not run here went, and its text as typed.
@@ -206,6 +207,8 @@ struct Slot {
     incarnation: Arc<()>,
     follow_pending: bool,
     opening: bool,
+    closing: bool,
+    sending: usize,
     restored: bool,
     // Kept in this UI until the user closes it, whether its agent runs or its file opens.
     opened: bool,
@@ -275,6 +278,8 @@ impl Slot {
             incarnation: Arc::new(()),
             follow_pending: false,
             opening: false,
+            closing: false,
+            sending: 0,
             restored: false,
             opened: false,
             shared: None,
@@ -306,7 +311,7 @@ impl Slot {
     }
 
     fn busy(&self) -> bool {
-        self.state != State::Idle
+        self.closing || self.sending != 0 || self.state != State::Idle
     }
 
     // Open here or run elsewhere, so its agents are looked for.
@@ -397,6 +402,8 @@ struct App {
     scanning: bool,
     runtime_scan_due: bool,
     listing_tickets: [Arc<()>; 2],
+    // Grouping survives a manager's row being closed; only the worker reads manager pointers.
+    projects: HashMap<PathBuf, PathBuf>,
     // A cleared draft isn't delivered until its asker result has been applied (sent).
     sending: usize,
     // Managers open here that failed to start on their own: their file's mtime then, and when. Tried
@@ -593,6 +600,7 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         scanning: false,
         runtime_scan_due: false,
         listing_tickets: [Arc::new(()), Arc::new(())],
+        projects: HashMap::new(),
         sending: 0,
         sender,
         updates,
@@ -1196,7 +1204,8 @@ impl App {
     }
 
     fn list_managers(&mut self, managers: follow::Managers) {
-        for (cwd, path, title, advisor) in managers {
+        self.projects.extend(managers.projects);
+        for (cwd, path, title, advisor) in managers.rows {
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.path.as_ref() == Some(&path)) {
                 (slot.manager, slot.advisor) = (true, advisor);
             } else if !self.closed.contains_key(&path) {
@@ -1209,6 +1218,7 @@ impl App {
     // draft and whether its file was seen, whether it opens or not (a deleted session's doesn't).
     fn reopen(&mut self, slot: usize) -> Result<(), String> {
         let view = &mut self.slots[slot];
+        if view.closing || view.sending != 0 { return Err("The session has input or a close pending; wait for its answer.".into()); }
         let draft = std::mem::take(&mut view.draft);
         self.slots[slot] = Slot { cwd: view.cwd.clone(), saved: view.saved, opened: view.opened, manager: view.manager, advisor: view.advisor, draft, ..Slot::new(view.path.clone(), view.title.clone()) };
         self.load(slot, None, None, None)
@@ -1433,7 +1443,7 @@ impl App {
     // reach it as messages, and a message to a session nothing runs only waits for the user.
     fn put_away(&mut self, slot: usize) {
         let view = &self.slots[slot];
-        if self.panes.iter().any(|pane| pane.target == Target::Session(slot)) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() || view.manager {
+        if view.closing || view.sending != 0 || self.panes.iter().any(|pane| pane.target == Target::Session(slot)) || (view.path.is_none() && !view.draft.text.is_empty()) || !view.agents.is_empty() || view.manager {
             return;
         }
         let Some((_, commands)) = &view.live else { return };
@@ -1472,6 +1482,7 @@ impl App {
     // Make sure the focused pane's session is open here, opening an earlier one shown from its
     // file. Output: false, with a notice, when it can't be (another piccosta runs it).
     fn ensure_open(&mut self) -> bool {
+        if self.current().closing { self.notice = Some("The session is closing; wait for its answer.".into()); return false; }
         if self.current().live.as_ref().is_some_and(|(_, commands)| !commands.is_closed()) {
             return true;
         }
@@ -1557,6 +1568,7 @@ impl App {
 
     fn send(&mut self, text: String, origin: crate::message::InputOrigin) {
         if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.notice = Some("Focus a session to send an agent a message.".into()); return; }
+        if self.current().closing { self.focused().draft.insert(&text); self.notice = Some("The session is closing; draft kept.".into()); return; }
         let pane = self.focus;
         self.panes[pane].scroll = 0;
         // A message for a session not open here goes to whatever runs it (the assistant's service,
@@ -1572,7 +1584,7 @@ impl App {
                     else { crate::runtime::send(&path, &sent, None, None) };
                 (slot, Update::Sent(result, text))
             })) {
-                Ok(()) => self.sending += 1,
+                Ok(()) => { self.sending += 1; self.slots[slot].sending += 1; }
                 Err(_) => {
                     self.slots[slot].draft.insert(&draft);
                     self.notice = Some("Couldn't send it: the delivery thread has stopped".into());
@@ -1609,13 +1621,14 @@ impl App {
     // first. One not sent goes back into the editor.
     fn sent(&mut self, slot: usize, sent: Result<crate::runtime::Sent, String>, text: String) {
         self.sending -= 1;
+        self.slots[slot].sending -= 1;
         self.notice = Some(match sent {
             Ok(crate::runtime::Sent::Queued) => {
                 self.slots[slot].elsewhere = false;
                 if self.slots[slot].live.is_some() { return; }
                 if self.slots[slot].path.is_some() && !self.restart_waiting && !self.quit {
                     self.slots[slot].opened = true;
-                    self.wake(slot);
+                    self.wake(slot, false);
                     return;
                 }
                 "It's queued in the session, for whatever opens it next.".into()
@@ -1704,11 +1717,20 @@ impl App {
     // Esc: the commands the turn is running move to the background, where they carry on and report
     // when they end, and the model stops.
     fn interrupt(&mut self) {
-        let Some((handle, commands)) = &self.focused().live else { return };
+        if self.current().closing { return; }
+        let Some((handle, commands)) = &self.focused().live else { self.interrupt_review(); return };
         let (steer, follow_up) = handle.clear();
         let _ = commands.send(Command::Stop(None));
         for message in steer.into_iter().chain(follow_up) {
             let _ = commands.send(Command::Prompt(message));
+        }
+    }
+
+    // Input: the focused pane. Ask a session's owner, local or followed, to cancel only a live
+    // review. Don't touch drafts/queues or ask a scratchpad to pretend it's a session.
+    fn interrupt_review(&mut self) {
+        if let Target::Session(slot) = self.panes[self.focus].target && let Some(file) = self.slots[slot].path.clone() {
+            let _ = self.deliveries.send(Box::new(move |_| { crate::runtime::stop_review(&file); (slot, Update::Nothing) }));
         }
     }
 
@@ -1718,7 +1740,7 @@ impl App {
     // nothing running it's enter.
     fn send_now(&mut self) {
         if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.submit(); return; }
-        if self.restart_waiting || !self.current().busy() {
+        if self.restart_waiting || self.current().closing || !self.current().busy() {
             self.submit();
             return;
         }
@@ -1870,7 +1892,7 @@ impl App {
                     && self.wake_failed.get(path).is_none_or(|(then, at)| *then != mtime(path) || at.elapsed() >= WAKE_RETRY)
             })
         }).collect();
-        for index in asleep { self.wake(index); }
+        for index in asleep { self.wake(index, true); }
         for index in 0..self.slots.len() {
             let finished = self.slots[index].parent.is_some() && self.slots[index].path.as_ref().is_some_and(|path| statuses.get(path) == Some(&None));
             if finished && !self.slots[index].opened && !self.panes.iter().any(|pane| pane.target == Target::Session(index)) {
@@ -1886,7 +1908,7 @@ impl App {
         if self.restart_waiting || self.quit { return Ok(()); }
         let view = &mut self.slots[slot];
         let Some(path) = view.path.clone() else { return Ok(()) };
-        if view.live.is_some() || view.follow_pending || view.opening { return Ok(()); }
+        if view.closing || view.live.is_some() || view.follow_pending || view.opening { return Ok(()); }
         if !view.saved && !path.exists() { return Ok(()); }
         let (ticket, host) = (Arc::downgrade(&view.incarnation), self.host.clone());
         view.followed = true;
@@ -1898,18 +1920,18 @@ impl App {
         Ok(())
     }
 
-    fn wake(&mut self, slot: usize) {
-        if self.restart_waiting || self.quit || self.slots[slot].opening { return; }
+    fn wake(&mut self, slot: usize, automatic: bool) {
+        if self.restart_waiting || self.quit || self.slots[slot].closing || self.slots[slot].opening { return; }
         let view = &self.slots[slot];
         let (path, host, ticket) = (view.path.clone().unwrap(), view.host.clone().unwrap_or_else(|| self.host.clone()), Arc::downgrade(&view.incarnation));
         self.slots[slot].opening = self.asks.send(Box::new(move |_| {
             let result = (|| {
-                if ticket.strong_count() == 0 || crate::session::is_closed(&host.agent_dir, &path) { return Err("session closed before wake".into()); }
-                let prepared = host.prepare(crate::session::Session::read(&path).map_err(|error| error.to_string())?, None, None, false)?;
+                if ticket.strong_count() == 0 || (automatic && crate::session::is_closed(&host.agent_dir, &path)) { return Err("session closed before wake".into()); }
+                let prepared = host.prepare(crate::session::Session::read(&path).map_err(|error| error.to_string())?, None, None, false, automatic)?;
                 let view = follow::Followed::replacement(&host, &prepared.session);
                 Ok((prepared, view))
             })();
-            (slot, Update::Awoken(ticket, Box::new(result)))
+            (slot, Update::Awoken(ticket, automatic, Box::new(result)))
         })).is_ok();
     }
 
@@ -1919,7 +1941,7 @@ impl App {
     fn listed(&self) -> Vec<usize> {
         let mut listed: Vec<usize> = (0..self.slots.len()).filter(|&index| !self.slots[index].gone()).collect();
         let manager = crate::manager::home(&self.host.agent_dir);
-        let mut projects = vec![manager.as_path(), self.host.cwd.as_path()];
+        let mut projects = vec![manager.as_path(), self.grouped_cwd(&self.host.cwd)];
         for &index in &listed {
             if !projects.contains(&self.project_of(index)) {
                 projects.push(self.project_of(index));
@@ -1940,9 +1962,12 @@ impl App {
         order
     }
 
-    // The folder a row is listed under: its own, or a subagent's top parent's, so a run a session
-    // started shows under that session wherever it works (a lane in a worktree, say). The steps are
-    // bounded by the number of rows, so a parent loop can't hang the sidebar.
+    // The worker resolves managed ancestors even when their manager rows are closed or hidden.
+    fn grouped_cwd<'a>(&'a self, cwd: &'a Path) -> &'a Path {
+        self.projects.get(cwd).map_or(cwd, PathBuf::as_path)
+    }
+
+    // A subagent follows its top parent's group. Bound the walk so a parent loop can't hang input.
     fn project_of(&self, mut index: usize) -> &Path {
         for _ in 0..self.slots.len() {
             match self.slots[index].parent {
@@ -1950,7 +1975,7 @@ impl App {
                 _ => break,
             }
         }
-        &self.slots[index].cwd
+        self.grouped_cwd(&self.slots[index].cwd)
     }
 
     // Take a session out of the open ones. Its task ends when its command channel closes; its pane
@@ -2003,6 +2028,19 @@ impl App {
                 }
                 return;
             }
+            Update::Closed(ticket, result) => {
+                if !ticket.ptr_eq(&Arc::downgrade(&self.slots[slot].incarnation)) { return; }
+                self.slots[slot].closing = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(path) = &self.slots[slot].path { self.closed.insert(path.clone(), crate::clock::now_ms()); }
+                        self.slots[slot].state = State::Idle;
+                        if self.close(slot) { self.slots[slot].path = None; }
+                    }
+                    Err(error) => self.notice = Some(format!("Couldn't close “{}”; it stays open: {error}", self.slots[slot].title)),
+                }
+                return;
+            }
             Update::Report(text) => { self.report(text); return; }
             Update::Scanned(scan) => { self.scanned(*scan); return; }
             Update::Listed(listing) => { self.listed_result(listing); return; }
@@ -2017,7 +2055,7 @@ impl App {
                 let cancel = view.live.as_ref().filter(|_| external).map(|(handle, _)| handle.clone());
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
-            Update::Report(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
+            Update::Closed(..) | Update::Report(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
             Update::TimerReport(file, text) => {
                 if view.path.as_ref() == Some(&file) { view.messages.push(commands::report_message(text)); }
             }
@@ -2059,14 +2097,23 @@ impl App {
                     Ok(None) => {}
                 }
             }
-            Update::Awoken(ticket, result) => {
+            Update::Awoken(ticket, automatic, result) => {
                 if !ticket.ptr_eq(&Arc::downgrade(&view.incarnation)) { self.retire(result); return; }
                 view.opening = false;
-                if view.live.is_some() || !view.opened || view.closed || self.restart_waiting { self.retire(result); return; }
+                if view.closing {
+                    self.retire(result);
+                    if self.slots[slot].sending == 0 { self.close_requested(slot); }
+                    return;
+                }
+                if view.live.is_some() || !view.opened || (view.closed && automatic) || self.restart_waiting { self.retire(result); return; }
                 let path = view.path.clone().unwrap();
                 let result = (*result).and_then(|(prepared, transcript)| prepared.finish(self.emitter(slot)).map(|(agent, shared)| (agent, shared, transcript)));
                 match result {
-                    Ok((agent, shared, transcript)) => { self.attach(slot, agent, shared, Some(transcript)); self.wake_failed.remove(&path); }
+                    Ok((agent, shared, transcript)) => {
+                        if !automatic { self.slots[slot].closed = false; self.closed.remove(&path); }
+                        self.attach(slot, agent, shared, Some(transcript));
+                        self.wake_failed.remove(&path);
+                    }
                     Err(error) => {
                         let now = path.metadata().and_then(|metadata| metadata.modified()).ok();
                         if self.wake_failed.get(&path).is_none_or(|(then, _)| *then != now) { self.notice = Some(format!("Couldn't start {}: {error}", self.slots[slot].title)); }
@@ -2074,7 +2121,10 @@ impl App {
                     }
                 }
             }
-            Update::Sent(sent, text) => self.sent(slot, sent, text),
+            Update::Sent(sent, text) => {
+                self.sent(slot, sent, text);
+                if self.slots[slot].closing && !self.slots[slot].opening && self.slots[slot].sending == 0 { self.close_requested(slot); }
+            }
             Update::Done(done) => {
                 if view.title == NEW_TITLE && let Some(title) = done.title { view.title = title; }
                 view.model = format!("{}/{}", done.model.provider, done.model.id);
@@ -2339,7 +2389,7 @@ impl App {
                 }
             }
             KeyCode::Esc if self.focus_busy() => self.interrupt(),
-            KeyCode::Esc => self.panes[self.focus].scroll = 0,
+            KeyCode::Esc => { self.interrupt_review(); self.panes[self.focus].scroll = 0; }
             KeyCode::Char('x') if control => {
                 self.chord = true;
                 self.notice = Some("ctrl+x: ctrl+s sends now".into());

@@ -298,6 +298,12 @@ pub fn project_manager(agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
     pointer(&project_home(agent_dir, cwd))
 }
 
+// Group a working directory under its nearest managed ancestor; execution still uses cwd.
+// This reads manager pointers, so callers in the TUI do it on the disk worker.
+pub fn managed_project<'a>(agent_dir: &Path, cwd: &'a Path) -> Option<(&'a Path, PathBuf)> {
+    cwd.ancestors().find_map(|folder| project_manager(agent_dir, folder).map(|manager| (folder, manager)))
+}
+
 // The session file of the advisor of the manager working in `cwd`, and of that manager.
 pub fn advisor(agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
     pointer(&home_for(agent_dir, Role::Advisor, cwd))
@@ -918,17 +924,19 @@ impl SessionsTool {
     // The directories that have sessions, the latest used first: how many, when last used, and
     // their project manager when they have one.
     fn projects(&self) -> String {
-        let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
-        for folder in fs::read_dir(self.agent_dir.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()) {
-            let Some((modified, header)) = crate::session::index::newest(crate::session::index::in_folder(&folder)).into_iter().find_map(|(modified, path)| Some((modified, crate::session::index::header(&path).ok()?))) else { continue };
+        let mut projects = std::collections::HashMap::<PathBuf, (std::time::SystemTime, usize)>::new();
+        for (modified, path) in crate::session::index::newest(crate::session::index::files(&self.agent_dir, false)) {
+            let Ok(header) = crate::session::index::header(&path) else { continue };
             let cwd = PathBuf::from(header.cwd);
-            if !cwd.is_dir() || cwd == home(&self.agent_dir) {
-                continue;
-            }
-            let count = fs::read_dir(&folder).into_iter().flatten().flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jsonl")).count();
-            let manager = project_manager(&self.agent_dir, &cwd).map_or(String::new(), |file| format!(" · manager {}", session_id(&file)));
-            found.push((modified, format!("{} · {count} sessions · last used {}{manager}", cwd.display(), ago(modified))));
+            let project = managed_project(&self.agent_dir, &cwd).map_or(cwd.as_path(), |(folder, _)| folder);
+            if !project.is_dir() || project == home(&self.agent_dir) { continue; }
+            let entry = projects.entry(project.to_path_buf()).or_insert((modified, 0));
+            entry.1 += 1;
         }
+        let mut found: Vec<_> = projects.into_iter().map(|(cwd, (modified, count))| {
+            let manager = project_manager(&self.agent_dir, &cwd).map_or(String::new(), |file| format!(" · manager {}", session_id(&file)));
+            (modified, format!("{} · {count} sessions · last used {}{manager}", cwd.display(), ago(modified)))
+        }).collect();
         found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         if found.is_empty() { "No projects yet.".into() } else { found.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n") }
     }

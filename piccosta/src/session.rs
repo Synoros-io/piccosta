@@ -653,30 +653,31 @@ pub fn is_closed(agent_dir: &Path, file: &Path) -> bool {
 // Close a session, or open it again. Entries for files that are gone are dropped as it's written,
 // whole through a temporary file so a reader never sees half of one.
 pub fn set_closed(agent_dir: &Path, file: &Path, closed: bool) {
-    mark_closed(agent_dir, file, closed, false);
+    if let Err(error) = mark_closed(agent_dir, file, closed, false) { eprintln!("piccosta: {error}"); }
 }
 
 // Only an explicit close from the user's terminal removes their replay schedules.
-pub fn set_closed_by_user(agent_dir: &Path, file: &Path) {
-    mark_closed(agent_dir, file, true, true);
+pub fn set_closed_by_user(agent_dir: &Path, file: &Path) -> Result<(), String> {
+    mark_closed(agent_dir, file, true, true)
 }
 
-fn mark_closed(agent_dir: &Path, file: &Path, closed: bool, by_user: bool) {
-    let mut all = closed_sessions(agent_dir);
+fn mark_closed(agent_dir: &Path, file: &Path, closed: bool, by_user: bool) -> Result<(), String> {
     let file = crate::tools::paths::canonical(file);
-    if closed && let Err(error) = crate::tools::checkin::cancel_all(agent_dir, &file, by_user) {
-        eprintln!("piccosta checkin: could not drop closed session's timers: {error}");
-    }
+    // Timer admission can reopen a session while holding its store lock. Cancel before taking
+    // the marker lock, then serialize every writer on an inode that rename never replaces.
+    if closed { crate::tools::checkin::cancel_all(agent_dir, &file, by_user)?; }
+    fs::create_dir_all(agent_dir).map_err(|error| error.to_string())?;
+    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(agent_dir.join(format!("{CLOSED_FILE}.lock"))).map_err(|error| error.to_string())?;
+    lock.lock().map_err(|error| error.to_string())?;
+    let mut all = closed_sessions(agent_dir);
     let changed = if closed { all.insert(file, clock::now_ms()).is_none() } else { all.remove(&file).is_some() };
-    if !changed {
-        return;
-    }
+    if !changed { return Ok(()); }
     all.retain(|file, _| file.exists());
     let path = agent_dir.join(CLOSED_FILE);
     let partial = path.with_extension("json.partial");
-    if fs::write(&partial, serde_json::to_string_pretty(&all).unwrap_or_default()).is_ok() {
-        let _ = fs::rename(partial, path);
-    }
+    let result = fs::write(&partial, serde_json::to_string_pretty(&all).map_err(|error| error.to_string())?).and_then(|()| fs::rename(&partial, &path));
+    if result.is_err() { let _ = fs::remove_file(partial); }
+    result.map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 impl Session {
@@ -920,12 +921,13 @@ impl Session {
         self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": message })))
     }
 
-    // Timer receipts live on their user message. Older durable check-ins keep their custom
-    // receipt, so both still deduplicate after a reopen or a lost admission answer.
+    // Prompt timers use their user message; reviews use ATTEMPT. Older check-ins keep their
+    // custom receipt too, so all deduplicate after a reopen or a lost admission answer.
     fn delivery_id(entry: &SessionEntry) -> Option<&str> {
         match entry {
             SessionEntry::Message { message: AgentMessage::User(user), .. } => user.timer.as_ref().map(|timer| timer.id.as_str()),
             SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == QUEUED_TYPE => data["delivery_id"].as_str(),
+            SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == crate::intent_review::ATTEMPT => data["occurrence"].as_str(),
             _ => None,
         }
     }

@@ -44,7 +44,7 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 49] = [
+const COMMANDS: [(&str, &str); 50] = [
     ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
     ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns (esc stops the focused turn)"),
     ("/clear [name]", "start a new session here; a name names the one left"),
@@ -69,6 +69,7 @@ const COMMANDS: [(&str, &str); 49] = [
     ("/status", "model, session, context and cost"),
     ("/context", "how full the context is"),
     ("/usage, /cost", "tokens and cost of this session"),
+    ("/align [interval [count]|off [id]]", "review against your instructions when idle; alone: list; off: cancel future reviews; Esc: stop a running review"),
     ("/timer [interval prompt|off [id]]", "replay your prompt when idle, repeating at the interval (30m, 2h, 5s); alone: next fire and last outcome; off: cancel this session's timers"),
     ("/diff", "git diff against HEAD, new files included"),
     ("/pwd", "the working directory"),
@@ -103,6 +104,10 @@ impl App {
     pub(super) fn command(&mut self, line: &str) -> bool {
         let (name, raw_argument) = line.split_once(' ').map_or((line.trim(), ""), |(name, rest)| (name, rest));
         let argument = raw_argument.trim();
+        if matches!(self.panes[self.focus].target, super::Target::Session(slot) if self.slots[slot].closing) && !matches!(name, "quit" | "exit" | "restart") {
+            self.notice = Some("The session is closing; wait for its answer.".into());
+            return true;
+        }
         match name {
             "scratch" => self.scratch(argument),
             "close" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => self.close_pane(),
@@ -143,11 +148,7 @@ impl App {
                     }
                 } {
                     self.show(slot);
-                    if self.close(left)
-                        && let Some(path) = self.slots[left].path.take()
-                    {
-                        self.user_closed(path);
-                    }
+                    self.request_close(left);
                 }
             }
             // /new <dir> starts the session in that directory; /new alone offers this one and the
@@ -376,15 +377,15 @@ impl App {
             "status" => self.report(self.status()),
             "context" => self.report(self.context()),
             "usage" | "cost" => self.report(self.usage()),
-            "timer" => {
+            "timer" | "align" => {
                 let slot = self.session_index();
                 let Some(file) = self.slots[slot].path.clone() else {
                     self.notice = Some("User timers need a saved session (not --no-session).".into());
                     return true;
                 };
-                let (agent_dir, argument) = (self.host.agent_dir.clone(), raw_argument.trim_start().to_string());
+                let (agent_dir, argument, review) = (self.host.agent_dir.clone(), raw_argument.trim_start().to_string(), name == "align");
                 if self.asks.send(Box::new(move |_| {
-                    let report = crate::tools::checkin::user_timer(&agent_dir, &file, &argument).unwrap_or_else(|error| error);
+                    let report = crate::tools::checkin::user_timer(&agent_dir, &file, &argument, review).unwrap_or_else(|error| error);
                     (slot, Update::TimerReport(file, report))
                 })).is_err() { self.notice = Some("The timer disk worker stopped.".into()); }
             }
@@ -420,11 +421,7 @@ impl App {
             // (from /resume, or a manager) opens it again.
             "close" => {
                 let slot = self.session_index();
-                if self.close(slot)
-                    && let Some(path) = self.slots[slot].path.take()
-                {
-                    self.user_closed(path);
-                }
+                self.request_close(slot);
             }
             "delete" => self.delete_shown(),
             "quit" | "exit" => self.quit = true,
@@ -443,15 +440,42 @@ impl App {
         true
     }
 
-    // The user's close cancels their timers too. Keep that locked store work on the disk worker,
-    // counted through completion so a restart cannot strand the close halfway through.
-    fn user_closed(&mut self, path: std::path::PathBuf) {
-        self.closed.insert(path.clone(), crate::clock::now_ms());
-        let agent_dir = self.host.agent_dir.clone();
-        if self.asks.send(Box::new(move |_| {
-            crate::session::set_closed_by_user(&agent_dir, &path);
-            (0, Update::Nothing)
-        })).is_err() { self.notice = Some("The disk worker stopped before the close was saved.".into()); }
+    // A close is not a view dismissal: the runtime must finish its shutdown first. Keep this
+    // incarnation pending, including any delivery or wake already preparing, until it answers.
+    fn request_close(&mut self, slot: usize) {
+        let view = &mut self.slots[slot];
+        if view.closing { return; }
+        view.closing = true;
+        view.release_generation = std::sync::Arc::new(());
+        self.notice = Some(format!("Closing “{}”…", view.title));
+        if !view.opening && view.sending == 0 { self.close_requested(slot); }
+    }
+
+    // File-backed runtimes answer on their socket even when this UI owns them. The worker waits,
+    // not the UI; memory-only runtimes use the same Close command and completion acknowledgement.
+    pub(super) fn close_requested(&mut self, slot: usize) {
+        let view = &self.slots[slot];
+        let ticket = std::sync::Arc::downgrade(&view.incarnation);
+        if let Some(path) = view.path.clone() {
+            let agent_dir = self.host.agent_dir.clone();
+            if self.asks.send(Box::new(move |_| {
+                let result = crate::runtime::end(&path, "close", None).transpose().and_then(|_| crate::runtime::close_by_user(&agent_dir, &path));
+                (slot, Update::Closed(ticket, result))
+            })).is_err() {
+                self.slots[slot].closing = false;
+                self.notice = Some("The disk worker stopped before the close was requested; the session stays open.".into());
+            }
+        } else {
+            let (answer, answered) = tokio::sync::oneshot::channel();
+            let sent = view.live.as_ref().is_some_and(|(_, commands)| commands.send(Command::Close(Some(answer))).is_ok());
+            let updates = self.sender.clone();
+            self.asks.pending += 1;
+            tokio::task::spawn_local(async move {
+                let result = if sent && matches!(tokio::time::timeout(crate::runtime::STOP_WAIT, answered).await, Ok(Ok(()))) { Ok(()) }
+                    else { Err("the runtime did not confirm its close".into()) };
+                let _ = updates.send((slot, Update::Asked(false, Box::new(Update::Closed(ticket, result)))));
+            });
+        }
     }
 
     // The sessions, open ones first, numbered as the sidebar lists them, with the one shown here
@@ -580,6 +604,7 @@ impl App {
 
     fn resume_path(&mut self, path: std::path::PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
+        if self.slots.iter().any(|slot| slot.path.as_ref() == Some(&path) && slot.closing) { self.notice = Some("The session is still closing.".into()); return; }
         crate::session::set_closed(&self.host.agent_dir, &path, false);
         self.closed.remove(&path);
         let slot = self.slots.iter().position(|slot| slot.path.as_ref() == Some(&path)).unwrap_or_else(|| {

@@ -155,13 +155,14 @@ impl SubagentTool {
 }
 
 impl SubagentTool {
-    // Each job in a line: its name, what it's for, and the models it runs on (the tool's
-    // description and the TUI's /agents both show this).
+    // Each job in a line: its name, what it's for, and its configured model order, so usage
+    // can't rewrite the prompt (the tool's description and the TUI's /agents both show this).
     pub fn describe(&self) -> Vec<String> {
+        let connected = crate::scale::connected(&self.agent_dir);
         self.jobs
             .iter()
             .map(|job| {
-                let models = crate::scale::find(&self.agent_dir, &job.name, false).map(|entry| crate::scale::available(&self.agent_dir, &entry).join(", else ")).unwrap_or_default();
+                let models = crate::scale::find(&self.agent_dir, &job.name, false).map(|entry| entry.models.into_iter().filter(|model| connected(model)).collect::<Vec<_>>().join(", else ")).unwrap_or_default();
                 let models = if models.is_empty() { "your own model".to_string() } else { models };
                 let owns: Vec<String> = crate::scale::owned(&self.agent_dir).into_iter().filter(|(_, kind)| *kind == job.name).map(|(tool, _)| tool).collect();
                 let owns = if owns.is_empty() { String::new() } else { format!(" Only this job has {}: hand it that work.", owns.join(", ")) };
@@ -183,7 +184,7 @@ impl Tool for SubagentTool {
         ToolDefinition {
             name: NAME.into(),
             description: format!(
-                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. Its answer is a claim: check what it built or found before you rely on it or pass it on. You choose the job; the user chose the models each job runs on, and the first one available is used. model (provider/id) and thinking, when given, replace the job's own. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
+                "Hand a task to a subagent: an agent with a fresh context that works in this directory. It runs in the background: you get its final answer as a message when it ends, and meanwhile you carry on or end your turn. Its answer is a claim: check what it built or found before you rely on it or pass it on. You choose the job; the user chose the models each job runs on, and the first one available is used, a plan running low last. model (provider/id) and thinking, when given, replace the job's own. Pick a job only when its description fits the task; when none does, do the task yourself rather than taking the nearest. The subagent also gets your discussion with the user, word for word (discussed chooses where it starts); the task should say what to do and what you want back, not retell the discussion.\nJobs:{jobs}"
             ),
             parameters: json!({
                 "type": "object",

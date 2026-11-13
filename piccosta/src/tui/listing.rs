@@ -20,13 +20,6 @@ pub(super) enum Kind {
     Resume(bool),
     Projects,
 }
-struct Group {
-    cwd: Option<PathBuf>,
-    files: VecDeque<(SystemTime, PathBuf)>,
-    limit: usize,
-    taken: usize,
-    other: bool,
-}
 pub(super) struct Listing {
     pub ticket: Weak<()>,
     pub kind: Kind,
@@ -35,7 +28,10 @@ pub(super) struct Listing {
     pub done: bool,
     host: Arc<Host>,
     index: Option<Index>,
-    groups: VecDeque<Group>,
+    files: VecDeque<(SystemTime, PathBuf)>,
+    taken: HashMap<PathBuf, usize>,
+    resolved: HashMap<PathBuf, PathBuf>,
+    local: PathBuf,
     known: BTreeSet<PathBuf>,
     closed: HashMap<PathBuf, i64>,
     others: usize,
@@ -43,34 +39,21 @@ pub(super) struct Listing {
 }
 impl Listing {
     fn new(host: Arc<Host>, kind: Kind, ticket: Weak<()>, known: BTreeSet<PathBuf>, projects: BTreeSet<PathBuf>) -> Self {
-        let group = |folder: PathBuf, cwd, limit, other| Group { cwd, files: index::newest(index::in_folder(&folder)).into(), limit, taken: 0, other };
-        let groups = match &kind {
-            Kind::Sidebar => {
-                let folders = index::newest(index::folders(&host.agent_dir).into_iter().filter(|folder| *folder != host.session_dir).collect());
-                std::iter::once(group(host.session_dir.clone(), Some(host.cwd.clone()), super::RECENT_SESSIONS, false))
-                    .chain(folders.into_iter().map(|(_, folder)| group(folder, None, super::RECENT_PER_OTHER_PROJECT, true)))
-                    .collect()
-            }
-            Kind::Resume(false) => VecDeque::from([group(host.session_dir.clone(), Some(host.cwd.clone()), super::PICKER_SESSIONS, false)]),
-            Kind::Resume(true) => VecDeque::from([Group {
-                cwd: None,
-                files: index::newest(index::files(&host.agent_dir, false)).into(),
-                limit: usize::MAX,
-                taken: 0,
-                other: false,
-            }]),
-            Kind::Projects => index::folders(&host.agent_dir).into_iter().map(|folder| group(folder, None, 1, false)).collect(),
-        };
+        let local = crate::manager::managed_project(&host.agent_dir, &host.cwd).map_or(host.cwd.as_path(), |(folder, _)| folder).to_path_buf();
+        let files = index::newest(index::files(&host.agent_dir, false).into_iter().chain(index::in_folder(&host.session_dir)).collect::<BTreeSet<_>>().into_iter().collect()).into();
         Self {
             index: Some(Index::open(&host.agent_dir)),
             closed: crate::session::closed_sessions(&host.agent_dir),
             host,
             kind,
             ticket,
-            groups,
+            files,
+            taken: HashMap::new(),
+            resolved: HashMap::new(),
+            local,
             known,
             summaries: Vec::new(),
-            managers: Vec::new(),
+            managers: follow::Managers::default(),
             done: false,
             others: 0,
             projects,
@@ -81,17 +64,7 @@ impl Listing {
             self.done = true;
             return;
         }
-        while self
-            .groups
-            .front()
-            .is_some_and(|group| group.files.is_empty() || group.taken == group.limit || (group.other && self.others >= super::OTHER_PROJECTS))
-        {
-            let group = self.groups.pop_front().unwrap();
-            if group.other && group.taken > 0 {
-                self.others += 1;
-            }
-        }
-        let Some(group) = self.groups.front_mut() else {
+        let Some((modified, path)) = self.files.pop_front() else {
             self.done = true;
             if matches!(self.kind, Kind::Sidebar) {
                 self.projects.extend(self.summaries.iter().map(|summary| summary.cwd.clone()));
@@ -99,7 +72,6 @@ impl Listing {
             }
             return;
         };
-        let (modified, path) = group.files.pop_front().unwrap();
         let canonical = crate::tools::paths::canonical(&path);
         let sidebar = matches!(self.kind, Kind::Sidebar);
         if sidebar && (self.known.contains(&canonical) || self.closed.contains_key(&canonical)) {
@@ -107,20 +79,29 @@ impl Listing {
         }
         let Ok(header) = index::header(&path) else { return };
         let cwd = PathBuf::from(&header.cwd);
-        if group.cwd.as_ref().is_some_and(|expected| *expected != cwd) {
-            return;
-        }
-        if (matches!(self.kind, Kind::Projects) || (sidebar && group.other)) && !cwd.is_dir() {
-            group.files.clear();
-            return;
-        }
+        let project = self.resolved.entry(cwd.clone()).or_insert_with(|| {
+            crate::manager::managed_project(&self.host.agent_dir, &cwd).map_or(cwd.as_path(), |(folder, _)| folder).to_path_buf()
+        });
+        let other = *project != self.local;
+        let limit = match self.kind {
+            Kind::Sidebar if other => super::RECENT_PER_OTHER_PROJECT,
+            Kind::Sidebar => super::RECENT_SESSIONS,
+            Kind::Resume(false) if other => return,
+            Kind::Resume(false) => super::PICKER_SESSIONS,
+            Kind::Resume(true) => usize::MAX,
+            Kind::Projects => 1,
+        };
+        let taken = self.taken.get(project).copied().unwrap_or(0);
+        if taken >= limit || (sidebar && other && taken == 0 && self.others >= super::OTHER_PROJECTS)
+            || ((matches!(self.kind, Kind::Projects) || (sidebar && other)) && !project.is_dir()) { return; }
         let summary = if matches!(self.kind, Kind::Projects) {
-            SessionSummary { path, modified, cwd, title: String::new(), id: header.id, closed: false }
+            SessionSummary { path, modified, cwd: project.clone(), title: String::new(), id: header.id, closed: false }
         } else {
             let Ok(summary) = self.index.as_mut().unwrap().summary(&path, modified, self.closed.contains_key(&canonical)) else { return };
             summary
         };
-        group.taken += 1;
+        if sidebar && other && taken == 0 { self.others += 1; }
+        self.taken.insert(project.clone(), taken + 1);
         self.summaries.push(summary);
     }
 }

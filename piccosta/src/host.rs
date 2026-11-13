@@ -402,11 +402,11 @@ impl Host {
     // Output: the agent and the tools' shared state (background jobs, web results), which the
     // caller shuts down at the end.
     pub fn open(&self, session: Session, model: Option<&str>, thinking: Option<&str>, emit: EventSink, hold_for_jobs: bool) -> Result<(Agent, Arc<ToolShared>), String> {
-        self.prepare(session, model, thinking, hold_for_jobs)?.finish(emit)
+        self.prepare(session, model, thinking, hold_for_jobs, false)?.finish(emit)
     }
 
-    pub(crate) fn prepare(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, hold_for_jobs: bool) -> Result<Prepared, String> {
-        let claim = crate::runtime::claim(&mut session)?;
+    pub(crate) fn prepare(&self, mut session: Session, model: Option<&str>, thinking: Option<&str>, hold_for_jobs: bool, automatic: bool) -> Result<Prepared, String> {
+        let claim = crate::runtime::claim(&mut session, automatic.then_some(self.agent_dir.as_path()))?;
         let registry = self.registry()?;
         let resumed = session.context();
         let picked = model.is_some();

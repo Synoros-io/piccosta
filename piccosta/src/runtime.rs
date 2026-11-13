@@ -77,7 +77,7 @@ pub enum Command {
     // A durable check-in starts a turn even when a frontend normally starts each one itself.
     Checkin,
     // Only the owning runtime admits a user timer. It must never enter the durable inbox first.
-    Timer(UserMessage, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
+    Timer(UserMessage, bool, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
     Stop(Option<oneshot::Sender<()>>),
     Close(Option<oneshot::Sender<()>>),
     // Acknowledge only between runs, after the frontend has set Handle::draining.
@@ -96,14 +96,14 @@ pub enum Command {
     Team(Team),
 }
 
-// A user timer advances on a delivery or an idle-only skip, never by steering active work.
+// Delivery or skip advances a timer; a deferred review stays due without spending its count.
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TimerOutcome { Delivered, SkippedBusy, SkippedNotRunning }
+pub enum TimerOutcome { Delivered, SkippedBusy, SkippedNotRunning, Deferred, SkippedUnchanged, SkippedRefused }
 
 impl TimerOutcome {
     pub fn label(self) -> &'static str {
-        match self { Self::Delivered => "delivered", Self::SkippedBusy => "skipped busy", Self::SkippedNotRunning => "skipped not running" }
+        match self { Self::Delivered => "delivered", Self::SkippedBusy => "skipped busy", Self::SkippedNotRunning => "skipped not running", Self::Deferred => "deferred", Self::SkippedUnchanged => "skipped unchanged", Self::SkippedRefused => "skipped restricted model" }
     }
 }
 
@@ -124,6 +124,7 @@ pub struct Done {
 struct Watch {
     since: Option<i64>,
     closing: bool,
+    review: Option<tokio_util::sync::CancellationToken>,
     receipts: std::collections::HashSet<String>,
     timer_answer: Option<(String, oneshot::Sender<Result<TimerOutcome, String>>)>,
     subscribers: Vec<mpsc::UnboundedSender<String>>,
@@ -264,9 +265,10 @@ impl Drop for Claim {
 // session holds whatever was queued meanwhile, take in an old inbox, and start listening. Output:
 // the claim, None for a session kept in memory, or an error when another piccosta runs it, or its
 // old inbox couldn't be kept.
-pub fn claim(session: &mut Session) -> Result<Option<Claim>, String> {
+pub fn claim(session: &mut Session, automatic_in: Option<&Path>) -> Result<Option<Claim>, String> {
     let Some(file) = session.file().map(Path::to_path_buf) else { return Ok(None) };
     let _held = hold(&file)?;
+    if automatic_in.is_some_and(|agent_dir| crate::session::is_closed(agent_dir, &file)) { return Err("session closed before wake".into()); }
     if (_held.is_some() || session.has_conversation()) && !file.exists() { return Err(format!("{} was deleted", file.display())); }
     let failed = |error: std::io::Error| format!("{}: {error}", socket_path(&file).display());
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/"))).map_err(failed)?;
@@ -318,12 +320,16 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>, 
                     }
                 },
                 "checkin" => json!({"ok": send(Command::Checkin)}),
+                "stop-review" => {
+                    let review = lock(&watch).review.clone().filter(|cancel| !cancel.is_cancelled());
+                    if let Some(cancel) = &review { cancel.cancel(); }
+                    json!({"ok": review.is_some()})
+                },
                 "thinking" => match request["level"].as_str().filter(|level| crate::provider::THINKING_LEVELS.contains(level)) {
                     Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
                     None => json!({"ok": false, "error": "no such level"}),
                 },
                 "timer" if lock(&watch).receipts.contains(request["id"].as_str().unwrap_or_default()) => json!({"outcome": TimerOutcome::Delivered}),
-                "timer" if lock(&watch).closing => json!({"outcome": TimerOutcome::SkippedBusy}),
                 "timer" => {
                     let (answer, answered) = oneshot::channel();
                     // Authentication may wait on disk. It must not extend the dispatcher's
@@ -332,15 +338,15 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>, 
                     let expires = Instant::now() + remaining;
                     let (target, id) = (file.clone(), request["id"].as_str().unwrap_or_default().to_string());
                     let admitted = tokio::task::spawn_blocking(move || crate::tools::checkin::timer_input(&crate::config::agent_dir(), &target, &id, peer)).await;
-                    let message = match admitted {
-                        Ok(Ok(message)) => message,
+                    let (message, review) = match admitted {
+                        Ok(Ok(input)) => input,
                         result => {
                             let error = match result { Ok(Err(error)) => error, Err(error) => error.to_string(), _ => unreachable!() };
                             let _ = write.write_all(format!("{}\n", json!({"error": error})).as_bytes()).await;
                             continue;
                         }
                     };
-                    let sent = Instant::now() < expires && send(Command::Timer(message, expires, answer));
+                    let sent = Instant::now() < expires && send(Command::Timer(message, review, expires, answer));
                     tokio::spawn(async move {
                         let result = if sent { tokio::time::timeout_at(tokio::time::Instant::from_std(expires), answered).await.ok().and_then(Result::ok) } else { None };
                         let reply = match result {
@@ -466,6 +472,10 @@ pub fn status(file: &Path) -> Option<Value> {
     }
 }
 
+// Idle Esc asks the owner to cancel only its current review, never the main turn or its queues.
+// Called on the TUI's delivery worker, so an unresponsive owner cannot hold the input thread.
+pub fn stop_review(file: &Path) { let _ = ask(file, json!({"do": "stop-review"}), ASK_WAIT); }
+
 // Whether something runs the session in `file`: its socket takes a connection, or would but for a
 // full backlog (connect).
 pub fn running(file: &Path) -> bool {
@@ -482,7 +492,8 @@ pub fn end(file: &Path, what: &str, ours: Option<&Run>) -> Option<Result<Option<
     let waited = STOP_WAIT.as_secs();
     Some(match ask(file, json!({"do": what}), STOP_WAIT) {
         Asked::Nobody => return None,
-        Asked::Answered(_) => Ok(None),
+        Asked::Answered(reply) if reply["ok"] == true => Ok(None),
+        Asked::Answered(reply) => Err(format!("the piccosta running it did not confirm {what}: {reply}")),
         Asked::Silent(Some(runner)) if ours != Some(&runner) => {
             Err(format!("it didn't answer in {waited} s; the piccosta running it (pid {}) isn't the run you started (not the same pid, start time and boot), so it was left alone", runner.pid))
         }
@@ -492,6 +503,14 @@ pub fn end(file: &Path, what: &str, ours: Option<&Run>) -> Option<Result<Option<
         Asked::Silent(_) => Err(format!("it didn't answer in {waited} s, and the piccosta running it couldn't be found to kill")),
         Asked::Unread => Err("the piccosta running it isn't taking requests (it's stopped, or stuck), so it couldn't be told, nor known for sure to kill: it was left alone".into()),
     })
+}
+
+// After an acknowledged close, save the user's marker under the claim/handoff lock. An automatic
+// claim either sees this marker, or got there first and keeps the view open for another close.
+pub fn close_by_user(agent_dir: &Path, file: &Path) -> Result<(), String> {
+    let _held = hold(file)?;
+    if running(file) { return Err("a runtime claimed the session before its close was saved; try /close again".into()); }
+    crate::session::set_closed_by_user(agent_dir, file)
 }
 
 // Change the session in `file` while nothing runs it, under its lock so no runtime starts meanwhile.
@@ -571,9 +590,12 @@ pub fn deliver_checkin(file: &Path, id: &str, message: &UserMessage, launch: Opt
 
 // Ask the owner to admit an ordinary prompt, without holding the session file. Its user entry
 // carries the occurrence id; a retry is acknowledged without starting that prompt again.
-pub fn deliver_timer(file: &Path, message: &UserMessage) -> Result<TimerOutcome, String> {
+pub fn deliver_timer(file: &Path, message: &UserMessage, review: bool) -> Result<TimerOutcome, String> {
     let timer = message.timer.as_ref().ok_or("missing timer occurrence")?;
     match ask(file, json!({"do": "timer", "id": timer.id, "title": timer.title, "text": message.content.text(), "message": message, "expiresAt": crate::clock::now_ms().saturating_add(ASK_WAIT.as_millis() as i64)}), ASK_WAIT) {
+        // A dead owner may have admitted this review before losing its answer. Reconcile its
+        // ATTEMPT receipt first; live owners use their receipt cache, not a raw read every tick.
+        Asked::Nobody if review && Session::read(file).map_err(|error| error.to_string())?.has_delivery(&timer.id) => Ok(TimerOutcome::Delivered),
         Asked::Nobody => Ok(TimerOutcome::SkippedNotRunning),
         Asked::Answered(answer) => serde_json::from_value(answer["outcome"].clone()).map_err(|_| answer["error"].as_str().unwrap_or("timer admission was not confirmed").to_string()),
         _ => Err("timer admission was not confirmed".into()),
@@ -876,11 +898,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     lock(&watch).receipts = agent.session.delivery_ids();
     // Each turn the model ends goes to the subscribers, with how many jobs still run.
     let (heard, jobs) = (watch.clone(), shared.clone());
-    let (worked, unattended) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let (did_work, admitted) = (worked.clone(), unattended.clone());
     agent.tap(move |event| {
-        if matches!(event, Event::AgentStart) { did_work.store(true, Ordering::Relaxed); }
-        if let Event::MessageEnd { message } = event && crate::intent_review::unattended(message) { admitted.store(true, Ordering::Relaxed); }
         if let Event::MessageEnd { message: AgentMessage::User(user) } = event && let Some(timer) = &user.timer {
             let mut watched = lock(&heard);
             watched.receipts.insert(timer.id.clone());
@@ -900,7 +918,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
     let timer = agent.session.file().map(|file| tokio::task::spawn_local(crate::tools::checkin::watch(host.agent_dir.clone(), Some(file.to_path_buf()))));
     let task = tokio::task::spawn_local(async move {
         let handle = agent.handle();
-        let mut reviews = if agent.manager_home().is_some() { crate::intent_review::State::load(agent.session.file()).await } else { crate::intent_review::State::default() };
+        let mut reviews = crate::intent_review::State::default();
         let mut team = crate::host::team(&agent.session);
         let mut queue: VecDeque<(Command, bool)> = VecDeque::new();
         let mut closing: Option<Option<oneshot::Sender<()>>> = None;
@@ -914,8 +932,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         closing = Some(answer);
                         break Err("Session closed during plugin discovery".into());
                     }
-                    Some((Command::Timer(message, _, answer), _)) => {
-                        let outcome = if message.timer.as_ref().is_some_and(|timer| lock(&watch).receipts.contains(&timer.id)) { TimerOutcome::Delivered } else { TimerOutcome::SkippedBusy };
+                    Some((Command::Timer(message, review, _, answer), _)) => {
+                        let outcome = if message.timer.as_ref().is_some_and(|timer| lock(&watch).receipts.contains(&timer.id)) { TimerOutcome::Delivered } else if review { TimerOutcome::Deferred } else { TimerOutcome::SkippedBusy };
                         let _ = answer.send(Ok(outcome));
                     }
                     Some(command) => queue.push_back(command),
@@ -999,11 +1017,14 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             };
             let work = match work {
                 Work::Review(result) => {
+                    lock(&watch).review = None;
                     if let Err(error) = crate::intent_review::apply(&mut agent, &host, result) { eprintln!("piccosta intent review: {error}"); }
                     if until_idle && queue.is_empty() && commands.is_empty() && claim.as_ref().is_none_or(|claim| claim.taken.is_empty()) { break; }
                     continue;
                 }
                 Work::Command(Command::Stop(answer), _) => {
+                    if let Some(data) = reviews.stop().await && let Err(error) = crate::intent_review::apply(&mut agent, &host, data) { eprintln!("piccosta intent review: {error}"); }
+                    lock(&watch).review = None;
                     answer.map(|answer| answer.send(()));
                     if until_idle {
                         break;
@@ -1019,7 +1040,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                     let _ = answer.send(());
                     continue;
                 }
-                Work::Command(Command::Timer(message, expires, answer), _) => {
+                Work::Command(Command::Timer(message, review, expires, answer), _) => {
                     let Some(timer) = &message.timer else { let _ = answer.send(Err("missing timer occurrence".into())); continue };
                     if answer.is_closed() || Instant::now() >= expires { continue; }
                     // Accepted occurrences count while their prompt is running too. Admission and
@@ -1028,10 +1049,21 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                         let _ = answer.send(Ok(TimerOutcome::Delivered));
                         continue;
                     }
-                    if handle.draining() || !queue.is_empty() || !commands.is_empty() || agent.has_pending_work() || agent.unattended_allowed().is_err() {
-                        let _ = answer.send(Ok(TimerOutcome::SkippedBusy));
+                    if handle.draining() || !queue.is_empty() || !commands.is_empty() || claim.as_ref().is_some_and(|claim| !claim.taken.is_empty()) || agent.has_pending_work() || reviews.running() || review && shared.jobs.running_count() != 0 {
+                        let _ = answer.send(Ok(if review { TimerOutcome::Deferred } else { TimerOutcome::SkippedBusy }));
                         continue;
                     }
+                    if review {
+                        let result = reviews.start(&host, &mut agent, &timer.id);
+                        if matches!(result, Ok(TimerOutcome::Delivered)) {
+                            let mut watched = lock(&watch);
+                            watched.receipts.insert(timer.id.clone());
+                            watched.review = reviews.cancellation();
+                        }
+                        let _ = answer.send(result);
+                        continue;
+                    }
+                    if agent.unattended_allowed().is_err() { let _ = answer.send(Ok(TimerOutcome::SkippedBusy)); continue; }
                     lock(&watch).timer_answer = Some((timer.id.clone(), answer));
                     Work::Command(Command::Prompt(message), false)
                 }
@@ -1097,8 +1129,6 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             let mut receiving = true;
             let attended = agent.unattended_allowed().is_ok();
             let occurrence = match &work { Work::Command(Command::Prompt(message), _) => message.timer.as_ref().map(|timer| timer.id.clone()), _ => None };
-            worked.store(false, Ordering::Relaxed);
-            unattended.store(false, Ordering::Relaxed);
             let result = {
                 let run = perform(&host, &mut agent, &mut team, work);
                 tokio::pin!(run);
@@ -1110,11 +1140,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                             say(format!("skipped for the request at {}: busy, the session was working", at(request)));
                         },
                         command = next(&mut commands, &mut claim), if receiving => match command {
-                            Some((Command::Timer(message, _, answer), _)) => {
+                            Some((Command::Timer(message, review, _, answer), _)) => {
                                 let id = message.timer.as_ref().map(|timer| timer.id.as_str());
                                 let result = if id.is_some_and(|id| lock(&watch).receipts.contains(id)) { Ok(TimerOutcome::Delivered) }
                                     else if id.is_some() && occurrence.as_deref() == id { Err("timer prompt append was not confirmed".into()) }
-                                    else { Ok(TimerOutcome::SkippedBusy) };
+                                    else { Ok(if review { TimerOutcome::Deferred } else { TimerOutcome::SkippedBusy }) };
                                 let _ = answer.send(result);
                             }
                             Some(other) if closing.is_some() => queue.push_back(other),
@@ -1133,6 +1163,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                                 shared.jobs.detach_all();
                             }
                             Some((Command::Stop(answer), _)) => {
+                                reviews.cancel();
                                 shared.jobs.detach_all();
                                 handle.abort();
                                 stops.push(answer);
@@ -1161,8 +1192,6 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 }
             };
             lock(&watch).since = None;
-            if !compacting && closing.is_none() && worked.load(Ordering::Relaxed) && unattended.load(Ordering::Relaxed)
-                && let Err(error) = reviews.start(&host, &mut agent) { eprintln!("piccosta intent review: {error}"); }
             // Only the normal user-message append acknowledges delivery. If it never happened,
             // the sender retries; there is no separate queued receipt to strand at the idle gate.
             if let Some(id) = &occurrence {
@@ -1217,8 +1246,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
         for (command, _) in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true))) {
             let message = match command {
                 Command::Message(message) | Command::Prompt(message) if !message.is_empty() => Some(AgentMessage::User(message)),
-                Command::Timer(_, _, answer) => {
-                    let _ = answer.send(Ok(TimerOutcome::SkippedBusy));
+                Command::Timer(_, review, _, answer) => {
+                    let _ = answer.send(Ok(if review { TimerOutcome::Deferred } else { TimerOutcome::SkippedBusy }));
                     None
                 }
                 Command::Stop(Some(answer)) | Command::Close(Some(answer)) => {

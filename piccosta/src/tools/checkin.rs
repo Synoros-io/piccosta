@@ -28,6 +28,10 @@ struct Checkin {
     user: bool,
     #[serde(default)]
     created: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remaining: Option<u64>,
     #[serde(default)]
     outcome: Option<(i64, crate::runtime::TimerOutcome)>,
     #[serde(default)]
@@ -64,12 +68,12 @@ impl Checkin {
 // The dispatcher holds the store lock through admission. Read its atomically published snapshot
 // without taking that lock, and verify the socket peer owns the claim. Timer words and dates
 // come from the user's stored timer, never from a caller's payload or claimed origin.
-pub(crate) fn timer_input(agent_dir: &Path, file: &Path, id: &str, peer: Option<i32>) -> Result<crate::message::UserMessage, String> {
+pub(crate) fn timer_input(agent_dir: &Path, file: &Path, id: &str, peer: Option<i32>) -> Result<(crate::message::UserMessage, bool), String> {
     let bytes = fs::read(agent_dir.join(STORE)).map_err(|error| error.to_string())?;
     let timers: Vec<Checkin> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     timers.iter().find(|timer| timer.user && timer.occurrence() == id && crate::tools::paths::canonical(&timer.file) == crate::tools::paths::canonical(file)
         && timer.claimed.as_ref().is_some_and(|(owner, _)| Some(owner.pid) == peer && owner.alive()))
-        .map(|timer| timer.user_input(agent_dir)).ok_or_else(|| "timer dispatcher or user-owned occurrence could not be verified".into())
+        .map(|timer| (timer.user_input(agent_dir), timer.review)).ok_or_else(|| "timer dispatcher or user-owned occurrence could not be verified".into())
 }
 
 fn save(path: &Path, timers: &[Checkin]) -> Result<(), String> {
@@ -232,8 +236,10 @@ fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
         // Cancellation and admission have one order: off either removes this occurrence before
         // we ask, or waits for its admission answer. The owner never needs this store lock.
         store(agent_dir, |timers| {
-            if !timers.iter().any(|timer| timer == &claimed) || crate::session::is_closed(agent_dir, &claimed.file) { return Ok(crate::runtime::TimerOutcome::SkippedBusy); }
-            crate::runtime::deliver_timer(&claimed.file, &claimed.user_input(agent_dir))
+            // A close after claiming mustn't advance past an admitted review's receipt. Keep
+            // that occurrence paused; reopening reconciles it before any offline skip.
+            if !timers.iter().any(|timer| timer == &claimed) || crate::session::is_closed(agent_dir, &claimed.file) { return Ok(if claimed.review { crate::runtime::TimerOutcome::Deferred } else { crate::runtime::TimerOutcome::SkippedBusy }); }
+            crate::runtime::deliver_timer(&claimed.file, &claimed.user_input(agent_dir), claimed.review)
         })
     } else {
         let text = format!("[{}, checkin {}]\n{}", crate::clock::iso_from_ms(crate::clock::now_ms()), claimed.id, claimed.text);
@@ -253,6 +259,11 @@ fn deliver(agent_dir: &Path, claimed: Checkin) -> Result<(), String> {
             }
             if timer.user { timer.outcome = sent.as_ref().ok().map(|outcome| (now, *outcome)); }
             (timer.retry_at, timer.retry_ms) = (0, 0);
+            if sent == Ok(crate::runtime::TimerOutcome::Deferred) { return true; }
+            if timer.review && sent == Ok(crate::runtime::TimerOutcome::Delivered) && let Some(remaining) = &mut timer.remaining {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 { return false; }
+            }
             if let Some(every) = timer.every_ms.filter(|every| *every > 0) {
                 // A repeat missed while nothing ran fires once, then keeps its rhythm.
                 timer.next = now.saturating_add(every - (now - timer.next) % every);
@@ -267,34 +278,36 @@ pub fn cancel_all(agent_dir: &Path, file: &Path, by_user: bool) -> Result<(), St
     store(agent_dir, |timers| { timers.retain(|timer| timer.user && !by_user || crate::tools::paths::canonical(&timer.file) != file); Ok(()) })
 }
 
-// /timer works on the shown session, even when another process owns it. Called on the TUI's
-// disk worker: neither a store lock nor a list of paused sessions belongs on the input thread.
-pub fn user_timer(agent_dir: &Path, file: &Path, argument: &str) -> Result<String, String> {
+// /timer and /align work on the shown session, even when another process owns it. The TUI's
+// disk worker calls this; neither a store lock nor paused-session reads belong on input.
+pub fn user_timer(agent_dir: &Path, file: &Path, argument: &str, review: bool) -> Result<String, String> {
     let file = crate::tools::paths::canonical(file);
+    let kind = if review { "alignment" } else { "user" };
     store(agent_dir, |timers| {
-        let ours = |timer: &Checkin| timer.user && crate::tools::paths::canonical(&timer.file) == file;
+        let ours = |timer: &Checkin| timer.user && timer.review == review && crate::tools::paths::canonical(&timer.file) == file;
         if argument.is_empty() {
             let paused = crate::session::is_closed(agent_dir, &file);
             let lines: Vec<_> = timers.iter().filter(|timer| ours(timer)).map(|timer| {
                 let last = timer.outcome.map_or("not fired".into(), |(when, outcome)| format!("{} at {}", outcome.label(), crate::clock::iso_from_ms(when)));
-                format!("{} · next {}{} · last {last}\n{}", timer.id, crate::clock::iso_from_ms(timer.next), if paused { " · paused while closed" } else { "" }, timer.text)
+                format!("{} · next {}{}{} · last {last}\n{}", timer.id, crate::clock::iso_from_ms(timer.next), if paused { " · paused while closed" } else { "" }, timer.remaining.map_or(String::new(), |count| format!(" · {count} remaining")), timer.text)
             }).collect();
-            return Ok(if lines.is_empty() { "No user timers.".into() } else { lines.join("\n") });
+            return Ok(if lines.is_empty() { format!("No {kind} timers.") } else { lines.join("\n") });
         }
         let (interval, prompt) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(word, rest)| (word, rest));
         if interval == "off" {
             let prompt = prompt.trim();
             let before = timers.len();
             timers.retain(|timer| !ours(timer) || !prompt.is_empty() && timer.id != prompt);
-            return Ok(format!("Cancelled {} user timer(s). An admitted turn is not revoked; Esc stops it.", before - timers.len()));
+            return Ok(format!("Cancelled {} {kind} timer(s). Admitted work is not revoked; Esc stops it.", before - timers.len()));
         }
-        let every = duration_ms(interval).ok_or("/timer <interval> <prompt> (like 30m, 2h or 5s), /timer, or /timer off [id]")?;
-        if prompt.trim().is_empty() { return Err("/timer needs the prompt to replay.".into()); }
+        let every = duration_ms(interval).ok_or(if review { "/align <interval> [count], /align, or /align off [id]" } else { "/timer <interval> <prompt> (like 30m, 2h or 5s), /timer, or /timer off [id]" })?;
+        let remaining = if review && !prompt.trim().is_empty() { Some(prompt.trim().parse::<u64>().ok().filter(|count| *count > 0).ok_or("/align count must be a positive integer")?) } else { None };
+        if !review && prompt.trim().is_empty() { return Err("/timer needs the prompt to replay.".into()); }
         let created = crate::clock::now_ms();
         let next = created.checked_add(every).ok_or("duration is too large")?;
         let id = uuid::Uuid::new_v4().to_string();
-        timers.push(Checkin { id: id.clone(), text: prompt.to_string(), next, every_ms: Some(every), user: true, created, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
-        Ok(format!("User timer {id} · next {} · every {interval}. Busy or not running: skipped, never queued.", crate::clock::iso_from_ms(next)))
+        timers.push(Checkin { id: id.clone(), text: if review { "Intent review".into() } else { prompt.to_string() }, next, every_ms: Some(every), user: true, review, remaining, created, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
+        Ok(format!("{kind} timer {id} · next {} · every {interval}. {}", crate::clock::iso_from_ms(next), if review { "Busy: deferred; unchanged or not running: skipped, count unchanged." } else { "Busy or not running: skipped, never queued." }))
     })
 }
 
@@ -329,7 +342,7 @@ impl Tool for CheckinTool {
                         };
                         let every_ms = arguments.get("every").and_then(Value::as_str).map(|every| duration_ms(every).ok_or("every needs a duration like 20m, 2h or 5s")).transpose()?;
                         let id = uuid::Uuid::new_v4().to_string();
-                        timers.push(Checkin { id: id.clone(), text: need("text")?.to_string(), next, every_ms, user: false, created: now, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
+                        timers.push(Checkin { id: id.clone(), text: need("text")?.to_string(), next, every_ms, user: false, review: false, remaining: None, created: now, outcome: None, retry_at: 0, retry_ms: 0, file, claimed: None, source: None });
                         Ok(format!("Check-in {id} set for {}.", crate::clock::iso_from_ms(next)))
                     }
                     "list" => {

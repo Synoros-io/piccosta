@@ -173,6 +173,7 @@ impl App {
             self.slots.push(super::Slot { saved: true, ..super::Slot::new(Some(path), super::NEW_TITLE.into()) });
             self.slots.len() - 1
         });
+        if self.slots[slot].closing { self.retire(reader); return Err("The session is still closing.".into()); }
         // Just a sidebar row, not a new runtime or a prompt. Existing live views stay untouched.
         if self.slots[slot].live.is_none() {
             let ticket = std::sync::Arc::downgrade(&self.slots[slot].incarnation);
