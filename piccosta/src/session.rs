@@ -1137,6 +1137,8 @@ impl Session {
         let base = self.next_base();
         let model_messages = to_model_messages(&self.context().messages, self.header.notice_token.as_deref());
         let system_message = current_system_message(&model_messages).map(|mut system| {
+            // This boundary retires legacy direction before retained-system APIs can replay it.
+            if let Some(sections) = &mut system.sections { sections.shift_remove("project_direction"); }
             system.timestamp = clock::ms_from_iso(&base.timestamp).unwrap_or(0);
             SystemSnapshot::System(system)
         });

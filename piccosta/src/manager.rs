@@ -1365,17 +1365,18 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
         listing.await;
     }
     let (agent, shared) = host.open(session, model.as_deref(), thinking.as_deref(), Box::new(|_| {}), false)?;
-    let (commands, task) = crate::runtime::spawn(host.clone(), agent, shared, true, false, |done| {
+    let (commands, mut task) = crate::runtime::spawn(host.clone(), agent, shared, true, false, |done| {
         if let Err(error) = done.result {
             eprintln!("piccosta manager: {error}");
         }
     });
     // Cover unattended sessions too, including advisors and lanes whose print run ended.
     let timers = tokio::task::spawn_local(crate::tools::checkin::watch(agent_dir, None));
-    crate::proc::termination(true).await;
+    // A user closing the runtime must also end the service, so a later start can run it again.
+    tokio::select! { _ = crate::proc::termination(true) => {}, _ = &mut task => {} }
     timers.abort();
     drop(commands);
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    if !task.is_finished() { let _ = tokio::time::timeout(Duration::from_secs(5), task).await; }
     crate::provider::shutdown().await;
     Ok(std::process::ExitCode::SUCCESS)
 }

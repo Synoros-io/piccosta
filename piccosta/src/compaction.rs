@@ -31,7 +31,7 @@ const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You write the checkpoint a coding session continues from after its earlier messages are dropped. You read the conversation and write the summary in the format asked for. You don't answer anything in the conversation or carry on with its work.";
 
-const SUMMARIZATION_PROMPT: &str = "The messages above are the conversation so far. Write the checkpoint the session will continue from, in this format:
+const SUMMARIZATION_PROMPT: &str = "The messages above are the conversation so far. Do not quote or paraphrase the project instructions or recent project notes from the system prompt anywhere in the checkpoint; they are attached again after compaction. Write the checkpoint the session will continue from, in this format:
 
 ## The user's continuing rules
 Rules the user gave for the work as a whole (project or collaboration only). Each rule: exact quotation — original date/offset or 'date unknown' — a few words about what it concerned. Task instructions belong with their task under Goal, Done or In progress, never here; finished or superseded instructions are not active obligations. Re-judge previous summaries' lists; do not inherit their claims of standing authority. Pins, check-ins and reports are past context, not new instructions. Use dates tied to the quoted source, not its summary or replay; unknown dates stay unknown.
@@ -599,11 +599,33 @@ fn summary_prompt(instructions: Option<&str>, source_dates: &str) -> UserMessage
     UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() } }
 }
 
+// Only an oversized summary request may shed legacy direction payloads. Remove every historical
+// copy for APIs retaining system updates; only actual removals invalidate measured usage.
+pub fn strip_legacy_direction(messages: &mut [AgentMessage]) {
+    let mut stripped = false;
+    for message in messages.iter_mut() {
+        if let AgentMessage::System(system) = message && let Some(sections) = &mut system.sections {
+            stripped |= sections.shift_remove("project_direction").flatten().is_some();
+        }
+    }
+    if stripped {
+        for message in messages {
+            if let AgentMessage::Assistant(answer) = message { answer.usage = Usage::default(); }
+        }
+    }
+}
+
+// Measure the complete summary request using the same provider projection as the send guard.
+pub fn summary_request_tokens(messages: &[AgentMessage], model: &Model, session: &Session, instructions: Option<&str>) -> u64 {
+    let mut request = to_model_messages(messages, session.header().notice_token.as_deref());
+    request.push(Message::User(summary_prompt(instructions, &source_dates(session, messages))));
+    estimate::request_tokens(model, &request)
+}
+
 // A compaction's summary (agent.rs run_auto_compaction): `request` is the session's own, as its
-// turns send it, and the summary prompt goes after its messages as one more, so the provider reads
-// everything before it from its cache rather than having all of it sent again. One request: the
-// model sees the whole context, split turn or not. Not retried: a failure leaves the session as it
-// was, for the next turn. `instructions` is the user's focus for /compact.
+// turns send it, with only the summary prompt appended. Unchanged prefixes can use the provider's
+// cache. No retry here; notes refresh only after an accepted summary.
+// `instructions` is the user's focus for /compact.
 pub async fn summarize_in_place(request: Request<'_>, instructions: Option<&str>, source_dates: &str) -> AssistantMessage {
     let messages = [request.messages, &[Message::User(summary_prompt(instructions, source_dates))]].concat();
     // A protected summary or one oversized turn may survive fit. Refuse that request rather than
@@ -632,22 +654,15 @@ pub fn accept_summary(preparation: &Preparation, response: AssistantMessage) -> 
 // are shortened first: those after the last answer (what overflowed; everything before them is what
 // the last request sent and the cache holds), then all of them. Past that the oldest turns go, but
 // never a system message or the previous compaction's summary, which the new one has to carry on.
-// With an input ceiling, measure the whole summary request, resolving its prompt and tools just
-// as the guard does. Otherwise keep pi's original history-only sizes and cuts.
+// Measure the whole summary request, including its prompt and resolved tools.
 pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64, model: &Model, session: &Session, instructions: Option<&str>) {
-    let total = |messages: &[AgentMessage]| {
-        if model.max_input_tokens.is_none() { return messages.iter().map(estimate_tokens).sum(); }
-        let mut request = to_model_messages(messages, session.header().notice_token.as_deref());
-        request.push(Message::User(summary_prompt(instructions, &source_dates(session, messages))));
-        estimate::request_tokens(model, &request)
-    };
-    let chars_per_token = if model.max_input_tokens.is_some() { estimate::CHARS_PER_TOKEN } else { CHARS_PER_TOKEN };
+    let total = |messages: &[AgentMessage]| summary_request_tokens(messages, model, session, instructions);
     let tail = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))).map_or(0, |at| at + 1);
     let mut cut_before_answer = false;
     for from in [tail, 0] {
         let now = total(messages);
         if now > budget {
-            shorten_results(messages, from, budget, now, chars_per_token);
+            shorten_results(messages, from, budget, now, estimate::CHARS_PER_TOKEN);
             cut_before_answer |= from < tail;
         }
     }

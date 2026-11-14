@@ -311,13 +311,10 @@ impl App {
             }
             // Claude Code's /effort auto: forget this model's saved level and go back to the default.
             "thinking" | "effort" if argument == "auto" => {
-                let model = self.current().model.clone();
-                if let Err(error) = crate::config::remember_thinking_level(&self.host.agent_dir, &model, None) {
-                    self.notice = Some(error);
-                }
+                let saved = crate::config::remember_thinking_level(&self.host.agent_dir, &self.current().model, None);
                 let level = self.host.settings.default_thinking_level();
-                self.notice = Some(format!("{model}: back to the default level, {level}"));
                 self.tell(Command::Thinking(level));
+                if let Err(error) = saved { self.notice = Some(error); }
             }
             // A level named is set straight away, the model's nearest when it doesn't take that one;
             // without one, a list of the levels this model takes (all of them when it can't be
@@ -360,7 +357,7 @@ impl App {
             }
             "name" | "rename" => self.notice = Some(format!("This session is “{}”; /rename <name> changes it.", self.current().title)),
             "compact" => {
-                self.focused().state = State::Compacting;
+                if self.current().live.is_some() { self.focused().state = State::Compacting; }
                 self.tell(Command::Compact(Some(argument.to_string()).filter(|text| !text.is_empty())));
             }
             "fast" => {
@@ -386,7 +383,7 @@ impl App {
                 let (agent_dir, argument, review) = (self.host.agent_dir.clone(), raw_argument.trim_start().to_string(), name == "align");
                 if self.asks.send(Box::new(move |_| {
                     let report = crate::tools::checkin::user_timer(&agent_dir, &file, &argument, review).unwrap_or_else(|error| error);
-                    (slot, Update::TimerReport(file, report))
+                    (slot, Update::SessionReport(file, report))
                 })).is_err() { self.notice = Some("The timer disk worker stopped.".into()); }
             }
             "diff" => self.diff(),
@@ -447,22 +444,31 @@ impl App {
         if view.closing { return; }
         view.closing = true;
         view.release_generation = std::sync::Arc::new(());
-        self.notice = Some(format!("Closing “{}”…", view.title));
+        self.notice = Some(format!("{} “{}”…", if view.deleting { "Deleting" } else { "Closing" }, view.title));
         if !view.opening && view.sending == 0 { self.close_requested(slot); }
     }
 
     // File-backed runtimes answer on their socket even when this UI owns them. The worker waits,
     // not the UI; memory-only runtimes use the same Close command and completion acknowledgement.
     pub(super) fn close_requested(&mut self, slot: usize) {
+        if self.slots[slot].deleting && !self.slots[slot].draft.text.is_empty() {
+            self.slots[slot].closing = false;
+            self.slots[slot].deleting = false;
+            self.notice = Some("Deletion cancelled: draft kept; send or clear it first.".into());
+            return;
+        }
         let view = &self.slots[slot];
         let ticket = std::sync::Arc::downgrade(&view.incarnation);
         if let Some(path) = view.path.clone() {
-            let agent_dir = self.host.agent_dir.clone();
+            let (agent_dir, deleting) = (self.host.agent_dir.clone(), view.deleting);
             if self.asks.send(Box::new(move |_| {
-                let result = crate::runtime::end(&path, "close", None).transpose().and_then(|_| crate::runtime::close_by_user(&agent_dir, &path));
+                let result = crate::runtime::end(&path, "close", None).transpose()
+                    .and_then(|_| crate::runtime::close_by_user(&agent_dir, &path))
+                    .and_then(|()| if deleting && path.exists() { trash_session(&path) } else { Ok(()) });
                 (slot, Update::Closed(ticket, result))
             })).is_err() {
                 self.slots[slot].closing = false;
+                self.slots[slot].deleting = false;
                 self.notice = Some("The disk worker stopped before the close was requested; the session stays open.".into());
             }
         } else {
@@ -552,16 +558,11 @@ impl App {
         if self.focus_cwd().as_os_str().is_empty() { self.host.cwd.clone() } else { self.focus_cwd().to_path_buf() }
     }
 
-    // Set this session's level and save it as the model's, saying so when the model runs a
-    // different one (the nearest it takes).
+    // Set this session's level and save it as the model's. tell reports the accepted level.
     fn set_thinking(&mut self, level: String) {
-        let model = self.current().model.clone();
-        let effective = self.host.registry().ok().and_then(|registry| registry.resolve(&model).ok().map(|found| crate::provider::clamp_thinking_level(found, &level)));
-        self.notice = match crate::config::remember_thinking_level(&self.host.agent_dir, &model, Some(&level)) {
-            Err(error) => Some(error),
-            Ok(()) => effective.filter(|effective| *effective != level).map(|effective| format!("{model} doesn't take {level}; it runs at {effective}")),
-        };
+        let saved = crate::config::remember_thinking_level(&self.host.agent_dir, &self.current().model, Some(&level));
         self.tell(Command::Thinking(level));
+        if let Err(error) = saved { self.notice = Some(error); }
     }
 
     // Every project's sessions, newest first, each with its directory. One picked opens in this
@@ -630,32 +631,14 @@ impl App {
         }
     }
 
-    // Close a session and move its file to the trash, so a mistake can be undone. Where it can't
-    // go there it stays where it was. A running session is left alone. Output: why the trash
-    // failed, which names where each file is, for the caller to report in the pane left showing
-    // (too long for the status line).
+    // Deletion uses the acknowledged close path, then trashes the file under its lease. Keep
+    // unsent input rather than dropping it with the view; pending deliveries finish first.
     fn delete(&mut self, slot: usize) -> Option<String> {
-        let (path, title) = (self.slots[slot].path.clone().filter(|path| path.exists()), self.slots[slot].title.clone());
-        // A session another piccosta is running would lose its file from under it. One open here
-        // answers on its socket too, so it's asked only when it isn't.
-        if self.slots[slot].live.is_none() && path.as_deref().is_some_and(crate::runtime::running) {
-            self.notice = Some(format!("“{title}” is open in another piccosta; quit it there first."));
-            return None;
-        }
-        if !self.close(slot) {
-            return None;
-        }
-        let Some(path) = path else {
-            self.notice = Some(format!("Closed “{title}”: it was never saved."));
-            return None;
-        };
-        self.notice = Some(format!("Moving “{title}” to the trash…"));
-        // Closing the pane only queues runtime shutdown. The existing counted disk worker waits
-        // for its lease, without blocking input or letting /restart strand a partial deletion.
-        self.asks.send(Box::new(move |_| {
-            let result = trash_session(&path);
-            (slot, Update::Deleted(path, result))
-        })).err().map(|_| "The disk worker stopped before the session could be trashed.".into())
+        if self.slots[slot].closing { return Some("The session already has a close or deletion pending.".into()); }
+        if !self.slots[slot].draft.text.is_empty() { return Some("Draft kept; send or clear it before deleting the session.".into()); }
+        self.slots[slot].deleting = true;
+        self.request_close(slot);
+        None
     }
 
     // Put a command's output in the focused pane.

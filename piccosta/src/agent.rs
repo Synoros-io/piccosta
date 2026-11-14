@@ -173,8 +173,9 @@ struct Inbox {
     follow_up: Vec<UserMessage>,
     steering_all: bool,
     follow_up_all: bool,
-    // A /fast that came during the run, for its next request.
+    // Settings that came during the run, for its next request.
     fast: Option<bool>,
+    thinking: Option<String>,
     // A restart lets the tool loop finish, but leaves new inputs for the next runtime.
     draining: bool,
 }
@@ -216,6 +217,11 @@ impl Handle {
     // Put in (Some) or take out (None) a /fast for the run's next request. Output: what was there.
     pub fn swap_fast(&self, on: Option<bool>) -> Option<bool> {
         std::mem::replace(&mut self.lock().fast, on)
+    }
+
+    // Put in or take out a thinking level for the run's next request.
+    pub fn swap_thinking(&self, level: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.lock().thinking, level)
     }
 
     // What's queued and not sent yet: steering, then follow-ups.
@@ -281,6 +287,7 @@ pub struct AgentConfig {
     // Whether the prompt carries the session's AGENTS.md files (--no-context-files turns them off);
     // they're looked at before each run, for an edit (prompt_update).
     pub context_files: bool,
+    pub recent_files: (String, String),
     pub retry: RetrySettings,
     // When to compact, resolved for this model.
     pub compaction: CompactionSettings,
@@ -556,7 +563,10 @@ impl Agent {
         // Copies and reopenings keep the prompt's namespace, so ordinary deliveries leave this
         // equal. Reconcile only a missing or obsolete notice rule.
         let notice_changed = current.as_ref().and_then(|system| system.sections.as_ref()?.get("notice_provenance")?.as_ref()) != self.config.sections.get("notice_provenance");
+        let held_direction = current.as_ref().and_then(|system| system.sections.as_ref()?.get("project_direction")?.clone());
+        let held_recent = current.as_ref().and_then(|system| system.sections.as_ref()?.get("project_recent")?.clone());
         let held = current.and_then(|system| system.sections?.shift_remove("project_context")?);
+        let boundary = missing_prompt || event.is_none_or(|event| event);
         let now = if self.config.context_files { crate::prompt::context_now(&self.config.cwd, &crate::config::agent_dir()) } else { Some(None) };
         // An edit is a file whose text the prompt doesn't hold yet. One gone from the list (removed,
         // or a second link to a file already there) waits for the next compaction, which builds the
@@ -566,11 +576,20 @@ impl Agent {
             // Each file's part with its closing tag, so a file cut short isn't found inside the old one.
             crate::prompt::instructions(project.as_deref()).split_inclusive(crate::prompt::FILE_END).any(|file| !held.contains(file))
         });
-        if !missing_prompt && !event.is_none_or(|event| event) && !edited && !notice_changed {
+        // Instruction and notice patches keep both snapshots, including legacy direction, until
+        // a boundary. Only then migrate direction away and read the latest project notes.
+        let recent = if boundary {
+            if self.config.context_files {
+                crate::prompt::recent_now(&self.config.cwd, &self.config.recent_files, held_recent.as_deref()).unwrap_or(held_recent)
+            } else { None }
+        } else { held_recent };
+        crate::prompt::set_section(&mut self.config.sections, "project_direction", if boundary { None } else { held_direction });
+        crate::prompt::set_section(&mut self.config.sections, "project_recent", recent);
+        if !boundary && !edited && !notice_changed {
             return None;
         }
         if let Some(project) = now {
-            crate::prompt::set_project_context(&mut self.config.sections, project);
+            crate::prompt::set_section(&mut self.config.sections, "project_context", project);
         }
         let (cwd, directory) = (self.config.cwd.clone(), self.config.tool_shared.bin_dir.parent()?.to_path_buf());
         let path = tokio::task::spawn_blocking(move || crate::scratchpad::path(&cwd, &directory)).await.ok()?;
@@ -1003,14 +1022,21 @@ impl Agent {
             && self.retry_attempt < retry.max_retries
     }
 
-    // Ask the model for one response and stream it out as events. Output: the response, already
-    // in the session, and its entry id.
-    async fn respond(&mut self) -> Result<(AssistantMessage, String, Vec<ToolResultMessage>), String> {
-        let mut external = Vec::new();
-        // A /fast from during the run applies here; one this model doesn't take waits for the run's end.
+    // Apply settings before any request, summaries too. A failed setting waits for the run's end.
+    fn apply_pending_settings(&mut self) {
         if let Some(on) = self.handle.swap_fast(None) && self.set_fast(on).is_err() {
             self.handle.swap_fast(Some(on));
         }
+        if let Some(level) = self.handle.swap_thinking(None) && self.set_thinking_level(&level).is_err() {
+            self.handle.swap_thinking(Some(level));
+        }
+    }
+
+    // Ask the model for one response and stream it out as events. Output: the response, already
+    // in the session, and its entry id.
+    async fn respond(&mut self) -> Result<(AssistantMessage, String, Vec<ToolResultMessage>), String> {
+        self.apply_pending_settings();
+        let mut external = Vec::new();
         let messages = crate::message::to_model_messages(&self.session.context().messages, self.session.header().notice_token.as_deref());
         let model = &self.config.model;
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
@@ -1380,31 +1406,39 @@ impl Agent {
         let pinning = pintask::enabled() || self.config.manager_home.is_some();
         let previous_status = if pinning { pintask::strip_previous_block(&mut preparation, &self.session.path_to_leaf()) } else { "none" };
 
+        self.apply_pending_settings();
+        let mut messages = self.session.context().messages;
+        let reply_room = if self.config.model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
+        let context_window = self.config.model.compaction_window(reply_room);
+        // Fitting summaries extend the held request unchanged. An oversized legacy direction
+        // can prevent fitting even on a smaller model; strip it only from this request copy.
+        if context_window > 0 && compaction::summary_request_tokens(&messages, &self.config.model, &self.session, instructions) > context_window.saturating_sub(reply_room) {
+            compaction::strip_legacy_direction(&mut messages);
+        }
         let cancel = self.cancel.child_token();
         let model = &self.config.model;
         let credential = auth::credential_for(&model.provider, self.config.registry.provider_config(&model.provider), &self.config.credentials).await;
         let outcome = match credential {
             Err(error) => Err(error),
             Ok(credential) => {
-                // Every compaction asks for its summary at the end of the session's own request, so
-                // the provider reads the context from its cache instead of being sent all of it
-                // again. A context past the model's window (an overflow, or a switch to a smaller
+                // Ask at the end of the session's request; unchanged prefixes can use its cache.
+                // A context past the model's window (an overflow, or a switch to a smaller
                 // model) is cut to fit first (compaction::fit); the bridge's window already keeps
                 // room for the reply.
-                let mut messages = self.session.context().messages;
-                let reply_room = if model.provider == provider::claude::PROVIDER { 0 } else { self.config.compaction.reserve_tokens };
-                let context_window = model.compaction_window(reply_room);
                 if context_window > 0 {
                     compaction::fit(&mut messages, context_window.saturating_sub(reply_room), model, &self.session, instructions);
                 }
                 let source_dates = compaction::source_dates(&self.session, &messages);
                 let messages = crate::message::to_model_messages(&messages, self.session.header().notice_token.as_deref());
                 let response = compaction::summarize_in_place(Self::request(&self.config, &self.session, &messages, &credential, cancel.clone(), self.ownership.clone()), instructions, &source_dates).await;
-                let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
-                    usage: response.usage.clone(), note: None };
-                let id = self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
-                (self.emit)(&Event::EntryAppended { entry });
-                self.check_cache(&id, &response)?;
+                // A local refusal spent nothing and must leave the journal unchanged.
+                if !response.request_not_sent {
+                    let entry = SessionEntry::Usage { base: self.session.next_base(), kind: "compaction".into(), provider: response.provider.clone(), model: response.model.clone(),
+                        usage: response.usage.clone(), note: None };
+                    let id = self.session.append(entry.clone()).map_err(|error| format!("Could not write the session: {error}"))?;
+                    (self.emit)(&Event::EntryAppended { entry });
+                    self.check_cache(&id, &response)?;
+                }
                 compaction::accept_summary(&preparation, response)
             }
         };

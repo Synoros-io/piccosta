@@ -259,6 +259,7 @@ Files live in `$PICCOSTA_AGENT_DIR`, else `$XDG_DATA_HOME/piccosta/agent`, else 
 - `web.fetch.maxSizeMB` (5): largest page fetched, PDFs aside.
 - `usage.refreshSeconds` (300): how often plan usage is polled.
 - `scratchpad.path`, `scratchpad.sharedAcrossWorktrees`: where the scratchpad lives (default: one per folder, outside the repo).
+- `recent.ledger` (`ledger.md`) and `recent.features` (`docs/features.md`): each independently finds the nearest file at or above the session folder. Up to 8,000 Unicode characters from each file's end, starting at a complete line, are attached with its path and last-change date; read the file for earlier entries. A final line too large to fit gets an omission note. Refreshed at session start, after compaction or on model change, not mid-conversation edits or reopen; failed or unsettled reads keep held notes. With `--no-context-files`, neither is attached. Notes don't guarantee a summary will fit; an oversized protected request is refused without discarding history.
 - `intentReview.model` (`provider/id[:level]`): explicit review override; otherwise the session's own model at low. Attempt bounds: `maxChars` (96000), `outputTokens` (8192), `seconds` (180), `outputChars` (65536), `overlap` (12), `outcomeChars` (2048), all under `intentReview`; scheduling is only `/align`.
 - `models.json` `compat.reasoningReplayField`: the field a model's thinking is sent back in.
 - `clientId` and `tokenUrl` in the `openai-codex` entry of `login/auth.json`: replace OpenAI's refresh client and endpoint.

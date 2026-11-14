@@ -113,9 +113,8 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
-    // A delayed timer report belongs to the captured session, not whichever pane has focus now.
-    TimerReport(PathBuf, String),
-    Deleted(PathBuf, Result<(), String>),
+    // A delayed command report belongs to its captured session, not whichever pane has focus now.
+    SessionReport(PathBuf, String),
     Closed(std::sync::Weak<()>, Result<(), String>),
     // /assistant's start, done: what it did, if anything; the assistant is shown when it's there.
     Assistant(Option<String>),
@@ -208,6 +207,7 @@ struct Slot {
     follow_pending: bool,
     opening: bool,
     closing: bool,
+    deleting: bool,
     sending: usize,
     restored: bool,
     // Kept in this UI until the user closes it, whether its agent runs or its file opens.
@@ -279,6 +279,7 @@ impl Slot {
             follow_pending: false,
             opening: false,
             closing: false,
+            deleting: false,
             sending: 0,
             restored: false,
             opened: false,
@@ -325,9 +326,9 @@ impl Slot {
         !self.saved && self.live.is_some() && !self.busy() && self.messages.is_empty() && self.draft.text.is_empty() && self.path.as_deref().is_none_or(|path| !path.exists())
     }
 
-    // Deleted, or closed before it was ever saved: kept only so the slot numbers stay put.
+    // Closed without a file or draft: kept only so the slot numbers stay put.
     fn gone(&self) -> bool {
-        self.live.is_none() && self.path.is_none()
+        self.live.is_none() && self.path.is_none() && self.draft.text.is_empty()
     }
 
 }
@@ -1655,11 +1656,41 @@ impl App {
     }
 
     fn tell(&mut self, command: Command) {
+        let accepted = match &command {
+            Command::Thinking(level) => Some(format!("Accepted effort {level}, from its next request.")),
+            _ => None,
+        };
+        // A followed session has no local command channel. Ask its owner off the UI thread;
+        // bind the answer to its file, not whichever pane has focus when the answer arrives.
+        if self.current().live.is_none() && self.current().elsewhere && !self.current().closing
+            && let Some(file) = self.current().path.clone()
+        {
+            let request = match serde_json::to_value(&command) {
+                Ok(request) => request,
+                Err(error) => { self.notice = Some(error.to_string()); return; }
+            };
+            let when = if matches!(command, Command::Thinking(_) | Command::Fast(_)) { "from its next request" } else { "after its current turn" };
+            let accepted = accepted.unwrap_or_else(|| format!("Accepted {}, {when}.", request["name"].as_str().unwrap_or("command")));
+            let slot = self.session_index();
+            if self.deliveries.send(Box::new(move |_| {
+                let text = match crate::runtime::ask(&file, serde_json::json!({"do": "command", "command": request}), crate::runtime::ASK_WAIT) {
+                    crate::runtime::Asked::Answered(reply) if reply["ok"] == true => accepted,
+                    crate::runtime::Asked::Nobody | crate::runtime::Asked::Unread => "Command didn't reach the session.".into(),
+                    crate::runtime::Asked::Answered(reply) if reply["ok"] == false => format!("Command didn't reach the session: {}", reply["error"].as_str().unwrap_or("the owner refused it")),
+                    _ => "Command not confirmed; the owner may have received it.".into(),
+                };
+                (slot, Update::SessionReport(file, text))
+            })).is_err() { self.notice = Some("Couldn't send the command: the delivery thread has stopped.".into()); }
+            return;
+        }
         if !self.ensure_open() {
             return;
         }
         if let Some((_, commands)) = &self.focused().live {
-            let _ = commands.send(command);
+            match commands.send(command) {
+                Ok(()) => if accepted.is_some() { self.notice = accepted; },
+                Err(_) => self.notice = Some("The command didn't reach the session: its runtime has stopped.".into()),
+            }
         }
     }
 
@@ -2030,14 +2061,28 @@ impl App {
             }
             Update::Closed(ticket, result) => {
                 if !ticket.ptr_eq(&Arc::downgrade(&self.slots[slot].incarnation)) { return; }
+                let deleting = std::mem::take(&mut self.slots[slot].deleting);
                 self.slots[slot].closing = false;
                 match result {
                     Ok(()) => {
+                        if deleting { self.notice = Some(format!("Deleted “{}” (saved files go to the trash).", self.slots[slot].title)); }
                         if let Some(path) = &self.slots[slot].path { self.closed.insert(path.clone(), crate::clock::now_ms()); }
                         self.slots[slot].state = State::Idle;
-                        if self.close(slot) { self.slots[slot].path = None; }
+                        // Text typed while shutdown was pending belongs in a fresh session, not the trash.
+                        if deleting && !self.slots[slot].draft.text.is_empty() {
+                            let (draft, cwd) = (std::mem::take(&mut self.slots[slot].draft), self.slots[slot].cwd.clone());
+                            self.slots[slot] = Slot { draft, cwd, opened: true, ..Slot::new(None, NEW_TITLE.into()) };
+                            self.notice = Some(match self.save_state() {
+                                Ok(()) => "Session deleted; pending draft kept in a new session.".into(),
+                                Err(error) => format!("Session deleted; draft kept here, but saving it failed: {error}"),
+                            });
+                        } else if self.close(slot) { self.slots[slot].path = None; }
                     }
-                    Err(error) => self.notice = Some(format!("Couldn't close “{}”; it stays open: {error}", self.slots[slot].title)),
+                    Err(error) => {
+                        let text = format!("Couldn't {} “{}”: {error}", if deleting { "delete" } else { "close" }, self.slots[slot].title);
+                        self.slots[slot].messages.push(commands::report_message(text.clone()));
+                        self.notice = Some(text);
+                    }
                 }
                 return;
             }
@@ -2056,16 +2101,9 @@ impl App {
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
             Update::Closed(..) | Update::Report(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
-            Update::TimerReport(file, text) => {
+            Update::SessionReport(file, text) => {
                 if view.path.as_ref() == Some(&file) { view.messages.push(commands::report_message(text)); }
             }
-            Update::Deleted(path, result) => match result {
-                Ok(()) => {
-                    if view.path.as_ref() == Some(&path) { view.path = None; }
-                    self.notice = Some(format!("Moved “{}” to the trash.", view.title));
-                }
-                Err(error) => self.report(error),
-            },
             Update::Assistant(started) => {
                 // Said only when it started something: a newer notice isn't cleared for nothing.
                 if started.is_some() {

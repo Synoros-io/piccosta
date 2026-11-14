@@ -8,7 +8,8 @@
 // - {"do": "stop"}: Esc: running commands move to the background and the turn stops; a run of its
 //   own (print mode) then ends;
 // - {"do": "close"}: stop, kill its jobs and end;
-// - {"do": "thinking", "level": ...}: set its thinking level, as /effort does;
+// - {"do": "command", "command": {"name": ..., "value": ...}}: a setting, as in the TUI;
+//   the older {"do": "thinking", "level": ...} is still accepted;
 // - {"do": "status"}: whether it's working and since when, and the session whose command started
 //   it and its job, when one did (a subagent);
 // - {"do": "subscribe"}: a line when it's subscribed, one for each turn that ends, then one when it
@@ -53,7 +54,7 @@ const LOCK_POLL: Duration = Duration::from_millis(20);
 // How long a question gets for its answer: a runtime answers messages at once; a stop or close
 // answers once the turn has stopped, which an interrupted Claude Code answer can take seconds to
 // do. A runner that hasn't answered a stop or close by then is killed (end).
-const ASK_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const ASK_WAIT: Duration = Duration::from_secs(2);
 pub const STOP_WAIT: Duration = Duration::from_secs(15);
 // How long status gets. Its listener answers it at once, off the session's thread, so one that
 // hasn't within this is stopped or stuck. Kept short because the terminal UI asks every runtime
@@ -71,19 +72,29 @@ static IDLE_NOTES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new())
 
 // What a runtime is asked. Message, Stop and Close are taken at once; the rest wait their turn.
 // Stop and Close answer on their sender, when there is one, once they've taken effect.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "name", content = "value", rename_all = "snake_case")]
 pub enum Command {
+    #[serde(skip)]
     Prompt(UserMessage),
+    #[serde(skip)]
     Message(UserMessage),
     // A durable check-in starts a turn even when a frontend normally starts each one itself.
+    #[serde(skip)]
     Checkin,
     // Only the owning runtime admits a user timer. It must never enter the durable inbox first.
+    #[serde(skip)]
     Timer(UserMessage, bool, Instant, oneshot::Sender<Result<TimerOutcome, String>>),
+    #[serde(skip)]
     Stop(Option<oneshot::Sender<()>>),
+    #[serde(skip)]
     Close(Option<oneshot::Sender<()>>),
     // Acknowledge only between runs, after the frontend has set Handle::draining.
+    #[serde(skip)]
     Drain(oneshot::Sender<()>),
     // A weak ticket expires when the frontend shows it again or edits its draft.
     // Only the runtime knows whether it has settled.
+    #[serde(skip)]
     ReleaseIfIdle(std::sync::Weak<()>),
     Model(String),
     Thinking(String),
@@ -325,9 +336,13 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>, 
                     if let Some(cancel) = &review { cancel.cancel(); }
                     json!({"ok": review.is_some()})
                 },
-                "thinking" => match request["level"].as_str().filter(|level| crate::provider::THINKING_LEVELS.contains(level)) {
-                    Some(level) => json!({"ok": send(Command::Thinking(level.to_string()))}),
-                    None => json!({"ok": false, "error": "no such level"}),
+                "command" | "thinking" => {
+                    let command = if request["do"] == "thinking" { json!({"name": "thinking", "value": request["level"]}) } else { request["command"].clone() };
+                    match serde_json::from_value::<Command>(command) {
+                        Ok(Command::Thinking(level)) if !crate::provider::THINKING_LEVELS.contains(&level.as_str()) => json!({"ok": false, "error": "no such level"}),
+                        Ok(command) => json!({"ok": send(command)}),
+                        Err(error) => json!({"ok": false, "error": error.to_string()}),
+                    }
                 },
                 "timer" if lock(&watch).receipts.contains(request["id"].as_str().unwrap_or_default()) => json!({"outcome": TimerOutcome::Delivered}),
                 "timer" => {
@@ -1122,7 +1137,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 _ => false,
             };
             let frontend = !notice && matches!(work, Work::Command(_, true));
-            let mut fast_frontend = false;
+            let mut setting = None;
             let compacting = matches!(work, Work::Idle);
             lock(&watch).since = Some(crate::clock::now_ms());
             let mut stops = Vec::new();
@@ -1174,11 +1189,15 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                                 handle.abort();
                                 closing = Some(answer);
                             }
-                            // Fast mode changes from the run's next request (Agent::respond), unless
-                            // commands typed before it wait: then it waits behind them, in order.
-                            Some((Command::Fast(on), frontend)) if queue.is_empty() && !handle.draining() => {
-                                handle.swap_fast(Some(on));
-                                fast_frontend = frontend;
+                            // Apply one request setting mid-run, then complete it in command order.
+                            // Later settings wait too, so no frontend completion slot is skipped.
+                            Some((command @ (Command::Thinking(_) | Command::Fast(_)), frontend)) if setting.is_none() && queue.is_empty() && !handle.draining() => {
+                                match &command {
+                                    Command::Thinking(level) => { handle.swap_thinking(Some(level.clone())); }
+                                    Command::Fast(on) => { handle.swap_fast(Some(*on)); }
+                                    _ => unreachable!(),
+                                }
+                                setting = Some((command, frontend));
                             }
                             Some(other) => queue.push_back(other),
                             None => {
@@ -1197,10 +1216,11 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             if let Some(id) = &occurrence {
                 lock(&watch).timer_done(id, Err(result.as_ref().err().cloned().unwrap_or_else(|| "timer prompt was not appended".into())));
             }
-            // A /fast no request took is done as a command of its own, before what came after it.
-            if let Some(on) = handle.swap_fast(None) {
-                queue.push_front((Command::Fast(on), fast_frontend));
-            }
+            // Complete the absorbed setting even if a request took it. The run's own Done comes
+            // first; reapplying the same thinking level records nothing.
+            handle.swap_fast(None);
+            handle.swap_thinking(None);
+            if let Some(setting) = setting { queue.push_front(setting); }
             // What a stop left unread stays queued here, for the session's next turn (or rpc's
             // clear_queue); it goes into the file when the session is given up.
             let stopped = !stops.is_empty();

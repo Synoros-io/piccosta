@@ -194,6 +194,12 @@ impl Settings {
         }
     }
 
+    // Recent project notes at prompt boundaries, each searched independently above cwd.
+    pub fn recent_files(&self) -> (String, String) {
+        (self.get_str("recent.ledger").unwrap_or("ledger.md").into(),
+         self.get_str("recent.features").unwrap_or("docs/features.md").into())
+    }
+
     // `defaultThinkingLevel`, "medium" when unset.
     pub fn default_thinking_level(&self) -> String {
         self.get_str("defaultThinkingLevel").unwrap_or(DEFAULT_THINKING_LEVEL).to_string()

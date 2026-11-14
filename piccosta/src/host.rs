@@ -42,7 +42,7 @@ pub struct Host {
 // it), and how. A pair answers back and forth in the one chat until a model says it's done or the
 // round limit, then the user speaks; a trio is the session's model answering, the other checking
 // that once, then the user.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Team {
     pub models: Vec<String>,
     pub pair: bool,
@@ -473,6 +473,7 @@ impl Host {
             cwd,
             sections,
             context_files: self.context_files,
+            recent_files: self.settings.recent_files(),
             retry: self.settings.retry(false),
             compaction,
             transport: self.settings.transport(),
