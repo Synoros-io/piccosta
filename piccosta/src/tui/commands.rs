@@ -237,13 +237,14 @@ impl App {
                         self.slots.len() - 1
                     }),
                     None => {
-                        // An advisor runs on the scale's advice kind, which ships off so nothing
-                        // else hands work to it.
-                        let (model, level, note) = if role == Role::Advisor { crate::scale::pick(&self.host.agent_dir, crate::manager::ADVISOR_KIND, true).unwrap_or_else(|error| (None, None, Some(error))) } else { (None, None, None) };
+                        // A new manager or advisor starts on the model and level the user has
+                        // selected, like any new session (new_session_in); /model and /effort change it.
+                        let current = match self.panes[self.focus].target { super::Target::Session(slot) => Some(&self.slots[slot]), super::Target::Scratchpad(_) => None };
+                        let model = current.map(|current| current.model.clone()).filter(|model| !model.is_empty()).or(self.model.clone());
+                        let thinking = current.map(|current| current.thinking.clone()).filter(|level| !level.is_empty());
                         self.slots.push(super::Slot { cwd, make: Some(role), ..super::Slot::new(None, super::NEW_TITLE.into()) });
                         let slot = self.slots.len() - 1;
-                        self.notice = note;
-                        if let Err(error) = self.load(slot, model, level, None) {
+                        if let Err(error) = self.load(slot, model, thinking, None) {
                             self.slots.pop();
                             self.notice = Some(error);
                             return true;

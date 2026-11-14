@@ -9,8 +9,8 @@
 //   agent's command started, or one on a scratch agent dir, makes none on its own (host.rs open). It runs wherever it's opened, or headless when it's messaged;
 //   the assistant's service fires its schedules. Its home is <agent dir>/projects/<the directory's
 //   session folder name>.
-// Either can have an advisor (/advisor), a standing session on the scale's advice kind that
-// advises its manager: its home is <manager's home>/advisor, and its `sessions` reads any session
+// Either can have an advisor (/advisor), a standing session on the user's model that advises
+// its manager: its home is <manager's home>/advisor, and its `sessions` reads any session
 // and messages managers, its own or another's, each message marked as from it. It hears its
 // manager only when messaged; its lanes are the sessions it starts itself, which it may message
 // and close. The user talks to both.
@@ -32,7 +32,7 @@
 // - `name`, the assistant's only: what the user calls it, when they've named it.
 //
 // Its context stays bounded however long it runs. When it compacts, the summary carries the
-// newest of the user's words verbatim up to MANAGER_PIN_CHARS (older ones as a one-line index;
+// newest of the user's words verbatim up to PIN_CHARS (older ones as a one-line index;
 // pintask.rs), and the newest LEDGER_VIEW_CHARS of the ledger. Everything else is on disk, word
 // for word, and `ledger search` brings it back.
 //
@@ -86,17 +86,12 @@ fn quota(settings: &crate::config::Settings, ask: bool) -> String {
     }
 }
 
-// What the manager runs on unless `manager.model`/`manager.thinking` say otherwise: the scale's
-// kind for managing a main lane (critical), a new one at its level.
-const MANAGER_KIND: &str = "critical";
 // The command `notify` runs with the message as its last argument, unless `manager.notifyCommand`
 // names another (a list of words).
 const DEFAULT_NOTIFY: [&str; 2] = ["notify-send", "piccosta manager"];
-// How much of the user's words, and of the ledger, a compaction keeps word for word: room for a
-// working day of instructions and the latest few dozen ledger entries, about 10k tokens together
-// against a 1M window. Older ones are a search away.
-pub const MANAGER_PIN_CHARS: usize = 24_000;
-const LEDGER_VIEW_CHARS: usize = 16_000;
+// Keep the ledger view to 8k bytes of whole entries so the checkpoint has more room
+// (2026-11-14). Assistant memory stays separate; older ledger entries are a search away.
+const LEDGER_VIEW_CHARS: usize = 8_000;
 // How big the assistant's memory can grow: about 2k tokens, room for a few dozen standing lines,
 // since all of it rides in its prompt. Past that, `remember` asks it to forget something first.
 const MEMORY_CHARS: usize = 8_000;
@@ -180,9 +175,8 @@ const GRANT_ENTRY: &str = "piccosta-subagents";
 pub const ASSISTANT_NAME: &str = "assistant";
 pub const PROJECT_NAME: &str = "manager";
 pub const ADVISOR_NAME: &str = "advisor";
-// An advisor's home, in its manager's, and the scale's kind it runs on.
+// An advisor's home, in its manager's.
 const ADVISOR_DIR: &str = "advisor";
-pub const ADVISOR_KIND: &str = "advice";
 // The file in the assistant's home that holds its name.
 const NAME_FILE: &str = "name";
 
@@ -369,7 +363,8 @@ fn roll_ledger(home: &Path) -> std::io::Result<()> {
 // The ledger as a compaction carries it: its newest entries whole, and where the rest is.
 pub fn ledger_view(home: &Path) -> String {
     let text = fs::read_to_string(home.join("ledger.md")).unwrap_or_default();
-    let start = text.len().saturating_sub(LEDGER_VIEW_CHARS);
+    let mut start = text.len().saturating_sub(LEDGER_VIEW_CHARS);
+    while !text.is_char_boundary(start) { start += 1; }
     let start = if start == 0 { 0 } else { text[start..].find("\n## ").map_or(text.len(), |at| start + at + 1) };
     let archived: Vec<String> = fs::read_dir(home.join("ledger-archive")).into_iter().flatten().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
     let older = if start > 0 || !archived.is_empty() { "\n(Older entries: earlier in ledger.md and in ledger-archive/; ledger search finds them.)" } else { "" };
@@ -895,7 +890,7 @@ impl SessionsTool {
         let written = |result: std::io::Result<String>| result.map(drop).map_err(|error| error.to_string());
         let (model, scale_level, note) = match (string(arguments, "model"), string(arguments, "use")) {
             (Some(model), _) => (Some(model.to_string()), None, None),
-            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind, false)?,
+            (None, Some(kind)) => crate::scale::pick(&self.agent_dir, kind)?,
             (None, None) => (None, None, None),
         };
         // The kind is kept in the session, so it runs with that kind's tools and readOnly.
@@ -1173,7 +1168,7 @@ impl Tool for ManagerTools {
         }
         crate::message::ToolDefinition {
             name: "ledger".into(),
-            description: format!("Your ledger and your notes to the user. Your ledger is your running record of what's going on {scope}: its newest entries ride through your compactions, and search finds the rest. A project's own files (AGENTS.md, direction.md, ledger.md, its feature list) are kept as its AGENTS.md says: write the ledger entries and record the user's requests it asks for, and change its AGENTS.md only when the user says so. action append: add an entry to your ledger, a line or two: the lanes you started and why (session ids, models), what came of each, what the user decided and what's next (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text).{memory}"),
+            description: format!("Your ledger and your notes to the user. Your ledger is your running record of what's going on {scope}: its newest entries ride through your compactions, and search finds the rest. A project's own files (AGENTS.md, direction.md, ledger.md) are kept as its AGENTS.md says: write the ledger entries, and change its AGENTS.md only when the user says so. action append: add an entry to your ledger, a line or two: the lanes you started and why (session ids, models), what came of each, what the user decided and what's next (text). search: ledger entries and things the user said to you that contain every word (text). notify: show the user a desktop notification (text).{memory}"),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -1338,29 +1333,27 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     fs::create_dir_all(&home).map_err(|error| format!("{}: {error}", home.display()))?;
     let host = Arc::new(Host::for_args_at(&args, home.clone()));
     // Its file is written from the start, so it can be locked and messaged at once.
-    let (mut session, new) = match session_file(&agent_dir) {
-        Some(path) => (crate::session::Session::open(&path, &home).map_err(|error| error.to_string())?, false),
+    let mut session = match session_file(&agent_dir) {
+        Some(path) => crate::session::Session::open(&path, &home).map_err(|error| error.to_string())?,
         None => {
             let mut session = crate::session::Session::create(&home, Some(&host.session_dir));
             make(&agent_dir, &mut session, Role::Assistant).map_err(|error| error.to_string())?;
-            (session, true)
+            session
         }
     };
     session.persist_now().map_err(|error| error.to_string())?;
     let file = session.file().ok_or("the manager needs a session file")?.to_path_buf();
     fs::write(home.join("session"), file.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
-    // Its notes (a kind with no model served) go to the assistant's log.
+    // Its notes go to the assistant's log. Unless `manager.model`/`manager.thinking` or the
+    // command line say otherwise, it runs on the user's default model, like any new session.
     let (model, thinking, note) = host.launch(&args)?;
-    let (model, level, note) = match model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string)) {
-        Some(model) => (Some(model), None, note),
-        None => crate::scale::pick(&agent_dir, MANAGER_KIND, false)?,
-    };
+    let model = model.or_else(|| host.settings.get("manager.model").and_then(Value::as_str).map(str::to_string));
     if let Some(note) = note {
         eprintln!("{note}");
     }
-    // A level asked for sets it; the scale's sets only a new one's. A restart carries on at the
-    // level the session had, or the one its model was last set to by hand (host.rs open).
-    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string)).or(level.filter(|_| new));
+    // A restart carries on at the level the session had, or the one its model was last set to
+    // by hand (host.rs open).
+    let thinking = thinking.or_else(|| host.settings.get("manager.thinking").and_then(Value::as_str).map(str::to_string));
     if let Some(listing) = host.listing(Some(&session), model.as_deref()) {
         listing.await;
     }

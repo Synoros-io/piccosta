@@ -57,7 +57,15 @@ What the user wants done. More than one item if the session covers several thing
 ## Facts needed to continue
 - Paths, names, numbers, error messages and references, exactly as they appeared.
 
-Keep the rest short, but keep paths, names and error messages exact.";
+This checkpoint is the main thing the session continues from. Write it in full, keeping paths, names and error messages exact.";
+
+// The checkpoint needs more room than its pinned context (2026-11-14): aim for 10k answer
+// tokens, lowered to half the available output so reasoning and length variation have room.
+const SUMMARY_TARGET_TOKENS: u64 = 10_000;
+const SUMMARY_OUTPUT_SHARE: u64 = 2;
+// Keep source metadata smaller than the checkpoint: 4k characters, including heading/omission.
+// This accompanies the reduced pin/index budgets from the same request.
+const SOURCE_DATE_CHARS: usize = 4_000;
 
 // Idle compaction's summary is asked for at the end of the session's own request, under the
 // session's system prompt, so the summarizer's role (SUMMARIZATION_SYSTEM_PROMPT) goes in the message.
@@ -524,8 +532,12 @@ pub fn source_dates(session: &Session, messages: &[AgentMessage]) -> String {
         let first = matches.next().unwrap_or("user source uncertain");
         if matches.all(|kind| kind == first) { first } else { "user source uncertain" }
     };
+    const HEADING: &str = "\n\n## Source/date reference\nUser excerpts survive filtering and merging; dated rows give local date/offset: excerpt@time. Human input has a recorded ingress source; unknown legacy input is not proof of authorship. Ambiguous excerpts do not identify a unique source. Other rows count source records. Summary/pin and replay times do not date original quotes.\n";
+    const OMITTED: &str = "\n[Older or oversized source references omitted; original dates not listed here remain unknown.]";
+    let mut remaining = SOURCE_DATE_CHARS - HEADING.chars().count() - OMITTED.chars().count();
+    let mut omitted = false;
     let mut groups = indexmap::IndexMap::<String, Vec<String>>::new();
-    for message in messages {
+    for message in messages.iter().rev() {
         let (source, timestamp, excerpt) = match message {
             AgentMessage::User(user) => {
                 let text = user.content.text();
@@ -550,13 +562,18 @@ pub fn source_dates(session: &Session, messages: &[AgentMessage]) -> String {
             },
             None => (source, String::new()),
         };
+        // Budget each complete reference newest-first before grouping. Charging a whole group
+        // label each time overestimates repeats, but never lets one busy day escape the cap.
+        let cost = group.chars().count() + reference.chars().count() + 3;
+        if cost > remaining { omitted = true; continue; }
+        remaining -= cost;
         groups.entry(group).or_default().push(reference);
     }
     let rows: Vec<String> = groups.into_iter().map(|(group, references)| {
         let values = if references.iter().all(String::is_empty) { references.len().to_string() } else { references.join(",") };
         format!("{group}: {values}")
     }).collect();
-    format!("\n\n## Source/date reference\nUser excerpts survive filtering and merging; dated rows give local date/offset: excerpt@time. Human input has a recorded ingress source; unknown legacy input is not proof of authorship. Ambiguous excerpts do not identify a unique source. Other rows count source records. Summary/pin and replay times do not date original quotes.\n{}", rows.join("\n"))
+    format!("{HEADING}{}{}", rows.join("\n"), if omitted { OMITTED } else { "" })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -593,10 +610,22 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
 }
 
 // The appended summary request, shared with the fitter so these instructions take room too.
-fn summary_prompt(instructions: Option<&str>, source_dates: &str) -> UserMessage {
+fn summary_prompt(model: &Model, messages: &[Message], thinking: &str, instructions: Option<&str>, source_dates: &str) -> UserMessage {
     let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
-    let prompt = format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}{focus}{source_dates}");
-    UserMessage { content: TextOrBlocks::Text(prompt), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() } }
+    let prompt = |target| UserMessage { content: TextOrBlocks::Text(format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}\nAim for about {target} tokens of checkpoint text; this is a soft target, not padding. Prioritize what the next session needs within that room.{focus}{source_dates}")), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() } };
+    // Include the target sentence itself in the same resolved context the output limiter sees.
+    // The full target has at least as many digits as the reduced one, so this is conservative.
+    let full = [messages, &[Message::User(prompt(SUMMARY_TARGET_TOKENS))]].concat();
+    let updates = matches!(model.api.as_str(), "openai-completions" | "openai-responses" | "openai-codex-responses") && model.compat_flag("supportsMidConvoSystemMessages");
+    let resolved = transcript::resolve_transcript(&full, updates);
+    // The bridge window is input-only and already keeps output room. Its catalog allowance is
+    // a target-sizing hint, not a verified Claude Code wire cap; don't subtract input twice.
+    let mut allowance = if model.provider == provider::claude::PROVIDER { model.max_tokens }
+        else { estimate::max_output_tokens(model.context_window, model.max_tokens, &resolved) };
+    if provider::clamp_thinking_level(model, thinking) != "off" && model.api == "anthropic-messages" && !model.compat_flag("forceAdaptiveThinking") {
+        allowance -= provider::anthropic_messages::thinking_budget(provider::clamp_thinking_level(model, thinking), allowance);
+    }
+    prompt(SUMMARY_TARGET_TOKENS.min((allowance / SUMMARY_OUTPUT_SHARE).max(1)))
 }
 
 // Only an oversized summary request may shed legacy direction payloads. Remove every historical
@@ -616,9 +645,9 @@ pub fn strip_legacy_direction(messages: &mut [AgentMessage]) {
 }
 
 // Measure the complete summary request using the same provider projection as the send guard.
-pub fn summary_request_tokens(messages: &[AgentMessage], model: &Model, session: &Session, instructions: Option<&str>) -> u64 {
+pub fn summary_request_tokens(messages: &[AgentMessage], model: &Model, session: &Session, thinking: &str, instructions: Option<&str>) -> u64 {
     let mut request = to_model_messages(messages, session.header().notice_token.as_deref());
-    request.push(Message::User(summary_prompt(instructions, &source_dates(session, messages))));
+    request.push(Message::User(summary_prompt(model, &request, thinking, instructions, &source_dates(session, messages))));
     estimate::request_tokens(model, &request)
 }
 
@@ -627,7 +656,7 @@ pub fn summary_request_tokens(messages: &[AgentMessage], model: &Model, session:
 // cache. No retry here; notes refresh only after an accepted summary.
 // `instructions` is the user's focus for /compact.
 pub async fn summarize_in_place(request: Request<'_>, instructions: Option<&str>, source_dates: &str) -> AssistantMessage {
-    let messages = [request.messages, &[Message::User(summary_prompt(instructions, source_dates))]].concat();
+    let messages = [request.messages, &[Message::User(summary_prompt(request.model, request.messages, request.thinking_level, instructions, source_dates))]].concat();
     // A protected summary or one oversized turn may survive fit. Refuse that request rather than
     // send it over the input ceiling or cut the user's text; a failed compaction keeps the history.
     if let Some(limit) = request.model.max_input_tokens {
@@ -655,8 +684,8 @@ pub fn accept_summary(preparation: &Preparation, response: AssistantMessage) -> 
 // the last request sent and the cache holds), then all of them. Past that the oldest turns go, but
 // never a system message or the previous compaction's summary, which the new one has to carry on.
 // Measure the whole summary request, including its prompt and resolved tools.
-pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64, model: &Model, session: &Session, instructions: Option<&str>) {
-    let total = |messages: &[AgentMessage]| summary_request_tokens(messages, model, session, instructions);
+pub fn fit(messages: &mut Vec<AgentMessage>, budget: u64, model: &Model, session: &Session, thinking: &str, instructions: Option<&str>) {
+    let total = |messages: &[AgentMessage]| summary_request_tokens(messages, model, session, thinking, instructions);
     let tail = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))).map_or(0, |at| at + 1);
     let mut cut_before_answer = false;
     for from in [tail, 0] {

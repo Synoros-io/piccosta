@@ -194,10 +194,9 @@ impl Settings {
         }
     }
 
-    // Recent project notes at prompt boundaries, each searched independently above cwd.
-    pub fn recent_files(&self) -> (String, String) {
-        (self.get_str("recent.ledger").unwrap_or("ledger.md").into(),
-         self.get_str("recent.features").unwrap_or("docs/features.md").into())
+    // The ledger tail attached at prompt boundaries, searched above cwd.
+    pub fn recent_ledger(&self) -> String {
+        self.get_str("recent.ledger").unwrap_or("ledger.md").into()
     }
 
     // `defaultThinkingLevel`, "medium" when unset.

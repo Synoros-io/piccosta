@@ -309,8 +309,7 @@ impl Host {
             _ => Vec::new(),
         };
         list.extend(subagents.map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>));
-        // A manager's own tools and the subagent tool stay whatever its kind lists (an advisor's,
-        // on advice).
+        // A manager's own tools and the subagent tool stay whatever its kind lists.
         let own = role.map(|role| crate::manager::tools(&self.agent_dir, &self.settings, role, cwd)).unwrap_or_default();
         // A lane granted subagents keeps the tool whatever its kind lists.
         let own_names: Vec<String> = own.iter().map(|tool| tool.name().to_string()).chain((role.is_some() || granted.is_some()).then(|| tools::subagent::NAME.to_string())).collect();
@@ -473,7 +472,7 @@ impl Host {
             cwd,
             sections,
             context_files: self.context_files,
-            recent_files: self.settings.recent_files(),
+            recent_ledger: self.settings.recent_ledger(),
             retry: self.settings.retry(false),
             compaction,
             transport: self.settings.transport(),
@@ -509,7 +508,7 @@ impl Host {
     pub fn launch(&self, args: &crate::cli::Args) -> Result<crate::scale::Pick, String> {
         match (crate::cli::model_name(args), &args.use_scale) {
             (None, Some(name)) => {
-                let (model, level, note) = crate::scale::pick(&self.agent_dir, name, false)?;
+                let (model, level, note) = crate::scale::pick(&self.agent_dir, name)?;
                 // The scale's level is for a new session: one reopened keeps its own.
                 let reopened = args.continue_recent || args.session.is_some() || args.resume.is_some();
                 Ok((model, args.thinking.clone().or(level.filter(|_| !reopened)), note))

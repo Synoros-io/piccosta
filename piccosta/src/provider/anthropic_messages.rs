@@ -23,6 +23,12 @@ const TOOL_ID_LIMIT: usize = 64;
 type BreakpointKey = (String, String, String);
 static BREAKPOINTS: LazyLock<Mutex<HashMap<BreakpointKey, (usize, usize)>>> = LazyLock::new(Default::default);
 
+// The fixed reasoning reservation is shared with compaction's soft answer-length target.
+pub(crate) fn thinking_budget(level: &str, max_tokens: u64) -> u64 {
+    let index = match level { "minimal" => 0, "low" => 1, "medium" => 2, _ => 3 };
+    THINKING_BUDGETS[index].min(max_tokens.saturating_sub(MIN_ANSWER_TOKENS))
+}
+
 fn string(value: &Value, key: &str) -> String {
     value.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
@@ -128,13 +134,7 @@ fn build_body(request: &Request<'_>) -> Value {
                 let effort = if level == "minimal" { "low" } else { level };
                 body["output_config"] = json!({"effort":model.provider_thinking_level(effort)});
             } else {
-                let index = match level {
-                    "minimal" => 0,
-                    "low" => 1,
-                    "medium" => 2,
-                    _ => 3,
-                };
-                let budget = THINKING_BUDGETS[index].min(max_tokens.saturating_sub(MIN_ANSWER_TOKENS));
+                let budget = thinking_budget(level, max_tokens);
                 body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
             }
         } else if !matches!(model.thinking_level_map.as_ref().and_then(|map| map.get("off")), Some(None)) {

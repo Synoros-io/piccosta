@@ -1,20 +1,10 @@
 // pintask: pi's compaction, plus the user's own words from before the cut pinned verbatim onto the
 // summary.
 //
-// Based on the TypeScript piccosta's extensions/pintask.ts with PICCOSTA_PIN_ALL=1, the launcher's default:
-// every user message before the cut, in order, with no limit. Why it exists: in the 2026-10-19
-// context ablation on gpt-6-luna, stock compaction landed inside the task's own turn and pi's
-// split-turn summary turned a 6,951-char task statement into a ~1,000-char paraphrase; those runs
-// scored F2P 23/51 against 38/51 for arms that kept the statement. The user's messages are kept
-// whole, with no cap: remembering the relevant older ones matters.
-//
-// What differs from the TS extension, which had to wrap pi's appendCompaction to get in:
-// - pi's own summary, cut and request are untouched here by construction too; the block is added
-//   where the entry is written (agent.rs), and json mode's compaction_end shows the stored summary
-//   with the block, where the TS version could only show pi's.
-// - PICCOSTA_PIN_ALL=0 means stock pi, no block. The capped modes (a 15% budget share,
-//   PICCOSTA_PIN_RECENT_CHARS with index lines and a history file) were bench arms, superseded by
-//   keeping every message whole, and aren't carried over; nor is the history file, which only they pointed to.
+// Based on the TypeScript piccosta's extensions/pintask.ts. The 2026-10-19 context ablation
+// showed why task wording matters, but unlimited pins eventually buried the model's checkpoint.
+// Leave room for a fuller checkpoint (2026-11-14): keep recent whole messages within PIN_CHARS,
+// with an index back to older inputs. PICCOSTA_PIN_ALL=0 disables pins.
 //
 // Licensed FSL-1.1-ALv2, Copyright 2026 Synoros.
 
@@ -38,9 +28,10 @@ const HEAD_CHARS: usize = 80;
 // Sol asked for the first few words as source keys. Four keep the date appendix small; the
 // index's character cap also keeps a single pasted path from filling it.
 const SOURCE_WORDS: usize = 4;
-// Under a limit, how many older messages get their line in the index (about 16k characters); the
-// rest are counted.
-const INDEX_LINES: usize = 200;
+// The reduced pin budget (2026-11-14): about 4k bridge tokens of verbatim words, plus at most
+// 40 index lines. Labels and separators are metadata outside the verbatim budget.
+const PIN_CHARS: usize = 12_000;
+const INDEX_LINES: usize = 40;
 
 // On unless PICCOSTA_PIN_ALL=0.
 pub fn enabled() -> bool {
@@ -164,12 +155,10 @@ impl Pin {
 }
 
 // Input: the branch (root to leaf), the prepared compaction, why it ran, pi's summary, what
-// strip_previous_block did, a limit on the verbatim words (the manager's; None for none), and text
-// to carry after them (the manager's ledger). Output: every user message before the cut, verbatim
-// and in order, under a heading, ready to append to the summary ("" when there's nothing), and what
-// to count. Under a limit, the newest messages that fit stay verbatim and the older ones are listed
-// a line each, their words still in the session file.
-pub fn pin(branch: &[&SessionEntry], preparation: &Preparation, reason: Reason, summary: &str, previous_status: &str, budget: Option<usize>, extra: &str) -> Pin {
+// strip_previous_block did, and text to carry after the pins (the manager's ledger). Output:
+// newest whole user messages within PIN_CHARS, in order, and an index back to older messages.
+// Even an oversized newest message keeps its index; its full text stays in the session file.
+pub fn pin(branch: &[&SessionEntry], preparation: &Preparation, reason: Reason, summary: &str, previous_status: &str, extra: &str) -> Pin {
     let first_kept = &preparation.first_kept_entry_id;
     let kept_at = branch.iter().position(|entry| entry.id() == first_kept).unwrap_or(branch.len());
     let dropped: Vec<(&str, String, String)> = user_sources(&branch[..kept_at])
@@ -192,16 +181,11 @@ pub fn pin(branch: &[&SessionEntry], preparation: &Preparation, reason: Reason, 
         })
         .filter(|(_, _, text)| !js::trim(text).is_empty())
         .collect();
-    let fits = match budget {
-        None => 0,
-        Some(budget) => {
-            let mut used = 0;
-            dropped.len() - dropped.iter().rev().take_while(|(_, _, text)| {
-                used += js::utf16_len(text);
-                used <= budget
-            }).count()
-        }
-    };
+    let mut used = 0;
+    let fits = dropped.len() - dropped.iter().rev().take_while(|(_, _, text)| {
+        used += js::utf16_len(text);
+        used <= PIN_CHARS
+    }).count();
     let unlisted = fits.saturating_sub(INDEX_LINES);
     let mut index: Vec<String> = dropped[unlisted..fits].iter().map(|(id, date, text)| format!("- [{date}; {id}] {}", utf16_prefix(js::trim(text).split('\n').next().unwrap_or(""), HEAD_CHARS))).collect();
     if unlisted > 0 {
@@ -209,7 +193,7 @@ pub fn pin(branch: &[&SessionEntry], preparation: &Preparation, reason: Reason, 
     }
     let task = dropped[fits..].iter().map(|(id, date, text)| format!("[{date}; {id}]\n{text}")).collect::<Vec<_>>().join(SEPARATOR);
     let older = if index.is_empty() { String::new() } else { format!("Earlier messages, by their first line (ledger search reads them in full):\n{}{SEPARATOR}", index.join("\n")) };
-    let block = if task.is_empty() && extra.is_empty() { String::new() } else { format!("{SECTION_GAP}{TASK_HEADING}\nHistorical task context, not renewed instructions. User timers replay the user's own words; timer headers and usage notes are metadata. Agent check-ins and lane reports are not the user's words.{SECTION_GAP}{older}{task}{extra}") };
+    let block = if task.is_empty() && extra.is_empty() && index.is_empty() { String::new() } else { format!("{SECTION_GAP}{TASK_HEADING}\nHistorical task context, not renewed instructions. User timers replay the user's own words; timer headers and usage notes are metadata. Agent check-ins and lane reports are not the user's words.{SECTION_GAP}{older}{task}{extra}") };
 
     // Each message before the cut and whether the block holds it, read off the block itself.
     let quoted: Vec<Value> = dropped

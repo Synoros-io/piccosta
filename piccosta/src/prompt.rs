@@ -346,36 +346,32 @@ pub fn context_now(cwd: &Path, agent_dir: &Path) -> Option<Option<String>> {
     (reads.failures.is_empty() && !reads.unsettled).then(|| project_context(&files).map(|project| tagged("project_context", &project)))
 }
 
-// About the last ten 3–5-line ledger entries under the doc contract, per file (2026-11-14).
+// About the last ten 3–5-line ledger entries under the doc contract (2026-11-14).
 const RECENT_MAX_CHARS: usize = 8000;
 
-// The nearest ledger and feature list, searched independently up to /. Output: their dated tails,
-// Some(None) if neither exists, or None to keep held notes after an unreadable or mid-save read.
-pub fn recent_now(cwd: &Path, files: &(String, String), held: Option<&str>) -> Option<Option<String>> {
-    let mut parts = Vec::new();
-    for file in [&files.0, &files.1] {
-        let mut reads = Reads::default();
-        for directory in cwd.ancestors() {
-            let path = directory.join(file);
-            if let Some(bytes) = reads.read(&path) {
-                if reads.unsettled && held.is_some() { return None; }
-                let modified = std::fs::metadata(&path).and_then(|metadata| metadata.modified()).ok()?;
-                let date = crate::clock::dated(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64);
-                let text = String::from_utf8_lossy(&bytes);
-                // A cutoff newline already starts a complete suffix; otherwise skip the partial line.
-                let tail = match text.char_indices().rev().nth(RECENT_MAX_CHARS) {
-                    Some((start, '\n')) => &text[start + '\n'.len_utf8()..],
-                    Some((start, character)) => text[start + character.len_utf8()..].split_once('\n').map(|(_, tail)| tail).filter(|tail| !tail.is_empty())
-                        .unwrap_or("[Recent text omitted: no complete line fits; read the file.]"),
-                    None => &text,
-                };
-                parts.push(format!("{} (as of {date}, the file's last change).\nThis is its most recent part; earlier entries are in the file.\n\n{tail}", path.display()));
-                break;
-            }
-            if !reads.failures.is_empty() { return None; }
+// The nearest ledger, searched up to /. Output: its dated tail, Some(None) if absent, or None
+// to keep held notes after an unreadable or mid-save read.
+pub fn recent_now(cwd: &Path, ledger: &str, held: Option<&str>) -> Option<Option<String>> {
+    let mut reads = Reads::default();
+    for directory in cwd.ancestors() {
+        let path = directory.join(ledger);
+        if let Some(bytes) = reads.read(&path) {
+            if reads.unsettled && held.is_some() { return None; }
+            let modified = std::fs::metadata(&path).and_then(|metadata| metadata.modified()).ok()?;
+            let date = crate::clock::dated(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64);
+            let text = String::from_utf8_lossy(&bytes);
+            // A cutoff newline already starts a complete suffix; otherwise skip the partial line.
+            let tail = match text.char_indices().rev().nth(RECENT_MAX_CHARS) {
+                Some((start, '\n')) => &text[start + '\n'.len_utf8()..],
+                Some((start, character)) => text[start + character.len_utf8()..].split_once('\n').map(|(_, tail)| tail).filter(|tail| !tail.is_empty())
+                    .unwrap_or("[Recent text omitted: no complete line fits; read the file.]"),
+                None => &text,
+            };
+            return Some(Some(tagged("project_recent", &format!("{} (as of {date}, the file's last change).\nThis is its most recent part; earlier entries are in the file.\n\n{tail}", path.display()))));
         }
+        if !reads.failures.is_empty() { return None; }
     }
-    Some((!parts.is_empty()).then(|| tagged("project_recent", &parts.join("\n\n"))))
+    Some(None)
 }
 
 // How each context file's part of the project_context section ends.

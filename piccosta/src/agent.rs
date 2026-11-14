@@ -287,7 +287,7 @@ pub struct AgentConfig {
     // Whether the prompt carries the session's AGENTS.md files (--no-context-files turns them off);
     // they're looked at before each run, for an edit (prompt_update).
     pub context_files: bool,
-    pub recent_files: (String, String),
+    pub recent_ledger: String,
     pub retry: RetrySettings,
     // When to compact, resolved for this model.
     pub compaction: CompactionSettings,
@@ -580,7 +580,7 @@ impl Agent {
         // a boundary. Only then migrate direction away and read the latest project notes.
         let recent = if boundary {
             if self.config.context_files {
-                crate::prompt::recent_now(&self.config.cwd, &self.config.recent_files, held_recent.as_deref()).unwrap_or(held_recent)
+                crate::prompt::recent_now(&self.config.cwd, &self.config.recent_ledger, held_recent.as_deref()).unwrap_or(held_recent)
             } else { None }
         } else { held_recent };
         crate::prompt::set_section(&mut self.config.sections, "project_direction", if boundary { None } else { held_direction });
@@ -1412,7 +1412,7 @@ impl Agent {
         let context_window = self.config.model.compaction_window(reply_room);
         // Fitting summaries extend the held request unchanged. An oversized legacy direction
         // can prevent fitting even on a smaller model; strip it only from this request copy.
-        if context_window > 0 && compaction::summary_request_tokens(&messages, &self.config.model, &self.session, instructions) > context_window.saturating_sub(reply_room) {
+        if context_window > 0 && compaction::summary_request_tokens(&messages, &self.config.model, &self.session, &self.config.thinking_level, instructions) > context_window.saturating_sub(reply_room) {
             compaction::strip_legacy_direction(&mut messages);
         }
         let cancel = self.cancel.child_token();
@@ -1426,7 +1426,7 @@ impl Agent {
                 // model) is cut to fit first (compaction::fit); the bridge's window already keeps
                 // room for the reply.
                 if context_window > 0 {
-                    compaction::fit(&mut messages, context_window.saturating_sub(reply_room), model, &self.session, instructions);
+                    compaction::fit(&mut messages, context_window.saturating_sub(reply_room), model, &self.session, &self.config.thinking_level, instructions);
                 }
                 let source_dates = compaction::source_dates(&self.session, &messages);
                 let messages = crate::message::to_model_messages(&messages, self.session.header().notice_token.as_deref());
@@ -1461,11 +1461,8 @@ impl Agent {
         };
 
         let write_error = |error: std::io::Error| format!("Could not write the session: {error}");
-        let (budget, ledger) = match &self.config.manager_home {
-            Some(home) => (Some(crate::manager::MANAGER_PIN_CHARS), crate::manager::ledger_view(home)),
-            None => (None, String::new()),
-        };
-        let pin = pinning.then(|| pintask::pin(&self.session.path_to_leaf(), &preparation, reason, &summary.summary, previous_status, budget, &ledger));
+        let ledger = self.config.manager_home.as_ref().map(|home| crate::manager::ledger_view(home)).unwrap_or_default();
+        let pin = pinning.then(|| pintask::pin(&self.session.path_to_leaf(), &preparation, reason, &summary.summary, previous_status, &ledger));
         let stored_summary = format!("{}{}", summary.summary, pin.as_ref().map_or("", |pin| pin.block.as_str()));
         let compaction_id = self
             .session

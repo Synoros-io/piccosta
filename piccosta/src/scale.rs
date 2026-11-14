@@ -3,7 +3,7 @@
 // a kind by name. All of it is one file: piccosta/scale.json ships compiled in, and the user's
 // <agent dir>/scale.json changes it by name, field by field (a kind it names gets those fields, new
 // names join; "off": true drops one from the lists and the jobs, false brings back one that ships
-// off; one that's off still runs what names it, as an advisor names advice). /scale shows it,
+// off). /scale shows it,
 // /scale edit writes the whole of it there and opens it, and /scale <kind> <model[:level]> ...
 // sets one kind's models.
 //
@@ -13,8 +13,8 @@
 // guards against a model's careless writes and deletes, not against one trying to escape, see
 // tools/readonly.rs) and its instructions, which go on the end of the subagent's system prompt. A
 // session the sessions tool starts for a kind gets its tools and readOnly too (host.rs). The
-// shipped defaults give the reading kinds (review, reading, search, exploration, advice) read and
-// a read-only bash, with the web tools for search and advice only; monitoring read and a bash that
+// shipped defaults give the reading kinds (review, reading, search, exploration) read and
+// a read-only bash, with the web tools for search only; monitoring read and a bash that
 // isn't sandboxed, since ssh makes sockets (ControlMaster); bugs read and bash, tests no web
 // tools, and the rest everything. A kind can own tools ("owns"): a session that can
 // hand work to it leaves those tools to its job (host.rs), so that work runs on its models.
@@ -156,7 +156,7 @@ fn every_use(agent_dir: &Path, off: bool) -> Vec<Use> {
         .collect()
 }
 
-// A use by name; with `off`, one that's off too (an advisor's advice).
+// A use by name; with `off`, one that's off too (/scale sets one).
 pub fn find(agent_dir: &Path, name: &str, off: bool) -> Result<Use, String> {
     let all = every_use(agent_dir, off);
     let names: Vec<String> = all.iter().map(|entry| entry.name.clone()).collect();
@@ -417,8 +417,8 @@ pub type Pick = (Option<String>, Option<String>, Option<String>);
 // The model and level a use runs on now: its first available model, or None for the model and a
 // line saying so when no connected account serves any of them, so the caller runs on the session's
 // or the default model. An error only for a use the scale doesn't have (or has off, without `off`).
-pub fn pick(agent_dir: &Path, name: &str, off: bool) -> Result<Pick, String> {
-    let entry = find(agent_dir, name, off)?;
+pub fn pick(agent_dir: &Path, name: &str) -> Result<Pick, String> {
+    let entry = find(agent_dir, name, false)?;
     let Some(first) = available(agent_dir, &entry).into_iter().next() else {
         return Ok((None, None, Some(format!("None of the \"{name}\" kind's models is served by a connected account, so it runs on the session's model, or the default one; /scale {name} <model> sets one"))));
     };
