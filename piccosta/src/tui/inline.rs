@@ -220,7 +220,7 @@ impl App {
         if (before.1, before.2) == (0, 0) {
             rows.extend(super::model_row(&slot.messages, Some(model.clone())));
         }
-        rows.extend(render::assistant(&done, None, &slot.tools, flags, self.frame, width, &mut self.tex));
+        rows.extend(render::assistant(&done, None, &slot.tools, Flags { voice: crate::voice::is_voice_turn(&slot.messages), ..flags }, self.frame, width, &mut self.tex));
         self.streamed = (*started, part, at, sum);
         rows
     }
@@ -230,19 +230,21 @@ impl App {
     pub(super) fn streaming(&mut self, slot_index: usize, width: u16) -> Option<Rows> {
         let slot = &self.slots[slot_index];
         let parts = slot.partial.as_ref()?;
+        let flags = Flags { voice: crate::voice::is_voice_turn(&slot.messages), ..self.flags };
         if !self.inline {
-            return Some(render::assistant(parts, None, &slot.tools, self.flags, self.frame, width, &mut self.tex));
+            return Some(render::assistant(parts, None, &slot.tools, flags, self.frame, width, &mut self.tex));
         }
         let (model, started) = slot.partial_model.clone()?;
         let printed = if self.streamed.0 == started { self.streamed } else { (started, 0, 0, 0) };
         let mut rows = if (printed.1, printed.2) == (0, 0) { super::model_row(&slot.messages, Some(model)) } else { Vec::new() };
-        rows.extend(render::assistant(&rest(parts, printed), None, &slot.tools, self.flags, self.frame, width, &mut self.tex));
+        rows.extend(render::assistant(&rest(parts, printed), None, &slot.tools, flags, self.frame, width, &mut self.tex));
         Some(rows)
     }
 
     // A message's rows, less what of it --single printed while it streamed.
-    pub(super) fn unprinted(&mut self, slot_index: usize, index: usize, width: u16, flags: Flags) -> Rows {
+    pub(super) fn unprinted(&mut self, slot_index: usize, index: usize, width: u16, mut flags: Flags) -> Rows {
         let slot = &self.slots[slot_index];
+        flags.voice = crate::voice::is_voice_turn(&slot.messages[..index]);
         match &slot.messages[index] {
             AgentMessage::Assistant(reply) if self.inline && reply.timestamp == self.streamed.0 => {
                 let ended = Some((&reply.stop_reason, reply.error_message.as_deref()));

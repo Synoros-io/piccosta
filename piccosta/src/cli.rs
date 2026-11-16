@@ -196,6 +196,10 @@ Usage:
   piccosta zed [dir]     Zed, with piccosta as its agent
   piccosta t3 [dir]      T3 Code, with piccosta as its Pi provider
   piccosta assistant     The user's assistant service (the terminal UI starts it with manager.autostart)
+  piccosta call [assistant | <id or name>]  Call a session (the assistant by default)
+  piccosta hangup        End the call
+  piccosta voice start   Push-to-talk down: run voice.listen for the call
+  piccosta voice stop    Push-to-talk up: deliver the transcript
   piccosta tell <text>   A message for the assistant
   piccosta tui           List running terminal UIs and their open sessions (JSON)
   piccosta open <id or name> [--tui <id or pid>]   Open in the sidebar without changing focus

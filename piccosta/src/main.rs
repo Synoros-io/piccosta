@@ -160,6 +160,7 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     });
     drop(commands);
     let agent = task.await.map_err(|error| error.to_string())?;
+    piccosta::voice::shutdown(false).await;
     // The last answer's Claude query waits for a next message that won't come here.
     piccosta::provider::shutdown().await;
     if let Some(code) = signalled.get() {
@@ -172,8 +173,10 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     // conversation reads as it happened; alone, only the last message is (below).
     if !json && !team.models.is_empty() {
         let mut speaker = String::new();
-        for message in agent.session.context().messages.into_iter().skip(before) {
+        let history = agent.session.context().messages;
+        for (index, message) in history.iter().enumerate().skip(before) {
             let AgentMessage::Assistant(reply) = message else { continue };
+            if piccosta::voice::is_voice_turn(&history[..index]) && piccosta::voice::is_silent(reply) { continue; }
             let model = format!("{}/{}", reply.provider, reply.model);
             if model != speaker {
                 write_line(&format!("\n── {model} ──"));
@@ -210,9 +213,9 @@ async fn run_print(args: cli::Args) -> Result<ExitCode, String> {
     // after the model's answer starts another turn when it ends, and the model's reply to that
     // news (often "nothing to do") would otherwise be all a subagent's parent gets.
     let since_prompt = messages.iter().rposition(|message| matches!(message, AgentMessage::User(_))).map_or(0, |prompt| prompt + 1);
-    for message in &messages[since_prompt..] {
+    for (index, message) in messages.iter().enumerate().skip(since_prompt) {
         let AgentMessage::Assistant(reply) = message else { continue };
-        if reply.stop_reason == StopReason::ToolUse { continue }
+        if reply.stop_reason == StopReason::ToolUse || piccosta::voice::is_voice_turn(&messages[..index]) && piccosta::voice::is_silent(reply) { continue }
         reply.content.iter().for_each(|block| if let Content::Text { text, .. } = block { write_line(text) });
     }
     if answer.stop_reason == StopReason::Length {
@@ -255,6 +258,11 @@ async fn run() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => { eprintln!("piccosta: {error}"); ExitCode::FAILURE }
         };
+    }
+    // Call controls must work without waiting on model discovery (especially push-to-talk up).
+    if arguments.first().is_some_and(|arg| matches!(arg.as_str(), "call" | "hangup" | "voice")) {
+        let command = if arguments[0] == "voice" { &arguments[1..] } else { &arguments };
+        return piccosta::voice::run(command).await.map_or_else(|error| { eprintln!("piccosta: {error}"); ExitCode::FAILURE }, |()| ExitCode::SUCCESS);
     }
     let args = cli::parse(&arguments);
     let agent_dir = config::agent_dir();

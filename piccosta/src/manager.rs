@@ -1370,6 +1370,7 @@ async fn serve(args: crate::cli::Args) -> Result<std::process::ExitCode, String>
     timers.abort();
     drop(commands);
     if !task.is_finished() { let _ = tokio::time::timeout(Duration::from_secs(5), task).await; }
+    crate::voice::shutdown(false).await;
     crate::provider::shutdown().await;
     Ok(std::process::ExitCode::SUCCESS)
 }

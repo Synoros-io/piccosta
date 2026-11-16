@@ -195,6 +195,8 @@ pub struct Shell {
 
 // One session's commands and background jobs, shared by every bash call.
 pub struct Jobs {
+    // Session-scoped resources (voice playback) stop before ownership is released.
+    pub closed: CancellationToken,
     pub shells: Mutex<Vec<Shell>>,
     pub soft_limit: Duration,
     pub hold: Option<Duration>,
@@ -240,6 +242,7 @@ impl Jobs {
     // Input: where finish messages go. Settings come from the environment (see the constants).
     pub fn new(notices: mpsc::UnboundedSender<CustomMessage>) -> Jobs {
         Jobs {
+            closed: CancellationToken::new(),
             shells: Mutex::new(Vec::new()),
             soft_limit: seconds_from_env(SOFT_LIMIT_ENV).unwrap_or(Duration::from_secs_f64(DEFAULT_SOFT_LIMIT_SECONDS)),
             // A hold of 0 would kill every job the moment the model is done, so it counts as unset.
@@ -341,6 +344,7 @@ impl Jobs {
     // Session end: kill running jobs without messages, then every command still running in the
     // foreground, and remove this session's spill files.
     pub fn shutdown(&self, reason: &str) {
+        self.closed.cancel();
         self.shutting_down.store(true, Ordering::SeqCst);
         self.kill_all(&format!("session shutdown ({reason})"), true);
         let left: Vec<_> = self.shells().iter().filter(|shell| !shell.handed).map(|shell| (shell.pid, shell.plugin.clone())).collect();

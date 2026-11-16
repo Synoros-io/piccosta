@@ -620,6 +620,7 @@ impl Agent {
 
     // Add a message to the session and announce it. Custom messages are their own entry type.
     fn add_message(&mut self, message: AgentMessage, new_messages: &mut Vec<AgentMessage>) -> Result<String, String> {
+        let delivery = match &message { AgentMessage::User(user) => user.voice.clone(), _ => None };
         // A message from the user starts fresh overflow recovery.
         if matches!(message, AgentMessage::User(_)) {
             self.overflow_recovery_attempted = false;
@@ -634,6 +635,9 @@ impl Agent {
         (self.emit)(&Event::MessageStart { message: message.clone() });
         (self.emit)(&Event::MessageEnd { message: message.clone() });
         new_messages.push(message);
+        if let Some(delivery) = delivery {
+            self.add_message(AgentMessage::Custom(crate::voice::notice(&delivery)), new_messages)?;
+        }
         Ok(id)
     }
 
@@ -811,9 +815,20 @@ impl Agent {
         Ok(aborted)
     }
 
+    // Taking a voice delivery can persist its off-conversation usage. Announce only the new
+    // entries, so an already-counted receipt is neither invisible to the UI nor counted twice.
+    pub(crate) fn receive(&mut self) -> Result<(), String> {
+        let before = self.session.entries().len();
+        crate::runtime::receive(&mut self.session)?;
+        for entry in &self.session.entries()[before..] {
+            if matches!(entry, SessionEntry::Usage { .. }) { (self.emit)(&Event::EntryAppended { entry: entry.clone() }); }
+        }
+        Ok(())
+    }
+
     // Durable deliveries are taken where steering is taken, not held until the whole run ends.
     fn deliveries(&mut self) -> Result<Vec<AgentMessage>, String> {
-        crate::runtime::receive(&mut self.session)?;
+        self.receive()?;
         Ok(self.session.queued())
     }
 

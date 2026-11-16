@@ -79,6 +79,8 @@ pub enum Command {
     Prompt(UserMessage),
     #[serde(skip)]
     Message(UserMessage),
+    #[serde(skip)]
+    StartCall(oneshot::Sender<Result<(), String>>),
     // A durable check-in starts a turn even when a frontend normally starts each one itself.
     #[serde(skip)]
     Checkin,
@@ -330,6 +332,16 @@ fn listen(listener: crate::ipc::Listener, gate: Gate, watch: Arc<Mutex<Watch>>, 
                         Err(error) => json!({"ok": false, "error": error.to_string()}),
                     }
                 },
+                "voice-call" => {
+                    let (answer, answered) = oneshot::channel();
+                    let sent = send(Command::StartCall(answer));
+                    tokio::spawn(async move {
+                        let result = if sent { answered.await.unwrap_or_else(|_| Err("session closed before the call started".into())) } else { Err("session is closing".into()) };
+                        let reply = match result { Ok(()) => json!({"ok": true}), Err(error) => json!({"error": error}) };
+                        let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                    });
+                    continue;
+                }
                 "checkin" => json!({"ok": send(Command::Checkin)}),
                 "stop-review" => {
                     let review = lock(&watch).review.clone().filter(|cancel| !cancel.is_cancelled());
@@ -418,7 +430,7 @@ fn socket_message(request: &Value, peer: Option<i32>) -> UserMessage {
     // Decode the body alone. Even malformed origin/timestamp/timer fields are not authority.
     let content = request.get("message").and_then(|message| message.get("content")).and_then(|content| serde_json::from_value(content.clone()).ok())
         .unwrap_or_else(|| crate::message::TextOrBlocks::Text(request["text"].as_str().unwrap_or_default().into()));
-    UserMessage { content, timestamp: crate::clock::now_ms(), timer: None, origin }
+    UserMessage { content, timestamp: crate::clock::now_ms(), timer: None, origin, voice: None }
 }
 
 // --- Asking a runtime from outside ---
@@ -581,11 +593,37 @@ pub fn send(file: &Path, message: &UserMessage, sender: Option<&Path>, launch: O
     }
 }
 
+// A transcript and quick result are durable as one input before waking even an idle editor.
+pub(crate) fn send_voice(file: &Path, message: &UserMessage) -> Result<Sent, String> {
+    let id = &message.voice.as_ref().ok_or("missing voice receipt")?.id;
+    deliver_to(file, &format!("voice:{id}"), message, true, None, None)
+}
+
+// Cancellation costs are passive: durable without a prompt, and taken at the next owner boundary.
+pub(crate) fn voice_usage(file: &Path, delivery: &crate::voice::Delivery) -> Result<(), String> {
+    let message = UserMessage::new("", Vec::new(), InputOrigin::Harness { name: "voice-usage".into() });
+    deliver_to(file, &format!("voice-usage:{}", delivery.id), &message, false, None, Some(delivery)).map(|_| ())
+}
+
+// Snapshot both the conversation and unread deliveries. Holding the handoff lock prevents the
+// owner from moving the inbox between these reads; nothing is consumed or written here.
+pub(crate) fn voice_context(file: &Path) -> Result<(Session, Vec<UserMessage>), String> {
+    let _held = hold(file)?;
+    let session = Session::read(file).map_err(|error| error.to_string())?;
+    let mut pending: Vec<_> = session.queued().into_iter().filter_map(|message| if let AgentMessage::User(user) = message { Some(user) } else { None }).collect();
+    let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
+    let text = match std::fs::read_to_string(inbox) { Ok(text) => text, Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(), Err(error) => return Err(error.to_string()) };
+    for line in text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        if !line["delivery_id"].as_str().is_some_and(|id| session.has_delivery(id)) && let Ok(message) = serde_json::from_value(line["message"].clone()) { pending.push(message); }
+    }
+    Ok((session, pending))
+}
+
 // A retryable delivery is on disk before its sender advances a cursor. The inbox belongs to the
 // receiver, under the same handoff lock as claim and shutdown. Its id survives consumption, so a
 // check-in can retry a lost wake answer without repeating a message the receiver already took.
 pub fn deliver(file: &Path, id: &str, message: &UserMessage) -> Result<(), String> {
-    deliver_to(file, id, message, false, None).map(|_| ())
+    deliver_to(file, id, message, false, None, None).map(|_| ())
 }
 
 // Origin says what the harness recorded at its own ingress, not who can tamper with its files.
@@ -594,13 +632,13 @@ pub fn deliver(file: &Path, id: &str, message: &UserMessage) -> Result<(), Strin
 // the socket only wakes the owner. CLI/RPC/ACP never enter it.
 pub(crate) fn send_keyboard(file: &Path, input: &UserMessage) -> Result<Sent, String> {
     let message = UserMessage { origin: InputOrigin::Human { interface: "tui-forwarded".into() }, timer: None, ..input.clone() };
-    deliver_to(file, &format!("keyboard:{}", uuid::Uuid::new_v4()), &message, false, None)
+    deliver_to(file, &format!("keyboard:{}", uuid::Uuid::new_v4()), &message, false, None, None)
 }
 
 // A check-in uses the same durable inbox, but wakes idle editor sessions too. An unattended lane
 // gets the same run a manager's message would give it; everyone else keeps the message queued.
 pub fn deliver_checkin(file: &Path, id: &str, message: &UserMessage, launch: Option<(&Path, &Path)>) -> Result<(), String> {
-    deliver_to(file, id, message, true, launch).map(|_| ())
+    deliver_to(file, id, message, true, launch, None).map(|_| ())
 }
 
 // Ask the owner to admit an ordinary prompt, without holding the session file. Its user entry
@@ -617,8 +655,9 @@ pub fn deliver_timer(file: &Path, message: &UserMessage, review: bool) -> Result
     }
 }
 
-fn deliver_to(file: &Path, id: &str, message: &UserMessage, wake: bool, launch: Option<(&Path, &Path)>) -> Result<Sent, String> {
+fn deliver_to(file: &Path, id: &str, message: &UserMessage, wake: bool, launch: Option<(&Path, &Path)>, usage: Option<&crate::voice::Delivery>) -> Result<Sent, String> {
     let held = hold(file)?;
+    if message.voice.is_some() && !running(file) { return Err("voice session is not running; open it before speaking".into()); }
     if held.is_none() { return Err(format!("{}: no such session for delivery", file.display())); }
     let inbox = PathBuf::from(format!("{}{INBOX_SUFFIX}", file.display()));
     let mut output = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&inbox).map_err(|error| error.to_string())?;
@@ -628,7 +667,9 @@ fn deliver_to(file: &Path, id: &str, message: &UserMessage, wake: bool, launch: 
         let length = output.metadata().map_err(|error| error.to_string())?.len();
         // Older live receivers only read text. Keep it beside the typed payload so a rolling
         // restart cannot acknowledge an empty message or discard an unread inbox.
-        let line = format!("{}\n", json!({"text": message.content.text(), "message": message, "delivery_id": id}));
+        let mut payload = json!({"text": message.content.text(), "message": message, "delivery_id": id});
+        if let Some(usage) = usage { payload["voiceUsage"] = serde_json::to_value(usage).map_err(|error| error.to_string())?; }
+        let line = format!("{payload}\n");
         if let Err(error) = output.write_all(line.as_bytes()).and_then(|()| output.sync_all()) {
             return Err(match output.set_len(length) {
                 Ok(()) => error.to_string(),
@@ -676,6 +717,10 @@ fn take_inbox(session: &mut Session) -> std::io::Result<()> {
     let taken = session.entries().iter().any(|entry| matches!(entry, crate::session::SessionEntry::Custom { custom_type, data: Some(data), .. } if custom_type == crate::session::QUEUED_TYPE && data["inbox"] == name));
     let mut texts = Vec::new();
     for line in pending.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        if let Some(usage) = line.get("voiceUsage") {
+            crate::voice::record_usage(session, &serde_json::from_value(usage.clone()).map_err(std::io::Error::other)?)?;
+            continue;
+        }
         if let Some(id) = line["delivery_id"].as_str() {
             // Recorded ingress, not authenticated authorship: same-user file writers can forge it.
             let message = line.get("message").and_then(|message| serde_json::from_value(message.clone()).ok())
@@ -1103,7 +1148,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
                 // A frontend that starts every turn itself (rpc, ACP) gets an idle message with
                 // its next prompt. A check-in above explicitly asks for its own turn.
                 Work::Command(Command::Message(message), _) if !wake => {
-                    let kept = receive(&mut agent.session).and_then(|()| {
+                    let kept = agent.receive().and_then(|()| {
                         if message.is_empty() { Ok(()) } else { agent.session.queue_message(AgentMessage::User(message)).map(|_| ()).map_err(|error| error.to_string()) }
                     });
                     if let Err(error) = kept { eprintln!("piccosta: could not queue a message: {error}"); }
@@ -1249,6 +1294,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             }
         }
         lock(&watch).closing = true;
+        if closing.is_some() && let Some(file) = agent.session.file() { crate::voice::hang_up(&host.agent_dir, file); }
         // The end, under the file's lock: the socket stops taking requests and the gate shuts, what's
         // unread goes into the file, the socket goes, then the jobs.
         let held = held.or_else(|| agent.session.file().map(hold));
@@ -1262,6 +1308,7 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             lock(&claim.gate).take();
             left.extend(std::iter::from_fn(|| claim.taken.try_recv().ok()).map(|command| (command, false)));
         }
+        if let Err(error) = take_inbox(&mut agent.session) { eprintln!("piccosta: could not keep deliveries at shutdown: {error}"); }
         requeue(&mut agent);
         for (command, _) in queue.into_iter().chain(left).chain(std::iter::from_fn(|| commands.try_recv().ok()).map(|command| (command, true))) {
             let message = match command {
@@ -1281,6 +1328,8 @@ pub fn spawn(host: Arc<Host>, mut agent: Agent, shared: Arc<ToolShared>, wake: b
             }
         }
         if let Some(data) = reviews.stop().await && let Err(error) = crate::intent_review::record(&mut agent, &data) { eprintln!("piccosta intent review: {error}"); }
+        // Finish playback while the print runtime still owns the session.
+        if until_idle && closing.is_none() { crate::voice::shutdown(true).await; }
         shared.jobs.shutdown("quit");
         agent.keep_notices();
         // Fence queued provider work before giving up the socket. If the bounded close times out,
@@ -1331,13 +1380,18 @@ async fn perform(host: &Host, agent: &mut Agent, team: &mut Team, work: Work) ->
         Work::Review(_) => return Ok(()),
     };
     if matches!(command, Command::Prompt(..) | Command::Message(_)) {
-        receive(&mut agent.session)?;
+        agent.receive()?;
     }
     match command {
         Command::Prompt(message) => host.answer(agent, team, message).await,
         Command::Message(message) => {
             agent.unattended_allowed()?;
             host.answer(agent, team, message).await
+        }
+        Command::StartCall(answer) => {
+            let result = written(agent.session.persist_now()).and_then(|()| crate::voice::set_call(&host.agent_dir, agent.session.file()).map_err(|error| error.to_string()));
+            let _ = answer.send(result.clone());
+            result
         }
         Command::Team(asked) => {
             *team = crate::host::record_team(&host.registry()?, &mut agent.session, &asked)?;

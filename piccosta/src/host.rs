@@ -151,6 +151,8 @@ pub(crate) struct Prepared {
 impl Prepared {
     pub fn finish(self, emit: EventSink) -> Result<(Agent, Arc<ToolShared>), String> {
         let shared = self.config.tool_shared.clone();
+        let settings = crate::config::Settings::load(&crate::config::agent_dir(), Some(&self.config.cwd));
+        let emit = crate::voice::speaking(&settings, &self.session, shared.jobs.closed.clone(), emit);
         let mut agent = Agent::new(self.session, self.config, emit).map_err(|error| format!("could not write the session: {error}"))?;
         agent.pending_plugins = self.plugins;
         Ok((agent, shared))

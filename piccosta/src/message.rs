@@ -321,6 +321,9 @@ impl InputOrigin {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
+    // One queued input carries its voice receipt; projection sends it as a separate notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<Box<crate::voice::Delivery>>,
     pub content: TextOrBlocks,
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,7 +338,7 @@ impl UserMessage {
     pub fn new(text: &str, images: Vec<Content>, origin: InputOrigin) -> Self {
         let mut blocks = vec![Content::text(text)];
         blocks.extend(images);
-        Self { content: TextOrBlocks::Blocks(blocks), timestamp: crate::clock::now_ms(), timer: None, origin }
+        Self { content: TextOrBlocks::Blocks(blocks), timestamp: crate::clock::now_ms(), timer: None, origin, voice: None }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -512,7 +515,7 @@ pub fn bash_execution_text(execution: &BashExecutionMessage) -> String {
 
 // A user-role block for pi's summaries and recorded user shell commands.
 fn user_text(text: String, timestamp: i64) -> Message {
-    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp, timer: None, origin: InputOrigin::Unknown })
+    Message::User(UserMessage { content: TextOrBlocks::Blocks(vec![Content::text(text)]), timestamp, timer: None, origin: InputOrigin::Unknown, voice: None })
 }
 
 // The session keeps the token, so this line never changes with a delivery or a reopen. It
@@ -537,7 +540,7 @@ fn harness_message(origin: &InputOrigin, content: &TextOrBlocks, timestamp: i64,
     };
     blocks.insert(0, Content::text(opening));
     if token.is_some() { blocks.push(Content::text("</piccosta-notice>")); }
-    Message::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp, timer: None, origin: InputOrigin::Unknown })
+    Message::User(UserMessage { content: TextOrBlocks::Blocks(blocks), timestamp, timer: None, origin: InputOrigin::Unknown, voice: None })
 }
 
 // Old entries have no source and keep pi's exact projection, including Custom's block shape.
@@ -550,7 +553,7 @@ pub fn to_model_messages(messages: &[AgentMessage], notice_token: Option<&str>) 
             AgentMessage::System(system) => Message::System(system.clone()),
             AgentMessage::User(user) if user.origin.is_notice() => harness_message(&user.origin, &user.content, user.timestamp, notice_token),
             AgentMessage::User(user) => {
-                let mut projected = UserMessage { timer: None, origin: InputOrigin::Unknown, ..user.clone() };
+                let mut projected = UserMessage { timer: None, origin: InputOrigin::Unknown, voice: None, ..user.clone() };
                 if let Some(interface) = user.origin.unverified_interface() {
                     let mut blocks = projected.content.into_blocks();
                     blocks.insert(0, Content::text(format!("[{}, interface {}]", user.origin.label(), interface)));
@@ -568,7 +571,7 @@ pub fn to_model_messages(messages: &[AgentMessage], notice_token: Option<&str>) 
             }
             AgentMessage::Custom(custom) if !custom.origin.is_unknown() => harness_message(&custom.origin, &custom.content, custom.timestamp, notice_token),
             AgentMessage::Custom(custom) => Message::User(UserMessage {
-                content: TextOrBlocks::Blocks(custom.content.clone().into_blocks()), timestamp: custom.timestamp, timer: None, origin: InputOrigin::Unknown,
+                content: TextOrBlocks::Blocks(custom.content.clone().into_blocks()), timestamp: custom.timestamp, timer: None, origin: InputOrigin::Unknown, voice: None,
             }),
             AgentMessage::BranchSummary(branch) => user_text(
                 format!("{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}", branch.summary),

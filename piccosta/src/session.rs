@@ -665,7 +665,10 @@ fn mark_closed(agent_dir: &Path, file: &Path, closed: bool, by_user: bool) -> Re
     let file = crate::tools::paths::canonical(file);
     // Timer admission can reopen a session while holding its store lock. Cancel before taking
     // the marker lock, then serialize every writer on an inode that rename never replaces.
-    if closed { crate::tools::checkin::cancel_all(agent_dir, &file, by_user)?; }
+    if closed {
+        crate::tools::checkin::cancel_all(agent_dir, &file, by_user)?;
+        crate::voice::hang_up(agent_dir, &file);
+    }
     fs::create_dir_all(agent_dir).map_err(|error| error.to_string())?;
     let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(agent_dir.join(format!("{CLOSED_FILE}.lock"))).map_err(|error| error.to_string())?;
     lock.lock().map_err(|error| error.to_string())?;
@@ -944,6 +947,7 @@ impl Session {
     // losing the acknowledgement without starting another turn for the same occurrence.
     pub fn queue_delivery(&mut self, id: &str, message: UserMessage) -> io::Result<()> {
         if !self.has_delivery(id) {
+            if let Some(delivery) = &message.voice { crate::voice::record_usage(self, delivery)?; }
             self.append_custom(QUEUED_TYPE, Some(serde_json::json!({ "message": AgentMessage::User(message), "delivery_id": id })))?;
         }
         Ok(())

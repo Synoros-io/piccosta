@@ -1,0 +1,23 @@
+[package]
+name = "lfm"
+version = "0.1.0"
+edition.workspace = true
+# Liquid AI's checkpoint code, ported to Rust; see LICENSE and NOTICE.
+license-file = "LICENSE"
+description = "LFM3-Audio-2B speech to text and text to speech on the CPU, in plain Rust"
+
+[dependencies]
+serde_json.workspace = true
+regex.workspace = true
+libc.workspace = true
+socket2.workspace = true
+rayon.workspace = true
+matrixmultiply.workspace = true
+wgpu = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+# Keep the workspace's ordinary build capable of using a GPU; CPU-only distributors can opt out.
+default = ["gpu"]
+# the language model and the depth decoder on a GPU (gpu.rs), chosen at run time with --device gpu
+gpu = ["dep:wgpu", "dep:bytemuck"]

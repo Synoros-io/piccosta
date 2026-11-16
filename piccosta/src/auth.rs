@@ -323,7 +323,10 @@ async fn first_credential(provider: &str, config: Option<&ProviderConfig>, paths
     }
     if owner == Some(&Owner::Opencode) {
         let opencode_file = paths.opencode_dir.join("auth.json");
-        if let Some(key) = read_json_object(&opencode_file)?.get(provider).and_then(|entry| entry.get("key")).and_then(Value::as_str) {
+        // opencode's key is account-wide and `opencode auth login` stores it under "opencode";
+        // an entry under the provider's own name is only what older files have.
+        let entries = read_json_object(&opencode_file)?;
+        if let Some(key) = ["opencode", provider].iter().find_map(|name| entries.get(*name)?.get("key")?.as_str()) {
             return Ok(Credential { key: key.to_string(), account_id: None, origin: None, source: format!("{}", opencode_file.display()) });
         }
     }

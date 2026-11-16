@@ -33,3 +33,4 @@ pub mod scratchpad;
 pub mod session;
 pub mod tools;
 pub mod tui;
+pub mod voice;

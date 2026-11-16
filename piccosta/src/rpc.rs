@@ -168,6 +168,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     if let Some(task) = live.task {
         let _ = tokio::time::timeout(STOP_WAIT, task).await;
     }
+    crate::voice::shutdown(false).await;
     crate::provider::shutdown().await;
     Ok(ExitCode::from(code))
 }

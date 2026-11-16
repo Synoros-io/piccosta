@@ -134,3 +134,8 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+The lfm crate is a Rust port of Liquid AI's LFM3-Audio checkpoint code, separately
+licensed under the LFM Open License v1.0. See lfm/LICENSE and lfm/NOTICE. Commercial
+use above that license's revenue threshold requires separate permission. Model weights
+are not distributed here and carry Liquid AI's license too.

@@ -2690,6 +2690,7 @@ impl App {
         }
         let tasks = std::mem::take(&mut self.tasks);
         let _ = tokio::time::timeout(SHUTDOWN_WAIT, futures_util::future::join_all(tasks)).await;
+        crate::voice::shutdown(false).await;
         crate::provider::shutdown().await;
     }
 
@@ -3136,9 +3137,10 @@ impl App {
     }
 
     // One message's rows, `width` wide, kept for the next draw unless a tool of its is still running.
-    fn rows_of(&mut self, slot_index: usize, index: usize, width: u16, flags: Flags) -> Rows {
+    fn rows_of(&mut self, slot_index: usize, index: usize, width: u16, mut flags: Flags) -> Rows {
         let frame = self.frame;
         let slot = &mut self.slots[slot_index];
+        flags.voice = crate::voice::is_voice_turn(&slot.messages[..index]);
         if let Some((_, _, rows)) = slot.cache.get(&index).filter(|(cached_width, cached_flags, _)| *cached_width == width && *cached_flags == flags) {
             return rows.clone();
         }

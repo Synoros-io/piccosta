@@ -65,6 +65,7 @@ pub struct Flags {
     // --single's printing into the scrollback: tools open but capped at INLINE_TOOL_ROWS, a
     // subagent's report and a notice whole.
     pub inline: bool,
+    pub voice: bool,
 }
 
 // The user's prompt, behind a bar.
@@ -130,6 +131,8 @@ pub fn report(text: &str, width: u16, tex: &mut Tex) -> Rows {
 // wasn't normally. `frame` turns running tools' spinners.
 pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, tools: &HashMap<String, ToolView>, flags: Flags, frame: usize, width: u16, tex: &mut Tex) -> Rows {
     let mut writer = Writer::new(tex, width);
+    let text: String = blocks.iter().filter_map(|block| if let Block::Text(text) = block { Some(text.as_str()) } else { None }).collect();
+    let silent = flags.voice && if ended.is_none() { crate::voice::SILENT.starts_with(text.trim()) } else { text.trim() == crate::voice::SILENT };
     let view = |id: &String| tools.get(id).cloned().unwrap_or(ToolView { running: ended.is_none(), ..Default::default() });
     let mut blocks = blocks.iter().peekable();
     while let Some(block) = blocks.next() {
@@ -151,7 +154,8 @@ pub fn assistant(blocks: &[Block], ended: Option<(&StopReason, Option<&str>)>, t
                 writer.blank();
             }
             Block::Thinking(_) => {}
-            Block::Text(text) => writer.markdown(text),
+            Block::Text(text) if !silent => writer.markdown(text),
+            Block::Text(_) => {},
             // Calls in a row: while tools are folded, the ones that have ended are one line counting
             // them, so a wall of commands doesn't fill the screen; a call still running keeps its
             // own line under it. ctrl+o opens them all.

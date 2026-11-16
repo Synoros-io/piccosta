@@ -612,7 +612,7 @@ fn summary_text(response: &AssistantMessage, label: &str) -> Result<String, Stri
 // The appended summary request, shared with the fitter so these instructions take room too.
 fn summary_prompt(model: &Model, messages: &[Message], thinking: &str, instructions: Option<&str>, source_dates: &str) -> UserMessage {
     let focus = instructions.filter(|focus| !focus.is_empty()).map(|focus| format!("\n\nAdditional focus: {focus}")).unwrap_or_default();
-    let prompt = |target| UserMessage { content: TextOrBlocks::Text(format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}\nAim for about {target} tokens of checkpoint text; this is a soft target, not padding. Prioritize what the next session needs within that room.{focus}{source_dates}")), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() } };
+    let prompt = |target| UserMessage { content: TextOrBlocks::Text(format!("{IN_PLACE_PROMPT} {SUMMARIZATION_SYSTEM_PROMPT}\n\n{SUMMARIZATION_PROMPT}\nAim for about {target} tokens of checkpoint text; this is a soft target, not padding. Prioritize what the next session needs within that room.{focus}{source_dates}")), timestamp: clock::now_ms(), timer: None, origin: crate::message::InputOrigin::Harness { name: "compaction".into() }, voice: None };
     // Include the target sentence itself in the same resolved context the output limiter sees.
     // The full target has at least as many digits as the reduced one, so this is conservative.
     let full = [messages, &[Message::User(prompt(SUMMARY_TARGET_TOKENS))]].concat();

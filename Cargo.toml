@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["piccosta", "plugins/computer"]
+members = ["piccosta", "plugins/computer", "lfm"]
 
 [workspace.package]
 edition = "2024"
@@ -72,6 +72,34 @@ ratex-layout = "0.1.15"
 ratex-types = "0.1.15"
 ratex-render = { version = "0.1.15", features = ["embed-fonts"] }
 term-maths = "1"
+# LFM's CPU matrix kernels and optional headless GPU backend.
+rayon = "1"
+matrixmultiply = "0.3"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
+bytemuck = "1"
+
+# Arithmetic and dispatch bookkeeping must run optimized even in an everyday debug build.
+# These packages belong to lfm alone; piccosta's existing dependency profiles stay unchanged.
+[profile.dev.package.lfm]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.matrixmultiply]
+opt-level = 3
+[profile.dev.package.wgpu]
+opt-level = 3
+[profile.dev.package.wgpu-core]
+opt-level = 3
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+[profile.dev.package.wgpu-types]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.ash]
+opt-level = 3
+[profile.dev.package.gpu-allocator]
+opt-level = 3
 
 # The everyday build (`cargo build --release`), made to rebuild quickly: piccosta is one large crate,
 # and thin LTO with one codegen unit spent about two minutes on every change. What it runs is

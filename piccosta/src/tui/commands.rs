@@ -81,6 +81,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/ps", "background jobs"),
     ("/stop", "kill the background jobs"),
     ("/scratch [edit]", "open the shared Markdown scratchpad read-only without moving focus; edit opens $EDITOR"),
+    ("/call [assistant]", "call this session (or the assistant)"),
+    ("/hangup", "end the call"),
     ("/split", "open a new session in another pane"),
     ("/layout", "cycle panes: columns, rows, grid (four panes start in a grid)"),
     ("/close", "close this pane without stopping its session; /resume can show it again"),
@@ -420,6 +422,17 @@ impl App {
                     shared.jobs.kill_all(crate::tools::jobs::STOPPED_BY_USER, false);
                 }
                 self.notice = Some(format!("Stopped {count} background job{}.", if count == 1 { "" } else { "s" }));
+            }
+            "call" | "hangup" => {
+                let file = if name == "hangup" { None } else if argument == "assistant" { crate::manager::session_file(&self.host.agent_dir) } else { self.current().path.clone() };
+                if name == "call" && file.is_none() { self.notice = Some("No saved session to call.".into()); return true; }
+                let (slot, agent_dir, success) = (self.session_index(), self.host.agent_dir.clone(), if name == "call" { "On a call." } else { "Hung up." });
+                // An empty session asks its owner to persist its header. Keep that IPC wait off
+                // the UI thread, where the same owner's task may need to run to answer it.
+                if self.asks.send(Box::new(move |_| {
+                    let text = crate::voice::set_call(&agent_dir, file.as_deref()).map_or_else(|error| format!("Voice: {error}"), |()| success.into());
+                    (slot, Update::Report(text))
+                })).is_err() { self.notice = Some("The disk worker stopped before the call changed.".into()); }
             }
             "split" => self.split(),
             "layout" => self.layout = self.layout.next(),

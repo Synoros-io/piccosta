@@ -275,6 +275,7 @@ async fn serve(args: crate::cli::Args) -> Result<ExitCode, String> {
     // Each runtime ends as its commands' channel goes.
     let tasks: Vec<_> = acp.sessions.drain().map(|(_, live)| live.task).collect();
     let _ = tokio::time::timeout(STOP_WAIT, futures_util::future::join_all(tasks)).await;
+    crate::voice::shutdown(false).await;
     crate::provider::shutdown().await;
     Ok(ExitCode::from(code))
 }
