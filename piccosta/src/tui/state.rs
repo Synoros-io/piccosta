@@ -5,7 +5,7 @@
 //
 // One file per terminal, written when it changes (at each agent scan, so a crash loses a couple
 // of seconds at most) and as piccosta quits. Without a terminal identity, each UI gets its own
-// file and -c reads the newest. /restart passes its file explicitly, even without a terminal.
+// file, never another UI's. /restart passes its file explicitly, even without a terminal.
 //
 // /restart also leaves a handover for the image it execs: the background jobs still running, by
 // session, the watcher (tools/reaper.rs), and the Claude Code processes waiting for their sessions'
@@ -54,12 +54,14 @@ pub struct State {
     pub sidebar_width: u16,
     #[serde(default = "pane_layout")]
     pub layout: super::PaneLayout,
+    #[serde(default)]
+    pub pane_sizes: super::PaneSizes,
     pub open: Vec<Kept>,
 }
 
 fn sidebar_width() -> u16 { super::SIDEBAR_WIDTH }
-// Snapshots from before /layout had columns, regardless of a fresh UI's default.
-fn pane_layout() -> super::PaneLayout { super::PaneLayout::Columns }
+// Fresh and older snapshots share the grid default; an explicit /layout choice stays saved.
+fn pane_layout() -> super::PaneLayout { super::PaneLayout::Grid }
 
 #[derive(Serialize, Default)]
 pub struct Handover {
@@ -93,14 +95,9 @@ pub struct Kept {
 pub fn load(agent_dir: &Path, own: &Path, legacy: bool) -> Option<State> {
     // An older /restart didn't pass a private file. Read exactly what it saved, not another UI.
     // An existing own snapshot never falls back to another UI, even if it can't be read.
-    let path = if legacy { agent_dir.join("tui-state.json") } else if own.exists() { own.to_path_buf() } else {
-        std::fs::read_dir(agent_dir).ok()?.flatten().filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("tui-state") && !name.starts_with("tui-state-single-") && name.ends_with(".json")
-        }).filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-            .max_by_key(|(time, _)| *time)?.1
-    };
+    // A new terminal must not inherit another terminal's panes just because its snapshot is
+    // newest. Only explicit legacy restoration or this terminal's own identity can restore it.
+    let path = if legacy { agent_dir.join("tui-state.json") } else { own.to_path_buf() };
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 

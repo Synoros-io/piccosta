@@ -105,22 +105,68 @@ pub fn remembered_thinking_level(agent_dir: &Path, model: &str) -> Option<String
     Settings::load(agent_dir, None).get(MODEL_THINKING_LEVELS)?.get(model)?.as_str().map(str::to_string)
 }
 
-// Change the agent dir's settings.json: `edit` gets its object, and the file is written back only
-// when that changed it. Everything else stays as it was, in its order; a file that isn't a JSON
-// object is left alone. The file is written whole beside it and renamed over it, so nothing ever
-// reads half a file. Another piccosta writing at the same moment can lose one of the two edits.
+// Locate a top-level value in already validated JSON using serde's byte offsets. Strings,
+// nested objects and escaped property names are parsed, not searched for as raw text. The
+// last duplicate wins, matching serde's object reader.
+fn setting_span(text: &str, name: &str) -> Option<std::ops::Range<usize>> {
+    let mut offset = text.find('{')? + 1;
+    let mut found = None;
+    loop {
+        offset = text.len() - text[offset..].trim_start().len();
+        if text.as_bytes().get(offset) == Some(&b'}') { return found; }
+        let mut key = serde_json::Deserializer::from_str(&text[offset..]).into_iter::<String>();
+        let key_name = key.next()?.ok()?;
+        offset += key.byte_offset();
+        offset += text[offset..].find(':')? + 1;
+        offset = text.len() - text[offset..].trim_start().len();
+        let start = offset;
+        let mut value = serde_json::Deserializer::from_str(&text[offset..]).into_iter::<Value>();
+        value.next()?.ok()?;
+        offset += value.byte_offset();
+        if key_name == name { found = Some(start..offset); }
+        offset = text.len() - text[offset..].trim_start().len();
+        if text.as_bytes().get(offset) != Some(&b',') { return found; }
+        offset += 1;
+    }
+}
+
+// Every settings writer holds the same stable sidecar lock across reread, patch and rename.
+// Only changed top-level values are replaced; a key edit leaves all text outside "keys"
+// byte-identical, including the trailing newline. The partial file belongs to this lock.
 fn edit_settings(agent_dir: &Path, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
     let path = agent_dir.join("settings.json");
     let failed = |error: &dyn std::fmt::Display| format!("could not save {}: {error}", path.display());
-    let mut settings = read_json_object(&path)?;
-    let before = settings.clone();
+    fs::create_dir_all(agent_dir).map_err(|error| failed(&error))?;
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.with_extension("json.lock")).map_err(|error| failed(&error))?;
+    lock.lock().map_err(|error| failed(&error))?;
+    let mut text = match fs::read_to_string(&path) { Ok(text) => text, Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".into(), Err(error) => return Err(failed(&error)) };
+    let before: Map<String, Value> = serde_json::from_str(&text).map_err(|error| failed(&error))?;
+    let mut settings = before.clone();
     edit(&mut settings);
-    if settings == before {
-        return Ok(());
+    if settings == before { return Ok(()); }
+    for (name, value) in settings.iter().filter(|(name, value)| before.get(*name) != Some(*value)) {
+        let value = serde_json::to_string_pretty(value).map_err(|error| failed(&error))?;
+        if let Some(span) = setting_span(&text, name) { text.replace_range(span, &value); }
+        else {
+            let at = text[..text.rfind('}').unwrap()].trim_end().len();
+            text.insert_str(at, &format!("{}\n  {}: {value}", if text[..at].ends_with('{') { "" } else { "," }, serde_json::to_string(name).unwrap()));
+        }
     }
-    let text = serde_json::to_string_pretty(&settings).map_err(|error| failed(&error))?;
     let partial = path.with_extension("json.partial");
-    fs::create_dir_all(agent_dir).and_then(|()| fs::write(&partial, text)).and_then(|()| fs::rename(&partial, &path)).map_err(|error| failed(&error))
+    fs::write(&partial, text).and_then(|()| fs::rename(&partial, &path)).map_err(|error| failed(&error))
+}
+
+// Save a TUI binding where its effective override lives. A project override must not hide
+// an apparently successful global edit; resets write the defaults explicitly for the same reason.
+pub fn remember_key(agent_dir: &Path, cwd: &Path, action: &str, binding: Value) -> Result<(), String> {
+    let project = cwd.join(PROJECT_CONFIG_DIR);
+    let local = read_json_object(&project.join("settings.json"))?;
+    let directory = if local.get("keys").and_then(|keys| keys.get(action)).is_some() { project.as_path() } else { agent_dir };
+    edit_settings(directory, |settings| {
+        let keys = settings.entry("keys").or_insert_with(|| Value::Object(Map::new()));
+        if !keys.is_object() { *keys = Value::Object(Map::new()); }
+        keys.as_object_mut().unwrap().insert(action.into(), binding);
+    })
 }
 
 // Save the thinking level a model (provider/id) was set to by hand, so its sessions start there;
@@ -154,9 +200,16 @@ impl Settings {
     pub fn load(agent_dir: &Path, cwd: Option<&Path>) -> Settings {
         let mut settings = Settings::default();
         let project = cwd.map(|cwd| cwd.join(PROJECT_CONFIG_DIR).join("settings.json"));
-        for path in std::iter::once(agent_dir.join("settings.json")).chain(project) {
+        for (scope, path) in std::iter::once(agent_dir.join("settings.json")).chain(project).enumerate() {
             match read_json_object(&path) {
-                Ok(object) => deep_merge(&mut settings.merged, &object),
+                Ok(mut object) => {
+                    // A repository cannot pick trusted executables or expose host files.
+                    if scope != 0 {
+                        object.remove("computer");
+                        object.remove("clipboard");
+                    }
+                    deep_merge(&mut settings.merged, &object);
+                }
                 Err(error) => settings.load_errors.push(error),
             }
         }
@@ -304,6 +357,8 @@ impl Settings {
             max_response_size_mb: self.get_u64("web.fetch.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_MAX_RESPONSE_MB),
             pdf_max_size_mb: self.get_u64("web.pdf.maxSizeMB").filter(|mb| *mb > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_SIZE_MB),
             pdf_max_pages: self.get_u64("web.pdf.maxPages").filter(|pages| *pages > 0).unwrap_or(DEFAULT_WEB_PDF_MAX_PAGES) as usize,
+            accept_language: self.get_str("web.acceptLanguage").unwrap_or("en-US,en;q=0.9").to_string(),
+            github_hosts: if self.get("web.github.hosts").is_some() { strings("web.github.hosts") } else { vec!["github.com".into(), "www.github.com".into()] },
             github_clone_enabled: self.get_bool("web.githubClone.enabled").unwrap_or(true),
             github_max_repo_size_mb: self.get("web.githubClone.maxRepoSizeMB").and_then(Value::as_f64).filter(|mb| *mb > 0.0).unwrap_or(DEFAULT_GITHUB_MAX_REPO_SIZE_MB),
             github_clone_timeout_s: self.get("web.githubClone.cloneTimeoutSeconds").and_then(Value::as_f64).filter(|s| *s > 0.0).unwrap_or(DEFAULT_GITHUB_CLONE_TIMEOUT_S),
@@ -337,6 +392,8 @@ pub struct WebSettings {
     pub fetch_timeout_ms: u64,
     // None means net.rs's own default.
     pub user_agent: Option<String>,
+    pub accept_language: String,
+    pub github_hosts: Vec<String>,
     // CIDR ranges the private-address check lets through (a fake-IP proxy's 198.18/15).
     pub allow_ranges: Vec<String>,
     pub domain_allow: Vec<String>,

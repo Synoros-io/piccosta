@@ -44,10 +44,15 @@ impl View {
     fn rows(&self) -> impl Iterator<Item = &ratatui::text::Line<'static>> { self.blocks.iter().flat_map(|block| &block.rows) }
 }
 
+#[derive(Default, PartialEq, Eq)]
+pub(super) enum Mode { #[default] Read, Append, Command }
+
 pub(super) struct Scratchpad {
     pub path: PathBuf,
     pub cwd: PathBuf,
     pub draft: Editor,
+    pub mode: Mode,
+    command: Editor,
     view: Arc<View>,
     ticket: Arc<()>,
     pending: bool,
@@ -133,15 +138,22 @@ fn scan(path: &Path, previous: &View, fit: Fit, ready: &[Stamp], mut tex: tex::T
 }
 
 impl App {
-    pub(super) fn draft(&self) -> &Editor { match self.panes[self.focus].target { Target::Session(slot) => &self.slots[slot].draft, Target::Scratchpad(board) => &self.scratchpads[board].draft } }
-    pub(super) fn draft_mut(&mut self) -> &mut Editor { match self.panes[self.focus].target { Target::Session(_) => &mut self.focused().draft, Target::Scratchpad(board) => &mut self.scratchpads[board].draft } }
+    pub(super) fn scratch_reading(&self) -> bool { matches!(self.panes[self.focus].target, Target::Scratchpad(board) if self.scratchpads[board].mode == Mode::Read) }
+    pub(super) fn scratch_command(&mut self) {
+        if let Target::Scratchpad(board) = self.panes[self.focus].target {
+            self.scratchpads[board].mode = Mode::Command;
+            self.scratchpads[board].command = Editor::with("/".into());
+        }
+    }
+    pub(super) fn draft(&self) -> &Editor { match self.panes[self.focus].target { Target::Session(slot) => &self.slots[slot].draft, Target::Scratchpad(board) => { let board = &self.scratchpads[board]; if board.mode == Mode::Command { &board.command } else { &board.draft } } } }
+    pub(super) fn draft_mut(&mut self) -> &mut Editor { match self.panes[self.focus].target { Target::Session(_) => &mut self.focused().draft, Target::Scratchpad(board) => { let board = &mut self.scratchpads[board]; if board.mode == Mode::Command { &mut board.command } else { &mut board.draft } } } }
     pub(super) fn focus_cwd(&self) -> &Path { match self.panes[self.focus].target { Target::Session(slot) => &self.slots[slot].cwd, Target::Scratchpad(board) => &self.scratchpads[board].cwd } }
     pub(super) fn focus_busy(&self) -> bool { matches!(self.panes[self.focus].target, Target::Session(slot) if self.slots[slot].busy()) }
     pub(super) fn append_pending(&self) -> bool { matches!(self.panes[self.focus].target, Target::Scratchpad(board) if self.scratchpads[board].appending) }
 
     pub(super) fn scratch_index(&mut self, path: PathBuf, cwd: PathBuf) -> usize {
         if let Some(index) = self.scratchpads.iter().position(|board| board.path == path) { return index; }
-        self.scratchpads.push(Scratchpad { path, cwd, draft: Editor::default(), view: Arc::new(View::default()), ticket: Arc::new(()), pending: false, appending: false, ready: Vec::new(), fit: Fit::default() });
+        self.scratchpads.push(Scratchpad { path, cwd, draft: Editor::default(), mode: Mode::Read, command: Editor::default(), view: Arc::new(View::default()), ticket: Arc::new(()), pending: false, appending: false, ready: Vec::new(), fit: Fit::default() });
         self.scratchpads.len() - 1
     }
 
@@ -156,13 +168,11 @@ impl App {
     pub(super) fn scratch_path(&mut self, cwd: PathBuf, path: PathBuf, edit: bool) {
         if self.quit || self.restart_waiting { return; }
         let board = if let Some(pane) = self.panes.iter().position(|pane| matches!(pane.target, Target::Scratchpad(board) if self.scratchpads[board].path == path)) {
-            self.focus = pane;
             let Target::Scratchpad(board) = self.panes[pane].target else { unreachable!() }; board
         } else {
             if self.panes.len() >= super::MAX_PANES { self.notice = Some("All four panes are occupied; close a pane before /scratch.".into()); return; }
             let board = self.scratch_index(path.clone(), cwd);
             self.panes.push(Pane { target: Target::Scratchpad(board), scroll: 0, anchor: None });
-            self.focus = self.panes.len() - 1;
             board
         };
         if edit {
@@ -246,8 +256,12 @@ impl App {
 
     pub(super) fn draw_scratch(&mut self, frame: &mut ratatui::Frame, pane: usize, index: usize, inner: ratatui::layout::Rect) {
         use ratatui::{layout::Rect, style::{Modifier, Style}, text::{Line, Span}, widgets::Paragraph};
-        let ([header, body, _, editor], editor_rows, cursor) = Self::editor_layout(&self.scratchpads[index].draft, inner, pane == self.focus, 0);
-        frame.render_widget(Paragraph::new(Line::from(vec![Span::styled("scratchpad", Style::new().fg(super::theme::ACCENT).add_modifier(Modifier::BOLD)), Span::styled(format!("  {}", self.scratchpads[index].path.display()), Style::new().fg(super::theme::DIM))])), header);
+        let board = &self.scratchpads[index];
+        let editing = pane == self.focus && board.mode != Mode::Read;
+        let draft = if board.mode == Mode::Command { &board.command } else { &board.draft };
+        let ([header, body, _, editor], editor_rows, cursor) = Self::editor_layout(draft, inner, editing, 0);
+        let mode = match board.mode { Mode::Read => format!("read only · {} commands", self.keys.short("scratch-command")), Mode::Append => "append".into(), Mode::Command => "command".into() };
+        frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{}scratchpad · {mode}{}", if pane == self.focus { "▶ " } else { "  " }, if board.mode == Mode::Read && !board.draft.text.is_empty() { " · draft kept" } else { "" }), Style::new().fg(if pane == self.focus { super::theme::ACCENT } else { super::theme::DIM }).add_modifier(Modifier::BOLD)), Span::styled(format!("  {}", board.path.display()), Style::new().fg(super::theme::DIM))])), header);
         let view = self.scratchpads[index].view.clone();
         let length: usize = view.blocks.iter().map(|block| block.rows.len()).sum();
         let scroll = self.panes[pane].scroll.min(length.saturating_sub(usize::from(body.height)));
@@ -280,6 +294,6 @@ impl App {
                 self.copied(super::clip::text(cells, from, to));
             }
         }
-        if pane == self.focus { self.draw_editor(frame, editor, &editor_rows, cursor); }
+        if editing { self.draw_editor(frame, editor, &editor_rows, cursor); }
     }
 }

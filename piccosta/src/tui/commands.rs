@@ -44,15 +44,15 @@ where even numbers slow.
             — gpt-6-luna, in piccosta, 2026-10-30";
 
 // /help's list, in the order people reach for them.
-const COMMANDS: [(&str, &str); 50] = [
-    ("/new [dir]", "start a new session in a directory you name, pick or type (^n too; enter: right here)"),
-    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns (esc stops the focused turn)"),
+const COMMANDS: &[(&str, &str)] = &[
+    ("/new [dir]", "start a new session in a directory you name, pick or type"),
+    ("/restart", "start piccosta again on its binary as it is now (after a build), everything as it was and background jobs carrying on; queues new work and waits for running turns"),
     ("/clear [name]", "start a new session here; a name names the one left"),
     ("/scale", "which model does which kind of work, and how much of each plan is used (--use <kind> picks from it)"),
     ("/manager", "this project's manager: shown, or made (the first session in a directory is one)"),
     ("/advisor", "the advisor of this pane's manager (or this project's): shown, or made; it advises the manager, and you can talk to both"),
     ("/assistant", "the assistant: shown, or started when it isn't running (it runs in the background)"),
-    ("/resume [text|all]", "the sessions to switch to (^s; ^d there deletes one); all: every project's"),
+    ("/resume [text|all]", "open a session beside your current task; all: every project's"),
     ("/fork, /branch [name]", "copy this session and carry on in the copy"),
     ("/rewind", "go back to before one of your prompts, in a copy, with that prompt in the editor"),
     ("/rename, /name <name>", "name this session"),
@@ -80,21 +80,15 @@ const COMMANDS: [(&str, &str); 50] = [
     ("/agents", "the subagent jobs and their models"),
     ("/ps", "background jobs"),
     ("/stop", "kill the background jobs"),
-    ("/scratch [edit]", "open/focus the shared Markdown scratchpad; enter appends, edit opens $EDITOR"),
+    ("/scratch [edit]", "open the shared Markdown scratchpad read-only without moving focus; edit opens $EDITOR"),
     ("/split", "open a new session in another pane"),
     ("/layout", "cycle panes: columns, rows, grid (four panes start in a grid)"),
-    ("/close", "close this session: it's done and leaves the list (/resume finds it, and a message opens it again)"),
-    ("/delete", "move this session to the trash and show the next; the Delete key twice, with nothing typed, does it too"),
+    ("/close", "close this pane without stopping its session; /resume can show it again"),
+    ("/delete", "move this session to the trash and show the next; /keys lists the delete-session shortcut"),
     ("/help", "this list"),
+    ("/keys [reload]", "current keybindings and contexts; reload rereads settings.json"),
     ("/quit, /exit", "leave piccosta"),
-    ("keys", "enter send · alt+enter newline · esc stop · ^c quit"),
-    ("", "^backspace deletes a word · ^shift+delete clears what's typed (↑ brings it back)"),
-    ("", "running: enter queues · ^x^s or ^enter sends now · ↑ takes back · esc stops, queue goes next"),
-    ("", "^n new · ^s sessions · pgup/pgdn or alt+↑↓ through the sidebar (shown, started when you type) · ^b sidebar"),
-    ("", "alt+, / alt+. narrow/widen sidebar · drag its right edge to resize"),
-    ("", "^\\ split · ^] close pane · alt+←→ panes · alt+pgup/pgdn or the wheel scrolls · ^o tools · ^t thinking"),
-    ("copy", "drag to select (double-click a word, triple-click a row); it copies when you let go · ^c copies a selection · shift+arrows extend it"),
-    ("paste", "right-click pastes the clipboard, middle-click the last selection, ^v the clipboard · shift+arrows select in the editor"),
+    ("copy / paste", "drag to select and copy; right-click pastes the clipboard, middle-click the primary selection; /keys lists keyboard actions"),
 ];
 
 
@@ -104,14 +98,28 @@ impl App {
     pub(super) fn command(&mut self, line: &str) -> bool {
         let (name, raw_argument) = line.split_once(' ').map_or((line.trim(), ""), |(name, rest)| (name, rest));
         let argument = raw_argument.trim();
-        if matches!(self.panes[self.focus].target, super::Target::Session(slot) if self.slots[slot].closing) && !matches!(name, "quit" | "exit" | "restart") {
+        if matches!(self.panes[self.focus].target, super::Target::Session(slot) if self.slots[slot].closing) && !matches!(name, "quit" | "exit" | "restart" | "close" | "keys" | "help") {
             self.notice = Some("The session is closing; wait for its answer.".into());
             return true;
         }
         match name {
             "scratch" => self.scratch(argument),
-            "close" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => self.close_pane(),
-            "help" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => self.notice = Some("Scratchpad: enter appends · alt+enter newline · /scratch edit · /layout · /close · ^s sessions · alt+←→ panes".into()),
+            "close" => self.close_pane(),
+            "keys" => {
+                if argument == "reload" { self.keys = super::keys::Keys::load(&crate::config::Settings::load(&self.host.agent_dir, Some(&self.host.cwd))); }
+                self.rebind = None;
+                self.captured.clear();
+                self.pick("keys", self.keys.rows(), "", |app, item| {
+                    app.command("keys");
+                    app.select(&item);
+                    app.rebind = super::keys::Keys::action(&item);
+                });
+                if !self.keys.problems.is_empty() { self.notice = Some(self.keys.problems.join(" · ")); }
+            }
+            "help" if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) => {
+                let help = format!("{}\n/scratch edit opens $EDITOR · /layout · /close · /keys", self.key_hint());
+                self.pick("scratchpad help", help.lines().map(str::to_string).collect(), "", |_, _| {});
+            }
             _ if matches!(self.panes[self.focus].target, super::Target::Scratchpad(_)) && !matches!(name, "layout" | "quit" | "exit" | "restart" | "resume" | "pwd" | "cwd" | "split" | "new") && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') => self.notice = Some(format!("/{name} is a session command; focus a session first.")),
             // --single has one session: the commands that open others only say so.
             "new" | "manager" | "advisor" | "assistant" if self.one_session() => {}
@@ -121,7 +129,7 @@ impl App {
             "clear" => {
                 let left = self.session_index();
                 if self.slots[left].busy() {
-                    self.notice = Some("A turn is running; esc stops it, then /clear.".into());
+                    self.notice = Some(format!("A turn is running; {} stops it, then /clear.", self.keys.label("stop")));
                 } else if let Some(slot) = {
                     if !argument.is_empty() {
                         self.focused().title = argument.to_string();
@@ -183,7 +191,7 @@ impl App {
                     Ok(dir) => {
                         // A directory alone is a plain new session there (an empty one is reused).
                         let flags = (words(argument).len() > args.messages.len()).then_some(args);
-                        if let Some(slot) = self.new_session_in(Some(dir), flags) {
+                        if let Some(slot) = self.new_session_in(Some(dir), flags, true) {
                             self.show(slot);
                             if let Some(note) = note {
                                 self.report(crate::scale::fell_back(&note, &self.current().model));
@@ -252,7 +260,7 @@ impl App {
                         slot
                     }
                 };
-                self.show(slot);
+                self.open_beside(slot);
             }
             // The assistant runs as a background service. It's started off the UI's thread
             // (systemctl can be slow), and shown once its session is there (Update::Assistant).
@@ -415,12 +423,6 @@ impl App {
             }
             "split" => self.split(),
             "layout" => self.layout = self.layout.next(),
-            // Closing says the session is done: it leaves the list for good, and a message in it
-            // (from /resume, or a manager) opens it again.
-            "close" => {
-                let slot = self.session_index();
-                self.request_close(slot);
-            }
             "delete" => self.delete_shown(),
             "quit" | "exit" => self.quit = true,
             // Start again on the binary as it is now (after a build), with everything as it was and
@@ -429,7 +431,7 @@ impl App {
             "restart" if self.restart_waiting => self.report("A restart is already waiting for the running turns.".into()),
             "restart" => self.drain(true),
             "descent" => self.report(DESCENT.into()),
-            "help" => self.report(COMMANDS.iter().map(|(name, what)| format!("{name:<28} {what}")).collect::<Vec<_>>().join("\n")),
+            "help" => self.report(format!("{}\n\n{}", COMMANDS.iter().map(|(name, what)| format!("{name:<28} {what}")).collect::<Vec<_>>().join("\n"), self.keys.help())),
             _ if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') => {
                 self.notice = Some(format!("No command /{name}; /help lists them."));
             }
@@ -514,9 +516,9 @@ impl App {
             let project = if slot.cwd == self.host.cwd || slot.cwd.as_os_str().is_empty() { String::new() } else { format!("{} · ", super::render::home_relative(&slot.cwd)) };
             format!("{} · {project}{}{}{age}", place + 1, if slot.live.is_some() { "open · " } else { "" }, super::render::fit(&slot.title, ITEM_CHARS))
         });
-        self.pick("sessions · del or ^d deletes", items.collect(), filter, |app, choice| {
+        self.pick("sessions · open beside", items.collect(), filter, |app, choice| {
             if let Some(slot) = number(&choice).and_then(|place| app.listed().get(place).copied()) {
-                app.show(slot);
+                app.open_beside(slot);
             }
         });
         let current = self.panes[self.focus].target;
@@ -542,7 +544,7 @@ impl App {
             if !dirs.contains(&dir) { dirs.push(dir); }
         }
         let filter = self.picker.as_ref().map(|picker| picker.filter.clone()).unwrap_or_default();
-        self.pick("new session in · enter: here · ~ is home · or type any path, then flags: --model --effort --pair --name …", dirs, &filter, |app, typed| { app.command(&format!("new {typed}")); });
+        self.pick("new session in · first choice: here · ~ is home · or type any path, then flags: --model --effort --pair --name …", dirs, &filter, |app, typed| { app.command(&format!("new {typed}")); });
         let base = self.base_dir();
         if let Some(picker) = &mut self.picker { picker.free = Some(base); }
     }
@@ -613,7 +615,7 @@ impl App {
             self.slots.push(super::Slot::new(Some(path), super::NEW_TITLE.into()));
             self.slots.len() - 1
         });
-        self.show(slot);
+        self.open_beside(slot);
     }
 
     // Delete the session shown here, then show the one after it in the list (or before, at the end).

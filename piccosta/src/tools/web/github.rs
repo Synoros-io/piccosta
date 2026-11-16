@@ -60,6 +60,8 @@ pub enum Kind {
 
 #[derive(Debug, Clone)]
 pub struct GithubUrl {
+    pub origin: String,
+    pub host: String,
     pub owner: String,
     pub repo: String,
     pub git_ref: Option<String>,
@@ -86,13 +88,18 @@ fn decode_component(segment: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-// A github.com repo, tree or blob URL (github-extract.ts parseGitHubUrl).
-pub fn parse_github_url(url: &str) -> Option<GithubUrl> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?.to_lowercase();
-    if host != "github.com" && host != "www.github.com" {
+// A repo, tree or blob URL at a configured GitHub host (github-extract.ts parseGitHubUrl).
+// Keep its origin all the way through clones and API reads, including cache identity.
+pub fn parse_github_url(url: &str, hosts: &[String]) -> Option<GithubUrl> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    let host = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_lowercase();
+    if !matches!(parsed.scheme(), "http" | "https") || !parsed.username().is_empty() || parsed.password().is_some() || !hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&host)) {
         return None;
     }
+    // The public www alias has always meant the same repository and cache as github.com.
+    if parsed.host_str()? == "www.github.com" { parsed.set_host(Some("github.com")).ok()?; }
+    let host = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+    let origin = parsed.origin().ascii_serialization();
     let mut segments = Vec::new();
     for segment in parsed.path().split('/').filter(|s| !s.is_empty()) {
         segments.push(decode_component(segment)?);
@@ -117,7 +124,7 @@ pub fn parse_github_url(url: &str) -> Option<GithubUrl> {
         return None;
     }
     if segments.len() == 2 {
-        return Some(GithubUrl { owner, repo, git_ref: None, ref_is_full_sha: false, path: String::new(), kind: Kind::Root });
+        return Some(GithubUrl { origin, host, owner, repo, git_ref: None, ref_is_full_sha: false, path: String::new(), kind: Kind::Root });
     }
     let kind = match segments[2].as_str() {
         "blob" => Kind::Blob,
@@ -129,7 +136,7 @@ pub fn parse_github_url(url: &str) -> Option<GithubUrl> {
         return None;
     }
     let ref_is_full_sha = git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
-    Some(GithubUrl { owner, repo, git_ref: Some(git_ref), ref_is_full_sha, path: segments[4..].join("/"), kind })
+    Some(GithubUrl { origin, host, owner, repo, git_ref: Some(git_ref), ref_is_full_sha, path: segments[4..].join("/"), kind })
 }
 
 // formatFileSize: B under a KiB, then KB and MB to one decimal.
@@ -474,7 +481,7 @@ impl Clones {
     }
 
     fn key(info: &GithubUrl) -> String {
-        serde_json::to_string(&json!([info.owner, info.repo, info.git_ref])).unwrap_or_default()
+        serde_json::to_string(&json!([info.origin, info.owner, info.repo, info.git_ref])).unwrap_or_default()
     }
 
     // A clone this process already made or is making for the repo and ref.
@@ -502,8 +509,11 @@ impl Clones {
             format!("{:016x}{}", hasher.finish(), uuid::Uuid::new_v4().simple())
         };
         let local = runtime.join(digest);
-        let mut args: Vec<String> = if self.has_gh().await {
-            vec!["gh".into(), "repo".into(), "clone".into(), format!("{}/{}", info.owner, info.repo), local.display().to_string(), "--".into(), "--depth".into(), "1".into(), "--single-branch".into()]
+        // gh's preliminary API lookup drops a clone URL's scheme and port. Git itself keeps
+        // both, so only ordinary HTTPS origins can safely take gh's authenticated clone path.
+        let origin = url::Url::parse(&info.origin).ok()?;
+        let mut args: Vec<String> = if origin.scheme() == "https" && origin.port().is_none() && self.has_gh().await {
+            vec!["gh".into(), "repo".into(), "clone".into(), format!("{}/{}/{}", info.origin, info.owner, info.repo), local.display().to_string(), "--".into(), "--depth".into(), "1".into(), "--single-branch".into()]
         } else {
             vec!["git".into(), "clone".into(), "--depth".into(), "1".into(), "--single-branch".into()]
         };
@@ -511,7 +521,7 @@ impl Clones {
             args.extend(["--branch".into(), git_ref.clone()]);
         }
         if args[0] == "git" {
-            args.extend([format!("https://github.com/{}/{}.git", info.owner, info.repo), local.display().to_string()]);
+            args.extend([format!("{}/{}/{}.git", info.origin, info.owner, info.repo), local.display().to_string()]);
         }
         let mut command = tokio::process::Command::new(&args[0]);
         command
@@ -521,7 +531,8 @@ impl Clones {
             .stderr(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GCM_INTERACTIVE", "Never")
-            .env("GH_PROMPT_DISABLED", "1");
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_HOST", &info.host);
         let (mut child, group) = self.spawn(&mut command)?;
         let pid = child.id().map(|pid| pid as i32);
         let succeeded = tokio::select! {
@@ -551,6 +562,17 @@ impl Drop for Clones {
     }
 }
 
+// gh's API routing is independent of the clone URL and the user's default GH_HOST.
+async fn api(clones: &Clones, info: &GithubUrl, args: &[&str], timeout: Duration) -> Option<String> {
+    let origin = url::Url::parse(&info.origin).ok()?;
+    // gh rejects ports in --hostname. The full Enterprise API URL keeps the requested scheme
+    // and port; --hostname selects authentication independently of the user's default GH_HOST.
+    let endpoint = if info.host == "github.com" { args[0].to_string() } else { format!("{}/api/v3/{}", info.origin, args[0]) };
+    let mut routed = vec!["api", "--hostname", origin.host_str()?, &endpoint];
+    routed.extend_from_slice(&args[1..]);
+    gh(clones, &routed, timeout).await
+}
+
 // The API view, when a repo is too big to clone, the ref is a commit, or the clone failed
 // (github-api.ts fetchViaApi). Needs gh.
 async fn fetch_via_api(url: &str, info: &GithubUrl, size_note: Option<String>, clones: &Clones) -> Option<Extracted> {
@@ -560,7 +582,7 @@ async fn fetch_via_api(url: &str, info: &GithubUrl, size_note: Option<String>, c
     let repo_path = format!("repos/{}/{}", info.owner, info.repo);
     let git_ref = match &info.git_ref {
         Some(git_ref) => git_ref.clone(),
-        None => gh(clones, &["api", &repo_path, "--jq", ".default_branch"], GH_API_TIMEOUT).await.map(|b| b.trim().to_string()).filter(|b| !b.is_empty())?,
+        None => api(clones, info, &[&repo_path, "--jq", ".default_branch"], GH_API_TIMEOUT).await.map(|b| b.trim().to_string()).filter(|b| !b.is_empty())?,
     };
     let mut lines: Vec<String> = Vec::new();
     if let Some(note) = size_note {
@@ -572,7 +594,7 @@ async fn fetch_via_api(url: &str, info: &GithubUrl, size_note: Option<String>, c
         base64::engine::general_purpose::STANDARD.decode(cleaned).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     };
     if info.kind == Kind::Blob && !info.path.is_empty() {
-        let content = gh(clones, &["api", &format!("{repo_path}/contents/{}?ref={git_ref}", info.path), "--jq", ".content"], GH_API_TIMEOUT).await.and_then(decode).filter(|c| !c.is_empty())?;
+        let content = api(clones, info, &[&format!("{repo_path}/contents/{}?ref={git_ref}", info.path), "--jq", ".content"], GH_API_TIMEOUT).await.and_then(decode).filter(|c| !c.is_empty())?;
         lines.push(format!("## {}", info.path));
         if crate::js::utf16_len(&content) > MAX_INLINE_FILE_CHARS {
             lines.extend([utf16_prefix(&content, MAX_INLINE_FILE_CHARS), "\n[File truncated at 100K chars]".to_string()]);
@@ -582,9 +604,9 @@ async fn fetch_via_api(url: &str, info: &GithubUrl, size_note: Option<String>, c
         return Some(Extracted { url: url.to_string(), title: format!("{}/{} - {}", info.owner, info.repo, info.path), content: lines.join("\n"), ..Default::default() });
     }
     let (tree_path, readme_path) = (format!("{repo_path}/git/trees/{git_ref}?recursive=1"), format!("{repo_path}/readme?ref={git_ref}"));
-    let tree_args = ["api", tree_path.as_str(), "--jq", ".tree[].path"];
-    let readme_args = ["api", readme_path.as_str(), "--jq", ".content"];
-    let (tree, readme) = tokio::join!(gh(clones, &tree_args, GH_TREE_TIMEOUT), gh(clones, &readme_args, GH_API_TIMEOUT));
+    let tree_args = [tree_path.as_str(), "--jq", ".tree[].path"];
+    let readme_args = [readme_path.as_str(), "--jq", ".content"];
+    let (tree, readme) = tokio::join!(api(clones, info, &tree_args, GH_TREE_TIMEOUT), api(clones, info, &readme_args, GH_API_TIMEOUT));
     let tree = tree.map(|text| text.trim().split('\n').filter(|line| !line.is_empty()).map(str::to_string).collect::<Vec<_>>()).filter(|paths| !paths.is_empty()).map(|paths| {
         let shown = paths[..paths.len().min(MAX_TREE_ENTRIES)].join("\n");
         if paths.len() > MAX_TREE_ENTRIES { format!("{shown}\n... ({} total entries)", paths.len()) } else { shown }
@@ -618,7 +640,7 @@ pub async fn extract_github(url: &str, info: &GithubUrl, force_clone: bool, web:
     if !force_clone
         && !clones.has_clone(info)
         && clones.has_gh().await
-        && let Some(size_kb) = gh(clones, &["api", &format!("repos/{}/{}", info.owner, info.repo), "--jq", ".size"], GH_API_TIMEOUT).await.and_then(|text| text.trim().parse::<f64>().ok())
+        && let Some(size_kb) = api(clones, info, &[&format!("repos/{}/{}", info.owner, info.repo), "--jq", ".size"], GH_API_TIMEOUT).await.and_then(|text| text.trim().parse::<f64>().ok())
     {
         let size_mb = size_kb / 1024.0;
         if size_mb > settings.github_max_repo_size_mb {

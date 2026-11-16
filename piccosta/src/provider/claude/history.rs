@@ -557,6 +557,10 @@ impl Records {
 
 // A path can name a new file after a checkpoint or transcript replacement. Keep the opened file's
 // identity, not its path, and notice same-length writes too.
+// How many times keep reads a transcript that changes under it before it gives up. One swap per
+// resume is what Claude Code 2.1.325 does (seen 2026-11-15); three leaves room for a second.
+const TRANSCRIPT_READS: u32 = 3;
+
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FileStamp {
     identity: (u64, u64),
@@ -855,34 +859,42 @@ pub fn keep(cache: Handle, key: &str, cc_session_id: &str, project_path: &str, c
     let shape_key = query_key(key, shape).1;
     let previous = session.shapes.get(&shape_key);
     let path = session_path(cc_session_id, project_path);
-    let mut reader = BufReader::new(fs::File::open(&path)?);
-    let stamp = file_stamp(reader.get_ref())?;
     let live = writer.is_some_and(|(_, pid, start)| crate::proc::start(pid as i32) == Some(start));
-    let offset = match previous.filter(|kept| live && kept.writer == writer).and_then(|kept| kept.source.as_ref().zip(kept.anchor.as_ref())) {
-        Some(((id, end), anchor)) if id == cc_session_id && anchor.matches_tail(&mut reader, *end, &stamp)? => Some(*end),
-        _ => None,
+    // Claude Code swaps in a new transcript file when a process resumes the session, which can
+    // land mid-read. Read the new file instead, from the start: its anchor no longer matches.
+    let mut reads = 0;
+    let (offset, end, records, mut anchor, current, last_line, last_start) = loop {
+        reads += 1;
+        let mut reader = BufReader::new(fs::File::open(&path)?);
+        let stamp = file_stamp(reader.get_ref())?;
+        let offset = match previous.filter(|kept| live && kept.writer == writer).and_then(|kept| kept.source.as_ref().zip(kept.anchor.as_ref())) {
+            Some(((id, end), anchor)) if id == cc_session_id && anchor.matches_tail(&mut reader, *end, &stamp)? => Some(*end),
+            _ => None,
+        };
+        if offset.is_none() && previous.is_some() { debug(&format!("kept: transcript reset for {cc_session_id}; rebuilding records")); }
+        reader.seek(SeekFrom::Start(offset.unwrap_or(0)))?;
+        let mut end = offset.unwrap_or(0);
+        let mut records = Vec::new();
+        let anchor = previous.filter(|_| offset.is_some()).and_then(|kept| kept.anchor.clone());
+        // Only the final complete line pins the cursor. Keep it in a second reusable buffer instead
+        // of hashing every line of a large initial capture or rereading the final line afterward.
+        let (mut line, mut last_line, mut last_start) = (String::new(), String::new(), end);
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') { break; }
+            let record: Value = serde_json::from_str(&line)?;
+            if record["uuid"].is_string() { records.push(record); }
+            last_start = end;
+            end += line.len() as u64;
+            std::mem::swap(&mut last_line, &mut line);
+        }
+        let current = file_stamp(reader.get_ref())?;
+        if current.identity != file_stamp(&fs::File::open(&path)?)?.identity || (current.length == stamp.length && current.modified != stamp.modified) {
+            if reads < TRANSCRIPT_READS { debug(&format!("kept: transcript {cc_session_id} replaced while reading; reading it again")); continue; }
+            return Err(io::Error::other("Claude transcript changed while keeping records"));
+        }
+        break (offset, end, records, anchor, current, last_line, last_start);
     };
-    if offset.is_none() && previous.is_some() { debug(&format!("kept: transcript reset for {cc_session_id}; rebuilding records")); }
-    reader.seek(SeekFrom::Start(offset.unwrap_or(0)))?;
-    let mut end = offset.unwrap_or(0);
-    let mut records = Vec::new();
-    let mut anchor = previous.filter(|_| offset.is_some()).and_then(|kept| kept.anchor.clone());
-    // Only the final complete line pins the cursor. Keep it in a second reusable buffer instead
-    // of hashing every line of a large initial capture or rereading the final line afterward.
-    let (mut line, mut last_line, mut last_start) = (String::new(), String::new(), end);
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') { break; }
-        let record: Value = serde_json::from_str(&line)?;
-        if record["uuid"].is_string() { records.push(record); }
-        last_start = end;
-        end += line.len() as u64;
-        std::mem::swap(&mut last_line, &mut line);
-    }
-    let current = file_stamp(reader.get_ref())?;
-    if current.identity != file_stamp(&fs::File::open(&path)?)?.identity || (current.length == stamp.length && current.modified != stamp.modified) {
-        return Err(io::Error::other("Claude transcript changed while keeping records"));
-    }
     if !last_line.is_empty() {
         anchor = Some(TranscriptAnchor { file: current, start: last_start, digest: Sha256::digest(last_line.as_bytes()).into() });
     } else if let Some(anchor) = &mut anchor { anchor.file = current; }

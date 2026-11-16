@@ -11,7 +11,9 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use unicode_width::UnicodeWidthStr;
 
 // A desktop's clipboard tools: the variable that says the desktop is there, then the commands that
@@ -45,40 +47,94 @@ fn tools() -> impl Iterator<Item = &'static Tools> {
     TOOLS.iter().filter(|tools| std::env::var_os(tools.desktop).is_some())
 }
 
-// Copy `text` to the clipboard and the primary selection. Output: what it went through, for the
-// notice. The tools stay behind to serve the copy; each is waited on from its own thread, so a
-// slow one never holds up the screen.
-pub fn copy(text: &str) -> String {
-    for tools in tools() {
-        let mut copied = false;
-        for command in tools.copy {
-            let Ok(mut child) = Command::new(command[0]).args(&command[1..]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { continue };
-            if let Some(mut stdin) = child.stdin.take() {
-                copied |= stdin.write_all(text.as_bytes()).is_ok();
-            }
-            std::thread::spawn(move || child.wait());
+// Commands are argv arrays, never shell lines. Only the user's settings can choose them;
+// absent selections use desktop detection, while an empty array disables that selection.
+async fn commands(copy: bool, primary: bool) -> Vec<Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        let settings = crate::config::Settings::load(&crate::config::agent_dir(), None);
+        let key = format!("clipboard.{}.{}", if copy { "copy" } else { "paste" }, if primary { "primary" } else { "clipboard" });
+        if let Some(value) = settings.get(&key) {
+            return value.as_array().and_then(|values| values.iter().map(|value| value.as_str().map(str::to_string)).collect::<Option<Vec<_>>>())
+                .filter(|command| command.first().is_some_and(|program| !program.is_empty())).into_iter().collect();
         }
-        if copied {
-            return tools.copy[0][0].to_string();
-        }
-    }
-    // OSC 52: the terminal sets its clipboard. Inside tmux it goes through as passthrough.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let sequence = format!("\x1b]52;c;{encoded}\x07");
-    let sequence = if std::env::var_os("TMUX").is_some() { format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b")) } else { sequence };
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(sequence.as_bytes()).and_then(|()| stdout.flush());
-    "the terminal (OSC 52)".into()
+        tools().map(|tools| (if copy { tools.copy } else { tools.paste })[usize::from(primary)].iter().map(|word| word.to_string()).collect()).collect()
+    }).await.unwrap_or_default()
 }
 
-// The clipboard's text, or the primary selection's (what was last selected anywhere, the middle
-// click's paste). None when no tool answers.
-pub fn paste(primary: bool) -> Option<String> {
-    tools().find_map(|tools| {
-        let command = tools.paste[usize::from(primary)];
-        let output = Command::new(command[0]).args(&command[1..]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-    })
+// Queue a copy without making a large stdin write or a configured command hold up the screen.
+// The task owns and reaps its children; dropping it at shutdown kills a still-blocked command.
+pub fn copy(text: &str) -> String {
+    static COPIES: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>> = std::sync::OnceLock::new();
+    let copies = COPIES.get_or_init(|| {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        // Preserve copy order even when a custom command is slow.
+        tokio::spawn(async move { while let Some(text) = receiver.recv().await { copy_text(text).await; } });
+        sender
+    });
+    let _ = copies.send(text.to_string());
+    "the clipboard/terminal (background)".into()
+}
+
+async fn copy_text(text: String) {
+    let mut copied = false;
+    for primary in [false, true] {
+        for command in commands(true, primary).await {
+            let Ok(mut child) = Command::new(&command[0]).args(&command[1..]).kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { continue };
+            let written = match child.stdin.take() {
+                Some(mut stdin) => stdin.write_all(text.as_bytes()).await.is_ok(),
+                None => false,
+            };
+            if child.wait().await.is_ok_and(|status| status.success()) && written { copied = true; break; }
+        }
+    }
+    if !copied {
+        // OSC 52: the terminal sets its clipboard. Inside tmux it goes through as passthrough.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&text);
+        let sequence = format!("\x1b]52;c;{encoded}\x07");
+        let sequence = if std::env::var_os("TMUX").is_some() { format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b")) } else { sequence };
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(sequence.as_bytes()).and_then(|()| stdout.flush());
+        }).await;
+    }
+}
+
+// A delayed paste belongs to the input that requested it, not a newly focused pane or picker.
+pub(super) struct Paste {
+    target: super::Target,
+    picker: Option<String>,
+    input: String,
+    text: Option<String>,
+}
+impl Paste {
+    pub(super) fn apply(self, app: &mut super::App) {
+        if self.target != app.panes[app.focus].target || self.picker != app.picker.as_ref().map(|picker| picker.title.clone()) || self.input != input(app) {
+            app.notice = Some("Clipboard arrived after the input changed; paste again.".into());
+        } else if let Some(text) = self.text {
+            app.paste_text(&text);
+        } else {
+            app.notice = Some("Nothing to paste: no clipboard command answered; the terminal's own paste key still works".into());
+        }
+    }
+}
+fn input(app: &super::App) -> String {
+    app.picker.as_ref().map_or_else(|| app.draft().text.clone(), |picker| picker.filter.clone())
+}
+
+// Read clipboard or primary text asynchronously, then wake the UI through its own update queue.
+pub(super) fn paste(app: &super::App, primary: bool) {
+    let mut paste = Paste { target: app.panes[app.focus].target, picker: app.picker.as_ref().map(|picker| picker.title.clone()), input: input(app), text: None };
+    let sender = app.sender.clone();
+    tokio::spawn(async move {
+        for command in commands(false, primary).await {
+            if let Ok(output) = Command::new(&command[0]).args(&command[1..]).kill_on_drop(true).stdin(Stdio::null()).stderr(Stdio::null()).output().await
+                && output.status.success() {
+                paste.text = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+                break;
+            }
+        }
+        let _ = sender.send((0, super::Update::Clipboard(paste)));
+    });
 }
 
 // A place in a pane's conversation that stays on its text when the text wraps again: the message

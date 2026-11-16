@@ -21,6 +21,11 @@ const MODE_ENV: &str = "PICCOSTA_TEX";
 // A TeX em as a fraction of a cell's height. Terminal fonts set a line at about 1.25 em, so a
 // formula's letters come out the size of the text beside them.
 const EM_PER_CELL_HEIGHT: f32 = 0.8;
+// Existing terminal-contrast choices, away from pure black/white; a pixel keeps antialiased
+// glyph edges from clipping at the PNG boundary.
+const DARK_INK: f32 = 0.12;
+const LIGHT_INK: f32 = 0.88;
+const IMAGE_PADDING: f32 = 1.0;
 // How long the terminal gets to answer the startup query, and how long past tmux's own answer
 // (tmux answers DA1 itself) the outer terminal's graphics reply may still take.
 #[cfg(unix)]
@@ -100,7 +105,7 @@ impl Tex {
             Some(mode) => mode == "image",
             None => replies.contains("_Gi=31;OK"),
         };
-        let shade = if background_is_light(&replies) { 0.12 } else { 0.88 };
+        let shade = if background_is_light(&replies) { DARK_INK } else { LIGHT_INK };
         // Image ids are per terminal, so two piccostas in one window start apart.
         let first_id = (std::process::id() % 4096) << 12 | 1;
         Tex { images, tmux, cell: cell_size(&replies), ink: TexColor::rgb(shade, shade, shade), cache: HashMap::new(), first_id, ids: std::sync::Arc::new(std::sync::Mutex::new((first_id, Vec::new()))), epoch: Default::default(), pending: Vec::new() }
@@ -150,7 +155,7 @@ impl Tex {
             let layout = ratex_layout::layout(&nodes, &ratex_layout::LayoutOptions { style, color: ink, ..Default::default() });
             let options = ratex_render::RenderOptions {
                 font_size: self.cell.1 as f32 * EM_PER_CELL_HEIGHT,
-                padding: 1.0,
+                padding: IMAGE_PADDING,
                 background_color: TexColor::new(0.0, 0.0, 0.0, 0.0),
                 ..Default::default()
             };

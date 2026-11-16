@@ -39,6 +39,47 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 pub const FALLBACK_QUESTION: &str = "Private app sandbox isolation is unavailable on this machine. Let the agent start an unrestricted app? It can reach your own desktop and files too.";
 pub static AVAILABLE: LazyLock<bool> = LazyLock::new(|| probe().is_ok());
 
+// This root is reserved for private desktop memory, not persistent profiles. Keep one choice
+// throughout the process: changing settings while a desktop runs must not move its files.
+pub fn data_dir() -> io::Result<PathBuf> {
+    static DIR: LazyLock<Result<PathBuf, String>> = LazyLock::new(|| (|| {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let agent = piccosta::config::agent_dir();
+        let root = piccosta::config::Settings::load(&agent, None).get("computer.dataDir").and_then(serde_json::Value::as_str).map(PathBuf::from)
+            .unwrap_or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or(agent).join("computer"));
+        if !root.is_absolute() { return Err(io::Error::other("computer.dataDir must be absolute")); }
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        let metadata = std::fs::metadata(&root)?;
+        if metadata.uid() != unsafe { libc::getuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::other("computer.dataDir must be a private directory owned by this user"));
+        }
+        Ok(root)
+    })().map_err(|error: io::Error| error.to_string()));
+    DIR.clone().map_err(io::Error::other)
+}
+
+// Extra runtime roots are an explicit user-authorized weakening: even a read-only socket can
+// reach a host service. Never read these from the repository, or cover our private writable root.
+pub fn mounts() -> io::Result<Vec<PathBuf>> {
+    let settings = piccosta::config::Settings::load(&piccosta::config::agent_dir(), None);
+    let Some(value) = settings.get("computer.mounts") else { return Ok(Vec::new()); };
+    let values = value.as_array().ok_or_else(|| io::Error::other("computer.mounts must be an array of absolute paths"))?;
+    let mut roots = Vec::new();
+    for value in values {
+        let root = value.as_str().map(Path::new).filter(|root| root.is_absolute()).ok_or_else(|| io::Error::other("computer.mounts must contain absolute paths"))?;
+        let root = std::fs::canonicalize(root)?;
+        let private = data_dir()?;
+        if [Path::new("/tmp"), Path::new("/proc"), Path::new("/dev"), &private].iter().any(|reserved| root.starts_with(reserved) || reserved.starts_with(&root)) {
+            return Err(io::Error::other("computer.mounts overlaps a private or kernel runtime path"));
+        }
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots.iter().filter(|root| !SYSTEM.iter().any(|system| root.starts_with(system)) && !roots.iter().any(|other| other != *root && root.starts_with(other))).cloned().collect())
+}
+
 pub fn fallback_notice() -> &'static str {
     static NOTICE: std::sync::Once = std::sync::Once::new();
     let mut first = false;
@@ -171,6 +212,10 @@ impl Sandbox {
             // A file (or a link to one) can't take Landlock's directory-only right to read entries.
             sandbox.rules.push((path(target)?, if target.is_dir() { FS_READ } else { FS_READ & !(1 << 3) }));
         }
+        for target in mounts()? {
+            sandbox.bind(&target, &target, true, false)?;
+            sandbox.rules.push((path(&target)?, if target.is_dir() { FS_READ } else { FS_READ & !(1 << 3) }));
+        }
         // resolv.conf is often a link into /run. Copy only its target, never the host /run.
         if let Ok(target) = std::fs::canonicalize("/etc/resolv.conf") && !SYSTEM.iter().any(|root| target.starts_with(root)) {
             sandbox.bind(&target, &target, true, false)?;
@@ -186,9 +231,11 @@ impl Sandbox {
             for name in ["home", "runtime"] {
                 let target = dir.join(name);
                 sandbox.bind(&target, &target, false, false)?;
+                sandbox.rules.push((path(&target)?, FS_ALL));
             }
             let auth = dir.join("Xauthority");
             sandbox.bind(&auth, &auth, true, false)?;
+            sandbox.rules.push((path(&auth)?, FS_READ & !(1 << 3)));
             if let Some(number) = socket {
                 sandbox.bind(&dir.join("x11").join(format!("X{number}")), &Path::new("/tmp/.X11-unix").join(format!("X{number}")), true, false)?;
             }
@@ -204,10 +251,13 @@ impl Sandbox {
         Ok(())
     }
     fn bind(&mut self, source: &Path, target: &Path, readonly: bool, device: bool) -> io::Result<()> {
+        let staged = path(&Path::new("/tmp").join(target.strip_prefix("/").unwrap()))?;
+        // An extra root can also be a built-in mount (notably resolv.conf's canonical target).
+        if self.binds.iter().any(|(bind, _, _)| bind.target == staged) { return Ok(()); }
         let directory = source.is_dir();
         self.folder(if directory { target } else { target.parent().unwrap() })?;
         let mut bind = Bind::new(source)?;
-        bind.target = path(&Path::new("/tmp").join(target.strip_prefix("/").unwrap()))?;
+        bind.target = staged;
         if !directory { self.files.push(bind.target.clone()); }
         self.binds.push((bind, readonly, device));
         Ok(())
@@ -284,6 +334,8 @@ pub fn isolate(command: &mut Command, display: &str, dir: &Path, cwd: &Path) -> 
     wrapped.args([std::ffi::OsStr::new(SANDBOX), display.as_ref(), dir.as_os_str(), cwd.as_os_str(), runtime.as_os_str(), std::ffi::OsStr::new(&status.to_string()), command.get_program()]);
     wrapped.args(command.get_args()).stdin(std::process::Stdio::null()).current_dir("/");
     for (key, value) in command.get_envs() { if let Some(value) = value { wrapped.env(key, value); } else { wrapped.env_remove(key); } }
+    // hide() replaces HOME for apps, so preserve the trusted settings location across re-exec.
+    wrapped.env(piccosta::config::AGENT_DIR_ENV, piccosta::config::agent_dir());
     wrapped.env("PICCOSTA_HOST_DISPLAY", std::env::var_os("DISPLAY").unwrap_or_default());
     unsafe { wrapped.pre_exec(move || { checked(libc::fcntl(status, libc::F_SETFD, 0) as _)?; Ok(()) }); }
     *command = wrapped;
@@ -342,7 +394,9 @@ pub fn run() -> io::Result<()> {
 // Do this independently of the app probe: TCP X, missing runtime or missing Landlock must not
 // put desktop profiles back on disk. If even a private tmpfs is impossible, don't start one.
 pub fn desktop() -> io::Result<()> {
+    let root = data_dir()?;
     User::new().enter()?;
+    tmpfs(&path(&root)?)?;
     tmpfs(c"/tmp")
 }
 pub fn display_view(command: &mut Command, dir: &Path) -> io::Result<()> {

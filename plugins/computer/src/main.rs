@@ -9,7 +9,8 @@ mod isolation;
 fn main() {
     if let Err(error) = isolation::run() { eprintln!("Private app sandbox: {error}"); std::process::exit(1); }
     let cwd = std::env::current_dir().unwrap_or_default();
-    let settings = piccosta::config::Settings::load(&piccosta::config::agent_dir(), Some(&cwd));
+    let settings = piccosta::config::Settings::load(&piccosta::config::agent_dir(), None);
+    if let Err(error) = isolation::mounts() { eprintln!("Private desktop mounts: {error}"); std::process::exit(1); }
     let _ = *isolation::AVAILABLE;
     if std::env::args().nth(1).as_deref() != Some("describe") && let Err(error) = isolation::desktop() {
         eprintln!("Private desktop sandbox: {error}"); std::process::exit(1);

@@ -1070,7 +1070,7 @@ A session you start or message is one of your lanes: its run carries on in a pro
                     let started = format!("Made session {id}, a session in {}{}.{}", dir.display(), model.map_or(String::new(), |model| format!(", on {model}")), note.map_or(String::new(), |note| format!(" {note}.")));
                     match string(&arguments, "message") {
                         Some(message) => {
-                            let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(80).collect(), str::to_string);
+                            let title = string(&arguments, "name").map_or_else(|| message.lines().next().unwrap_or_default().chars().take(crate::host::TITLE_CHARS).collect(), str::to_string);
                             let message = crate::session::delegation_message(context, string(&arguments, "discussed"), message)?;
                             text(format!("{started} {}", self.run(&file, &dir, &message, &title, context.session_file.as_deref()).await?))
                         }

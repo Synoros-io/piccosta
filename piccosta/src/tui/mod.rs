@@ -14,6 +14,7 @@ mod tex;
 mod follow;
 mod listing;
 mod scratch;
+mod keys;
 
 use crate::agent::{Event, Handle};
 use crate::host::Host;
@@ -49,12 +50,6 @@ pub mod theme {
     pub const REMOVED: Color = Color::Rgb(0xd9, 0x77, 0x6f);
 }
 
-// The status line when there's no notice: what's most used first, since a narrow screen cuts the
-// end; /help has every key and command.
-const HELP: &str = "enter send · esc stop · pgup/pgdn or alt+↑↓ sessions · ^n new · ^s sessions · del twice deletes · drag copies, right-click pastes · /pair, /trio a second model · /help all keys · ^c ^c quit";
-// The same for --single, without the keys for other sessions or the mouse's (the terminal has the
-// mouse there), and what those keys say there.
-const SINGLE_HELP: &str = "enter send · esc stop · ^x^s sends now · /pair, /trio a second model · /help all keys · ^c ^c quit";
 const SINGLE: &str = "--single has one session; start piccosta without it for more";
 // How many of this directory's earlier sessions the sidebar lists, and of other projects': the most
 // recently used projects, a few sessions each.
@@ -74,6 +69,12 @@ const SIDEBAR_MIN_SCREEN: u16 = 90;
 const MAX_PANES: usize = 4;
 // A shared top border, a header, and the editor's two borders around one text row.
 const PANE_MIN_HEIGHT: u16 = 5;
+// Two marker cells, two title cells, the eight-cell close control and two margin cells.
+// Keyboard resizing moves two cells at a time; thousandth weights keep wide-screen drags smooth.
+const PANE_MIN_WIDTH: u16 = 14;
+const PANE_TITLE_RESERVE: u16 = 6;
+const PANE_RESIZE_STEP: u16 = 2;
+const PANE_WEIGHT: u16 = 1000;
 const EDITOR_MAX_ROWS: usize = 8;
 // How often running sessions' spinners turn, and how many turns each of the working line's dots
 // lasts (about 400 ms).
@@ -113,6 +114,7 @@ enum Update {
     Done(Box<Done>),
     // A command's output that came later, for the focused pane (/models refresh).
     Report(String),
+    Clipboard(clip::Paste),
     // A delayed command report belongs to its captured session, not whichever pane has focus now.
     SessionReport(PathBuf, String),
     Closed(std::sync::Weak<()>, Result<(), String>),
@@ -377,6 +379,8 @@ struct App {
     sidebar_width: u16,
     sidebar_drag: bool,
     layout: PaneLayout,
+    pane_sizes: PaneSizes,
+    pane_drag: Option<(bool, usize, usize)>,
     // --single: one pane on one session, no sidebar, and no other sessions looked for or listed.
     single: bool,
     // --inline: --single printed into the terminal's scrollback (inline.rs) instead of filling the
@@ -393,8 +397,10 @@ struct App {
     quit_armed: Option<Instant>,
     // The Delete key was pressed once on this session; a second press soon after deletes it.
     delete_armed: Option<(Instant, usize)>,
-    // ctrl+x was pressed: the next key finishes a two-key chord.
-    chord: bool,
+    keys: keys::Keys,
+    rebind: Option<&'static str>,
+    captured: Vec<KeyEvent>,
+    close_rects: Vec<(usize, Rect)>,
     // How many times scan_agents has run, where the UI's asks of runtimes go (asker), and whether a
     // scan is out, so a slow one (a stopped runtime's wait) isn't asked again before it's back.
     scans: u64,
@@ -448,7 +454,7 @@ struct App {
     // Where things were drawn, for the mouse.
     sidebar_rows: Vec<(u16, usize)>,
     pane_rects: Vec<Rect>,
-    pane_layout: Option<(PaneLayout, Rect, usize)>,
+    pane_layout: Option<(PaneLayout, PaneSizes, Rect, usize)>,
     body_rects: Vec<Rect>,
     // The focused pane's editor text and its first row in view, and whether the mouse is selecting in it.
     editor_area: (Rect, usize),
@@ -592,6 +598,8 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         sidebar_width: SIDEBAR_WIDTH,
         sidebar_drag: false,
         layout: PaneLayout::default(),
+        pane_sizes: PaneSizes::default(),
+        pane_drag: None,
         single: args.single,
         inline: args.inline,
         flags: Flags::default(),
@@ -611,7 +619,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
         notice: None,
         quit_armed: None,
         delete_armed: None,
-        chord: false,
+        keys: keys::Keys::load(&host.settings),
+        rebind: None,
+        captured: Vec::new(),
+        close_rects: Vec::new(),
         scans: 0,
         wake_failed: HashMap::new(),
         state_file,
@@ -667,6 +678,10 @@ async fn run_local(mut args: crate::cli::Args) -> Result<std::process::ExitCode,
     if !host.settings.load_errors.is_empty() {
         app.report(format!("Invalid settings file:\n{}", host.settings.load_errors.join("\n")));
         app.notice = Some("Invalid settings; details are shown above.".into());
+    }
+    if !app.keys.problems.is_empty() {
+        app.report(app.keys.problems.join("\n"));
+        app.notice = Some(app.keys.problems.join(" · "));
     }
     app.adopt_jobs(handover.sessions);
     // After a /restart the conversation is in the scrollback already.
@@ -1084,20 +1099,14 @@ impl App {
         if !errors.is_empty() {
             self.notice = Some(errors.join("; "));
         }
-        // A saved off-screen session still comes back when there was no saved pane.
-        if self.panes.is_empty()
-            && let Some(slot) = self.slots.iter().position(|slot| slot.opened)
-        {
-            self.panes.push(Pane { target: Target::Session(slot), scroll: 0, anchor: None });
-        }
-        if self.panes.is_empty() {
-            self.slots.clear();
-            return false;
-        }
+        // Off-screen drafts stay in the sidebar, never promoted into unexpected panes.
+        // If all saved panes vanished, start a fresh pane without discarding those drafts.
+        if self.panes.is_empty() { return false; }
         self.focus = state.focus.min(self.panes.len() - 1);
         self.sidebar = state.sidebar;
         self.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         self.layout = state.layout;
+        self.pane_sizes = state.pane_sizes;
         true
     }
 
@@ -1124,7 +1133,7 @@ impl App {
             .map(|index| kept(&self.slots[index], 0))
             .collect();
         open.extend(self.scratchpads.iter().enumerate().filter(|(index, board)| !board.draft.text.is_empty() && !self.panes.iter().any(|pane| pane.target == Target::Scratchpad(*index))).map(|(_, board)| state::Kept { session: None, scratchpad: Some(board.path.clone()), title: String::new(), cwd: board.cwd.clone(), scroll: 0, draft: board.draft.text.clone() }));
-        let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, sidebar_width: self.sidebar_width, layout: self.layout, open }).unwrap_or_default();
+        let text = serde_json::to_string_pretty(&state::State { panes, focus: self.focus, sidebar: self.sidebar, sidebar_width: self.sidebar_width, layout: self.layout, pane_sizes: self.pane_sizes, open }).unwrap_or_default();
         self.saved_state.save(&self.state_file, &text)
     }
 
@@ -1415,27 +1424,38 @@ impl App {
         } else if let Some(&first) = listed.first() { self.show(first); }
     }
 
-    // Show a slot in the focused pane. An earlier session is read from its file and nothing starts:
-    // its agent starts only when something is typed into it. Its row stays open in this UI even
-    // without an agent. A new session left empty behind it goes away.
-    fn show(&mut self, slot: usize) {
-        let leaving = self.panes[self.focus].target;
-        // --single keeps no session open but the one shown (a /fork's or /clear's leaves it).
-        if let Target::Session(leaving) = leaving { self.slots[leaving].opened &= !self.single; }
+    // Prepare a session's view without choosing its destination. Reading an earlier session
+    // starts no agent; its row stays open here until the user closes it.
+    fn prepared_pane(&mut self, slot: usize) -> Pane {
         self.slots[slot].opened = true;
         self.slots[slot].release_generation = Arc::new(());
         if self.slots[slot].live.is_none() {
             self.slots[slot].elsewhere = self.slots[slot].path.as_deref().is_some_and(crate::runtime::running);
-            if let Err(error) = self.follow(slot) {
-                self.notice = Some(format!("{}: {error}", self.slots[slot].title));
-            }
+            if let Err(error) = self.follow(slot) { self.notice = Some(format!("{}: {error}", self.slots[slot].title)); }
         }
         self.slots[slot].unread = false;
-        self.panes[self.focus] = Pane { target: Target::Session(slot), scroll: 0, anchor: None };
+        Pane { target: Target::Session(slot), scroll: 0, anchor: None }
+    }
+
+    fn show(&mut self, slot: usize) {
+        let leaving = self.panes[self.focus].target;
+        // --single keeps no session open but the one shown (a /fork's or /clear's leaves it).
+        if let Target::Session(leaving) = leaving { self.slots[leaving].opened &= !self.single; }
+        self.panes[self.focus] = self.prepared_pane(slot);
         match leaving {
             Target::Session(leaving) => self.put_away(leaving),
             Target::Scratchpad(board) => { self.invalidate_scratch(board); self.clear_scratch_images(board); },
         }
+    }
+
+    // Resume beside the current task, never replacing its pane or stealing its editor.
+    // Sidebar navigation still uses show(); restoration and closing choose focus separately.
+    fn open_beside(&mut self, slot: usize) {
+        if self.single { self.show(slot); return; }
+        if self.panes.iter().any(|pane| pane.target == Target::Session(slot)) { return; }
+        if self.panes.len() >= MAX_PANES { self.notice = Some("All four panes are occupied; close a pane first.".into()); return; }
+        let pane = self.prepared_pane(slot);
+        self.panes.push(pane);
     }
 
     // Ask an off-screen runtime to release itself when idle. Never drop its sender on the UI's
@@ -1467,17 +1487,14 @@ impl App {
         let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', TAB_SPACES);
         if let Some(picker) = &mut self.picker {
             picker.filter.push_str(&text);
-        } else {
+        } else if !self.scratch_reading() {
             self.draft_mut().insert(&text);
         }
     }
 
     // Paste from the clipboard (or the primary selection), read through the desktop's tool.
     fn paste(&mut self, primary: bool) {
-        match clip::paste(primary) {
-            Some(text) => self.paste_text(&text),
-            None => self.notice = Some("Nothing to paste: no clipboard tool (wl-paste, xclip, xsel) answered; the terminal's own paste key still works".into()),
-        }
+        clip::paste(self, primary);
     }
 
     // Make sure the focused pane's session is open here, opening an earlier one shown from its
@@ -1503,17 +1520,17 @@ impl App {
     // A new session on the focused one's model and level, or the focused one itself when it's an
     // empty one nobody has typed into yet, so ^n and /clear don't pile up empty rows.
     fn new_session(&mut self) -> Option<usize> {
-        self.new_session_in(None, None)
+        self.new_session_in(None, None, true)
     }
 
     // The same in another directory (None: the focused session's), with the command line's flags
     // when given (/new <dir> --model … --pair …): the model and level, its team and name, and
     // its own tools and prompt settings. Without flags it takes the focused session's model and
     // level. The session runs in that directory: its tools, its AGENTS.md, its session folder.
-    fn new_session_in(&mut self, dir: Option<PathBuf>, args: Option<crate::cli::Args>) -> Option<usize> {
+    fn new_session_in(&mut self, dir: Option<PathBuf>, args: Option<crate::cli::Args>, reuse: bool) -> Option<usize> {
         let current = match self.panes[self.focus].target { Target::Session(slot) => Some(&self.slots[slot]), Target::Scratchpad(_) => None };
         let dir = dir.unwrap_or_else(|| if self.focus_cwd().as_os_str().is_empty() { self.host.cwd.clone() } else { self.focus_cwd().to_path_buf() });
-        if current.is_some_and(|current| current.empty() && current.cwd == dir) && args.is_none() {
+        if reuse && current.is_some_and(|current| current.empty() && current.cwd == dir) && args.is_none() {
             return Some(self.session_index());
         }
         let flags = args.as_ref();
@@ -1548,7 +1565,10 @@ impl App {
 
     // The editor's text: a command, a prompt, or steering for a run in progress.
     fn submit(&mut self) {
+        if self.scratch_reading() { return; }
+        let command_only = matches!(self.panes[self.focus].target, Target::Scratchpad(board) if self.scratchpads[board].mode == scratch::Mode::Command);
         let text = self.draft_mut().take();
+        if let Target::Scratchpad(board) = self.panes[self.focus].target { self.scratchpads[board].mode = scratch::Mode::Read; }
         if text.trim().is_empty() {
             return;
         }
@@ -1561,6 +1581,10 @@ impl App {
             && self.command(command)
         {
             return;
+        }
+        if command_only {
+            if let Target::Scratchpad(board) = self.panes[self.focus].target { self.scratchpads[board].mode = scratch::Mode::Command; }
+            self.draft_mut().insert(&text); self.notice = Some("Command not found; draft kept. /help lists commands.".into()); return;
         }
         if self.append_pending() { self.draft_mut().insert(&text); self.notice = Some("An append is still pending; draft kept.".into()); }
         else if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) { self.append_scratch(text); }
@@ -1613,7 +1637,7 @@ impl App {
         }
         slot.state = State::Running;
         if slot.title == NEW_TITLE {
-            slot.title = render::fit(text.lines().next().unwrap_or(""), 80);
+            slot.title = render::fit(text.lines().next().unwrap_or(""), crate::host::TITLE_CHARS);
         }
     }
 
@@ -1723,12 +1747,10 @@ impl App {
     }
 
     fn split(&mut self) {
-        if self.one_session() || self.panes.len() >= MAX_PANES {
-            return;
-        }
-        if let Some(slot) = self.new_session() {
+        if self.one_session() { return; }
+        if self.panes.len() >= MAX_PANES { self.notice = Some("All four panes are occupied; close a pane first.".into()); return; }
+        if let Some(slot) = self.new_session_in(None, None, false) {
             self.panes.push(Pane { target: Target::Session(slot), scroll: 0, anchor: None });
-            self.focus = self.panes.len() - 1;
         }
     }
 
@@ -1740,7 +1762,10 @@ impl App {
                 Target::Session(slot) => self.put_away(slot),
                 Target::Scratchpad(board) => { self.invalidate_scratch(board); self.clear_scratch_images(board); },
             }
+        } else if let Some(slot) = self.new_session_in(None, None, false) {
+            self.show(slot);
         }
+        if let Err(error) = self.save_state() { self.notice = Some(format!("Pane closed, but snapshot could not be saved: {error}")); }
     }
 
     // Stop the focused session's run; what was queued goes out at once as the next prompt, and the
@@ -2087,6 +2112,7 @@ impl App {
                 return;
             }
             Update::Report(text) => { self.report(text); return; }
+            Update::Clipboard(paste) => { paste.apply(self); return; }
             Update::Scanned(scan) => { self.scanned(*scan); return; }
             Update::Listed(listing) => { self.listed_result(listing); return; }
             Update::ModelProbe(flow, result) => { self.probed_model(flow, result); return; }
@@ -2100,7 +2126,7 @@ impl App {
                 let cancel = view.live.as_ref().filter(|_| external).map(|(handle, _)| handle.clone());
                 self.questions.push_back(Picker { title: format!("{} · {question}", view.title), items, filter: String::new(), selected: 0, apply: |_, _| {}, delete: None, confirming: false, free: None, answer: Some(answer), cancel, text: false, masked: false });
             }
-            Update::Closed(..) | Update::Report(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
+            Update::Closed(..) | Update::Report(_) | Update::Clipboard(_) | Update::Scratch(..) | Update::Appended(..) | Update::ScratchEdit(..) | Update::ScratchPath(..) => unreachable!(),
             Update::SessionReport(file, text) => {
                 if view.path.as_ref() == Some(&file) { view.messages.push(commands::report_message(text)); }
             }
@@ -2118,7 +2144,7 @@ impl App {
                     self.slots.push(Slot { cwd: home, manager: true, ..Slot::new(Some(file), crate::manager::assistant_name(&self.host.agent_dir)) });
                     self.slots.len() - 1
                 });
-                self.show(slot);
+                self.open_beside(slot);
             }
             Update::ModelProbe(..) | Update::Scanned(..) | Update::Listed(..) | Update::Asked(..) | Update::Nothing => unreachable!(),
             Update::Followed(ticket, result) => {
@@ -2272,6 +2298,19 @@ impl App {
                             *scroll = if mouse.kind == MouseEventKind::ScrollUp { *scroll + WHEEL_ROWS } else { scroll.saturating_sub(WHEEL_ROWS) };
                         }
                     }
+                    // A shared border owns its resize until release, even outside its pane.
+                    MouseEventKind::Down(MouseButton::Left) if self.picker.is_none() && self.pane_border(at).is_some() => {
+                        self.pane_drag = self.pane_border(at);
+                        self.selection = None;
+                        self.editor_drag = false;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if self.pane_drag.is_some() => {
+                        if let Some((vertical, split, pane)) = self.pane_drag { self.resize_panes(vertical, split, pane, if vertical { at.y } else { at.x }); }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.pane_drag.is_some() => {
+                        if let Some((vertical, split, pane)) = self.pane_drag.take() { self.resize_panes(vertical, split, pane, if vertical { at.y } else { at.x }); }
+                        let _ = self.save_state();
+                    }
                     // The sidebar's border owns its drag, even once the pointer crosses a pane.
                     MouseEventKind::Down(MouseButton::Left) if self.picker.is_none() && self.sidebar_rect.contains(at) && at.x + 1 == self.sidebar_rect.right() => {
                         self.sidebar_drag = true;
@@ -2283,6 +2322,12 @@ impl App {
                     // A press on a pane's conversation starts a selection there; a second or third quick
                     // press on the same cell selects its word or its row. One in the editor puts its
                     // cursor there, and a drag from it selects in the editor.
+                    MouseEventKind::Down(MouseButton::Left) if self.picker.is_none() && self.close_rects.iter().any(|(_, rect)| rect.contains(at)) => {
+                        if let Some(&(pane, _)) = self.close_rects.iter().find(|(_, rect)| rect.contains(at)) {
+                            self.focus = pane;
+                            self.close_pane();
+                        }
+                    }
                     MouseEventKind::Down(MouseButton::Left) if self.editor_area.0.contains(at) => {
                         let cursor = self.editor_offset(at);
                         (self.selection, self.editor_drag) = (None, true);
@@ -2329,6 +2374,7 @@ impl App {
                 self.selection.iter_mut().for_each(|selection| selection.held = false);
                 self.editor_drag = false;
                 self.sidebar_drag = false;
+                self.pane_drag = None;
             }
             // tmux drops images sent to a hidden pane; send them all again on coming back.
             Input::FocusGained => self.lost_images(),
@@ -2342,55 +2388,109 @@ impl App {
         self.scan_scratchpads();
     }
 
+    fn picker_hint(&self) -> String {
+        let (choose, cancel) = (self.keys.short("picker-choose"), self.keys.short("picker-cancel"));
+        if let Some(action) = self.rebind { return format!("{action}: {} · press keys · {choose} confirms · {cancel} cancels", self.captured.iter().map(|key| keys::Keys::key_name(*key)).collect::<Vec<_>>().join(" ")); }
+        let Some(picker) = &self.picker else { return String::new() };
+        if picker.confirming { return format!("{choose} deletes · {cancel} keeps"); }
+        if picker.title == "keys" { return format!("type to search · {choose} rebind · {} reset · {} disable · {cancel} close", self.keys.short("reset-binding"), self.keys.short("disable-binding")); }
+        format!("type to search · {}/{} move · {choose} choose · {cancel} cancel{}", self.keys.short("picker-up"), self.keys.short("picker-down"), if picker.delete.is_some() { format!(" · {} deletes", self.keys.short("picker-delete")) } else { String::new() })
+    }
+
+    fn key_hint(&self) -> String {
+        if self.picker.is_some() { return self.picker_hint(); }
+        let pane_keys = if self.panes.len() > 1 { format!("{} switch · {} close · ", self.keys.short("cycle-focus"), self.keys.short("close-pane")) } else { String::new() };
+        if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) {
+            return if self.scratch_reading() { format!("{pane_keys}Read only; wheel scrolls · {} append · {} edit · {} keys", self.keys.short("scratch-append"), self.keys.short("scratch-edit"), self.keys.short("show-keys")) }
+            else { format!("{pane_keys}{} submit · {} back (draft kept) · {} keys", self.keys.short("submit"), self.keys.short("stop"), self.keys.short("show-keys")) };
+        }
+        format!("{pane_keys}{} send · {} {} · {} keys (/keys)", self.keys.short("submit"), self.keys.short(if self.focus_busy() { "stop" } else { "sessions" }), if self.focus_busy() { "stop" } else { "sessions" }, self.keys.short("show-keys"))
+    }
+
+    fn save_binding(&mut self, action: &str, binding: Value) {
+        if let Err(error) = self.keys.validate(action, &binding) { self.notice = Some(error); self.captured.clear(); return; }
+        match crate::config::remember_key(&self.host.agent_dir, &self.host.cwd, action, binding) {
+            Ok(()) => {
+                self.command("keys reload");
+                self.notice = Some(format!("Saved {action}: {}{}", self.keys.label(action), if self.keys.problems.is_empty() { String::new() } else { format!(" · {}", self.keys.problems.join(" · ")) }));
+            }
+            Err(error) => self.notice = Some(format!("Binding not saved: {error}")),
+        }
+    }
+
+    fn key_action(&mut self, contexts: &[keys::Context], key: KeyEvent) -> Option<&'static str> {
+        match self.keys.resolve(contexts, key) {
+            keys::Match::Action(action) => Some(action), keys::Match::None => Some(""),
+            keys::Match::Prefix(notice) => { self.notice = Some(notice); None }
+        }
+    }
+
     fn key(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        if self.picker.is_some() {
-            self.picker_key(key);
+        use keys::Context::{Pane, Picker, Scratch, Selection};
+        if let Some(action) = self.rebind {
+            self.captured.push(key);
+            match self.key_action(&[Picker], key) {
+                Some("picker-cancel") => { self.rebind = None; self.captured.clear(); self.notice = None; }
+                Some("picker-choose") => {
+                    self.captured.truncate(self.captured.len() - self.keys.suffix_len("picker-choose", &self.captured));
+                    let binding = self.captured.iter().map(|key| keys::Keys::key_name(*key)).collect::<Vec<_>>().join(" ");
+                    self.save_binding(action, binding.into());
+                }
+                Some(_) => self.notice = None,
+                None => {},
+            }
             return;
         }
-        if !(control && matches!(key.code, KeyCode::Char('c' | 'd'))) {
-            self.quit_armed = None;
+        let contexts = if self.picker.is_some() {
+            let mut contexts = vec![keys::Context::Global];
+            if self.picker.as_ref().is_some_and(|picker| picker.title == "keys") { contexts.push(keys::Context::Keys); }
+            contexts.push(Picker); contexts
+        } else {
+            let mut contexts = vec![keys::Context::Global];
+            if self.selection.is_some() || (!self.scratch_reading() && self.draft().selection().is_some()) { contexts.push(Selection); }
+            if self.scratch_reading() { contexts.push(Scratch); }
+            contexts.push(Pane);
+            if !self.scratch_reading() { contexts.push(keys::Context::Editor); }
+            contexts
+        };
+        let Some(action) = self.key_action(&contexts, key) else { return; };
+        if action == "show-keys" { self.command("keys"); return; }
+        if matches!(action, "reset-binding" | "disable-binding") {
+            if let Some(selected) = self.picker.as_ref().and_then(|picker| picker.chosen()).as_deref().and_then(keys::Keys::action) {
+                self.save_binding(selected, if action == "reset-binding" { keys::Keys::defaults(selected) } else { serde_json::json!([]) });
+            }
+            return;
         }
+        if self.picker.is_some() { self.picker_key(action, key); return; }
+        if !matches!(action, "cancel" | "quit-empty") { self.quit_armed = None; }
         let delete_armed = self.delete_armed.take();
-        // A notice lasts until the next key.
         self.notice = None;
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        // A mouse selection: ctrl+c copies it, shift+arrows (and shift+home/end) move its end, the
-        // page keys scroll under it; any other key lets it go and does what it does.
         if let Some(selection) = &mut self.selection {
             let at = &mut selection.at;
-            selection.moved = shift;
-            match key.code {
-                KeyCode::Char('c') if control => return selection.copy = true,
-                KeyCode::Left if shift => return at.x = at.x.saturating_sub(1),
-                KeyCode::Right if shift => return at.x = at.x.saturating_add(1),
-                KeyCode::Up if shift => return at.y = at.y.saturating_sub(1),
-                KeyCode::Down if shift => return at.y = at.y.saturating_add(1),
-                KeyCode::Home if shift => return at.x = 0,
-                KeyCode::End if shift => return at.x = u16::MAX,
-                KeyCode::PageUp | KeyCode::PageDown => {}
+            selection.moved = action.starts_with("select-");
+            match action {
+                "copy-selection" => return selection.copy = true,
+                "select-left" => return at.x = at.x.saturating_sub(1),
+                "select-right" => return at.x = at.x.saturating_add(1),
+                "select-up" => return at.y = at.y.saturating_sub(1),
+                "select-down" => return at.y = at.y.saturating_add(1),
+                "select-home" => return at.x = 0,
+                "select-end" => return at.x = u16::MAX,
+                "previous-session" | "next-session" | "scroll-up" | "scroll-down" => {}
                 _ => self.selection = None,
             }
         }
-        // The second key of a ctrl+x chord (Claude Code's and readline's): ctrl+s sends now.
-        if std::mem::take(&mut self.chord) {
-            if control && key.code == KeyCode::Char('s') {
-                self.send_now();
-            }
-            return;
-        }
-        match key.code {
+        match action {
             // Text selected in the editor (shift+arrows): ctrl+c copies it.
-            KeyCode::Char('c') if control && self.draft().selection().is_some() => {
+            "copy-selection" if !self.scratch_reading() && self.draft().selection().is_some() => {
                 let draft = self.draft();
                 let text = draft.selection().map(|range| draft.text[range].to_string()).unwrap_or_default();
                 let via = clip::copy(&text);
                 self.notice = Some(format!("Copied {} characters with {via}", text.chars().count()));
             }
-            KeyCode::Char('v') if control => self.paste(false),
+            "paste" => { if !self.scratch_reading() { self.paste(false); } },
             // Ctrl+Shift+Delete clears what's typed; ↑ brings it back from the history.
-            KeyCode::Delete if control && shift => {
+            "clear-draft" if !self.scratch_reading() => {
                 let text = self.draft_mut().take();
                 if !text.trim().is_empty() && self.history.last() != Some(&text) {
                     self.history.push(text);
@@ -2398,126 +2498,133 @@ impl App {
             }
             // The Delete key with nothing typed deletes the session shown here: the first press says
             // which, a second soon after moves it to the trash and shows the next one in the list.
-            KeyCode::Delete if self.draft().text.is_empty() && matches!(self.panes[self.focus].target, Target::Scratchpad(_)) => self.close_pane(),
-            KeyCode::Delete if self.draft().text.is_empty() => {
+            "delete-session" if matches!(self.panes[self.focus].target, Target::Scratchpad(_)) && self.scratch_reading() => self.close_pane(),
+            "delete-session" if self.draft().text.is_empty() && matches!(self.panes[self.focus].target, Target::Session(_)) => {
                 let slot = self.session_index();
                 if delete_armed.is_some_and(|(when, armed)| armed == slot && when.elapsed() < QUIT_CONFIRM) {
                     self.delete_shown();
                 } else {
                     self.delete_armed = Some((Instant::now(), slot));
-                    self.notice = Some(format!("Delete again moves “{}” to the trash", render::fit(&self.current().title, 60)));
+                    self.notice = Some(format!("{} again moves “{}” to the trash", self.keys.label("delete-session"), render::fit(&self.current().title, 60)));
                 }
             }
-            // The session list, also on ctrl+m where the terminal tells it from enter.
-            KeyCode::Char('m') if control => self.sessions(""),
+
             // Claude Code's ctrl+c: stop the run here; else clear the draft; else a second press
             // within QUIT_CONFIRM quits. ctrl+d on an empty draft quits the same two-press way.
-            KeyCode::Char('c') if control && self.focus_busy() => self.interrupt(),
-            KeyCode::Char('c') if control && !self.draft().text.is_empty() => {
+            "cancel" if self.focus_busy() => self.interrupt(),
+            "cancel" if !self.scratch_reading() && !self.draft().text.is_empty() => {
                 self.draft_mut().take();
             }
-            KeyCode::Char('c' | 'd') if control && (key.code == KeyCode::Char('c') || self.draft().text.is_empty()) => {
+            "cancel" | "quit-empty" if action == "cancel" || self.scratch_reading() || self.draft().text.is_empty() => {
                 if self.quit_armed.is_some_and(|armed| armed.elapsed() < QUIT_CONFIRM) {
                     self.quit = true;
                 } else {
                     self.quit_armed = Some(Instant::now());
                     let running = if self.slots.iter().any(Slot::busy) { "sessions are running; " } else { "" };
-                    let pressed = if key.code == KeyCode::Char('d') { "ctrl+d" } else { "ctrl+c" };
-                    self.notice = Some(format!("{running}{pressed} again quits piccosta (to delete a session: the Delete key)"));
+                    let pressed = self.keys.label(action);
+                    self.notice = Some(format!("{running}{pressed} again quits piccosta (delete a session: {})", self.keys.label("delete-session")));
                 }
             }
-            KeyCode::Esc if self.focus_busy() => self.interrupt(),
-            KeyCode::Esc => { self.interrupt_review(); self.panes[self.focus].scroll = 0; }
-            KeyCode::Char('x') if control => {
-                self.chord = true;
-                self.notice = Some("ctrl+x: ctrl+s sends now".into());
+            "stop" if self.focus_busy() => self.interrupt(),
+            "stop" => {
+                if let Target::Scratchpad(board) = self.panes[self.focus].target {
+                    self.scratchpads[board].mode = scratch::Mode::Read;
+                } else { self.interrupt_review(); }
+                self.panes[self.focus].scroll = 0;
             }
-            // Ctrl+enter arrives as itself only where the terminal reports it (not through tmux
-            // without extended-keys); ctrl+x ctrl+s works anywhere.
-            KeyCode::Enter if control => self.send_now(),
-            KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => self.draft_mut().insert("\n"),
-            KeyCode::Char('j') if control => self.draft_mut().insert("\n"),
-            KeyCode::Enter => self.submit(),
+            "scratch-append" => { if let Target::Scratchpad(board) = self.panes[self.focus].target { self.scratchpads[board].mode = scratch::Mode::Append; } }
+            "scratch-command" => self.scratch_command(),
+            "scratch-edit" => self.scratch("edit"),
+            "send-now" if !self.scratch_reading() => self.send_now(),
+            "newline" if !self.scratch_reading() => self.draft_mut().insert("\n"),
+            "submit" if !self.scratch_reading() => self.submit(),
             // A new session: where, from a list that starts with this directory (enter keeps it).
-            KeyCode::Char('n') if control => {
+            "new-session" => {
                 self.command("new");
             }
             // Up and down the sidebar's list, one session at a time: alt+↑↓, or page up and down, which
             // get through terminals and remote links that keep alt (or ctrl and shift with the page
             // keys) for themselves. Alt with the page keys scrolls instead, below, as the page keys
             // alone do in --single.
-            KeyCode::Up | KeyCode::Down if alt => self.next_session(key.code == KeyCode::Up),
-            KeyCode::PageUp | KeyCode::PageDown if !alt && !self.single => self.next_session(key.code == KeyCode::PageUp),
-            KeyCode::Char('s') if control => self.sessions(""),
-            KeyCode::Left if alt => self.focus = self.focus.saturating_sub(1),
-            KeyCode::Right if alt => self.focus = (self.focus + 1).min(self.panes.len() - 1),
-            KeyCode::Char('\\') if control => self.split(),
-            KeyCode::Char('4') if control => self.split(),
-            KeyCode::Char(']') if control => self.close_pane(),
-            KeyCode::Char('5') if control => self.close_pane(),
-            KeyCode::Char('o') if control => {
+            "previous-session" | "next-session" if !self.single && !self.scratch_reading() => self.next_session(action == "previous-session"),
+            "sessions" => self.sessions(""),
+            "focus-left" => self.focus = self.focus.saturating_sub(1),
+            "focus-right" => self.focus = (self.focus + 1).min(self.panes.len() - 1),
+            "cycle-focus" => self.focus = (self.focus + 1) % self.panes.len(),
+            "cycle-layout" => self.layout = self.layout.next(),
+            "pane-wider" | "pane-narrower" | "pane-taller" | "pane-shorter" => self.resize_focused(action),
+            "split" => self.split(),
+            "close-pane" => self.close_pane(),
+            "toggle-tools" => {
                 self.flags.tools_open = !self.flags.tools_open;
             }
-            KeyCode::Char('t') if control => {
+            "toggle-thinking" => {
                 self.flags.thinking_open = !self.flags.thinking_open;
             }
-            KeyCode::Char('b') if control => {
+            "toggle-sidebar" => {
                 self.sidebar = !self.sidebar;
                 self.sidebar_drag = false;
             }
-            KeyCode::Char(',') if alt => self.resize_sidebar(self.sidebar_rect.width.saturating_sub(1)),
-            KeyCode::Char('.') if alt => self.resize_sidebar(self.sidebar_rect.width.saturating_add(1)),
-            KeyCode::PageUp => {
+            "narrow-sidebar" => self.resize_sidebar(self.sidebar_rect.width.saturating_sub(1)),
+            "widen-sidebar" => self.resize_sidebar(self.sidebar_rect.width.saturating_add(1)),
+            "history-previous" if self.scratch_reading() => self.panes[self.focus].scroll += WHEEL_ROWS,
+            "history-next" if self.scratch_reading() => self.panes[self.focus].scroll = self.panes[self.focus].scroll.saturating_sub(WHEEL_ROWS),
+            "scroll-up" | "previous-session" => {
                 let step = self.pane_rects.get(self.focus).map_or(10, |rect| usize::from(rect.height / 2));
                 self.panes[self.focus].scroll += step;
             }
-            KeyCode::PageDown => {
+            "scroll-down" | "next-session" => {
                 let step = self.pane_rects.get(self.focus).map_or(10, |rect| usize::from(rect.height / 2));
                 let scroll = &mut self.panes[self.focus].scroll;
                 *scroll = scroll.saturating_sub(step);
             }
             // Tab finishes a command name from what's typed: the first that fits.
-            KeyCode::Tab if self.draft().text.starts_with('/') && !self.draft().text.contains(char::is_whitespace) => {
+            "complete" if !self.scratch_reading() && self.draft().text.starts_with('/') && !self.draft().text.contains(char::is_whitespace) => {
                 if let Some(name) = commands::completions(&self.draft().text, false).first() {
                     let text = format!("{name} ");
                     *self.draft_mut() = Editor::with(text);
                 }
             }
             // Down from a recalled prompt steps to the newer one, and past the newest to empty.
-            KeyCode::Down if !shift && self.history.contains(&self.draft().text) => {
+            "history-next" if !self.scratch_reading() && self.history.contains(&self.draft().text) => {
                 let current = self.draft().text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(0);
                 let text = self.history.get(position + 1).cloned().unwrap_or_default();
                 *self.draft_mut() = Editor::with(text);
             }
             // Up from the editor's first line takes back what's queued, as in Claude Code.
-            KeyCode::Up if !shift && !self.draft().text[..self.draft().cursor].contains('\n') && matches!(self.panes[self.focus].target, Target::Session(_)) && self.take_back() => {}
-            KeyCode::Up if !shift && (self.draft().text.is_empty() || self.history.contains(&self.draft().text)) => {
+            "history-previous" if !self.scratch_reading() && !self.draft().text[..self.draft().cursor].contains('\n') && matches!(self.panes[self.focus].target, Target::Session(_)) && self.take_back() => {}
+            "history-previous" if !self.scratch_reading() && (self.draft().text.is_empty() || self.history.contains(&self.draft().text)) => {
                 let current = self.draft().text.clone();
                 let position = self.history.iter().rposition(|entry| *entry == current).unwrap_or(self.history.len());
                 if let Some(previous) = position.checked_sub(1).and_then(|index| self.history.get(index)).cloned() {
                     *self.draft_mut() = Editor::with(previous);
                 }
             }
-            _ => self.draft_mut().key(key),
+            _ if !self.scratch_reading() => {
+                // An inapplicable pane action yields the real key to the editor registry.
+                // An editor sequence already resolved above must not be looked up a second time.
+                let action = if self.keys.context == Some(keys::Context::Editor) { action } else {
+                    let Some(action) = self.key_action(&[keys::Context::Editor], key) else { return; };
+                    action
+                };
+                self.draft_mut().key(action, key);
+            }
+            _ => {},
         }
     }
 
-    fn picker_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) { self.listing_tickets[1] = Arc::new(()); }
-        // While probing, even Enter stays here. Only Esc can close it; pastes are dropped too.
-        if self.model_probe.is_some() && key.code != KeyCode::Esc { return; }
+    fn picker_key(&mut self, action: &str, key: KeyEvent) {
+        if action == "picker-cancel" { self.listing_tickets[1] = Arc::new(()); }
+        // Probes accept cancellation only; textless model choices reject typing and paste.
+        if self.model_probe.is_some() && action != "picker-cancel" { return; }
         if self.model_add.is_some() && self.picker.as_ref().is_some_and(|picker| !picker.text)
-            && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
-            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) { return; }
-        if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.paste(false);
-            return;
-        }
+            && (action == "picker-backspace" || action.is_empty()) { return; }
+        if action == "picker-paste" { self.paste(false); return; }
         let Some(picker) = &mut self.picker else { return };
         if picker.confirming {
-            match key.code {
-                KeyCode::Enter => {
+            match action {
+                "picker-choose" => {
                     let (choice, delete) = (picker.chosen(), picker.delete);
                     self.picker = None;
                     if let (Some(choice), Some(delete)) = (choice, delete) {
@@ -2525,33 +2632,31 @@ impl App {
                     }
                 }
                 // Keeping it closes the list too: whoever asked to delete is done with it.
-                KeyCode::Esc => self.picker = None,
+                "picker-cancel" => self.picker = None,
                 _ => {}
             }
             return;
         }
-        match key.code {
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && picker.delete.is_some() => picker.confirming = true,
-            KeyCode::Delete if picker.delete.is_some() => picker.confirming = true,
-            KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL) => {
+        match action {
+            "picker-delete" if picker.delete.is_some() => picker.confirming = true,
+            "picker-cancel" => {
                 if let Some(cancel) = &picker.cancel { cancel.abort(); }
                 self.picker = None;
                 self.model_add = None;
                 if let Some(probe) = self.model_probe.take() { probe.abort(); }
                 self.model_flow += 1;
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => picker.filter.clear(),
-            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Down => picker.selected += 1,
-            KeyCode::Backspace => {
+            "picker-clear" => picker.filter.clear(),
+            "picker-up" => picker.selected = picker.selected.saturating_sub(1),
+            "picker-down" => picker.selected += 1,
+            "picker-backspace" => {
                 picker.filter.pop();
                 picker.selected = 0;
             }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                picker.filter.push(character);
-                picker.selected = 0;
+            "" if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if let KeyCode::Char(character) = key.code { picker.filter.push(character); picker.selected = 0; }
             }
-            KeyCode::Enter => {
+            "picker-choose" => {
                 let (choice, apply, answer) = (picker.chosen(), picker.apply, picker.answer.take());
                 self.picker = None;
                 if let Some(answer) = answer { if let Some(choice) = choice { let _ = answer.send(choice); } }
@@ -2588,6 +2693,63 @@ impl App {
         crate::provider::shutdown().await;
     }
 
+    // One axis of visible panes, in reading order. Grid rows share their column weights;
+    // a full-width third pane has no horizontal divider but still has a vertical neighbor.
+    fn pane_axis(&self, vertical: bool, pane: usize) -> Vec<Rect> {
+        let Some(focused) = self.pane_rects.get(pane) else { return Vec::new() };
+        let mut axis: Vec<Rect> = Vec::new();
+        for &rect in &self.pane_rects {
+            if !vertical && rect.y != focused.y { continue; }
+            if axis.last().is_none_or(|last| if vertical { last.y != rect.y } else { last.x != rect.x }) { axis.push(rect); }
+        }
+        axis
+    }
+
+    fn pane_border(&self, at: Position) -> Option<(bool, usize, usize)> {
+        let first = self.pane_rects.first()?;
+        for (pane, rect) in self.pane_rects.iter().enumerate().filter(|(_, rect)| rect.contains(at)) {
+            let vertical = if at.y == rect.y && rect.y > first.y { true } else if at.x == rect.x && rect.x > first.x { false } else { continue };
+            let axis = self.pane_axis(vertical, pane);
+            let split = axis.iter().position(|item| if vertical { item.y == rect.y } else { item.x == rect.x })?;
+            if split > 0 { return Some((vertical, split, pane)); }
+        }
+        None
+    }
+
+    // Move only the two neighbors' shared boundary. Preserve their combined weight so other
+    // panes stay put; minimum sizes keep a drag from hiding an editor or a close control.
+    fn resize_panes(&mut self, vertical: bool, split: usize, pane: usize, coordinate: u16) {
+        let axis = self.pane_axis(vertical, pane);
+        if split == 0 || split >= axis.len() { return; }
+        let extent = if vertical { axis.last().unwrap().bottom() - axis[0].y } else { axis.last().unwrap().right() - axis[0].x };
+        let minimum = (if vertical { PANE_MIN_HEIGHT } else { PANE_MIN_WIDTH }).min(extent / axis.len() as u16);
+        let (before, after) = (axis[split - 1], axis[split]);
+        let (start, end) = if vertical { (before.y, after.bottom()) } else { (before.x, after.right()) };
+        let available = (end - start).saturating_sub(2 * minimum);
+        if available == 0 { return; }
+        let weights = if vertical { &mut self.pane_sizes.heights } else { &mut self.pane_sizes.widths };
+        let total = u32::from(weights[split - 1].max(1)) + u32::from(weights[split].max(1));
+        let length = coordinate.saturating_sub(start).clamp(minimum, end - start - minimum) - minimum;
+        let left = (u64::from(length) * u64::from(total)).div_ceil(u64::from(available)) as u32;
+        let left = left.clamp(1, total - 1);
+        weights[split - 1] = left.min(u32::from(u16::MAX)) as u16;
+        weights[split] = (total - left).min(u32::from(u16::MAX)) as u16;
+    }
+
+    fn resize_focused(&mut self, action: &str) {
+        let vertical = matches!(action, "pane-taller" | "pane-shorter");
+        let axis = self.pane_axis(vertical, self.focus);
+        if axis.len() < 2 { self.notice = Some("No shared border on that axis; use the other resize direction or change /layout.".into()); return; }
+        let focused = self.pane_rects[self.focus];
+        let position = axis.iter().position(|rect| if vertical { rect.y == focused.y } else { rect.x == focused.x }).unwrap_or(0);
+        let split = (position + 1).min(axis.len() - 1);
+        let coordinate = if vertical { axis[split].y } else { axis[split].x };
+        let grow = matches!(action, "pane-wider" | "pane-taller");
+        let coordinate = if grow == (position < split) { coordinate.saturating_add(PANE_RESIZE_STEP) } else { coordinate.saturating_sub(PANE_RESIZE_STEP) };
+        self.resize_panes(vertical, split, self.focus, coordinate);
+        let _ = self.save_state();
+    }
+
     // Resize the visible sidebar, leaving the panes their minimum room. Hidden and single UIs
     // keep their preference; a terminal shrinking only limits what gets drawn, not what is saved.
     fn resize_sidebar(&mut self, width: u16) {
@@ -2601,7 +2763,7 @@ impl App {
         // least every agent scan, so the name shows up within one of the 12 s mark.
         let toward = commands::toward_descent(&self.draft().text);
         self.descent_since = if toward { self.descent_since.or_else(|| Some(Instant::now())) } else { None };
-        let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+        let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1 + u16::from(self.notice.is_some() || self.restart_waiting))]).areas(frame.area());
         let sidebar = self.sidebar && !self.single && main.width >= SIDEBAR_MIN_SCREEN;
         let [side, panes] = Layout::horizontal([Constraint::Length(if sidebar { self.sidebar_width.min(main.width.saturating_sub(SIDEBAR_PANES_WIDTH)) } else { 0 }), Constraint::Fill(1)]).areas(main);
         self.sidebar_rect = side;
@@ -2609,13 +2771,14 @@ impl App {
             self.draw_sidebar(frame, side);
         }
         // Focus and transcript updates don't move panes. Reuse their rectangles until they do.
-        let layout = (self.layout, panes, self.panes.len());
+        let layout = (self.layout, self.pane_sizes, panes, self.panes.len());
         if self.pane_layout != Some(layout) {
-            self.layout.areas(panes, self.panes.len(), &mut self.pane_rects);
+            self.layout.areas(panes, self.panes.len(), self.pane_sizes, &mut self.pane_rects);
             self.pane_layout = Some(layout);
             self.scan_scratchpads();
         }
         self.body_rects.clear();
+        self.close_rects.clear();
         self.editor_area = Default::default();
         self.typing_at = None;
         // A selection goes once its pane loses the focus or shows another session.
@@ -2623,16 +2786,24 @@ impl App {
             self.selection = None;
         }
         for index in 0..self.pane_rects.len() {
-            self.draw_pane(frame, index, self.pane_rects[index]);
+            let rect = self.pane_rects[index];
+            self.draw_pane(frame, index, rect);
+            let close = format!(" [× {}] ", self.keys.short("close-pane"));
+            let width = (close.width() as u16).min(rect.width.saturating_sub(PANE_TITLE_RESERVE));
+            let area = Rect { x: rect.right().saturating_sub(width + 1), y: rect.y + u16::from(rect.y > self.pane_rects[0].y), width, height: u16::from(rect.height > 0) };
+            frame.render_widget(Clear, area);
+            frame.render_widget(Paragraph::new(close).style(Style::new().fg(if index == self.focus { theme::ACCENT } else { theme::DIM })), area);
+            self.close_rects.push((index, area));
         }
         let line = if self.restart_waiting {
             let names: Vec<_> = self.slots.iter().enumerate().filter(|(slot, _)| self.restart_draining.contains_key(slot)).map(|(_, slot)| slot.title.as_str()).collect();
             if names.is_empty() { "Restarting; waiting for input delivery, session preparation and Claude Code handover".into() }
-            else { format!("Restart waiting on: {} · esc stops the focused turn", names.join(", ")) }
-        } else { self.notice.clone().unwrap_or_else(|| if self.single { SINGLE_HELP } else { HELP }.to_string()) };
+            else { format!("Restart waiting on: {} · {} stops the focused turn", names.join(", "), self.keys.label("stop")) }
+        } else { self.notice.clone().unwrap_or_else(|| self.key_hint()) };
         let cwd = render::home_relative(self.focus_cwd());
         let room = usize::from(status.width).saturating_sub(cwd.width() + 2);
-        let text = format!(" {:<room$} {cwd}", render::fit(&line, room));
+        let mut text = format!(" {:<room$} {cwd}", render::fit(&line, room));
+        if status.height > 1 { text.push_str(&format!("\n {}", self.key_hint())); }
         frame.render_widget(Paragraph::new(text).style(Style::new().fg(theme::DIM)), status);
         if self.picker.is_some() {
             self.draw_picker(frame, main);
@@ -2644,7 +2815,8 @@ impl App {
         let block = Block::new().borders(Borders::RIGHT).border_style(Style::new().fg(theme::DIM));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let mut lines = vec![Line::from(Span::styled(" piccosta", Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD))), Line::default()];
+        frame.render_widget(Paragraph::new("↔").style(Style::new().fg(theme::ACCENT)), Rect { x: area.right().saturating_sub(1), y: area.y + area.height / 2, width: 1, height: u16::from(area.height > 0) });
+        let mut lines = vec![Line::from(Span::styled(" piccosta · drag ↔", Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD))), Line::default()];
         self.sidebar_rows.clear();
         let room = usize::from(inner.width).saturating_sub(3);
         let shown = self.panes[self.focus].target;
@@ -2691,9 +2863,11 @@ impl App {
         let first = self.pane_rects[0];
         let borders = if rect.x > first.x { Borders::LEFT } else { Borders::NONE }
             | if rect.y > first.y { Borders::TOP } else { Borders::NONE };
-        let block = Block::new().borders(borders).border_style(Style::new().fg(theme::DIM));
+        let block = Block::new().borders(borders).border_style(Style::new().fg(if focused { theme::ACCENT } else { theme::DIM }));
         let inner = block.inner(rect).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
         frame.render_widget(block, rect);
+        if borders.contains(Borders::LEFT) { frame.render_widget(Paragraph::new("↔").style(Style::new().fg(theme::DIM)), Rect { x: rect.x, y: rect.y + rect.height / 2, width: 1, height: u16::from(rect.height > 0) }); }
+        if borders.contains(Borders::TOP) { frame.render_widget(Paragraph::new("↕").style(Style::new().fg(theme::DIM)), Rect { x: rect.x + rect.width / 2, y: rect.y, width: u16::from(rect.width > 0), height: 1 }); }
         let slot_index = match self.panes[index].target {
             Target::Session(slot) => slot,
             Target::Scratchpad(board) => return self.draw_scratch(frame, index, board, inner),
@@ -2710,7 +2884,7 @@ impl App {
         let ([header, body, queue, editor], editor_rows, cursor) = Self::editor_layout(&self.slots[slot_index].draft, inner, focused, queued.len().min(3) + usize::from(!completions.is_empty()));
 
         let slot = &self.slots[slot_index];
-        let mut spans = vec![Span::styled(render::fit(&slot.title, usize::from(width) / 2), if focused { Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) })];
+        let mut spans = vec![Span::styled(format!("{}{}", if focused { "▶ " } else { "  " }, render::fit(&slot.title, usize::from(width) / 2)), Style::new().fg(if focused { theme::ACCENT } else { theme::DIM }).add_modifier(Modifier::BOLD))];
         let mut facts = format!("  {} · {}{} · {}/{} context", slot.model, slot.thinking, if slot.fast { " · fast" } else { "" }, crate::cache::tokens(slot.context_tokens), crate::cache::tokens(slot.context_window));
         if !slot.team.models.is_empty() {
             let names: Vec<&str> = slot.team.models.iter().map(|model| model.rsplit('/').next().unwrap_or(model)).collect();
@@ -2864,7 +3038,7 @@ impl App {
         // An empty box says nothing, except the two keys that matter while a turn runs.
         if self.draft().text.is_empty() {
             if self.focus_busy() {
-                frame.render_widget(Paragraph::new("esc stops · ^x^s sends now").style(Style::new().fg(theme::DIM)), text_area);
+                frame.render_widget(Paragraph::new(format!("{} stops · {} sends now", self.keys.label("stop"), self.keys.label("send-now"))).style(Style::new().fg(theme::DIM)), text_area);
             }
         } else {
             let shown: Vec<Line> = editor_rows.iter().skip(first).take(visible).map(|row| Line::from(row.clone())).collect();
@@ -2998,9 +3172,9 @@ impl App {
         // As tall as its items, up to the whole area less a row each side, and moved up as far as it
         // needs so its last row stays on screen.
         let height = (question_rows + shown.len() as u16 + 3).min(area.height.saturating_sub(2)).max(4).min(area.height);
-        let rect = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height / 5).min(area.height - height), width, height };
+        let rect = if picker.title == "keys" { area } else { Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height / 5).min(area.height - height), width, height } };
         frame.render_widget(Clear, rect);
-        let title = if picker.confirming { "delete it? enter deletes · esc keeps it" } else if picker.answer.is_some() { "allow this call? enter chooses · esc refuses" } else { &picker.title };
+        let title = format!("{} · {}", if picker.answer.is_some() { "allow this call?" } else { &picker.title }, self.picker_hint());
         let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::ACCENT)).title(format!(" {title} "));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -3028,24 +3202,47 @@ pub enum PaneLayout {
     Grid,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneSizes { widths: [u16; MAX_PANES], heights: [u16; MAX_PANES] }
+impl Default for PaneSizes {
+    fn default() -> Self { Self { widths: [PANE_WEIGHT; MAX_PANES], heights: [PANE_WEIGHT; MAX_PANES] } }
+}
+impl PaneSizes {
+    // Reserve each pane's minimum first, then divide the remaining cells by saved weights.
+    // On tiny terminals the minimum shrinks rather than overflowing the screen.
+    fn split(self, area: Rect, vertical: bool, count: usize) -> Vec<Rect> {
+        let extent = if vertical { area.height } else { area.width };
+        let minimum = (if vertical { PANE_MIN_HEIGHT } else { PANE_MIN_WIDTH }).min(extent / count as u16);
+        let weights = if vertical { self.heights } else { self.widths };
+        let total: u32 = weights[..count].iter().map(|weight| u32::from((*weight).max(1))).sum();
+        let available = extent - minimum * count as u16;
+        let mut used = 0;
+        let constraints: Vec<_> = weights[..count].iter().enumerate().map(|(index, weight)| {
+            let length = if index + 1 == count { extent - used } else { minimum + (u32::from(available) * u32::from((*weight).max(1)) / total) as u16 };
+            used += length;
+            Constraint::Length(length)
+        }).collect();
+        if vertical { Layout::vertical(constraints).split(area).to_vec() } else { Layout::horizontal(constraints).split(area).to_vec() }
+    }
+}
+
 impl PaneLayout {
     // Rectangles stay in reading order, so the existing pane keys and mouse lookup agree.
     // Two panes share one row; three give the last pane the whole lower row; four make a quad.
-    fn areas(self, area: Rect, count: usize, rects: &mut Vec<Rect>) {
+    fn areas(self, area: Rect, count: usize, sizes: PaneSizes, rects: &mut Vec<Rect>) {
         rects.clear();
-        let constraints = [Constraint::Fill(1); MAX_PANES];
         // Columns need no horizontal separators. Use them when stacking would hide the editor;
         // keep the preference so growing the terminal brings its rows or grid back.
         let rows = match self { Self::Rows => count, Self::Grid => count.div_ceil(2), Self::Columns => 1 };
         let layout = if area.height / (rows as u16) < PANE_MIN_HEIGHT { Self::Columns } else { self };
         match layout {
-            Self::Rows => rects.extend_from_slice(&Layout::vertical(constraints[..count].iter().copied()).split(area)),
+            Self::Rows => rects.extend(sizes.split(area, true, count)),
             Self::Grid if count > 2 => {
-                for (row, area) in Layout::vertical(constraints[..rows].iter().copied()).split(area).iter().enumerate() {
-                    rects.extend_from_slice(&Layout::horizontal(constraints[..(count - row * 2).min(2)].iter().copied()).split(*area));
+                for (row, area) in sizes.split(area, true, rows).into_iter().enumerate() {
+                    rects.extend(sizes.split(area, false, (count - row * 2).min(2)));
                 }
             }
-            _ => rects.extend_from_slice(&Layout::horizontal(constraints[..count].iter().copied()).split(area)),
+            _ => rects.extend(sizes.split(area, false, count)),
         }
     }
 
@@ -3307,60 +3504,54 @@ impl Editor {
 
     // The readline keys Claude Code and pi share. Alt+letter is a key, never a typed letter. A
     // movement with shift held selects from where it started; one without lets the selection go.
-    fn key(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+    fn key(&mut self, action: &str, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let moves = matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End);
+        let moves = matches!(action, "cursor-left" | "cursor-right" | "cursor-up" | "cursor-down" | "word-back" | "word-forward" | "line-start" | "line-end");
         if moves {
             self.anchor = if shift { Some(self.anchor.unwrap_or(self.cursor)) } else { None };
         }
-        match key.code {
-            KeyCode::Backspace | KeyCode::Delete if self.selection().is_some() => {
+        match action {
+            "backspace" | "delete-character" if self.selection().is_some() => {
                 self.save();
                 self.remove_selection();
             }
-            KeyCode::Char('a') if control => self.cursor = self.line_start(),
-            KeyCode::Char('e') if control => self.cursor = self.line_end(),
-            KeyCode::Char('u') if control => self.cut(self.line_start()..self.cursor),
-            KeyCode::Char('k') if control => self.cut(self.cursor..self.line_end()),
+            "line-start" => self.cursor = self.line_start(),
+            "line-end" => self.cursor = self.line_end(),
+            "cut-line-start" => self.cut(self.line_start()..self.cursor),
+            "cut-line-end" => self.cut(self.cursor..self.line_end()),
             // Ctrl+w goes back to whitespace (a whole path); alt+backspace to the word's start.
-            KeyCode::Char('w') if control => {
+            "cut-whitespace-word" => {
                 let start = self.text[..self.cursor].trim_end().rfind([' ', '\n']).map_or(0, |index| index + 1);
                 self.cut(start..self.cursor);
             }
             // Terminals that don't report ctrl+backspace as such send it as ctrl+h.
-            KeyCode::Backspace if alt || control => self.cut(self.word_back()..self.cursor),
-            KeyCode::Char('h') if control => self.cut(self.word_back()..self.cursor),
-            KeyCode::Char('d') if alt => self.cut(self.cursor..self.word_forward()),
-            KeyCode::Char('b') if alt => self.cursor = self.word_back(),
-            KeyCode::Char('f') if alt => self.cursor = self.word_forward(),
-            KeyCode::Left if control => self.cursor = self.word_back(),
-            KeyCode::Right if control => self.cursor = self.word_forward(),
-            // Ctrl+_ (which terminals also send as ctrl+7 or ctrl+/).
-            KeyCode::Char('_' | '7' | '/') if control => {
+            "cut-word-back" => self.cut(self.word_back()..self.cursor),
+            "cut-word-forward" => self.cut(self.cursor..self.word_forward()),
+            "word-back" => self.cursor = self.word_back(),
+            "word-forward" => self.cursor = self.word_forward(),
+            "undo" => {
                 if let Some((text, cursor)) = self.undo.pop() {
                     (self.text, self.cursor, self.anchor) = (text, cursor, None);
                 }
             }
-            KeyCode::Char(character) if !control && !alt => self.insert(&character.to_string()),
-            KeyCode::Backspace => {
+            "" if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if let KeyCode::Char(character) = key.code { self.insert(&character.to_string()); }
+            }
+            "backspace" => {
                 if let Some(previous) = self.previous() {
                     self.cut(previous..self.cursor);
                 }
             }
             // Delete, and ctrl+d with text in the editor: the character after the cursor.
-            KeyCode::Delete | KeyCode::Char('d') if key.code == KeyCode::Delete || control => {
+            "delete-character" => {
                 if let Some(next) = self.next() {
                     self.cut(self.cursor..next);
                 }
             }
-            KeyCode::Left => self.cursor = self.previous().unwrap_or(0),
-            KeyCode::Right => self.cursor = self.next().unwrap_or(self.cursor),
-            KeyCode::Home => self.cursor = self.line_start(),
-            KeyCode::End => self.cursor = self.line_end(),
-            KeyCode::Up => self.vertical(true),
-            KeyCode::Down => self.vertical(false),
+            "cursor-left" => self.cursor = self.previous().unwrap_or(0),
+            "cursor-right" => self.cursor = self.next().unwrap_or(self.cursor),
+            "cursor-up" => self.vertical(true),
+            "cursor-down" => self.vertical(false),
             _ => {}
         }
     }

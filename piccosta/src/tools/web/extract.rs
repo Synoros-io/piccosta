@@ -104,7 +104,7 @@ pub async fn extract_content(url: &str, mode: Mode, force_clone: bool, web: &Web
     }
     // A GitHub repo, tree or blob URL is a clone (raw mode always fetches the page itself).
     if mode != Mode::Raw
-        && let Some(info) = super::github::parse_github_url(url)
+        && let Some(info) = super::github::parse_github_url(url, &web.settings.github_hosts)
         && let Some(found) = tokio::select! {
             found = super::github::extract_github(url, &info, force_clone, web, cancel) => found,
             () = cancel.cancelled() => None,
@@ -140,14 +140,14 @@ pub async fn extract_content(url: &str, mode: Mode, force_clone: bool, web: &Web
 }
 
 // The request's headers (extract.ts:1288-1300).
-fn request_headers(user_agent: &str, prefer_markdown: bool) -> HeaderMap {
+fn request_headers(user_agent: &str, accept_language: &str, prefer_markdown: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let mut set = |name: &'static str, value: &str| {
         headers.insert(HeaderName::from_static(name), net::header_value(value));
     };
     set("user-agent", user_agent);
     set("accept", if prefer_markdown { MARKDOWN_FIRST_ACCEPT } else { BROWSER_ACCEPT });
-    set("accept-language", "en-US,en;q=0.9");
+    set("accept-language", accept_language);
     set("cache-control", "no-cache");
     set("sec-fetch-dest", "document");
     set("sec-fetch-mode", "navigate");
@@ -242,14 +242,16 @@ fn executable_script_count(html: &str) -> usize {
         .count()
 }
 
-// Under 500 characters of body text and more than three scripts (extract.ts:1166-1184).
+// The upstream heuristic (extract.ts:1166-1184): short visible text with several scripts.
+const JS_BODY_CHARS: usize = 500;
+const JS_SCRIPT_COUNT: usize = 3;
 fn is_likely_js_rendered(html: &str) -> bool {
     static BODY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<body[^>]*>([\s\S]*?)</body>").unwrap());
     let Some(body) = BODY.captures(html) else { return false };
     let without_scripts = SCRIPT_BLOCK.replace_all(&body[1], "");
     let without_styles = STYLE_BLOCK.replace_all(&without_scripts, "");
     let text = collapse_whitespace(&ANY_TAG.replace_all(&without_styles, ""));
-    crate::js::utf16_len(&text) < 500 && executable_script_count(html) > 3
+    crate::js::utf16_len(&text) < JS_BODY_CHARS && executable_script_count(html) > JS_SCRIPT_COUNT
 }
 
 // The page's visible text length, for saying how incomplete an extraction looks
@@ -445,7 +447,7 @@ async fn fetch_and_extract(
     cancel: &CancellationToken,
     meta_hops: usize,
 ) -> Extracted {
-    let headers = request_headers(&client.user_agent, prefer_markdown);
+    let headers = request_headers(&client.user_agent, &web.settings.accept_language, prefer_markdown);
     let (response, final_url) = match client.get(parsed, &headers).await {
         Ok(found) => found,
         Err(error) => return Extracted::failed(url, error),

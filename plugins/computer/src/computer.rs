@@ -124,6 +124,7 @@ pub struct Settings {
     xvfb: String,
     size: String,
     accessibility_config: String,
+    commands: Arc<HashMap<String, String>>,
     held: Arc<Mutex<Held>>,
 }
 
@@ -139,12 +140,14 @@ struct Held {
 impl Settings {
     pub fn new(settings: &piccosta::config::Settings) -> Settings {
         let text = |key: &str, default: &str| settings.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).unwrap_or(default).to_string();
-        Settings { display: text("computer.display", DEFAULT_DISPLAY), xvfb: text("computer.xvfb", DEFAULT_XVFB), size: text("computer.size", DEFAULT_SIZE), accessibility_config: text("computer.accessibilityConfig", DEFAULT_ACCESSIBILITY_CONFIG), held: Arc::default() }
+        let commands = [("xdotool", "xdotool"), ("xauth", "xauth"), ("dbus-daemon", "dbus-daemon"), ("import", "screenshot")].into_iter()
+            .map(|(program, key)| (program.to_string(), text(&format!("computer.commands.{key}"), program))).collect();
+        Settings { display: text("computer.display", DEFAULT_DISPLAY), xvfb: text("computer.xvfb", DEFAULT_XVFB), size: text("computer.size", DEFAULT_SIZE), accessibility_config: text("computer.accessibilityConfig", DEFAULT_ACCESSIBILITY_CONFIG), commands: Arc::new(commands), held: Arc::default() }
     }
 
     // Each plugin process owns its desktop's files, not another session's desktop or profiles.
-    fn dir(&self) -> PathBuf {
-        PathBuf::from("/tmp").join(format!("computer-{}", std::process::id()))
+    fn dir(&self) -> Result<PathBuf, String> {
+        crate::isolation::data_dir().map(|root| root.join(format!("c{}", std::process::id()))).map_err(|error| error.to_string())
     }
 
     // The hidden desktop, checked and started when it isn't up. This plugin keeps its claim
@@ -198,12 +201,13 @@ fn hide(command: &mut Command, display: &str, dir: &Path) {
 pub struct Desktop {
     display: String,
     dir: Option<PathBuf>,
+    commands: Arc<HashMap<String, String>>,
 }
 
 impl Desktop {
     // A program run on this desktop.
     fn command(&self, program: &str) -> Command {
-        let mut command = Command::new(program);
+        let mut command = Command::new(self.commands.get(program).map(String::as_str).unwrap_or(program));
         command.env("DISPLAY", &self.display).stdin(Stdio::null());
         self.hide(&mut command);
         if let Some(dir) = &self.dir {
@@ -384,7 +388,14 @@ fn hidden(settings: &Settings) -> Result<Desktop, String> {
     let error = |error: std::io::Error| error.to_string();
     let number = settings.display.strip_prefix(':').map(|rest| rest.split('.').next().unwrap_or(rest)).filter(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
     let number = number.ok_or_else(|| format!("computer.display is {}; the hidden desktop's has to be a local display number, like {DEFAULT_DISPLAY}.", settings.display))?;
-    let dir = settings.dir();
+    let dir = settings.dir()?;
+    // sockaddr_un's pathname includes its terminating NUL. Refuse a long configured root before
+    // starting services, rather than silently truncating or moving their sockets elsewhere.
+    let socket = dir.join("runtime/a11y");
+    use std::os::unix::ffi::OsStrExt;
+    if socket.as_os_str().as_bytes().len() >= std::mem::size_of_val(&unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path) {
+        return Err("computer.dataDir is too long for Unix sockets; choose a shorter absolute path".into());
+    }
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(error)?;
     let mut held = settings.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if held.closed {
@@ -393,7 +404,7 @@ fn hidden(settings: &Settings) -> Result<Desktop, String> {
     if held.user.is_none() {
         held.user = Some(User { dir: dir.clone() });
     }
-    let desktop = Desktop { display: settings.display.clone(), dir: Some(dir.clone()) };
+    let desktop = Desktop { display: settings.display.clone(), dir: Some(dir.clone()), commands: settings.commands.clone() };
     // What's checked here is a moment: an Xvfb that exits after it, its display taken by another
     // server before the next xdotool or import connects by number, isn't caught. That window is
     // accepted; the signals, which could reach a process given a recorded pid, go through pidfds.
@@ -532,7 +543,7 @@ impl ComputerTool {
         tokio::select! {
             result = async {
                 let desktop = match arguments.desktop.as_deref() {
-                    Some("main") => Desktop { display: std::env::var("DISPLAY").map_err(|_| "This session has no DISPLAY, so there's no X11 desktop of the user's to reach.")?, dir: None },
+                    Some("main") => Desktop { display: std::env::var("DISPLAY").map_err(|_| "This session has no DISPLAY, so there's no X11 desktop of the user's to reach.")?, dir: None, commands: self.0.commands.clone() },
                     None | Some("hidden") => self.0.claim().await?,
                     Some(other) => return Err(format!("Unknown desktop {other}")),
                 };
