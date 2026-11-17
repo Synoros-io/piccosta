@@ -26,6 +26,9 @@ pub struct Limits {
 // image-resize-core.ts:31-38). The limits for a model whose catalog entry gives none.
 const ANTHROPIC_LIMITS: Limits = Limits { max_width: 2000, max_height: 2000, max_bytes: 4_718_592, jpeg_quality: 80 };
 const JPEG_QUALITIES: [u8; 4] = [85, 70, 55, 40];
+// Forty images at this size use 20 MiB, below Claude Code's 24 MiB request-media cap.
+// This is a soft encoding threshold in base64 bytes, not a per-image maximum.
+const PASSTHROUGH_BASE64_BYTES: usize = 512 * 1024;
 
 impl Limits {
     // A model's own limits, from its catalog `inputLimits` (`images.resize`: maxWidth, maxHeight,
@@ -167,11 +170,11 @@ pub(crate) const MAX_PLUGIN_RESPONSE_PIXELS: u64 = 4 * 2000 * 2000;
 const MAX_PLUGIN_DECODE_BYTES: u64 = MAX_PLUGIN_RESPONSE_PIXELS * 4;
 
 // Validate dimensions and decoder allocation before decoding. Always normalize plugin bytes,
-// then fit that PNG to the provider: a small JPEG can become a much larger PNG.
+// then fit the decoded image to the provider rather than forwarding its original encoding.
 pub(super) fn prepare_plugin(bytes: &[u8], limits: Limits, pixels_left: &mut u64) -> Result<Prepared, String> {
     let image = decode_guarded(bytes, pixels_left)?;
-    // No original bytes to forward: fit the decoded frame first, then encode a clean PNG (or
-    // JPEG when PNG won't fit). Encoding the full source first needlessly expands large JPEGs.
+    // No original bytes to forward: fit the decoded frame first, then choose a clean encoding.
+    // Encoding the full source first needlessly expands large JPEGs.
     prepare_decoded(&[], "image/png", limits, image)
 }
 
@@ -194,8 +197,8 @@ pub(crate) fn decode_guarded(bytes: &[u8], pixels_left: &mut u64) -> Result<Dyna
 
 // Input: an image file's bytes, its sniffed type and the limits to fit. Output: the image as it goes to the model,
 // or the note that replaces it when it can't be made small enough (image-process.ts:75-110).
-// BMP isn't an inline type anywhere, so it's always re-encoded. An image already within both
-// limits goes out as it was.
+// BMP isn't an inline type anywhere, so it's always re-encoded. Small images and JPEGs within
+// both limits go out as they were; larger images get the smallest fitting encoding at this quality.
 pub fn prepare(bytes: &[u8], mime_type: &str, limits: Limits) -> Result<Prepared, String> {
     let image = decode(bytes).ok_or_else(|| {
         if mime_type == "image/bmp" {
@@ -210,16 +213,28 @@ pub fn prepare(bytes: &[u8], mime_type: &str, limits: Limits) -> Result<Prepared
 fn prepare_decoded(bytes: &[u8], mime_type: &str, limits: Limits, image: DynamicImage) -> Result<Prepared, String> {
     let Limits { max_width, max_height, max_bytes, jpeg_quality } = limits;
     let mut hints = Vec::new();
-    let converted_from = (mime_type == "image/bmp").then_some(mime_type);
+    let is_bmp = mime_type == "image/bmp";
     let (width, height) = (image.width(), image.height());
 
-    if !bytes.is_empty() && converted_from.is_none() && width <= max_width && height <= max_height && base64_len(bytes.len()) < max_bytes {
+    // The original fits the box, so it's only a candidate at its own size, the first one tried.
+    let original_inline = !bytes.is_empty() && !is_bmp && width <= max_width && height <= max_height && base64_len(bytes.len()) < max_bytes;
+    if original_inline && (base64_len(bytes.len()) < PASSTHROUGH_BASE64_BYTES || mime_type == "image/jpeg") {
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         return Ok(Prepared { data, mime_type: mime_type.to_string(), hints, width, height });
     }
 
-    // Fit inside the box first, keeping the aspect ratio, then try PNG and every JPEG quality at
-    // that size, and shrink by a quarter until something fits (image-resize-core.ts:113-161).
+    // An alpha channel alone doesn't mean transparency. Check its pixels at their native depth;
+    // JPEG drops alpha, so even one non-opaque pixel rules it out, including the quality fallback.
+    let transparent = match &image {
+        DynamicImage::ImageLumaA8(image) => image.pixels().any(|pixel| pixel.0[1] != u8::MAX),
+        DynamicImage::ImageRgba8(image) => image.pixels().any(|pixel| pixel.0[3] != u8::MAX),
+        DynamicImage::ImageLumaA16(image) => image.pixels().any(|pixel| pixel.0[1] != u16::MAX),
+        DynamicImage::ImageRgba16(image) => image.pixels().any(|pixel| pixel.0[3] != u16::MAX),
+        DynamicImage::ImageRgba32F(image) => image.pixels().any(|pixel| pixel.0[3] != 1.0),
+        _ => false,
+    };
+    // Fit inside the box, keeping aspect ratio. At each size prefer the smallest encoding at the
+    // configured quality; only if none fits try other qualities, then shrink by a quarter.
     let (mut target_width, mut target_height) = (width, height);
     if target_width > max_width {
         target_height = ((target_height as f64 * max_width as f64) / target_width as f64).round() as u32;
@@ -236,34 +251,33 @@ fn prepare_decoded(bytes: &[u8], mime_type: &str, limits: Limits, image: Dynamic
         } else {
             image.resize_exact(current_width, current_height, image::imageops::FilterType::Lanczos3)
         };
-        let candidates = std::iter::once(encode_png(&resized).map(|png| (png, "image/png")))
-            .chain(std::iter::once(jpeg_quality).chain(JPEG_QUALITIES.into_iter().filter(|quality| *quality != jpeg_quality)).map(|quality| encode_jpeg(&resized, quality).map(|jpeg| (jpeg, "image/jpeg"))));
-        for (encoded, encoded_type) in candidates.flatten() {
-            if base64_len(encoded.len()) < max_bytes {
-                if let Some(from) = converted_from
-                    && from != encoded_type
-                {
-                    hints.push(format!("[Image converted from {from} to {encoded_type}.]"));
-                }
-                if (current_width, current_height) != (width, height) {
-                    let scale = crate::js::to_fixed(width as f64 / current_width as f64, 2);
-                    hints.push(format!(
-                        "[Image: original {width}x{height}, displayed at {current_width}x{current_height}. Multiply coordinates by {scale} to map to original image.]"
-                    ));
-                }
-                let data = base64::engine::general_purpose::STANDARD.encode(&encoded);
-                return Ok(Prepared { data, mime_type: encoded_type.to_string(), hints, width: current_width, height: current_height });
+        let candidate = [
+            encode_png(&resized).map(|png| (png, "image/png")),
+            (!transparent).then(|| encode_jpeg(&resized, jpeg_quality)).flatten().map(|jpeg| (jpeg, "image/jpeg")),
+            original_inline.then(|| (bytes.to_vec(), mime_type)),
+        ].into_iter().flatten().filter(|(encoded, _)| base64_len(encoded.len()) < max_bytes).min_by_key(|(encoded, _)| encoded.len())
+            .or_else(|| JPEG_QUALITIES.into_iter().filter(|quality| !transparent && *quality != jpeg_quality)
+                .filter_map(|quality| encode_jpeg(&resized, quality).map(|jpeg| (jpeg, "image/jpeg")))
+                .find(|(encoded, _)| base64_len(encoded.len()) < max_bytes));
+        if let Some((encoded, encoded_type)) = candidate {
+            if is_bmp {
+                hints.push(format!("[Image converted from {mime_type} to {encoded_type}.]"));
             }
+            if (current_width, current_height) != (width, height) {
+                let scale = crate::js::to_fixed(width as f64 / current_width as f64, 2);
+                hints.push(format!(
+                    "[Image: original {width}x{height}, displayed at {current_width}x{current_height}. Multiply coordinates by {scale} to map to original image.]"
+                ));
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&encoded);
+            return Ok(Prepared { data, mime_type: encoded_type.to_string(), hints, width: current_width, height: current_height });
         }
         if current_width == 1 && current_height == 1 {
             break;
         }
-        let next_width = if current_width == 1 { 1 } else { ((current_width as f64 * SHRINK_FACTOR).floor() as u32).max(1) };
-        let next_height = if current_height == 1 { 1 } else { ((current_height as f64 * SHRINK_FACTOR).floor() as u32).max(1) };
-        if (next_width, next_height) == (current_width, current_height) {
-            break;
-        }
-        (current_width, current_height) = (next_width, next_height);
+        // A side above one always shrinks and one stays one, so this ends at 1x1 above.
+        let shrink = |side: u32| ((side as f64 * SHRINK_FACTOR).floor() as u32).max(1);
+        (current_width, current_height) = (shrink(current_width), shrink(current_height));
     }
     Err("[Image omitted: could not be resized below the inline image size limit.]".to_string())
 }

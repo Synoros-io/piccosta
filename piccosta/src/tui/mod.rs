@@ -2525,6 +2525,9 @@ impl App {
                     self.notice = Some(format!("{running}{pressed} again quits piccosta (delete a session: {})", self.keys.label("delete-session")));
                 }
             }
+            // Esc in a pane scrolled up first brings back the newest output; only at the bottom does it
+            // stop a working model, so getting back to the bottom never interrupts a run.
+            "stop" if self.panes[self.focus].scroll > 0 => self.panes[self.focus].scroll = 0,
             "stop" if self.focus_busy() => self.interrupt(),
             "stop" => {
                 if let Target::Scratchpad(board) = self.panes[self.focus].target {
@@ -2569,6 +2572,8 @@ impl App {
             "widen-sidebar" => self.resize_sidebar(self.sidebar_rect.width.saturating_add(1)),
             "history-previous" if self.scratch_reading() => self.panes[self.focus].scroll += WHEEL_ROWS,
             "history-next" if self.scratch_reading() => self.panes[self.focus].scroll = self.panes[self.focus].scroll.saturating_sub(WHEEL_ROWS),
+            "previous-session" if !self.single => self.next_session(true),
+            "next-session" if !self.single => self.next_session(false),
             "scroll-up" | "previous-session" => {
                 let step = self.pane_rects.get(self.focus).map_or(10, |rect| usize::from(rect.height / 2));
                 self.panes[self.focus].scroll += step;

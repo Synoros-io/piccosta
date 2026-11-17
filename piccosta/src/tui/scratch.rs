@@ -234,7 +234,11 @@ impl App {
             Ok(Some(mut view)) if current && !superseded => {
                 for id in view.retired.drain(..) { self.tex.discard(id); }
                 self.tex.receive(std::mem::take(&mut view.graphics));
-                if let Some((reference, problem)) = view.assets.iter().find_map(|(reference, asset)| asset.problem.as_ref().map(|problem| (reference, problem))) { self.notice = Some(format!("Scratchpad image {reference}: {problem}; keeping its last preview or alt text.")); }
+                // Say each image problem once, by file name: the pane already shows the alt text, and
+                // repeating a full path on every rescan buried the status line.
+                let shown = &self.scratchpads[index].view.assets;
+                let new_problem = view.assets.iter().find_map(|(reference, asset)| asset.problem.as_ref().filter(|problem| shown.get(reference).and_then(|old| old.problem.as_ref()) != Some(*problem)).map(|problem| (reference, problem)));
+                if let Some((reference, problem)) = new_problem { self.notice = Some(format!("Scratchpad image {}: {problem}", reference.rsplit('/').next().unwrap_or(reference))); }
                 let old = std::mem::replace(&mut self.scratchpads[index].view, Arc::new(view));
                 self.retire(old);
             }
